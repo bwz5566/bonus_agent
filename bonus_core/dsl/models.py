@@ -49,7 +49,7 @@ class RuleItem(_Base):
     confirmed_by: str | None = None
 
 
-FieldType = Literal["money", "number", "int", "ratio", "text", "enum", "date", "id"]
+FieldType = Literal["money", "number", "int", "ratio", "text", "enum", "date", "id", "bool"]
 
 
 class FieldDef(_Base):
@@ -63,7 +63,10 @@ class DatasetDef(_Base):
     """标准数据表。
 
     - 有 key：实体表，每行一个实体（如人员表 key=employee_id）。
-    - 有 link：明细表，每行通过 link 字段挂到某一层级的实体上（如销售明细 link=employee_id）。
+      key 不是分配层级主键的实体表是“关联实体”（如项目表 key=project_id、销售单 key=sales_id）：
+      它挂在上级对象下面（link 指定，不写时按表中出现的层级主键或其他实体主键自动推断），
+      可以有自己作用域的变量（scope 写表名），其他表的行通过同名编号字段引用它的字段和变量。
+    - 只有 link：明细表，每行通过 link 字段挂到某一层级或某个关联实体上（如销售明细 link=employee_id、回款 link=sales_id）。
     - 都没有：公司级表，行属于“全部”，只能在 global 作用域聚合（如各月净利润）。
     """
     desc: str = ""
@@ -110,13 +113,23 @@ class Variable(RuleItem):
 
 class Pool(RuleItem):
     expr: str
+    scope: str = "global"      # 写分配层级名（如 部门）时，奖金池在该层每个对象上分别计算（四舍五入到分），上层为合计
+
+
+class Check(RuleItem):
+    """数据校验：在 scope 的每个对象上求值，结果必须为“是”，否则阻断计算（或提示）。"""
+    id: str
+    scope: str = "global"      # global、分配层级名或关联实体表名
+    expr: str                  # 条件表达式，如 abs(sum(share) - 1) < 0.000001
+    message: str = ""
+    severity: Literal["blocking", "warning"] = "blocking"
 
 
 class AllocationLevel(RuleItem):
     level: str                 # 层级名：部门 / 小组 / 个人 ...
     key: str                   # 实体主键字段
     parent_key: str | None = None
-    weight: str                # 权重表达式，在本层级求值
+    weight: str = ""           # 权重表达式，在本层级求值；奖金池所在层及以上不需要
 
 
 class PayoutCondition(RuleItem):
@@ -143,6 +156,7 @@ class RuleSet(_Base):
     pool: Pool
     allocation: list[AllocationLevel]
     payout: list[PayoutCondition] = []
+    checks: list[Check] = []
     tests: list[GoldenCase] = []
 
     # ---- 便捷方法 ----

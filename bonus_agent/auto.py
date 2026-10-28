@@ -28,7 +28,6 @@ from bonus_agent.parsing.docs import PARSERS, Block, ParsedDoc, md_table, parse_
 from bonus_core.data.mapping import DatasetMapping, Mapping, apply_mapping
 from bonus_core.data.table import ConvertError, convert
 from bonus_core.data.table_detect import SheetTable, detect
-from bonus_core.dsl.functions import FUNCTIONS
 from bonus_core.dsl.models import DatasetDef, FieldDef, FieldType, RuleSet
 from bonus_core.engine.allocation import AdjustConflict
 from bonus_core.engine.evaluator import EvalError
@@ -41,7 +40,7 @@ SKIP_DIRS = {".git", ".venv", "venv", "env", "__pycache__", "node_modules", "sit
              ".hypothesis", "reports"}
 MAX_FILES = 30
 FIELD_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
-RESERVED = {"and", "or", "not"} | set(FUNCTIONS)
+RESERVED = {"and", "or", "not", "true", "false"}   # 函数名可以作字段名（语法上能区分），如 month
 
 
 # ---------------- 1. 盘点 ----------------
@@ -236,7 +235,7 @@ def check_dataset(name: str, pd: PlanDataset, st: SheetTable, field_types: dict[
         errors.append(f"数据表「{name}」没有字段")
     for f, pf in pd.fields.items():
         if not FIELD_NAME.match(f) or f in RESERVED:
-            errors.append(f"「{name}」的字段名 {f} 不合法：只能用英文小写字母、数字和下划线，且不能是函数名或 and/or/not")
+            errors.append(f"「{name}」的字段名 {f} 不合法：只能用英文小写字母、数字和下划线，且不能是 and/or/not/true/false")
             continue
         col = _fix_column(pf.column, st.headers)
         if col is None:

@@ -12,7 +12,7 @@ from decimal import ROUND_HALF_UP, Decimal
 
 from bonus_core.data.table import Datasets
 from bonus_core.dsl.models import RuleSet
-from bonus_core.dsl.validator import validate
+from bonus_core.dsl.validator import _weighted, validate
 from bonus_core.engine.allocation import CENT, AdjustConflict, allocate, max_allowed, round_pool, round_tree
 from bonus_core.engine.evaluator import EvalError, Evaluator, Trace
 from bonus_core.engine.issues import EngineError, Issue
@@ -114,8 +114,9 @@ class Engine:
         self.ev = Evaluator(rs, root, by_level)
         self.nodes: dict[str, Node] = {n.id: n for n in root.walk()}
         try:
-            self.pool_exact = self.ev.evaluate(rs.pool.expr, root, f"{ROOT_LEVEL}/奖金池", "pool")
-            for lv in rs.allocation:
+            self.issues += self._checks()
+            self.pool_exact = self._pool()
+            for lv in _weighted(rs):
                 for n in by_level[lv.level]:
                     w = self.ev.evaluate(lv.weight, n, f"{n.id}/权重", f"allocation.{lv.level}")
                     if w < 0:
@@ -127,22 +128,68 @@ class Engine:
             raise EngineError([Issue.block("pool_negative", f"奖金池为负：{self.pool_exact}")])
         self.hash = input_hash(rs, data)
 
+    def _pool(self) -> Decimal:
+        """奖金池。scope 为某层级时，在该层每个对象上分别计算并四舍五入到分，上层为下级合计，这些对象的金额固定。"""
+        rs = self.rs
+        if rs.pool.scope == "global":
+            return self.ev.evaluate(rs.pool.expr, self.root, f"{ROOT_LEVEL}/奖金池", "pool")
+        levels = [lv.level for lv in rs.allocation]
+        at = levels.index(rs.pool.scope)
+        for n in self.by_level[rs.pool.scope]:
+            v = self.ev.evaluate(rs.pool.expr, n, f"{n.id}/奖金池", "pool")
+            if v < 0:
+                raise EngineError([Issue.block("pool_negative", f"{n.id} 的奖金池为负：{v}", n.id)])
+            n.fixed = round_pool(v)
+        for lvl in reversed(levels[:at]):
+            for n in self.by_level[lvl]:
+                n.fixed = sum((c.fixed for c in n.children), Decimal(0))
+        return sum((c.fixed for c in self.root.children), Decimal(0))
+
+    def _checks(self) -> list[Issue]:
+        """数据校验规则：每个对象上条件必须成立。阻断类不通过时直接报错，提示类记入结果。"""
+        out = []
+        for c in self.rs.checks:
+            if c.scope == "global":
+                targets = [self.root]
+            elif c.scope in self.by_level:
+                targets = self.by_level[c.scope]
+            else:
+                targets = sorted((self.root.index or {}).get(c.scope, {}).values(), key=lambda n: n.key)
+            failed = []
+            for n in targets:
+                tid = f"{n.id}/校验/{c.id}"
+                v = self.ev._eval_traced(c.expr, n, tid, f"checks.{c.id}").v
+                if not isinstance(v, bool):
+                    raise EvalError(f"校验 {c.id} 的结果应为是/否，得到 {v}", n.id)
+                if not v:
+                    failed.append(f"{n.id}：{self.ev.traces[tid].rendered}")
+            if failed:
+                msg = (f"校验 {c.id} 未通过" + (f"（{c.message}）" if c.message else "") + f"，{len(failed)} 个对象："
+                       + "；".join(failed[:10]) + ("……" if len(failed) > 10 else ""))
+                out.append(Issue(c.severity, "check_failed", msg, f"checks.{c.id}"))
+        blocking = [i for i in out if i.severity == "blocking"]
+        if blocking:
+            raise EngineError(blocking)
+        return out
+
     # ---- 分配 ----
     def _apply(self, adjustments: list[Adjustment], actor_scopes: dict[str, set[str]] | None) -> list[Adjustment]:
         active = [a for a in sorted(adjustments, key=lambda a: a.created_at) if not a.revoked]
         for n in self.nodes.values():
-            n.lock = None
+            n.lock = n.fixed
         for a in active:
             n = self.nodes.get(a.node_id)
             if n is None:
                 raise AdjustConflict(a.node_id, "节点不存在")
             if n is self.root:
                 raise AdjustConflict(a.node_id, "奖金池总额不能调整")
+            if n.fixed is not None:
+                raise AdjustConflict(a.node_id, f"{n.level}的奖金包由规则直接算出，不能调整，只能调整它下面的对象")
             if a.amount < 0 or a.amount != a.amount.quantize(CENT):
                 raise AdjustConflict(a.node_id, f"调整金额必须是非负、精确到分的数：{a.amount}")
             if actor_scopes is not None and n.parent.id not in actor_scopes.get(a.actor, set()):
                 raise PermissionError(f"{a.actor} 无权调整 {a.node_id}（只能调整自己管辖节点的下级）")
-            n.lock = a.amount  # 同一节点多次调整，以最后一次为准
+            n.lock = a.amount.quantize(CENT)  # 同一节点多次调整，以最后一次为准
         allocate(self.root, self.pool_exact)
         round_tree(self.root, round_pool(self.pool_exact))
         return active
@@ -155,7 +202,7 @@ class Engine:
             n.id: NodeResult(
                 id=n.id, level=n.level, key=n.key, label=n.label,
                 parent=n.parent.id if n.parent else None,
-                weight=str(n.weight), exact=str(n.exact), final=str(n.final), locked=n.locked,
+                weight=str(n.weight), exact=str(n.exact), final=str(n.final), locked=n.locked and n.fixed is None,
             )
             for n in self.root.walk()
         }

@@ -67,6 +67,8 @@ def convert(value, fd: FieldDef):
         return d
     if t == "date":
         return _to_date(value)
+    if t == "bool":
+        return to_bool(value)
     s = str(value).strip()
     if isinstance(value, float) and value.is_integer():
         s = str(int(value))  # Excel 里的编号常被存成 1001.0
@@ -75,7 +77,26 @@ def convert(value, fd: FieldDef):
     return s
 
 
+_TRUE = {"true", "1", "是", "y", "yes", "√", "已审批", "已确认"}
+_FALSE = {"false", "0", "否", "n", "no", "×", "未审批", "未确认"}
+
+
+def to_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    s = str(int(value) if isinstance(value, float) and value.is_integer() else value).strip().lower()
+    if s in _TRUE:
+        return True
+    if s in _FALSE:
+        return False
+    raise ConvertError(f"无法解析为是/否: {value!r}")
+
+
 _DATE = re.compile(r"^(\d{4})\s*[-/.年]\s*(\d{1,2})(?:\s*[-/.月]\s*(\d{1,2})\s*日?)?\s*月?")
+
+
+def to_date(value) -> date:
+    return _to_date(value)
 
 
 def _to_date(value) -> date:

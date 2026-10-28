@@ -44,6 +44,7 @@ class DatasetMapping(BaseModel):
     sheet: str | None = None
     header_rows: list[int] | None = None  # 自动识别的表头不对时，指定 Excel 表头行号
     columns: dict[str, str]            # 标准字段 -> 列名
+    filter: dict[str, list[str] | str] = {}  # 只取这些行：列名 -> 允许的取值（如 目标值表里 entity_type 为 group 的行）
     confidence: dict[str, float] = {}  # 推荐时填写
     confirmed_by: str | None = None
 
@@ -104,8 +105,8 @@ def suggest_heuristic(rs: RuleSet, sheets: list[SheetTable], history: Mapping | 
 def used_fields(rs: RuleSet) -> set[str]:
     """规则表达式里实际用到的字段，加上主键和关联键。"""
     used = set()
-    exprs = [v.expr for v in rs.variables.values()] + [rs.pool.expr] + [lv.weight for lv in rs.allocation]
-    exprs += [p.hold_ratio for p in rs.payout]
+    exprs = [v.expr for v in rs.variables.values()] + [rs.pool.expr] + [lv.weight for lv in rs.allocation if lv.weight.strip()]
+    exprs += [p.hold_ratio for p in rs.payout] + [c.expr for c in rs.checks]
     for e in exprs:
         used |= names(parse(e))
     for d in rs.datasets.values():
@@ -147,7 +148,13 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping) -> tup
                 issues.append(Issue.block("column_missing", f"列「{m.columns[f]}」不在 sheet「{st.sheet}」中", ds_name))
         idx = {f: st.headers.index(c) for f, c in m.columns.items() if c in st.headers and f in ds.fields}
         t = StdTable(ds_name)
+        keep = row_filter(st.headers, m.filter)
+        if isinstance(keep, str):
+            issues.append(Issue.block("filter_column", keep, ds_name))
+            continue
         for excel_row, vals in st.rows:
+            if not keep(vals):
+                continue
             src = RowRef(st.file, st.sheet, excel_row)
             rv = {}
             for f, fd in ds.fields.items():
@@ -162,6 +169,24 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping) -> tup
         issues += _reconcile(st, idx, ds, t)
         issues += _sanity(ds_name, ds, t, needed)
     return data, issues
+
+
+def cell_text(v) -> str:
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    return "" if v is None else str(v).strip()
+
+
+def row_filter(headers: list[str], flt: dict[str, list[str]]):
+    """返回行筛选函数；列名不存在时返回错误信息。"""
+    if not flt:
+        return lambda vals: True
+    idx = {}
+    for col, allowed in flt.items():
+        if col not in headers:
+            return f"筛选条件的列「{col}」不在表头中：{[h for h in headers if h]}"
+        idx[headers.index(col)] = {cell_text(a) for a in ([allowed] if isinstance(allowed, str) else allowed)}
+    return lambda vals: all(cell_text(vals[i] if i < len(vals) else None) in ok for i, ok in idx.items())
 
 
 def _reconcile(st: SheetTable, idx, ds, t: StdTable) -> list[Issue]:

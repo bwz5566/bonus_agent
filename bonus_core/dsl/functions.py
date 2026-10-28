@@ -32,6 +32,13 @@ FUNCTIONS: dict[str, FnSpec] = {
     "round": FnSpec(1, 2, doc="round(x, 位数=2) 四舍五入"),
     "clamp": FnSpec(3, 3, doc="clamp(x, 下限, 上限)"),
     "abs": FnSpec(1, 1, doc="绝对值"),
+    "date": FnSpec(1, 1, doc='date("2026-07-01") 日期常量；日期字段也可以直接和 "2026-07-01" 这样的字符串比较'),
+    "between": FnSpec(3, 3, doc='between(x, 下限, 上限) 两端都包含，如 between(recognition_date, "2026-07-01", "2026-09-30")'),
+    "years_between": FnSpec(2, 2, doc='years_between(起始日期, 截止日期) 已满整年数，如工龄 years_between(join_date, "2026-09-30")'),
+    "days_between": FnSpec(2, 2, doc="days_between(起始日期, 截止日期) 相差天数"),
+    "year": FnSpec(1, 1, doc="日期的年份"),
+    "month": FnSpec(1, 1, doc="日期的月份"),
+    "quarter": FnSpec(1, 1, doc="日期所在季度 1~4"),
 }
 
 

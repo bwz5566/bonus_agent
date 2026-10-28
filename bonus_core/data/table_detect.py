@@ -80,9 +80,14 @@ def detect_sheet(ws, file: str) -> SheetTable | None:
         return None
     rows = [best]
     # 两行表头：上一行是分组标题（如「金额（万元）」跨两列），下一行是具体列名
+    # 只有上一行像分组标题（有合并展开后的重复值，或下一行有值处上一行为空）才算两行表头，
+    # 避免把全是文字的数据行（如 部门编号 | 部门名称）当成表头
     if best + 1 < len(grid):
-        nxt = grid[best + 1]
-        if _filled(nxt) >= 2 and all(_is_text(v) or v in (None, "") for v in nxt):
+        head, nxt = grid[best], grid[best + 1]
+        vals = [v for v in head if v not in (None, "")]
+        grouped = len(set(vals)) < len(vals) or any(
+            (head[i] if i < len(head) else None) in (None, "") and v not in (None, "") for i, v in enumerate(nxt))
+        if grouped and _filled(nxt) >= 2 and all(_is_text(v) or v in (None, "") for v in nxt):
             rows.append(best + 1)
     t = _build(grid, file, ws.title, rows)
     t.confidence = min(1.0, best_score / max(len(t.headers), 1))

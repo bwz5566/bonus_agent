@@ -1,0 +1,12 @@
+name: QUARTER 季度奖
+version: '2026Q3'
+tables:
+  R_Q_TIER: {kind: tier, mode: whole, steps: [[0, 0.08], [10000000, 0.10], [20000000, 0.12]]}
+  R_COMPLETION: {kind: tier, mode: whole, steps: [[0, 0.8], [0.8, 1.0], [1, 1.1]]}
+variables:
+  d_eff: {scope: 部门, expr: 'sum(q_eff, of: "项目")'}
+  d_actual: {scope: 部门, expr: 'sum(q_sales, of: "项目")', desc: 实际销售额，含低毛利项目}
+  d_net: {scope: 部门, expr: 'sum(sales_amount - cost_amount - expense_amount, where: between(recognition_date, "2026-07-01", "2026-09-30"))'}
+  d_target: {scope: 部门, expr: 'sum(sales_target, of: "部门目标", where: period == "Q3")'}
+  d_coef: {scope: 部门, expr: 'tier_rate(R_COMPLETION, ratio(d_actual, d_target))'}
+pool: {scope: 部门, expr: 'round((tier(R_Q_TIER, d_eff) + max(d_net, 0) * 5%) * d_coef, 2)'}

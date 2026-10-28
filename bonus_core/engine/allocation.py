@@ -3,7 +3,8 @@
 已确认的业务规则：
 - 调整后总额不变；
 - 被调整的节点锁定为调整值，同级未锁定节点按「原始权重」分剩余金额；
-- 多次调整时，之前调整过的节点保持锁定。
+- 多次调整时，之前调整过的节点保持锁定；
+- 取整用最大余数法：先向下取整到分，剩余的分按余数从大到小每人补 1 分，余数相同按编号升序。
 """
 from __future__ import annotations
 
@@ -62,7 +63,8 @@ def round_tree(node: Node, target: Decimal) -> None:
     n = int((rest - sum(floor, Decimal(0))) / CENT)
     if free and n < 0:
         raise AdjustConflict(node.id, "取整后剩余金额为负")
-    order = sorted(range(len(free)), key=lambda i: (exact[i] - floor[i], free[i].id), reverse=True)
+    # 余数大的先补 1 分；余数相同按编号升序
+    order = sorted(range(len(free)), key=lambda i: (-(exact[i] - floor[i]), free[i].id))
     for i in order[:n]:
         floor[i] += CENT
     for c, f in zip(free, floor):

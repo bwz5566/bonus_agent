@@ -55,6 +55,11 @@ class Str:
 
 
 @dataclass(frozen=True)
+class Const:
+    value: bool
+
+
+@dataclass(frozen=True)
 class Name:
     id: str
 
@@ -118,6 +123,8 @@ class _ToAst(Transformer):
         return Str(str(tok)[1:-1])
 
     def name(self, tok):
+        if str(tok).lower() in ("true", "false"):
+            return Const(str(tok).lower() == "true")
         return Name(str(tok))
 
     def call(self, fn, args=None):

@@ -1,0 +1,38 @@
+部门: {file: 业务输入.xlsx, sheet: 部门, columns: {dept_id: dept_id, dept_name: dept_name}}
+小组: {file: 业务输入.xlsx, sheet: 小组, columns: {group_id: group_id, dept_id: dept_id, group_name: group_name, perf_q3: perf_q3}}
+员工: {file: 业务输入.xlsx, sheet: 员工, columns: {employee_id: employee_id, group_id: group_id, employee_name: employee_name, join_date: join_date}}
+项目:
+  file: 业务输入.xlsx
+  sheet: 项目
+  columns: {project_id: project_id, group_id: group_id, region: region, contract_date: contract_date, difficulty: difficulty}
+销售明细:
+  file: 业务输入.xlsx
+  sheet: 销售明细
+  columns: {sales_id: sales_id, project_id: project_id, recognition_date: recognition_date, sales_amount: sales_amount,
+            cost_amount: cost_amount, expense_amount: expense_amount}
+回款明细: {file: 业务输入.xlsx, sheet: 回款明细, columns: {sales_id: sales_id, receipt_date: receipt_date, receipt_amount: receipt_amount}}
+项目参与: {file: 业务输入.xlsx, sheet: 项目参与, columns: {employee_id: employee_id, project_id: project_id, share: share}}
+绩效评分:
+  file: 业务输入.xlsx
+  sheet: 绩效评分
+  columns: {employee_id: employee_id, period: period, contribution_score: contribution_score, output_score: output_score, approved: approved}
+# 目标值表里部门、小组、个人的目标混在一起，按 entity_type 筛选后分别作为三张明细表
+部门目标:
+  file: 业务输入.xlsx
+  sheet: 目标值
+  filter: {entity_type: department}
+  columns: {dept_id: entity_id, period: period, sales_target: sales_target}
+小组目标:
+  file: 业务输入.xlsx
+  sheet: 目标值
+  filter: {entity_type: group}
+  columns: {group_id: entity_id, period: period, sales_target: sales_target}
+个人目标:
+  file: 业务输入.xlsx
+  sheet: 目标值
+  filter: {entity_type: employee}
+  columns: {employee_id: entity_id, period: period, sales_target: sales_target}
+里程碑:
+  file: 业务输入.xlsx
+  sheet: 里程碑
+  columns: {project_id: project_id, acceptance_date: acceptance_date, status: status, base_bonus: base_bonus}

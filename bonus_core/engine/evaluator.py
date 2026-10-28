@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import operator
 from dataclasses import asdict, dataclass, field
+from datetime import date
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 
-from bonus_core.data.table import Row
+from bonus_core.data.table import ConvertError, Row, to_bool, to_date
 from bonus_core.dsl.models import LookupTable, RuleSet, TierTable
-from bonus_core.dsl.parser import BinOp, BoolOp, Call, Cmp, Name, Neg, Not, Num, Str, names, parse
+from bonus_core.dsl.parser import BinOp, BoolOp, Call, Cmp, Const, Name, Neg, Not, Num, Str, names, parse
 from bonus_core.dsl.scope import Layout, is_aggregate
 from bonus_core.engine.tree import Node
 
@@ -88,15 +89,17 @@ class Evaluator:
         self.layout = Layout(rs)
         # 只能在聚合里使用的字段 -> 所在的明细表/公司级表（不含主键/关联键）
         self.detail_fields = self.layout.row_only
+        self.index: dict[str, dict[str, Node]] = root.index or {}
+        self._row_node = {id(n.row): n for tbl in self.index.values() for n in tbl.values()}
 
     # ---------------- 对外接口 ----------------
     def evaluate(self, expr: str, node: Node, trace_id: str, rule_item: str) -> Decimal:
         val = self._eval_traced(expr, node, trace_id, rule_item)
         return self._num(val, trace_id)
 
-    def variable(self, name: str, node: Node) -> Val:
+    def variable(self, name: str, node: Node, row: Row | None = None) -> Val:
         var = self.rs.variables[name]
-        target = self._scope_node(var.scope, node, name)
+        target = self._scope_node(var.scope, node, name, row)
         key = (name, target.id)
         if key in self._cache:
             return self._cache[key]
@@ -126,13 +129,35 @@ class Evaluator:
         self._values[trace_id] = val.v
         return Val(val.v, fmt(val.v), frozenset({trace_id}))
 
-    def _scope_node(self, scope: str, node: Node, name: str) -> Node:
+    def _scope_node(self, scope: str, node: Node, name: str, row: Row | None = None) -> Node:
         if scope == "global":
             return self.root
         for n in node.chain():
             if n.level == scope:
                 return n
+        if row is not None:
+            for ref in self._refs(row):
+                for n in ref.chain():
+                    if n.level == scope:
+                        return n
+        if scope in self.layout.aux:
+            raise EvalError(f"变量 {name} 属于关联实体「{scope}」，这里取不到对应的{scope}（当前行没有它的编号 "
+                            f"{self.rs.datasets[scope].key}）", node.id)
         raise EvalError(f"变量 {name} 属于「{scope}」层级，不能在「{node.level}」层直接引用（需要聚合）", node.id)
+
+    def _refs(self, row: Row):
+        """当前行经编号字段引用到的关联实体，近的在前（如回款 → 销售单 → 项目）。"""
+        seen, todo = set(), [row]
+        while todo:
+            r = todo.pop(0)
+            for f, v in r.values.items():
+                tbl = self.index.get(self.layout.aux_by_key.get(f, ""))
+                n = tbl.get(str(v)) if tbl is not None and v is not None else None
+                if n is None or n.row is r or id(n) in seen:
+                    continue
+                seen.add(id(n))
+                yield n
+                todo.append(n.row)
 
     def _num(self, val: Val, where: str) -> Decimal:
         if isinstance(val.v, bool) or not isinstance(val.v, Decimal):
@@ -145,6 +170,8 @@ class Evaluator:
                 return Val(v, fmt(v))
             case Str(value=s):
                 return Val(s, fmt(s))
+            case Const(value=b):
+                return Val(b, fmt(b))
             case Name(id=n):
                 return self._name(n, ctx)
             case Neg(operand=x):
@@ -163,6 +190,7 @@ class Evaluator:
                 return Val(_ARITH[op](x, y), text, deps, rows)
             case Cmp(op=op, left=l, right=r):
                 a, b = self.ev(l, ctx), self.ev(r, ctx)
+                a, b = _coerce(a, b, ctx.where), _coerce(b, a, ctx.where)
                 if type(a.v) is not type(b.v) and not (a.v is None or b.v is None):
                     raise EvalError(f"无法比较 {a.text} 和 {b.text}（类型不同）", ctx.where)
                 if (a.v is None or b.v is None) and op not in ("==", "!="):
@@ -181,6 +209,16 @@ class Evaluator:
                 return self._call(ast, ctx)
         raise EvalError(f"无法求值的节点 {ast!r}", ctx.where)
 
+    def _date(self, val: Val, ctx: Ctx) -> date:
+        if isinstance(val.v, date):
+            return val.v
+        if isinstance(val.v, str):
+            try:
+                return to_date(val.v)
+            except ConvertError as e:
+                raise EvalError(str(e), ctx.where) from None
+        raise EvalError(f"需要日期，得到 {val.text}", ctx.where)
+
     def _bool(self, val: Val, ctx: Ctx) -> bool:
         if not isinstance(val.v, bool):
             raise EvalError(f"需要条件（是/否），得到 {val.text}", ctx.where)
@@ -194,7 +232,14 @@ class Evaluator:
                 raise EvalError(f"字段 {n} 为空", str(ctx.row.src))
             return Val(v, n, rows=(ctx.row,))
         if n in self.rs.variables:
-            return self.variable(n, ctx.node)
+            return self.variable(n, ctx.node, ctx.row)
+        if ctx.row is not None:
+            for ref in self._refs(ctx.row):
+                if n in ref.attrs:
+                    v = ref.attrs[n]
+                    if v is None:
+                        raise EvalError(f"{ref.id} 的字段 {n} 为空", str(ref.attr_src))
+                    return Val(v, f"{n}[{ref.key}]", rows=(ref.row,))
         for node in ctx.node.chain():
             if n in node.attrs:
                 v = node.attrs[n]
@@ -268,22 +313,51 @@ class Evaluator:
         if fn == "abs":
             a = self.ev(c.args[0], ctx)
             return Val(abs(self._num(a, ctx.where)), f"|{a.text}|", a.deps, a.rows)
+        if fn == "date":
+            a = self.ev(c.args[0], ctx)
+            d = self._date(a, ctx)
+            return Val(d, fmt(d), a.deps, a.rows)
+        if fn == "between":
+            x, lo, hi = (self.ev(a, ctx) for a in c.args)
+            lo, hi = _coerce(lo, x, ctx.where), _coerce(hi, x, ctx.where)
+            if not (type(x.v) is type(lo.v) is type(hi.v)) or isinstance(x.v, (bool, str)):
+                raise EvalError(f"between 的三个参数类型要一致（数字或日期）：{x.text}, {lo.text}, {hi.text}", ctx.where)
+            deps, rows = _merge(x, lo, hi)
+            return Val(lo.v <= x.v <= hi.v, f"{lo.text} ≤ {x.text} ≤ {hi.text}", deps, rows)
+        if fn in ("years_between", "days_between"):
+            a, b = self.ev(c.args[0], ctx), self.ev(c.args[1], ctx)
+            d1, d2 = self._date(a, ctx), self._date(b, ctx)
+            if fn == "days_between":
+                r = Decimal((d2 - d1).days)
+            else:
+                r = Decimal(d2.year - d1.year - ((d2.month, d2.day) < (d1.month, d1.day)))
+            deps, rows = _merge(a, b)
+            return Val(r, f"{fn}({a.text}, {b.text})", deps, rows)
+        if fn in ("year", "month", "quarter"):
+            a = self.ev(c.args[0], ctx)
+            d = self._date(a, ctx)
+            r = Decimal(d.year if fn == "year" else d.month if fn == "month" else (d.month - 1) // 3 + 1)
+            return Val(r, f"{fn}({a.text})", a.deps, a.rows)
         raise EvalError(f"不支持的函数 {fn}", ctx.where)
 
     def _aggregate(self, c: Call, ctx: Ctx) -> Val:
         kw = c.kw()
         ds = self._agg_dataset(c, ctx)
         rows = ctx.node.rows(ds)
+        aux = ds in self.layout.aux
+
+        def rctx(r):   # 关联实体的行在它自己的节点上求值，才能用到该实体的变量
+            return Ctx(self._row_node[id(r)], r, ctx.where) if aux else Ctx(ctx.node, r, ctx.where)
         if "where" in kw:
             cond = kw["where"]
-            rows = [r for r in rows if self._bool(self.ev(cond, Ctx(ctx.node, r, ctx.where)), ctx)]
+            rows = [r for r in rows if self._bool(self.ev(cond, rctx(r)), ctx)]
         deps: set = set()
         if c.fn == "count":
             r = Decimal(len(rows))
         else:
             vals = []
             for row in rows:
-                v = self.ev(c.args[0], Ctx(ctx.node, row, ctx.where))
+                v = self.ev(c.args[0], rctx(row))
                 deps |= v.deps
                 vals.append(v.v)
             if c.fn == "count_distinct":
@@ -324,6 +398,17 @@ class Evaluator:
         if hi == lo:
             return Val(Decimal(1), f"minmax({own.text})=1", deps)
         return Val((nums[node.id] - lo) / (hi - lo), f"minmax({own.text})", deps)
+
+
+def _coerce(a: Val, other: Val, where: str) -> Val:
+    """字符串和日期、是/否比较时，把字符串按对方的类型转换（如 recognition_date >= "2026-07-01"）。"""
+    if isinstance(a.v, str) and isinstance(other.v, (date, bool)):
+        try:
+            v = to_bool(a.v) if isinstance(other.v, bool) else to_date(a.v)
+        except ConvertError as e:
+            raise EvalError(str(e), where) from None
+        return Val(v, a.text, a.deps, a.rows)
+    return a
 
 
 _PREC = {"+": 1, "-": 1, "*": 2, "/": 2}

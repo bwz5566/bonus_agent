@@ -1,0 +1,32 @@
+# 两个方案共用的系数表、变量和分配层级
+tables:
+  R_REGION: {kind: lookup, mapping: {华东: 1.10, 华南: 1.00, 华北: 0.90, 西部: 1.20}}
+  R_MARGIN: {kind: tier, mode: whole, steps: [[0, 0], [0.15, 0.8], [0.25, 1.0], [0.35, 1.2]]}
+variables:
+  q_sales: {scope: 项目, expr: 'sum(sales_amount, where: between(recognition_date, "2026-07-01", "2026-09-30"))', desc: 项目本季度销售额}
+  q_cost: {scope: 项目, expr: 'sum(cost_amount, where: between(recognition_date, "2026-07-01", "2026-09-30"))'}
+  q_margin: {scope: 项目, expr: 'ratio(q_sales - q_cost, q_sales, zero: 0)', desc: 项目本季度毛利率}
+  new_coef: {scope: 项目, expr: 'if(contract_date >= "2026-01-01", 1.10, 0.95)', desc: 新老项目系数}
+  q_eff: {scope: 项目, expr: 'q_sales * lookup(R_REGION, region) * new_coef * tier_rate(R_MARGIN, q_margin)', desc: 项目有效销售额}
+  tenure: {scope: 个人, expr: 'years_between(join_date, "2026-09-30")'}
+  contrib: {scope: 个人, expr: 'sum(contribution_score, where: period == "Q3" and approved)'}
+  output: {scope: 个人, expr: 'sum(output_score, where: period == "Q3" and approved)'}
+  avg_diff: {scope: 个人, expr: 'ratio(sum(share * difficulty), sum(share))', desc: 按参与比例加权的项目难度}
+  attrib: {scope: 个人, expr: 'sum(q_sales * share)', desc: 个人归属销售额}
+  e_target: {scope: 个人, expr: 'sum(sales_target, of: "个人目标", where: period == "Q3")'}
+  n_proj: {scope: 个人, expr: 'count_distinct(project_id, of: "项目参与")'}
+allocation:
+  - {level: 部门, key: dept_id}
+  - level: 小组
+    key: group_id
+    parent_key: dept_id
+    weight: 'round(perf_q3 / 100 * min(ratio(sum(q_sales, of: "项目"), sum(sales_target, of: "小组目标", where: period == "Q3")), 1.2), 6)'
+  - level: 个人
+    key: employee_id
+    parent_key: group_id
+    weight: >-
+      round(0.1 * min(tenure, 5) / 5 + 0.2 * contrib / 100 + 0.15 * avg_diff / 3
+      + 0.3 * min(ratio(attrib, e_target), 1.5) / 1.5 + 0.1 * min(n_proj, 8) / 8 + 0.15 * output / 100, 6)
+checks:
+  - {id: share_sum, scope: 项目, expr: 'abs(sum(share, of: "项目参与") - 1) < 0.000001', message: 参与比例在每个项目内必须合计为 1}
+  - {id: target_nonzero, scope: 个人, expr: 'e_target > 0', message: 个人目标值不能为 0}
