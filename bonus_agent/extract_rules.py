@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from bonus_agent.llm import LLM, LLMError, Usage, image_part, parse_json
 from bonus_agent.parsing.docs import Block, ParsedDoc, parse_any
 from bonus_core.dsl.functions import describe as describe_functions
-from bonus_core.dsl.models import AllocationLevel, DatasetDef, PayoutCondition, Pool, RuleSet, Table, Variable
+from bonus_core.dsl.models import AllocationLevel, Check, DatasetDef, PayoutCondition, Pool, RuleSet, Table, Variable
 from bonus_core.dsl.validator import validate
 from bonus_core.engine.issues import Issue
 
@@ -48,6 +48,7 @@ class Extraction(BaseModel):
     pool: Pool
     allocation: list[AllocationLevel]
     payout: list[PayoutCondition] = []
+    checks: list[Check] = []
     questions: list[Question] = []
 
 
@@ -86,7 +87,8 @@ class ExtractResult:
 def data_dictionary(datasets: dict[str, DatasetDef]) -> str:
     lines = []
     for n, d in datasets.items():
-        kind = (f"实体表，主键 {d.key}" if d.key else f"明细表，每行通过 {d.link} 关联" if d.link
+        kind = (f"实体表，主键 {d.key}" + (f"，挂在 {d.link} 下" if d.link else "") if d.key
+                else f"明细表，每行通过 {d.link} 关联" if d.link
                 else "公司级表，行属于“全部”，只能在 global 作用域聚合")
         if d.desc:
             kind += f"；{d.desc}"

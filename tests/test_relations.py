@@ -115,3 +115,82 @@ def test_date_functions():
     assert val('between(date("2026-09-30"), "2026-07-01", "2026-09-30")') is True
     assert val('quarter("2026-08-15") == 3 and month("2026-08-15") == 8') is True
     assert val('days_between("2026-01-01", "2026-03-01")') == 59
+
+
+def _agent_script():
+    """按 datasets.yaml / mapping.yaml / 规则文件生成一段智能体操作：共用部分 + 两个方案 + 修订。"""
+    y = lambda n: yaml.safe_load((CASE / n).read_text(encoding="utf-8"))  # noqa: E731
+    dsets, maps, shared = y("datasets.yaml"), y("mapping.yaml"), y("weights.yaml")
+    script = []
+    for name, d in dsets.items():
+        m = maps[name]
+        fields = {f: {"column": m["columns"][f], **fd} for f, fd in d["fields"].items()}
+        args = {"name": name, "file": m["file"], "sheet": m["sheet"], "fields": fields,
+                **{k: d[k] for k in ("key", "link") if k in d}}
+        if "filter" in m:
+            args["filter"] = m["filter"]
+        script.append({"tool": "define_dataset", "args": args})
+    script.append({"tool": "set_rules", "args": {"scheme": "共用", **shared}})
+    for scheme in ("quarter", "process"):
+        own = y(f"rules_{scheme}.yaml")
+        args = {"scheme": scheme.upper(), **{k: own[k] for k in ("tables", "variables", "pool") if k in own}}
+        if scheme == "quarter":
+            args["revisions"] = [{"name": "R1", "adjust": [{"node": "小组:G01", "amount": 300000}]},
+                                 {"name": "R2", "adjust": [{"node": "个人:E001", "amount": 150000}]}]
+        script.append({"tool": "set_rules", "args": args})
+    script += [{"tool": "trial_run"}, {"tool": "explain", "args": {"id": "项目:P01/q_eff", "scheme": "QUARTER"}},
+               {"tool": "evaluate", "args": {"expr": "q_sales", "node": "项目:P01", "scheme": "QUARTER"}},
+               {"tool": "finish", "args": {"summary": "季度奖和过程奖"}}]
+    return script
+
+
+def test_agent_multi_scheme_with_revisions(tmp_path):
+    from bonus_agent.agent import run_agent
+    from bonus_agent.llm import FakeLLM
+    ar = run_agent(FakeLLM(_agent_script()), [XLSX], tmp_path)
+    assert ar.ok, (ar.error, [s.result for s in ar.steps if not s.ok])
+    assert set(ar.results) == {"QUARTER", "PROCESS"} and list(ar.results["QUARTER"]) == ["R0", "R1", "R2"]
+    for scheme in ("QUARTER", "PROCESS"):
+        r0 = ar.results[scheme]["R0"]
+        assert {k: r0.nodes[k].final for k in EXPECTED[scheme]} == EXPECTED[scheme]
+    r2 = ar.results["QUARTER"]["R2"]
+    assert r2.nodes["小组:G01"].final == "300000.00" and r2.nodes["个人:E001"].final == "150000.00"
+    assert r2.nodes["部门:D01"].final == EXPECTED["QUARTER"]["部门:D01"]
+    assert ar.recheck.count("一致") == 4 and "不一致" not in ar.recheck, ar.recheck
+    names = {p.name for p in tmp_path.iterdir()}
+    assert {"result.xlsx", "result_QUARTER.xlsx", "result_QUARTER_R2.xlsx", "result_PROCESS.xlsx",
+            "rules_QUARTER.yaml", "adjust_QUARTER_R2.yaml", "mapping.yaml"} <= names
+    wb = openpyxl.load_workbook(tmp_path / "result.xlsx")
+    assert {"各方案结果", "方案汇总", "待确认问题", "智能体规划"} <= set(wb.sheetnames)
+    assert [c.value for c in wb["各方案结果"][1]][3:] == ["QUARTER", "QUARTER R1", "QUARTER R2", "PROCESS"]
+    ev = next(s for s in ar.steps if s.tool == "evaluate")
+    assert ev.ok and "项目:P01/q_sales" not in ev.result
+
+
+def test_compare_with_expected_workbook(tmp_path):
+    from bonus_agent.agent import run_agent
+    from bonus_agent.compare import compare_expected, report
+    from bonus_agent.llm import FakeLLM
+    # 期望结果：一张长表，方案列 + 编号列 + 金额列；故意改错一个人
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "期望结果"
+    ws.append(["scheme", "level", "entity_id", "expected_bonus"])
+    for scheme in ("QUARTER", "PROCESS"):
+        for k, v in EXPECTED[scheme].items():
+            amount = float(v) + (1 if (scheme, k) == ("PROCESS", "个人:E003") else 0)
+            ws.append([scheme, k.split(":")[0], k.split(":")[1], amount])
+    exp = tmp_path / "期望.xlsx"
+    wb.save(exp)
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    (inputs / "业务输入.xlsx").write_bytes(XLSX.read_bytes())
+    (inputs / "期望.xlsx").write_bytes(exp.read_bytes())
+    ar = run_agent(FakeLLM(_agent_script()), [inputs], tmp_path / "out", exclude=[inputs / "期望.xlsx"])
+    assert ar.ok and all(f.name != "期望.xlsx" for f in ar.ws.inv.files)      # 期望结果不给智能体
+    ms = {(m.scheme, m.revision): m for m in compare_expected(ar.results, exp)}
+    assert ms[("QUARTER", "R0")].ok and ms[("QUARTER", "R0")].column == "expected_bonus"
+    p = ms[("PROCESS", "R0")]
+    assert p.matched == p.total - 1 and p.diffs[0][0] == "E003"
+    text = "\n".join(report(ms.values()))
+    assert "E003 期望" in text and "14/14" in text

@@ -25,8 +25,8 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from bonus_agent.extract_rules import ExtractResult, Question, extract, prompt
 from bonus_agent.llm import LLM, LLMError, parse_json
 from bonus_agent.parsing.docs import PARSERS, Block, ParsedDoc, md_table, parse_any
-from bonus_core.data.mapping import DatasetMapping, Mapping, apply_mapping
-from bonus_core.data.table import ConvertError, convert
+from bonus_core.data.mapping import DatasetMapping, Mapping, apply_mapping, cell_text, row_filter
+from bonus_core.data.table import convert
 from bonus_core.data.table_detect import SheetTable, detect
 from bonus_core.dsl.models import DatasetDef, FieldDef, FieldType, RuleSet
 from bonus_core.engine.allocation import AdjustConflict
@@ -223,13 +223,29 @@ def _fix_column(col: str, headers: list[str]) -> str | None:
     return norm[close[0]] if close else None
 
 
+def filter_sheet(st: SheetTable, flt: dict | None) -> tuple[SheetTable, str]:
+    """按 filter（列名 -> 允许的取值）筛选行，返回 (筛选后的表, 错误信息)。"""
+    if not flt:
+        return st, ""
+    keep = row_filter(st.headers, flt)
+    if isinstance(keep, str):
+        return st, keep
+    out = SheetTable(st.file, st.sheet, st.header_row, st.headers, [r for r in st.rows if keep(r[1])], [], st.confidence)
+    if not out.rows:
+        seen = {c: sorted({cell_text(v[st.headers.index(c)]) for _, v in st.rows})[:20] for c in flt}
+        return st, f"按 filter {flt} 筛选后没有任何行，这些列实际的取值：{seen}"
+    return out, ""
+
+
 def check_dataset(name: str, pd: PlanDataset, st: SheetTable, field_types: dict[str, tuple[str, str]] | None = None,
-                  header_rows: list[int] | None = None) -> tuple[DatasetDef | None, DatasetMapping | None, list[str], list[str]]:
+                  header_rows: list[int] | None = None, flt: dict | None = None
+                  ) -> tuple[DatasetDef | None, DatasetMapping | None, list[str], list[str]]:
     """校验一张数据表的定义：列是否存在、字段名是否合法、类型能否转换。返回 (数据表, 映射, 警告, 错误)。"""
     errors, warnings = [], []
     field_types = {} if field_types is None else field_types
-    if pd.key and pd.link:
-        errors.append(f"数据表「{name}」不能同时有 key 和 link")
+    st, err = filter_sheet(st, flt)
+    if err:
+        return None, None, warnings, [err]
     cols, fields = {}, {}
     if not pd.fields:
         errors.append(f"数据表「{name}」没有字段")
@@ -281,7 +297,8 @@ def check_dataset(name: str, pd: PlanDataset, st: SheetTable, field_types: dict[
     if errors:
         return None, None, warnings, errors
     return (DatasetDef(desc=pd.desc, key=pd.key, link=pd.link, fields=fields),
-            DatasetMapping(file=st.file, sheet=st.sheet, header_rows=header_rows, columns=cols), warnings, [])
+            DatasetMapping(file=st.file, sheet=st.sheet, header_rows=header_rows, columns=cols, filter=flt or {}),
+            warnings, [])
 
 
 def check_plan(plan: Plan, inv: Inventory) -> tuple[dict[str, DatasetDef], Mapping, list[str], list[str]]:

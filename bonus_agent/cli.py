@@ -4,7 +4,7 @@
   extract --datasets D.yaml [--model M] --out draft.yaml 文档...
                                            从规则文档抽取规则草稿和问题卡
   map --rules R.yaml [--model M] 数据.xlsx 推荐字段映射（启发式 + 大模型）
-  auto [--model M] [--answers Q.yaml] [--pipeline] --out 目录 文件或文件夹...
+  auto [--model M] [--answers Q.yaml] [--expected 期望结果.xlsx] [--pipeline] --out 目录 文件或文件夹...
                                            全自动：大模型自主调用工具完成建模和试算，引擎计算，输出 Excel
                                            （--pipeline 改用固定流程：规划 → 抽取 → 计算）
 """
@@ -50,6 +50,7 @@ def main(argv=None) -> int:
     p.add_argument("--max-files", type=int, default=30, help="一批最多处理的文件数，防止误传整个目录")
     p.add_argument("--max-steps", type=int, default=80, help="安全上限：智能体最多调用工具的轮数，完成即停，正常用不满")
     p.add_argument("--max-tokens", type=int, default=1_000_000, help="安全上限：本次最多消耗的 tokens，超过即停止")
+    p.add_argument("--expected", help="期望结果 Excel，只在算完后用来逐个对象核对，不会交给智能体；不要放在输入文件夹里")
     p.add_argument("--pipeline", action="store_true", help="使用固定流程（规划 → 抽取 → 计算），不让模型自主调度")
     p.add_argument("paths", nargs="+", help="本批次的规则文档、Excel 数据，或只包含它们的文件夹")
     a = ap.parse_args(argv)
@@ -181,6 +182,7 @@ def _agent(a, cfg) -> int:
 
     try:
         ar = run_agent(llm, a.paths, a.out, answers=answers, max_steps=a.max_steps, max_tokens=a.max_tokens,
+                       exclude=[a.expected] if a.expected else [],
                        max_history_chars=hist,
                        max_files=a.max_files, on_step=show)
     except ToolError as e:
@@ -188,16 +190,27 @@ def _agent(a, cfg) -> int:
         return 1
     if ar.ws.summary:
         print(f"\n【方案】{ar.ws.summary}")
-    if ar.result is not None:
-        print(f"【结果】奖金池 {Decimal(ar.result.pool):,}，结果已写入 {ar.outputs.get('excel')}")
+    for name, revs in ar.results.items():
+        for rev, res in revs.items():
+            label = "" if ar.single else f"「{name}{'' if rev == 'R0' else ' ' + rev}」"
+            print(f"【结果】{label}奖金池 {Decimal(res.pool):,}")
+    if ar.results:
+        print(f"结果已写入 {ar.outputs.get('excel')}" + ("" if ar.single else "（各方案明细见同目录 result_*.xlsx）"))
         print(f"【复算核对】{ar.recheck}")
+    if a.expected and ar.results:
+        from bonus_agent.compare import compare_expected, report
+        lines = report(compare_expected(ar.results, a.expected))
+        (Path(a.out) / "expected_check.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print("\n【与期望结果核对】（已写入 expected_check.txt）")
+        for ln in lines:
+            print(f"  {ln}")
     if ar.questions:
         print(f"\n【待确认问题】{len(ar.questions)} 个（已按建议理解先算，答复后用 --answers 重跑）：")
         for q in ar.questions:
             print(f"  {q.id}. {q.text}  选项：{' / '.join(q.options)}")
     if ar.error:
         print(f"\n未完成：{ar.error}")
-    print(f"\n输出目录：{a.out}（result.xlsx、rules.yaml、mapping.yaml、questions.yaml、agent_log.json）")
+    print(f"\n输出目录：{a.out}（result*.xlsx、rules*.yaml、mapping.yaml、questions.yaml、agent_log.json）")
     u = llm.usage
     cached = f"（其中命中缓存 {u.cached_tokens}）" if u.cached_tokens else ""
     print(f"共 {len(ar.steps)} 步，调用模型 {u.calls} 次，输入 {u.prompt_tokens} tokens{cached}，输出 {u.completion_tokens} tokens，"

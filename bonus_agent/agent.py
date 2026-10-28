@@ -20,7 +20,7 @@ import yaml
 from pydantic import ValidationError
 
 from bonus_agent.auto import (DATA_SUFFIXES, MAX_FILES, Inventory, PlanDataset, TooManyFiles, build_inventory,
-                              check_dataset, collect_files, sheet_ref)
+                              check_dataset, collect_files, filter_sheet)
 from bonus_agent.extract_rules import Extraction, Question, check_quotes, prompt
 from bonus_agent.llm import LLM, LLMError, image_part, parse_json
 from bonus_core.data.mapping import DatasetMapping, apply_mapping
@@ -31,11 +31,13 @@ from bonus_core.dsl.validator import validate
 from bonus_core.engine.allocation import AdjustConflict
 from bonus_core.engine.evaluator import EvalError, Evaluator, fmt
 from bonus_core.engine.issues import EngineError
-from bonus_core.engine.run import Result, compute
+from bonus_core.engine.run import Adjustment, Engine, Result, compute
 from bonus_core.engine.tree import ROOT_LEVEL, build_tree
 from bonus_core.report.excel import write_excel
 
 MAX_RESULT_CHARS = 6000
+DEFAULT_SCHEME = "默认"        # 只有一个方案时的方案名
+SHARED = "共用"                # 多个方案共用的部分（权重、校验、共用变量），合并进每个方案
 KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保留全文
 BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
 READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate"}
@@ -72,31 +74,44 @@ TOOLS: list[dict] = [
                     "较早的对话会被裁剪，重要内容请及时记下。同一 topic 再次记录会覆盖，text 为空则删除。",
      "parameters": _obj({"topic": _S, "text": _S}, ["topic", "text"])},
     {"name": "define_dataset",
-     "description": "定义（或重新定义）一张数据表。实体表写 key（每行一个对象）；明细表写 link（每行挂到某层级对象上）；"
-                    "公司级表 key、link 都不写。同名字段表示关联。返回校验结果和换算后的样例行。",
+     "description": "定义（或重新定义）一张数据表。实体表写 key（每行一个对象，如员工、小组，以及被别的表按编号引用的项目、销售单）；"
+                    "明细表写 link（每行挂到某层级对象或某个实体上，如回款 link=sales_id）；公司级表 key、link 都不写。"
+                    "同名字段表示关联。一张工作表混放多类数据时（如目标值表按 entity_type 区分部门/小组/个人），"
+                    "用 filter 只取其中一类，并把编号列映射成对应的字段名（如 group_id ← entity_id）。返回校验结果和换算后的样例行。",
      "parameters": _obj({"name": {**_S, "description": "中文表名，如 人员、销售明细"}, "file": _S, "sheet": _S,
                          "header_rows": {"type": "array", "items": _I, "description": "可选：表头所在的 Excel 行号，多行表头写多个"},
                          "key": _S, "link": _S, "desc": _S,
+                         "filter": {"type": "object", "description": '可选：只取这些行，{"列名": "取值"} 或 {"列名": ["取值1", "取值2"]}'},
                          "fields": {"type": "object", "additionalProperties": FIELD_SCHEMA,
                                     "description": "字段名（英文小写加下划线） -> 定义"}},
                         ["name", "file", "sheet", "fields"])},
     {"name": "remove_dataset", "description": "删除一张已定义的数据表。", "parameters": _obj({"name": _S}, ["name"])},
     {"name": "set_rules",
      "description": "写入或修改计算规则。只给出要改的部分：tables / variables 按名字合并（值为 null 表示删除），"
-                    "pool、allocation、payout 整体替换。返回静态校验结果。",
-     "parameters": _obj({"tables": {"type": "object"}, "variables": {"type": "object"}, "pool": {"type": "object"},
+                    "pool、allocation、payout、checks、revisions 整体替换。返回静态校验结果。"
+                    "一批文件里有多个方案（如季度奖、过程奖、年度奖）时，每个方案用 scheme 分别写 pool 等；"
+                    "各方案相同的部分（分配层级与权重、数据校验、共用的参数表和变量）写到 scheme=\"共用\"，会合并进每个方案。"
+                    "只有一个方案时不写 scheme。",
+     "parameters": _obj({"scheme": {**_S, "description": "方案名，如 QUARTER；共用部分写 共用"},
+                         "tables": {"type": "object"}, "variables": {"type": "object"}, "pool": {"type": "object"},
                          "allocation": {"type": "array", "items": {"type": "object"}},
-                         "payout": {"type": "array", "items": {"type": "object"}}})},
-    {"name": "trial_run", "description": "用当前数据表和规则试算，返回奖金池、各层级金额分布和提示。", "parameters": _obj({})},
-    {"name": "explain", "description": "查看计算链：节点 id（如 个人:E1001、全部）或变量追踪 id 的公式、代入数值后的算式和结果。",
-     "parameters": _obj({"id": _S}, ["id"])},
-    {"name": "evaluate", "description": "在某个节点上计算任意表达式（如 sum(net_profit)），用于核对数据和规则。需要先在 set_rules 里设定 allocation。",
-     "parameters": _obj({"expr": _S, "node": {**_S, "description": "节点 id，默认 全部"}}, ["expr"])},
+                         "payout": {"type": "array", "items": {"type": "object"}},
+                         "checks": {"type": "array", "items": {"type": "object"}},
+                         "revisions": {"type": "array", "items": {"type": "object"},
+                                       "description": '人工调整的修订版本，后一个包含前面的调整：[{"name": "R1", "adjust": '
+                                                      '[{"node": "小组:G01", "amount": 900000, "reason": "..."}]}]；R0 为不调整的基准'}})},
+    {"name": "trial_run", "description": "用当前数据表和规则试算，返回奖金池、各层级金额分布、各修订的变化和提示。不写 scheme 时试算全部方案。",
+     "parameters": _obj({"scheme": _S})},
+    {"name": "explain", "description": "查看计算链：节点 id（如 个人:E1001、项目:P001、全部）或变量追踪 id 的公式、代入数值后的算式和结果。",
+     "parameters": _obj({"id": _S, "scheme": _S, "revision": {**_S, "description": "默认 R0"}}, ["id"])},
+    {"name": "evaluate", "description": "在某个节点上用引擎计算任意表达式（如 sum(net_profit)），用于核对数据和规则。"
+                                        "节点可以是层级对象或关联实体（如 项目:P001）。需要先在 set_rules 里设定 allocation。",
+     "parameters": _obj({"expr": _S, "node": {**_S, "description": "节点 id，默认 全部"}, "scheme": _S}, ["expr"])},
     {"name": "ask_question",
      "description": "记录需要财务确认的问题（不会中断工作）。按 suggested 的理解继续计算。",
      "parameters": _obj({"text": _S, "options": {"type": "array", "items": _S}, "suggested": _I, "related": _S},
                         ["text", "options"])},
-    {"name": "finish", "description": "完成。要求最近一次修改之后已成功试算。",
+    {"name": "finish", "description": "完成。要求每个方案在最近一次修改之后都已成功试算。",
      "parameters": _obj({"summary": {**_S, "description": "两三句话说明：什么奖金、奖金池怎么来、怎么分、发放条件"},
                          "ignored": {"type": "array", "items": _obj({"ref": _S, "reason": _S})}}, ["summary"])},
 ]
@@ -121,11 +136,11 @@ class Workspace:
     inv: Inventory
     datasets: dict[str, DatasetDef] = field(default_factory=dict)
     mapping: dict[str, DatasetMapping] = field(default_factory=dict)
-    draft: dict = field(default_factory=dict)              # 规则草稿：tables / variables / pool / allocation / payout
+    drafts: dict[str, dict] = field(default_factory=dict)  # 方案 -> 规则草稿（tables / variables / pool / allocation ...）
     questions: list[Question] = field(default_factory=list)
     transcripts: dict[str, str] = field(default_factory=dict)
-    result: Result | None = None
-    dirty: bool = True                                     # 最近一次修改后是否还没试算成功
+    results: dict[str, dict[str, Result]] = field(default_factory=dict)   # 方案 -> 修订（R0 为基准）-> 结果
+    untested: set[str] = field(default_factory=set)        # 最近修改后还没试算成功的方案
     summary: str = ""
     ignored: list[dict] = field(default_factory=list)
     notes: dict[str, str] = field(default_factory=dict)
@@ -228,7 +243,8 @@ class Workspace:
 
     # ---- 数据表 ----
     def define_dataset(self, name: str, file: str, sheet: str, fields: dict, key: str | None = None,
-                       link: str | None = None, desc: str = "", header_rows: list[int] | None = None) -> str:
+                       link: str | None = None, desc: str = "", header_rows: list[int] | None = None,
+                       filter: dict | None = None) -> str:
         f = self._file(file)
         try:
             st = table_at(f, sheet, header_rows) if header_rows else self.inv.sheet(f"{f.name}/{sheet}")
@@ -241,14 +257,19 @@ class Workspace:
         except ValidationError as e:
             raise ToolError(f"参数格式不对：{e}") from None
         types = {fn: (fd.type, n) for n, d in self.datasets.items() if n != name for fn, fd in d.fields.items()}
-        d, m, warnings, errors = check_dataset(name, pd, st, types, header_rows)
+        if filter is not None and not (isinstance(filter, dict) and all(isinstance(v, (str, int, float, list))
+                                                                         for v in filter.values())):
+            raise ToolError('filter 的格式是 {"列名": "取值"} 或 {"列名": ["取值1", "取值2"]}')
+        flt = {str(k): ([str(x) for x in v] if isinstance(v, list) else str(v)) for k, v in (filter or {}).items()}
+        d, m, warnings, errors = check_dataset(name, pd, st, types, header_rows, flt)
         if errors:
             raise ToolError("未保存，请修正：\n" + "\n".join(f"- {e}" for e in errors))
         self.datasets[name], self.mapping[name] = d, m
-        self.dirty = True
+        self.untested |= set(self.schemes)
         kind = f"实体表，主键 {d.key}" if d.key else f"明细表，关联 {d.link}" if d.link else "公司级表"
         sample = []
         from bonus_core.data.table import convert
+        st, _ = filter_sheet(st, flt)
         for _, vals in st.rows[:3]:
             sample.append({fn: fmt(convert(vals[st.headers.index(c)], d.fields[fn])) for fn, c in m.columns.items()})
         lines = [f"已保存「{name}」（{kind}），{len(st.rows)} 行" + (f"，另有 {len(st.totals)} 行合计（不计入）" if st.totals else "")]
@@ -260,41 +281,81 @@ class Workspace:
         if name not in self.datasets:
             raise ToolError(f"没有数据表「{name}」")
         del self.datasets[name], self.mapping[name]
-        self.dirty = True
+        self.untested |= set(self.schemes)
         return f"已删除「{name}」"
 
-    # ---- 规则 ----
-    def set_rules(self, **parts) -> str:
-        draft = json.loads(json.dumps(self.draft))
+    # ---- 规则（可以有多个方案，"共用" 方案合并进每个方案） ----
+    def _scheme(self, scheme: str | None, *, for_write: bool = False) -> str:
+        if scheme:
+            if not for_write and scheme not in self.schemes:
+                raise ToolError(f"没有方案「{scheme}」，已有方案：{self.schemes or '无'}")
+            return scheme
+        if for_write or not self.schemes:
+            return self.schemes[0] if len(self.schemes) == 1 else DEFAULT_SCHEME
+        if len(self.schemes) == 1:
+            return self.schemes[0]
+        raise ToolError(f"有多个方案 {self.schemes}，请用 scheme 指定")
+
+    @property
+    def schemes(self) -> list[str]:
+        """要计算的方案（不含共用部分）。"""
+        return [s for s in self.drafts if s != SHARED]
+
+    def set_rules(self, scheme: str | None = None, **parts) -> str:
+        name = self._scheme(scheme, for_write=True)
+        if name == SHARED and parts.get("pool") is not None:
+            raise ToolError("pool 是每个方案自己的，不能写在共用部分")
+        draft = json.loads(json.dumps(self.drafts.get(name, {})))
         for k in ("tables", "variables"):
             for n, v in (parts.get(k) or {}).items():
                 if v is None:
                     draft.setdefault(k, {}).pop(n, None)
                 else:
                     draft.setdefault(k, {})[n] = v
-        for k in ("pool", "allocation", "payout"):
+        for k in ("pool", "allocation", "payout", "checks", "revisions"):
             if parts.get(k) is not None:
                 draft[k] = parts[k]
         try:
-            rs = self._ruleset(draft)
+            _revisions(draft.get("revisions"))
+            targets = self.schemes if name == SHARED else [name]
+            rss = {t: self._ruleset(t, {**self.drafts, name: draft}) for t in targets}
         except (ValidationError, ValueError) as e:
             raise ToolError(f"规则格式不对，未保存：{str(e)[:2500]}") from None
-        self.draft, self.dirty = draft, True
-        issues = validate(rs)
-        if "pool" not in draft:
-            issues = [i for i in issues if i.where != "pool"]
-        blocking = [str(i) for i in issues if i.severity == "blocking"]
-        warns = [str(i) for i in issues if i.severity == "warning"]
-        head = "已保存。" + ("" if "pool" in draft else "（尚未设定 pool）")
-        if blocking:
-            return head + "静态校验发现问题，需要修正：\n" + "\n".join(f"- {e}" for e in blocking)
-        return head + "静态校验通过。" + ("\n提示：\n" + "\n".join(f"- {w}" for w in warns) if warns else "")
+        self.drafts[name] = draft
+        self.untested |= set(targets)
+        out = [f"已保存{'共用部分' if name == SHARED else f'方案「{name}」'}。"]
+        for t, rs in rss.items():
+            full = self._merged(t)
+            issues = validate(rs)
+            if "pool" not in full:
+                issues = [i for i in issues if i.where != "pool"]
+            blocking = [str(i) for i in issues if i.severity == "blocking"]
+            warns = [str(i) for i in issues if i.severity == "warning"]
+            head = f"「{t}」" + ("（尚未设定 pool）" if "pool" not in full else "")
+            if blocking:
+                out.append(head + "静态校验发现问题，需要修正：\n" + "\n".join(f"- {e}" for e in blocking))
+            else:
+                out.append(head + "静态校验通过。" + ("\n提示：\n" + "\n".join(f"- {w}" for w in warns) if warns else ""))
+        if not rss:
+            out.append("还没有具体方案；用 set_rules(scheme=方案名, pool=...) 写入各方案后再校验。")
+        return "\n".join(out)
 
-    def _ruleset(self, draft: dict | None = None) -> RuleSet:
-        draft = self.draft if draft is None else draft
+    def _merged(self, scheme: str, drafts: dict | None = None) -> dict:
+        drafts = self.drafts if drafts is None else drafts
+        base, own = drafts.get(SHARED, {}), drafts.get(scheme, {})
+        out = {k: v for k, v in base.items() if k not in ("tables", "variables")}
+        for k in ("tables", "variables"):
+            if base.get(k) or own.get(k):
+                out[k] = {**base.get(k, {}), **own.get(k, {})}
+        out.update({k: v for k, v in own.items() if k not in ("tables", "variables")})
+        return out
+
+    def _ruleset(self, scheme: str | None = None, drafts: dict | None = None) -> RuleSet:
+        scheme = scheme or self._scheme(None)
+        draft = {k: v for k, v in self._merged(scheme, drafts).items() if k != "revisions"}
         ext = Extraction.model_validate({"pool": {"expr": "0"}, "allocation": [], **draft})
-        return RuleSet(name=self.summary[:30] or "智能体草稿", version="agent-draft", datasets=self.datasets,
-                       **ext.model_dump(exclude={"questions"}))
+        return RuleSet(name=scheme if scheme != DEFAULT_SCHEME else (self.summary[:30] or "智能体草稿"),
+                       version="agent-draft", datasets=self.datasets, **ext.model_dump(exclude={"questions"}))
 
     def _data(self, rs: RuleSet):
         data, issues = apply_mapping(rs, self.data_files, self.mapping)
@@ -303,62 +364,96 @@ class Workspace:
             raise ToolError("数据问题：\n" + "\n".join(f"- {i}" for i in blocking[:8]))
         return data, issues
 
-    def trial_run(self) -> str:
+    def trial_run(self, scheme: str | None = None) -> str:
         if not self.datasets:
             raise ToolError("还没有定义数据表")
-        if "pool" not in self.draft or not self.draft.get("allocation"):
-            raise ToolError("规则还缺 pool 或 allocation")
-        rs = self._ruleset()
+        names = [self._scheme(scheme)] if scheme or len(self.schemes) <= 1 else self.schemes
+        out = []
+        for name in names:
+            if "pool" not in self._merged(name) or not self._merged(name).get("allocation"):
+                raise ToolError(f"方案「{name}」的规则还缺 pool 或 allocation")
+            out.append(self._trial(name))
+        return "\n\n".join(out)
+
+    def _trial(self, name: str) -> str:
+        rs = self._ruleset(name)
         data, issues = self._data(rs)
         try:
-            res = compute(rs, data)
+            eng = Engine(rs, data)
+            res = {"R0": eng.compute()}
+            done: list[Adjustment] = []
+            for rev in _revisions(self._merged(name).get("revisions")):
+                done += [Adjustment(a["node"], Decimal(str(a["amount"])), reason=a.get("reason", ""), id=a.get("id", ""),
+                                    created_at=f"{len(done) + i:06d}") for i, a in enumerate(rev["adjust"])]
+                res[rev["name"]] = eng.compute(list(done))
         except EngineError as e:
-            raise ToolError("试算失败：\n" + "\n".join(f"- {i}" for i in e.issues[:8])) from None
+            raise ToolError(f"方案「{name}」试算失败：\n" + "\n".join(f"- {i}" for i in e.issues[:8])) from None
         except (EvalError, AdjustConflict, ValueError) as e:
-            raise ToolError(f"试算失败：{e}") from None
-        self.result, self.dirty = res, False
-        lines = [f"试算成功。奖金池 {fmt(Decimal(res.pool))} 元（精确值 {res.pool_exact}）"]
-        for lv in res.levels:
-            ns = sorted((n for n in res.nodes.values() if n.level == lv), key=lambda n: -float(n.final))
+            raise ToolError(f"方案「{name}」试算失败：{e}") from None
+        self.results[name] = res
+        self.untested.discard(name)
+        base = res["R0"]
+        lines = [f"方案「{name}」试算成功。奖金池 {fmt(Decimal(base.pool))} 元（精确值 {base.pool_exact}）"]
+        for lv in base.levels:
+            ns = sorted((n for n in base.nodes.values() if n.level == lv), key=lambda n: -float(n.final))
             total = sum(float(n.final) for n in ns)
             zero = sum(1 for n in ns if float(n.final) == 0)
             top = "，".join(f"{n.id}（{n.label}）{fmt(Decimal(n.final))}" for n in ns[:8])
             lines.append(f"「{lv}」{len(ns)} 个，合计 {total:,.2f}，为 0 的 {zero} 个；最多的：{top}"
                          + ("……" if len(ns) > 8 else "") + f"；最少的：{ns[-1].id} {fmt(Decimal(ns[-1].final))}")
-        held = sum(float(p.held) for p in res.payouts.values())
-        if res.payouts:
+        for rev, r in list(res.items())[1:]:
+            changed = [k for k, n in r.nodes.items() if n.final != base.nodes[k].final]
+            lines.append(f"修订 {rev}：{len(changed)} 个对象金额变化，奖金池 {fmt(Decimal(r.pool))}；"
+                         + "，".join(f"{k} {fmt(Decimal(base.nodes[k].final))}→{fmt(Decimal(r.nodes[k].final))}"
+                                    for k in changed[:6]))
+        held = sum(float(p.held) for p in base.payouts.values())
+        if base.payouts:
             lines.append(f"发放：本期暂缓合计 {held:,.2f}")
-        warns = [str(i) for i in list(issues) + list(res.issues) if i.severity == "warning"]
+        warns = [str(i) for i in list(issues) + list(base.issues) if i.severity == "warning"]
         if warns:
             lines.append("数据提示：\n" + "\n".join(f"- {w}" for w in warns[:8]))
         return "\n".join(lines)
 
-    def explain(self, id: str) -> str:
-        if self.result is None:
-            raise ToolError("先 trial_run")
-        tr = self.result.traces
+    @property
+    def result(self) -> Result | None:
+        """第一个方案的基准结果（兼容只有一个方案的情况）。"""
+        s = self.schemes[0] if self.schemes else None
+        return self.results.get(s, {}).get("R0") if s else None
+
+    @property
+    def dirty(self) -> bool:
+        return bool(self.untested) or not self.schemes or any(s not in self.results for s in self.schemes)
+
+    def explain(self, id: str, scheme: str | None = None, revision: str = "R0") -> str:
+        name = self._scheme(scheme)
+        res = self.results.get(name, {}).get(revision)
+        if res is None:
+            raise ToolError(f"方案「{name}」{revision} 还没有试算结果，先 trial_run")
+        tr = res.traces
         keys = [k for k in tr if k == id or k.startswith(id + "/")] or [k for k in tr if id in k]
         if not keys:
-            raise ToolError(f"没有找到「{id}」的计算链，节点 id 形如 {next(iter(self.result.nodes), '')}")
+            raise ToolError(f"没有找到「{id}」的计算链，节点 id 形如 {next(iter(res.nodes), '')}")
         out = []
         for k in keys[:12]:
             t = tr[k]
             out.append(f"{t.id}：{t.expr}\n  = {t.rendered}\n  = {t.value}" + (f"\n  明细行：{', '.join(t.rows[:5])}" if t.rows else ""))
-        if id in self.result.nodes:
-            n = self.result.nodes[id]
+        if id in res.nodes:
+            n = res.nodes[id]
             out.append(f"{id} 最终金额 {fmt(Decimal(n.final))}（权重 {n.weight}，上级 {n.parent}）")
         return "\n".join(out)
 
-    def evaluate(self, expr: str, node: str = ROOT_LEVEL) -> str:
-        if not self.draft.get("allocation"):
+    def evaluate(self, expr: str, node: str = ROOT_LEVEL, scheme: str | None = None) -> str:
+        name = self._scheme(scheme) if self.schemes else self._scheme(None, for_write=True)
+        if not self._merged(name).get("allocation"):
             raise ToolError("需要先用 set_rules 设定 allocation（pool 可以先写 0）")
-        rs = self._ruleset()
+        rs = self._ruleset(name)
         data, _ = self._data(rs)
         root, by_level, issues = build_tree(rs, data)
         blocking = [i for i in issues if i.severity == "blocking"]
         if blocking:
             raise ToolError("建树失败：" + "；".join(str(i) for i in blocking[:5]))
         nodes = {n.id: n for n in root.walk()}
+        nodes.update({n.id: n for tbl in (root.index or {}).values() for n in tbl.values()})
         if node not in nodes:
             raise ToolError(f"没有节点「{node}」，例：{list(nodes)[:5]}")
         ev = Evaluator(rs, root, by_level)
@@ -375,8 +470,11 @@ class Workspace:
         return f"已记录问题 {q.id}，请按「{options[suggested] if suggested is not None and 0 <= suggested < len(options) else '最可能的理解'}」继续"
 
     def finish(self, summary: str, ignored: list[dict] | None = None) -> str:
-        if self.dirty or self.result is None:
-            raise ToolError("最近一次修改之后还没有成功试算，请先 trial_run")
+        if not self.schemes:
+            raise ToolError("还没有写入规则")
+        pending = [s for s in self.schemes if s in self.untested or s not in self.results]
+        if pending:
+            raise ToolError(f"方案 {pending} 最近一次修改之后还没有成功试算，请先 trial_run")
         self.summary, self.ignored, self.done = summary, ignored or [], True
         return "已完成"
 
@@ -389,20 +487,42 @@ class Workspace:
         if self.datasets:
             for n, d in self.datasets.items():
                 m = self.mapping[n]
-                kind = f"key={d.key}" if d.key else f"link={d.link}" if d.link else "公司级"
-                lines.append(f"- 数据表「{n}」← {m.file}/{m.sheet}（{kind}）字段：{', '.join(d.fields)}")
+                kind = (f"key={d.key}" + (f", link={d.link}" if d.link else "")) if d.key else f"link={d.link}" if d.link else "公司级"
+                flt = f" 筛选 {m.filter}" if m.filter else ""
+                lines.append(f"- 数据表「{n}」← {m.file}/{m.sheet}{flt}（{kind}）字段：{', '.join(d.fields)}")
         else:
             lines.append("- 尚未定义数据表")
-        if self.draft:
-            lines.append("- 规则（摘要，不含出处；修改时按名字只传要改的部分）：\n" + _rules_brief(self.draft))
+        if self.drafts:
+            for s, d in self.drafts.items():
+                title = "共用部分（合并进每个方案）" if s == SHARED else f"方案「{s}」"
+                lines.append(f"- {title}规则摘要（不含出处；修改时按名字只传要改的部分）：\n" + _rules_brief(d))
         else:
             lines.append("- 尚未写入规则")
         if self.questions:
             lines.append("- 已记录问题：" + "；".join(q.text for q in self.questions))
         if self.transcripts:
             lines.append(f"- 已查看图片：{', '.join(self.transcripts)}")
-        lines.append("- 试算：" + ("最近修改后尚未试算" if self.dirty else f"已试算，奖金池 {fmt(Decimal(self.result.pool))}"))
+        for s in self.schemes:
+            r = self.results.get(s, {})
+            lines.append(f"- 试算「{s}」：" + ("最近修改后尚未试算" if s in self.untested or not r else
+                                             f"已试算，奖金池 {fmt(Decimal(r['R0'].pool))}" + (f"，修订 {list(r)[1:]}" if len(r) > 1 else "")))
         return "\n".join(lines)
+
+
+def _revisions(revs) -> list[dict]:
+    """修订版本：[{"name": "R1", "adjust": [{"node": "小组:G01", "amount": 900000, "reason": ...}]}, ...]。
+    后一个修订包含前面所有修订的调整（逐步累加），R0 是不做调整的基准。"""
+    out = []
+    for r in revs or []:
+        if not isinstance(r, dict) or not r.get("name") or not isinstance(r.get("adjust"), list):
+            raise ValueError('revisions 的每一项应为 {"name": "R1", "adjust": [{"node": "小组:G01", "amount": 900000}]}')
+        if r["name"] == "R0":
+            raise ValueError("R0 是不做调整的基准结果，修订从 R1 开始命名")
+        for a in r["adjust"]:
+            if not isinstance(a, dict) or "node" not in a or "amount" not in a:
+                raise ValueError(f"修订 {r['name']} 的调整项应为 {{\"node\": 节点 id, \"amount\": 金额}}，得到 {a}")
+        out.append(r)
+    return out
 
 
 def _rules_brief(draft: dict, limit: int = 3000) -> str:
@@ -415,11 +535,16 @@ def _rules_brief(draft: dict, limit: int = 3000) -> str:
     for n, v in (draft.get("variables") or {}).items():
         out.append(f"  变量 {n}[{v.get('scope', 'global')}] = {v.get('expr')}")
     if "pool" in draft:
-        out.append(f"  pool = {(draft['pool'] or {}).get('expr')}")
+        p = draft["pool"] or {}
+        out.append(f"  pool[{p.get('scope', 'global')}] = {p.get('expr')}")
     for lv in draft.get("allocation") or []:
         out.append(f"  分配 {lv.get('level')}（key={lv.get('key')}, parent_key={lv.get('parent_key')}）权重 = {lv.get('weight')}")
     for p in draft.get("payout") or []:
         out.append(f"  发放 {p.get('id')}[{p.get('scope')}] 暂缓比例 = {p.get('hold_ratio')}")
+    for c in draft.get("checks") or []:
+        out.append(f"  校验 {c.get('id')}[{c.get('scope', 'global')}]：{c.get('expr')}")
+    for r in draft.get("revisions") or []:
+        out.append(f"  修订 {r.get('name')}：" + "，".join(f"{a.get('node')}={a.get('amount')}" for a in r.get("adjust") or []))
     text = "\n".join(out)
     return text if len(text) <= limit else text[:limit] + "……"
 
@@ -452,6 +577,13 @@ class AgentResult:
     quote_hits: int = 0
     quote_total: int = 0
     recheck: str = ""
+    rulesets: dict[str, RuleSet] = field(default_factory=dict)          # 方案 -> 规则
+    results: dict[str, dict[str, Result]] = field(default_factory=dict)  # 方案 -> 修订 -> 结果
+
+    @property
+    def single(self) -> bool:
+        """只有一个默认方案、没有修订：输出文件和以前一样（rules.yaml、result.xlsx）。"""
+        return list(self.results) == [DEFAULT_SCHEME] and list(self.results[DEFAULT_SCHEME]) == ["R0"]
 
     @property
     def ok(self) -> bool:
@@ -514,11 +646,11 @@ def _answers_text(answers: list[dict] | None) -> str:
 
 def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = None, *,
               answers: list[dict] | None = None, max_steps: int = 80, max_history_chars: int = 24000,
-              max_files: int = MAX_FILES, max_tokens: int | None = 1_000_000,
+              max_files: int = MAX_FILES, max_tokens: int | None = 1_000_000, exclude: list[str | Path] = (),
               on_step: Callable[[int, Step], None] | None = None) -> AgentResult:
     """max_steps 和 max_tokens 都是安全上限：模型调用 finish 就结束，正常不会用满。"""
     try:
-        files = collect_files(paths, exclude=[out_dir] if out_dir else [], max_files=max_files)
+        files = collect_files(paths, exclude=([out_dir] if out_dir else []) + list(exclude), max_files=max_files)
     except (TooManyFiles, FileNotFoundError) as e:
         raise ToolError(str(e)) from None
     if not files:
@@ -632,10 +764,13 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     else:
         error = f"达到最大步数 {max_steps} 仍未完成"
 
-    rs = ws._ruleset() if ws.datasets and ws.draft.get("allocation") else None
-    ar = AgentResult(ws, steps, rs if ws.result is not None else None, ws.result if not ws.dirty else None, error)
-    if rs is not None:
-        ar.quote_hits, ar.quote_total, _ = check_quotes(rs, ws.inv.docs)
+    tested = {s: ws.results[s] for s in ws.schemes if s in ws.results and s not in ws.untested}
+    rss = {s: ws._ruleset(s) for s in tested}
+    first = next(iter(rss), None)
+    ar = AgentResult(ws, steps, rss.get(first), tested[first]["R0"] if first else None, error, rulesets=rss, results=tested)
+    for rs in rss.values():
+        h, t, _ = check_quotes(rs, ws.inv.docs)
+        ar.quote_hits, ar.quote_total = ar.quote_hits + h, ar.quote_total + t
     if out_dir is not None:
         ar.outputs = write_agent_outputs(ar, Path(out_dir), answers)
     return ar
@@ -650,9 +785,17 @@ def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None) 
         paths["mapping"].write_text(yaml.safe_dump({k: v.model_dump(exclude_none=True, exclude_defaults=True)
                                                     for k, v in ws.mapping.items()}, allow_unicode=True, sort_keys=False),
                                     encoding="utf-8")
-    if ar.ruleset is not None:
-        paths["rules"] = out / "rules.yaml"
-        paths["rules"].write_text(ar.ruleset.dump_yaml(), encoding="utf-8")
+    for name, rs in ar.rulesets.items():
+        key = "rules" if ar.single else f"rules:{name}"
+        paths[key] = out / ("rules.yaml" if ar.single else f"rules_{_safe(name)}.yaml")
+        paths[key].write_text(rs.dump_yaml(), encoding="utf-8")
+        done = []
+        for rev in _revisions(ws._merged(name).get("revisions")):
+            done += [{"node_id": a["node"], "amount": str(a["amount"]), "reason": a.get("reason", ""), "id": a.get("id", ""),
+                      "created_at": f"{len(done) + i:06d}"} for i, a in enumerate(rev["adjust"])]
+            paths[f"adjust:{name}:{rev['name']}"] = out / f"adjust_{_safe(name)}_{_safe(rev['name'])}.yaml"
+            paths[f"adjust:{name}:{rev['name']}"].write_text(yaml.safe_dump(list(done), allow_unicode=True, sort_keys=False),
+                                                             encoding="utf-8")
     prev = {a.get("text"): a.get("answer") for a in answers or []}
     qrows = [{"id": q.id, "text": q.text, "options": q.options, "suggested": q.suggested, "related": q.related,
               "answer": prev.get(q.text)} for q in ws.questions]
@@ -666,26 +809,79 @@ def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None) 
     paths["log"].write_text(json.dumps({"summary": ws.summary, "error": ar.error, "transcripts": ws.transcripts,
                                         "steps": [vars(s) for s in ar.steps]}, ensure_ascii=False, indent=2),
                             encoding="utf-8")
-    if ar.result is not None and ar.ruleset is not None:
-        ar.recheck = _recheck(ar, paths)
+    if not ar.results:
+        return paths
+    ar.recheck = "；".join(_recheck(ar, paths, name, rev) for name, revs in ar.results.items() for rev in revs)
+    if ar.single:
         paths["excel"] = out / "result.xlsx"
         write_excel(ar.ruleset, ar.result, paths["excel"], extra_sheets=_sheets(ar, qrows))
+        return paths
+    for name, revs in ar.results.items():
+        for rev, res in revs.items():
+            k = f"excel:{name}:{rev}"
+            paths[k] = out / (f"result_{_safe(name)}.xlsx" if rev == "R0" else f"result_{_safe(name)}_{_safe(rev)}.xlsx")
+            write_excel(ar.rulesets[name], res, paths[k])
+    paths["excel"] = out / "result.xlsx"
+    _overview(ar, qrows, paths["excel"])
     return paths
 
 
-def _recheck(ar: AgentResult, paths: dict[str, Path]) -> str:
-    """从写出的 rules.yaml、mapping.yaml 重新读入并重算，逐个对象核对金额，证明结果只来自引擎、可复算。"""
+def _safe(s: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in s)
+
+
+def _overview(ar: AgentResult, qrows: list[dict], path: Path):
+    """多个方案 / 修订时的总览：每个对象一行，每个方案（修订）一列。修订是同一方案的不同版本，不能相加。"""
+    import openpyxl
+    from bonus_core.report.excel import MONEY, _sheet
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    cols = [(n, r) for n, revs in ar.results.items() for r in revs]
+    heads = [n if r == "R0" else f"{n} {r}" for n, r in cols]
+    rows, seen = [], set()
+    for n, revs in ar.results.items():
+        for node in revs["R0"].nodes.values():
+            if node.id in seen:
+                continue
+            seen.add(node.id)
+            rows.append([node.level, node.key or "", node.label]
+                        + [float(ar.results[c][r].nodes[node.id].final) if node.id in ar.results[c][r].nodes else None
+                           for c, r in cols])
+    _sheet(wb, "各方案结果", ["层级", "编号", "名称"] + heads, rows, money_cols=range(4, 4 + len(cols)))
+    summary = [[h, float(Decimal(ar.results[c][r].pool)), f"result_{_safe(c)}" + ("" if r == "R0" else f"_{_safe(r)}") + ".xlsx"]
+               for h, (c, r) in zip(heads, cols)]
+    ws = _sheet(wb, "方案汇总", ["方案", "奖金池", "明细文件（含计算链）"], summary, money_cols=[2])
+    ws.append([])
+    ws.append(["说明：同一方案的 R1、R2 是人工调整后的修订版本，与 R0 是同一笔奖金的不同版本，不能相加。"])
+    for title, headers, data, widths in _sheets(ar, qrows):
+        _sheet(wb, title, headers, data, widths=widths)
+    for w in wb.worksheets:
+        for row in w.iter_rows(min_row=2):
+            for c in row:
+                if isinstance(c.value, float):
+                    c.number_format = MONEY
+    wb.save(path)
+
+
+def _recheck(ar: AgentResult, paths: dict[str, Path], name: str, rev: str) -> str:
+    """从写出的规则、映射（和调整）文件重新读入并重算，逐个对象核对金额，证明结果只来自引擎、可复算。"""
     from bonus_core.data.mapping import load_mapping
+    label = "" if ar.single else f"{name}{'' if rev == 'R0' else ' ' + rev}："
+    want = ar.results[name][rev]
     try:
-        rs = RuleSet.load(paths["rules"])
+        rs = RuleSet.load(paths["rules" if ar.single else f"rules:{name}"])
         data, _ = apply_mapping(rs, ar.ws.data_files, load_mapping(paths["mapping"]))
-        again = compute(rs, data)
+        adj = []
+        if rev != "R0":
+            adj = [Adjustment(**a) for a in yaml.safe_load(paths[f"adjust:{name}:{rev}"].read_text(encoding="utf-8"))]
+        again = compute(rs, data, adj)
     except Exception as e:  # 复算失败要如实写进结果，不能当作通过
-        return f"复算失败：{e}"
-    diff = [i for i, n in ar.result.nodes.items() if i not in again.nodes or again.nodes[i].final != n.final]
-    if again.pool != ar.result.pool or diff:
-        return f"复算不一致：奖金池 {again.pool} / {ar.result.pool}，不一致的对象 {diff[:10]}"
-    return f"一致：按 rules.yaml + mapping.yaml 重新计算，奖金池和 {len(again.nodes)} 个对象的金额逐分相同"
+        return f"{label}复算失败：{e}"
+    diff = [i for i, n in want.nodes.items() if i not in again.nodes or again.nodes[i].final != n.final]
+    if again.pool != want.pool or diff:
+        return f"{label}复算不一致：奖金池 {again.pool} / {want.pool}，不一致的对象 {diff[:10]}"
+    files = "rules.yaml + mapping.yaml" if ar.single else f"规则、映射{'和调整' if rev != 'R0' else ''}文件"
+    return f"{label}一致：按 {files} 重新计算，奖金池和 {len(again.nodes)} 个对象的金额逐分相同"
 
 
 def _sheets(ar: AgentResult, qrows: list[dict]):
@@ -693,11 +889,12 @@ def _sheets(ar: AgentResult, qrows: list[dict]):
     plan = [["状态", ("智能体草稿：规则和数据映射由大模型生成，尚未经财务确认。请先处理「待确认问题」，确认后重算。"
                       if ar.ok else f"未完成：{ar.error}")],
             ["方案概述", ws.summary],
+            ["计算方案", "、".join(f"{n}（{'、'.join(r)}）" for n, r in ar.results.items()) or "无"],
             ["规则来源", "、".join(d.name for d in ws.inv.docs)]]
     for n, d in ws.datasets.items():
         m = ws.mapping[n]
         kind = f"实体表，主键 {d.key}" if d.key else f"明细表，关联 {d.link}" if d.link else "公司级表"
-        plan.append([f"数据表：{n}", f"{m.file}/{m.sheet}（{kind}）"])
+        plan.append([f"数据表：{n}", f"{m.file}/{m.sheet}" + (f"，筛选 {m.filter}" if m.filter else "") + f"（{kind}）"])
         plan += [[f"  {f}", f"← 「{c}」 {d.fields[f].type}" + (f"，{d.fields[f].unit}" if d.fields[f].unit else "")]
                  for f, c in m.columns.items()]
     plan += [["已忽略", f"{i.get('ref')}：{i.get('reason', '')}"] for i in ws.ignored]
