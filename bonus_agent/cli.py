@@ -45,7 +45,8 @@ def main(argv=None) -> int:
     p.add_argument("--model")
     p.add_argument("--answers", help="上一次输出的 questions.yaml，填写 answer 后传入重算")
     p.add_argument("--out", required=True, help="输出目录")
-    p.add_argument("paths", nargs="+", help="规则文档、Excel 数据，或包含它们的文件夹")
+    p.add_argument("--max-files", type=int, default=30, help="一批最多处理的文件数，防止误传整个目录")
+    p.add_argument("paths", nargs="+", help="本批次的规则文档、Excel 数据，或只包含它们的文件夹")
     a = ap.parse_args(argv)
 
     cfg = load_config()
@@ -114,8 +115,15 @@ def main(argv=None) -> int:
         from bonus_agent.auto import run_auto
         answers = yaml.safe_load(Path(a.answers).read_text(encoding="utf-8")) if a.answers else None
         llm = LLM.from_config(a.model, cfg)
-        print(f"使用模型 {llm.name}，处理 {len(a.paths)} 个路径 ...", flush=True)
-        ar = run_auto(llm, a.paths, a.out, answers=answers)
+        print(f"使用模型 {llm.name}", flush=True)
+
+        def show(files):
+            print(f"本批次共 {len(files)} 个文件：", flush=True)
+            for f in files:
+                print(f"  {f}", flush=True)
+            print("统筹规划中 ...", flush=True)
+
+        ar = run_auto(llm, a.paths, a.out, answers=answers, max_files=a.max_files, on_files=show)
         po = ar.plan
         if po.plan:
             print(f"\n【规划】{po.plan.summary}")
@@ -135,6 +143,8 @@ def main(argv=None) -> int:
                 print(f"  {i}")
         if ar.error:
             print(f"\n失败：{ar.error}")
+            for e in po.errors:
+                print(f"  - {e}")
         print(f"\n输出目录：{a.out}（规则 rules.yaml、映射 mapping.yaml、问题 questions.yaml、日志 agent_log.json）")
         u = llm.usage
         print(f"调用 {u.calls} 次，输入 {u.prompt_tokens} tokens，输出 {u.completion_tokens} tokens，耗时 {u.latency_s:.0f} 秒")

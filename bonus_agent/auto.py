@@ -37,20 +37,37 @@ from bonus_core.engine.run import Result, compute
 from bonus_core.report.excel import write_excel
 
 DATA_SUFFIXES = {".xlsx", ".xlsm"}
+SKIP_DIRS = {".git", ".venv", "venv", "env", "__pycache__", "node_modules", "site-packages", ".pytest_cache",
+             ".hypothesis", "reports"}
+MAX_FILES = 30
 FIELD_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 RESERVED = {"and", "or", "not"} | set(FUNCTIONS)
 
 
 # ---------------- 1. 盘点 ----------------
-def collect_files(paths: list[str | Path]) -> list[Path]:
+class TooManyFiles(ValueError):
+    pass
+
+
+def collect_files(paths: list[str | Path], exclude: list[str | Path] = (), max_files: int = MAX_FILES) -> list[Path]:
+    """展开文件夹，跳过临时文件、程序目录和输出目录。一批计算应只包含本批次的文件。"""
+    skip = [Path(e).resolve() for e in exclude]
     out: list[Path] = []
     for p in map(Path, paths):
         cands = sorted(x for x in p.rglob("*") if x.is_file()) if p.is_dir() else [p]
         for f in cands:
+            rel = f.relative_to(p).parts[:-1] if p.is_dir() else ()
             if f.name.startswith(("~$", ".")) or f.suffix.lower() not in PARSERS:
                 continue
-            if f not in out:
-                out.append(f)
+            if any(part in SKIP_DIRS or part.endswith(".egg-info") for part in rel):
+                continue
+            rf = f.resolve()
+            if any(rf.is_relative_to(e) for e in skip) or rf in out:
+                continue
+            out.append(rf)
+    if len(out) > max_files:
+        raise TooManyFiles(f"找到 {len(out)} 个文件，超过上限 {max_files}。一次只放一个批次（一个部门、一期）的规则和数据，"
+                           f"不要传整个项目目录；确实需要更多文件可加 --max-files。前几个文件：{[f.name for f in out[:8]]}")
     return out
 
 
@@ -209,6 +226,8 @@ def check_plan(plan: Plan, inv: Inventory) -> tuple[dict[str, DatasetDef], Mappi
         if pd.key and pd.link:
             errors.append(f"数据表「{name}」不能同时有 key 和 link")
         cols, fields = {}, {}
+        if not pd.fields:
+            errors.append(f"数据表「{name}」没有字段")
         for f, pf in pd.fields.items():
             if not FIELD_NAME.match(f) or f in RESERVED:
                 errors.append(f"「{name}」的字段名 {f} 不合法：只能用英文小写字母、数字和下划线，且不能是函数名或 and/or/not")
@@ -248,11 +267,12 @@ def check_plan(plan: Plan, inv: Inventory) -> tuple[dict[str, DatasetDef], Mappi
             for excel_row, vals in st.rows:
                 try:
                     convert(vals[i], fd)
-                except ConvertError as e:
-                    bad.append(f"{f} 第 {excel_row} 行：{e}")
+                except Exception as e:  # 任何转换失败都反馈给模型，而不是中断规划
+                    bad.append(f"{f}（{fd.type}）第 {excel_row} 行：{e}")
                     break
         if bad:
-            errors.append(f"「{name}」有字段类型与数据不符：" + "；".join(bad[:5]))
+            errors.append(f"「{name}」有字段类型与数据不符：" + "；".join(bad[:5])
+                          + "。请改成与数据相符的类型；月份、期间这类标签如果不参与日期计算，用 text 即可")
         datasets[name] = DatasetDef(desc=pd.desc, key=pd.key, link=pd.link, fields=fields)
         mapping[name] = DatasetMapping(file=st.file, sheet=st.sheet, columns=cols)
 
@@ -296,9 +316,10 @@ def make_plan(llm: LLM, inv: Inventory, max_repairs: int = 2) -> PlanOutcome:
         raws.append(out)
         try:
             plan = Plan.model_validate(parse_json(out))
-            datasets, mapping, warnings, errors = check_plan(plan, inv)
         except (LLMError, ValidationError, ValueError) as e:
             plan, errors = None, [f"输出不符合格式：{e}"[:3000]]
+        else:
+            datasets, mapping, warnings, errors = check_plan(plan, inv)
         if not errors:
             break
         messages = messages + [
@@ -390,8 +411,14 @@ class AutoResult:
 
 
 def run_auto(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = None, *,
-             answers: list[dict] | None = None, max_repairs: int = 2) -> AutoResult:
-    files = collect_files(paths)
+             answers: list[dict] | None = None, max_repairs: int = 2, max_files: int = MAX_FILES,
+             on_files=None) -> AutoResult:
+    try:
+        files = collect_files(paths, exclude=[out_dir] if out_dir else [], max_files=max_files)
+    except TooManyFiles as e:
+        return AutoResult(PlanOutcome(None, {}, {}, [], [], [], 0), error=str(e))
+    if on_files:
+        on_files(files)
     if not files:
         return AutoResult(PlanOutcome(None, {}, {}, [], [], [], 0), error="没有找到可处理的文件")
     inv = build_inventory(files)

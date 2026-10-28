@@ -134,3 +134,28 @@ def test_plan_errors_are_repaired():
     assert po.attempts == 2 and not po.errors
     feedback = llm.calls[1][-1]["content"]
     assert "工资" in feedback and "name" in feedback and "本年在职 月数" not in feedback
+
+
+def test_collect_files_skips_program_and_output_dirs(tmp_path):
+    from bonus_agent.auto import TooManyFiles, collect_files
+    (tmp_path / ".venv" / "lib").mkdir(parents=True)
+    (tmp_path / ".venv" / "lib" / "x.xlsx").write_bytes(b"")
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "result.xlsx").write_bytes(b"")
+    (tmp_path / "~$temp.docx").write_bytes(b"")
+    (tmp_path / "方案.docx").write_bytes(b"")
+    (tmp_path / "说明.txt").write_text("x")
+    assert [f.name for f in collect_files([tmp_path], exclude=[tmp_path / "out"])] == ["方案.docx"]
+    for i in range(5):
+        (tmp_path / f"{i}.png").write_bytes(b"")
+    with pytest.raises(TooManyFiles):
+        collect_files([tmp_path], max_files=3)
+
+
+def test_plan_accepts_month_labels_as_dates():
+    from bonus_agent.auto import build_inventory, collect_files, make_plan
+    from evals.run_eval import fake_plan
+    plan = fake_plan(load_case(ANNUAL))
+    plan["datasets"]["月度利润"]["fields"]["month"]["type"] = "date"   # 数据是 "2026-01" 这样的年月
+    po = make_plan(FakeLLM([json.dumps(plan, ensure_ascii=False)]), build_inventory(collect_files([ANNUAL])))
+    assert not po.errors, po.errors

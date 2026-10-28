@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 from bonus_core.dsl.models import DatasetDef, FieldDef, RuleSet
@@ -66,17 +66,38 @@ def convert(value, fd: FieldDef):
             raise ConvertError(f"应为整数: {value!r}")
         return d
     if t == "date":
-        if isinstance(value, datetime):
-            return value.date()
-        if isinstance(value, date):
-            return value
-        return date.fromisoformat(str(value).strip()[:10])
+        return _to_date(value)
     s = str(value).strip()
     if isinstance(value, float) and value.is_integer():
         s = str(int(value))  # Excel 里的编号常被存成 1001.0
     if t == "enum" and fd.values and s not in fd.values:
         raise ConvertError(f"取值 {s!r} 不在枚举 {fd.values} 中")
     return s
+
+
+_DATE = re.compile(r"^(\d{4})\s*[-/.年]\s*(\d{1,2})(?:\s*[-/.月]\s*(\d{1,2})\s*日?)?\s*月?")
+
+
+def _to_date(value) -> date:
+    """日期：Excel 日期、2026-01-15、2026/1/5、2026年1月5日；只有年月（2026-01、2026年1月）取当月 1 日。"""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if 20000 < value < 80000:  # Excel 序列号
+            return date(1899, 12, 30) + timedelta(days=int(value))
+        value = str(int(value))
+    s = str(value).strip()
+    if re.fullmatch(r"\d{6}|\d{8}", s):  # 202601 / 20260115
+        s = f"{s[:4]}-{s[4:6]}" + (f"-{s[6:]}" if len(s) == 8 else "")
+    m = _DATE.match(s)
+    if m:
+        try:
+            return date(int(m[1]), int(m[2]), int(m[3] or 1))
+        except ValueError:
+            pass
+    raise ConvertError(f"无法解析为日期: {value!r}")
 
 
 def from_records(rs: RuleSet, records: dict[str, list[dict]], file: str = "inline") -> Datasets:
