@@ -23,6 +23,7 @@ from pydantic import ValidationError
 from bonus_agent.auto import (DATA_SUFFIXES, MAX_FILES, Inventory, PlanDataset, TooManyFiles, build_inventory,
                               check_dataset, collect_files, filter_sheet)
 from bonus_agent import case as cs
+from bonus_agent import facts as fx
 from bonus_agent.extract_rules import Extraction, Question, check_quotes, prompt
 from bonus_agent.llm import LLM, LLMError, image_part, parse_json
 from bonus_core.data.mapping import DatasetMapping, apply_mapping
@@ -44,6 +45,7 @@ SHARED = "共用"                # 多个方案共用的部分（权重、校验
 KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保留全文
 BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
 READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate"}
+RULE_SUFFIXES = {".docx", ".pptx", ".png", ".jpg", ".jpeg", ".txt", ".md"}   # 规则文档：要登记参数
 
 
 class ToolError(Exception):
@@ -76,6 +78,18 @@ TOOLS: list[dict] = [
      "description": "把读到的关键信息记在工作区（如某条规则、某个参数、文件用途、待核对事项）。笔记每轮都会附给你，"
                     "较早的对话会被裁剪，重要内容请及时记下。同一 topic 再次记录会覆盖，text 为空则删除。",
      "parameters": _obj({"topic": _S, "text": _S}, ["topic", "text"])},
+    {"name": "record_facts",
+     "description": "登记从材料里读到的参数和口径（比例、金额、阶梯、系数、门槛、日期、取数口径等），程序据此比对冲突。"
+                    "每个文件里出现的都要登记，同一参数在几个文件（或一个文件的几处）出现就登记几次，用同一个 name；"
+                    "取值不一致时程序会自动向财务提问，你不要自行取舍。value 写原文的写法（如 5%、30万元、1.2），"
+                    "quote 逐字复制包含该取值的原文（不超过 200 字），程序会核对 quote 在文件里、value 在 quote 里。",
+     "parameters": _obj({"facts": {"type": "array", "items": _obj({
+         "name": {**_S, "description": "参数名，写清适用范围，如 季度奖-部门净利润提成比例"},
+         "value": {**_S, "description": "原文写法"}, "file": _S, "quote": _S,
+         "meaning": {**_S, "description": "可选：文字口径的规范说法，如 含税"},
+         "override": {"type": "boolean", "description": "原文明确写了修改旧规定（修改为 / 以本通知为准）时为 true，"
+                                                         "quote 要包含这句话"}}, ["name", "value", "file", "quote"])}},
+         ["facts"])},
     {"name": "define_dataset",
      "description": "定义（或重新定义）一张数据表。实体表写 key（每行一个对象，如员工、小组，以及被别的表按编号引用的项目、销售单）；"
                     "明细表写 link（每行挂到某层级对象或某个实体上，如回款 link=sales_id）；公司级表 key、link 都不写。"
@@ -158,6 +172,9 @@ class Workspace:
     done: bool = False
     budget: str = ""
     round: int = 1                                          # 第几轮（同一案卷和财务来回的次数）
+    facts: list[fx.Fact] = field(default_factory=list)      # 参数台账：从材料里登记的参数和口径
+    conflicts: dict[str, fx.Conflict] = field(default_factory=dict)   # 已提问的参数冲突
+    _sheet_corpus: dict[str, str] = field(default_factory=dict)
 
     @property
     def data_files(self) -> list[Path]:
@@ -252,6 +269,51 @@ class Workspace:
         else:
             self.notes.pop(topic, None)
         return f"已记录「{topic}」（共 {len(self.notes)} 条笔记，每轮都会附在工作区状态里）"
+
+    # ---- 参数台账 ----
+    def _corpus(self) -> dict[str, str]:
+        """每个文件规范化后的全文：文档文字、图片转写、Excel 各单元格。"""
+        out = {}
+        for f in self.inv.files:
+            if f.suffix.lower() in DATA_SUFFIXES:
+                if f.name not in self._sheet_corpus:
+                    import openpyxl
+                    wb = openpyxl.load_workbook(f, data_only=True, read_only=True)
+                    self._sheet_corpus[f.name] = "".join(
+                        fx.norm("".join("" if v is None else str(v) for v in r)) for w in wb.worksheets
+                        for r in w.iter_rows(values_only=True))
+                out[f.name] = self._sheet_corpus[f.name]
+            else:
+                d = next(d for d in self.inv.docs if d.name == f.name)
+                out[f.name] = fx.norm(d.full_text() + "".join(t for k, t in self.transcripts.items()
+                                                             if k.rsplit("#", 1)[0] == f.name))
+        return out
+
+    def record_facts(self, facts: list[dict]) -> str:
+        corpus, lines, added = self._corpus(), [], 0
+        for i, a in enumerate(facts, start=1):
+            try:
+                f = fx.Fact.model_validate({**a, "round": self.round}) if isinstance(a, dict) else None
+            except ValidationError as e:
+                lines.append(f"第 {i} 条格式不对：{str(e)[:200]}")
+                continue
+            if f is None:
+                lines.append(f"第 {i} 条应为对象")
+                continue
+            bad = fx.check_fact(f, corpus)
+            if bad:
+                lines.append(f"第 {i} 条「{f.name}」未登记：{bad}")
+                continue
+            if any((g.name, g.file, fx.norm(g.quote)) == (f.name, f.file, fx.norm(f.quote)) for g in self.facts):
+                continue
+            self.facts.append(f)
+            added += 1
+        new = fx.detect(self.facts, self.conflicts, self.questions, self.round)
+        out = [f"已登记 {added} 条（台账共 {len(self.facts)} 条）。"] + lines
+        if new:
+            out.append("程序发现取值冲突，已自动向财务提问（阻断，不要自行取舍，相关规则先按待定处理）：")
+            out += [f"- {q.id} {q.text}" for q in new]
+        return "\n".join(out)
 
     # ---- 数据表 ----
     def define_dataset(self, name: str, file: str, sheet: str, fields: dict, key: str | None = None,
@@ -550,18 +612,31 @@ class Workspace:
     @property
     def pending(self) -> list[Question]:
         """还在等财务答复的问题。"""
-        return [q for q in self.questions if q.blocking and not q.answer]
+        return [q for q in self.questions if q.blocking and not q.answer and not q.withdrawn]
 
     def finish(self, summary: str, ignored: list[dict] | None = None) -> str:
+        # 上一轮登记过的忽略项继续有效，本轮同名的覆盖
+        ignored = list({str(i.get("ref", "")): i for i in [*self.ignored, *(ignored or [])] if isinstance(i, dict)}.values())
+        self.ignored = ignored                 # finish 被拦下时也保留，修正后再 finish 不必重写
+        skipped = {str(i.get("ref", "")) for i in ignored}
+        docs = [f.name for f in self.inv.files if f.suffix.lower() in RULE_SUFFIXES]
+        bare = [d for d in docs if d not in skipped and not any(f.file == d for f in self.facts)]
+        if bare:
+            raise ToolError(f"这些规则文档还没有登记参数：{'、'.join(bare)}。请用 record_facts 登记其中的参数和口径"
+                            "（程序靠台账比对冲突）；确实与计算无关的写进 finish 的 ignored（ref 写文件名，说明原因）")
         if self.pending:     # 有问题等答复：结束本轮，不出正式结果
-            self.summary, self.ignored, self.done = summary, ignored or [], True
+            self.summary, self.ignored, self.done = summary, ignored, True
             return f"本轮结束，等待财务答复 {len(self.pending)} 个问题：{'、'.join(q.id for q in self.pending)}"
         if not self.schemes:
             raise ToolError("还没有写入规则")
         pending = [s for s in self.schemes if s in self.untested or s not in self.results]
         if pending:
             raise ToolError(f"方案 {pending} 最近一次修改之后还没有成功试算，请先 trial_run")
-        self.summary, self.ignored, self.done = summary, ignored or [], True
+        miss = [n for n in fx.unused(self.facts, self.drafts, self.conflicts, self.questions) if n.split("（")[0] not in skipped]
+        if miss:
+            raise ToolError(f"台账里这些参数的数值在规则里没有出现：{'、'.join(miss)}。请核对规则是否漏了或写错；"
+                            "确实不参与计算的写进 ignored（ref 写参数名，说明原因）")
+        self.summary, self.ignored, self.done = summary, ignored, True
         return "已完成"
 
     def state(self) -> str:
@@ -584,9 +659,16 @@ class Workspace:
                 lines.append(f"- {title}规则摘要（不含出处；修改时按名字只传要改的部分）：\n" + _rules_brief(d))
         else:
             lines.append("- 尚未写入规则")
+        if self.facts:
+            by = {}
+            for f in self.facts:
+                by.setdefault(f.file, []).append(f.name)
+            lines.append(f"- 参数台账 {len(self.facts)} 条（再登记同一参数请用相同的名字）：")
+            lines += [f"  · {k}：{'、'.join(dict.fromkeys(v))}" for k, v in by.items()]
         if self.questions:
             lines.append("- 问题：")
-            lines += [f"  · {q.id} {q.text} → " + (f"财务答复：{q.answer}" if q.answer else "等待答复" if q.blocking else "提示")
+            lines += [f"  · {q.id} {q.text} → " + (f"财务答复：{q.answer}" if q.answer else f"已撤回：{q.withdrawn}" if q.withdrawn
+                                          else "等待答复" if q.blocking else "提示")
                       for q in self.questions]
         if self.transcripts:
             lines.append(f"- 已查看图片：{', '.join(self.transcripts)}")
@@ -774,13 +856,16 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     if resumed:
         cs.restore(ws, case["workspace"])
         changes = cs.file_changes(last["files"] if last else {}, prints)
+        gone = set(changes["修改"]) | set(changes["删除"])
+        ws.facts = [f for f in ws.facts if f.file not in gone]       # 这些文件的参数要按新内容重新登记
+        withdrawn = fx.withdraw_stale(ws.facts, ws.conflicts, ws.questions)
     else:   # 首轮就带了答复（如上一次单轮运行的 questions.yaml）：作为已答复的问题放进工作区
         ws.questions = [Question(id=a.get("id") or f"q{i + 1}", text=a["text"], options=a.get("options") or [])
                         for i, a in enumerate(answers or []) if a.get("text") and a.get("answer") not in (None, "")]
     fresh = cs.apply_answers(ws.questions, answers)
     handlers = {t["name"]: getattr(ws, t["name"]) for t in TOOLS}
     if resumed:
-        task = _resume_task(ws, last, changes, fresh)
+        task = _resume_task(ws, last, changes, fresh, withdrawn)
     else:
         task = ("请完成本批次的奖金计算。文件清单：\n" + ws.list_files() + _answers_text(answers)
                 + "\n\n完成后调用 finish。")
@@ -922,7 +1007,8 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     return ar
 
 
-def _resume_task(ws: Workspace, last: dict | None, changes: dict | None, fresh: list[Question]) -> str:
+def _resume_task(ws: Workspace, last: dict | None, changes: dict | None, fresh: list[Question],
+                 withdrawn: list[Question] = ()) -> str:
     n = ws.round
     lines = [f"这是同一笔奖金的第 {n} 轮处理（上一轮状态：{(last or {}).get('status', '未知')}）。上一轮的数据表、列映射、规则、"
              "笔记和问题都已恢复到工作区（见工作区状态），没有变化的材料不必重读。", "", "本轮变化："]
@@ -932,14 +1018,16 @@ def _resume_task(ws: Workspace, last: dict | None, changes: dict | None, fresh: 
     for k, v in (changes or {}).items():
         if v:
             lines.append(f"- {k}文件：{'、'.join(v)}")
+    if withdrawn:
+        lines.append("- 程序撤回的问题（冲突所依据的材料已修改，请按新内容重新登记参数）：" + "；".join(q.id for q in withdrawn))
     if not fresh and not any((changes or {}).values()):
         lines.append("- 没有新答复，也没有文件变化")
     if ws.pending:
         lines.append("- 仍在等待答复：" + "；".join(f"{q.id} {q.text}" for q in ws.pending))
     lines += ["", "请：",
               "1. 按新答复修改规则（答复只影响它相关的部分，其余保持不变）；",
-              "2. 阅读新增、修改的文件，与已有规则、笔记逐项对照：同一参数取值不同、口径前后矛盾、新增内容不明确时，"
-              "用 ask_question 提问，写明冲突双方的出处，不要自行取舍；补充说明明确覆盖旧规定的，按新规定改；",
+              "2. 阅读新增、修改的文件，用 record_facts 登记其中的参数（与已有台账同一参数用相同的名字），"
+              "取值不一致时程序会自动提问；口径前后矛盾、新增内容不明确时用 ask_question 提问，写明出处，不要自行取舍；",
               "3. 删除的文件如果被数据表用到，改映射或提问；",
               "4. 试算全部方案，确认结果合理后 finish。还有问题等答复时，做完不受影响的部分就 finish 结束本轮。",
               "", "当前文件清单：", ws.list_files()]
@@ -970,7 +1058,8 @@ def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None =
             paths[f"adjust:{name}:{rev['name']}"].write_text(yaml.safe_dump(list(done), allow_unicode=True, sort_keys=False),
                                                              encoding="utf-8")
     qrows = [{"id": q.id, "round": q.round, "text": q.text, "options": q.options, "suggested": q.suggested,
-              "related": q.related, "blocking": q.blocking, "answer": q.answer} for q in ws.questions]
+              "related": q.related, "blocking": q.blocking, "answer": q.answer,
+              **({"withdrawn": q.withdrawn} if q.withdrawn else {})} for q in ws.questions]
     paths["questions"] = out / "questions.yaml"
     paths["questions"].write_text(
         "# 财务答复：在 answer 里填选项序号（从 0 开始）或直接写文字；有补充材料放进材料文件夹，\n"
@@ -1090,12 +1179,20 @@ def _sheets(ar: AgentResult, qrows: list[dict]):
         plan.append(["规则改动（与上一轮比）", "；".join(ar.rule_changes) or "无"])
     q = [[r["id"], r.get("round", 1), r["text"], " / ".join(r.get("options") or []),
           (r["options"][r["suggested"]] if isinstance(r.get("suggested"), int)
-           and 0 <= r["suggested"] < len(r.get("options") or []) else ""), "" if r.get("answer") is None else str(r["answer"])]
+           and 0 <= r["suggested"] < len(r.get("options") or []) else ""),
+          f"（已撤回：{r['withdrawn']}）" if r.get("withdrawn") else "" if r.get("answer") is None else str(r["answer"])]
          for r in qrows]
     log = [[i, s.tool, json.dumps(s.args, ensure_ascii=False)[:300], ("" if s.ok else "失败：") + s.result[:500]]
            for i, s in enumerate(ar.steps, start=1)]
     out = [("待确认问题", ["编号", "提出轮次", "问题", "选项", "智能体建议（未采用）", "财务答复"], q,
             {"问题": 60, "选项": 40, "智能体建议（未采用）": 20})]
+    if ws.facts:
+        conflicted = {c.name: c.question for c in ws.conflicts.values()}
+        out.append(("参数台账", ["参数", "原文取值", "换算", "文件", "原文", "登记轮次", "冲突问题"],
+                    [[f.name, fx.label(f), fx.same_value(f) if fx.number(f.value) is not None else "", f.file, f.quote,
+                      f.round, conflicted.get(f.name, "以此为准（原文明确修改）" if f.override else "")]
+                     for f in sorted(ws.facts, key=lambda f: f.name)],
+                    {"参数": 30, "原文": 60}))
     if ar.compared:
         out.append(("与上一轮对比", ["方案", "修订", "对象", "名称", "上一轮应得", "本轮应得", "差额", "上一轮实发", "本轮实发"],
                     ar.diff_rows or [["（所有对象金额与上一轮相同）"]], {"对象": 16, "名称": 14}))

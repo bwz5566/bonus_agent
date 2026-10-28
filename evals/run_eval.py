@@ -93,6 +93,9 @@ def fake_agent_script(case: Case) -> list:
     ref, plan = case.reference, fake_plan(case)
     script = [{"tool": "list_files"}]
     script += [{"tool": "read_document", "args": {"file": Path(d).name}} for d in case.spec["docs"]]
+    facts = case.spec.get("facts") or []
+    if facts:
+        script.append({"tool": "record_facts", "args": {"facts": facts}})
     for n, d in plan["datasets"].items():
         file, sheet = d["sheet"].split("/", 1)
         script.append({"tool": "define_dataset", "args": {"name": n, "file": file, "sheet": sheet, "key": d["key"],
@@ -108,7 +111,10 @@ def fake_agent_script(case: Case) -> list:
         if c["type"] == "question":
             script.append({"tool": "ask_question", "args": {"text": "请确认：" + "、".join(map(str, c["keywords"])),
                                                            "options": ["全额累进", "超额累进"], "suggested": 0}})
-    script.append({"tool": "finish", "args": {"summary": ref.name}})
+    covered = {f["file"] for f in facts}
+    ignored = [{"ref": Path(d).name, "reason": "演练脚本未登记参数"} for d in case.spec["docs"] if Path(d).name not in covered]
+    ignored += [{"ref": f["name"], "reason": i} for f in facts if (i := f.get("ignore"))]
+    script.append({"tool": "finish", "args": {"summary": ref.name, **({"ignored": ignored} if ignored else {})}})
     return script
 
 

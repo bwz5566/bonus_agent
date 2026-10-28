@@ -11,6 +11,15 @@ finance_answers:
   超额: 全额累进：净利润达到某一档后，全部净利润按该档比例计提
   累进: 全额累进：净利润达到某一档后，全部净利润按该档比例计提
 
+# 演练脚本登记的参数台账（ignore：不直接出现在规则里的原因）
+facts:
+  - {name: 年终奖总包-净利润门槛, value: 3000 万元, file: 年终奖方案.pptx, quote: 全年净利润达到 3000 万元的，按 8% 计提}
+  - {name: 年终奖总包-达到门槛计提比例, value: 8%, file: 年终奖方案.pptx, quote: 全年净利润达到 3000 万元的，按 8% 计提}
+  - {name: 年终奖总包-未达门槛计提比例, value: 5%, file: 年终奖方案.pptx, quote: 未达到 3000 万元的，按 5% 计提}
+  - {name: 年终奖-春节前发放比例, value: 70%, file: 年终奖方案.pptx, quote: 个人年终奖的 70% 随春节前工资发放,
+     ignore: 由暂缓 30% 推出}
+  - {name: 研发中心KPI系数, value: "1.1", file: 补充通知.docx, quote: 研发中心的 KPI 得分按 1.1 倍计入}
+
 checks:
   - {name: 净利润阶梯档位, type: tier, steps: [[0, 0.05], [30000000, 0.08]]}
   - {name: 绩效系数（图片）, type: lookup, mapping: {A: 1.5, B: 1.2, C: 1.0, D: 0.5}}

@@ -28,7 +28,7 @@ def _sheet(wb, title, headers, rows, money_cols=(), widths=None):
         for (cell,) in ws.iter_rows(min_row=2, min_col=col, max_col=col):
             cell.number_format = MONEY
     for i, h in enumerate(headers, start=1):
-        w = (widths or {}).get(h) or max(10, min(60, max(len(str(h)) * 2, *(len(str(r[i - 1])) for r in rows) if rows else [0])))
+        w = (widths or {}).get(h) or max(10, min(60, max(len(str(h)) * 2, *(len(str(r[i - 1])) if len(r) >= i else 0 for r in rows) if rows else [0])))
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A2"
     return ws

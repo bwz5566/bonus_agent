@@ -234,7 +234,8 @@ def _agent(a, cfg) -> int:
     if ar.questions:
         print(f"\n【问题】{len(ar.questions)} 个：")
         for q in ar.questions:
-            state = f"已答复：{q.answer}" if q.answer else "等待答复" if q.blocking else "提示"
+            state = (f"已答复：{q.answer}" if q.answer else f"已撤回：{q.withdrawn}" if q.withdrawn
+                     else "等待答复" if q.blocking else "提示")
             print(f"  {q.id}. {q.text}  选项：{' / '.join(q.options) or '无'}  [{state}]")
     if ar.status == "NEEDS_CONFIRMATION":
         print(f"\n【状态】NEEDS_CONFIRMATION：{len(ar.pending)} 个问题等财务答复，本轮不出结果。")

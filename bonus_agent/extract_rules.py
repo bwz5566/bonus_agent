@@ -42,6 +42,7 @@ class Question(BaseModel):
     blocking: bool = True      # 未答复前不出正式结果（冲突、缺失、理解不明确都要等财务答复，不自行假设）
     answer: str | None = None  # 财务答复
     round: int = 1             # 第几轮提出的
+    withdrawn: str = ""        # 程序撤回的原因（如冲突所依据的材料已修改）
 
 
 class Extraction(BaseModel):
