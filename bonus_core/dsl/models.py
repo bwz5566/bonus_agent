@@ -133,9 +133,20 @@ class AllocationLevel(RuleItem):
 
 
 class PayoutCondition(RuleItem):
+    """发放条件，二选一：hold_ratio 挂起比例（挂起 = ROUND(应得 × 比例, 2)），
+    或 pay_ratio 可发比例（可发上限 = ROUND(应得 × 比例, 2)，挂起 = 应得 − 可发上限，如按回款比例发放）。"""
     id: str
     scope: str                 # 目前只支持最末一层（个人）
-    hold_ratio: str            # 挂起比例，0~1
+    hold_ratio: str = ""
+    pay_ratio: str = ""
+
+
+class Offset(RuleItem):
+    """已发金额抵扣（如年度奖扣减预付和已发的季度奖）：本次实发 = MAX(可发上限 − 已发, 0)，
+    超发待核对 = MAX(已发 − 可发上限, 0)，只登记不追回。"""
+    id: str
+    scope: str                 # 目前只支持最末一层（个人）
+    expr: str                  # 已发金额
 
 
 class GoldenCase(_Base):
@@ -156,6 +167,7 @@ class RuleSet(_Base):
     pool: Pool
     allocation: list[AllocationLevel]
     payout: list[PayoutCondition] = []
+    offsets: list[Offset] = []
     checks: list[Check] = []
     tests: list[GoldenCase] = []
 

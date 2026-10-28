@@ -49,11 +49,12 @@ def write_excel(rs: RuleSet, res: Result, path: str | Path, ledger: list[dict] |
 
     # 汇总
     total_held = sum((_d(p.held) for p in res.payouts.values()), Decimal(0))
+    total_paid = sum((_d(p.paid) for p in res.payouts.values()), Decimal(0)) if res.payouts else _d(res.pool)
     rows = [
         ["规则", f"{res.rule_set}（{res.rule_version}）"],
         ["奖金池（精确值）", float(_d(res.pool_exact))],
         ["奖金池（保留到分）", float(_d(res.pool))],
-        ["本期实发合计", float(_d(res.pool) - total_held)],
+        ["本期实发合计", float(total_paid)],
         ["本期挂起合计", float(total_held)],
         ["调整次数", len([a for a in res.adjustments if not a.revoked])],
     ]
@@ -90,10 +91,11 @@ def write_excel(rs: RuleSet, res: Result, path: str | Path, ledger: list[dict] |
     pay_rows = []
     for nid, p in res.payouts.items():
         n = nodes[nid]
-        pay_rows.append([nid, n.label, nodes[n.parent].label, float(_d(p.final)), float(_d(p.paid)), float(_d(p.held))]
+        pay_rows.append([nid, n.label, nodes[n.parent].label, float(_d(p.final)), float(_d(p.held)),
+                         float(_d(p.cap or p.paid)), float(_d(p.offset)), float(_d(p.paid)), float(_d(p.overpaid))]
                         + [float(_d(p.holds[c])) for c in conds])
-    _sheet(wb, f"{leaf}发放", ["节点", "名称", "上级", "应发", "本期实发", "挂起"] + [f"挂起：{c}" for c in conds],
-           pay_rows, money_cols=range(4, 7 + len(conds)))
+    _sheet(wb, f"{leaf}发放", ["节点", "名称", "上级", "应得", "暂缓", "可发上限", "已发抵扣", "本次实发", "超发待核对"]
+           + [f"挂起：{c}" for c in conds], pay_rows, money_cols=range(4, 10 + len(conds)))
 
     # 调整记录
     adj_rows = [[a.created_at, a.node_id, nodes[a.node_id].label if a.node_id in nodes else "", float(a.amount),

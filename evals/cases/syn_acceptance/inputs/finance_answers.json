@@ -1,0 +1,21 @@
+{
+  "fixture_id": "BONUS-SYN-20261028-V1",
+  "approved_by": "FIN_SAMPLE_01",
+  "is_synthetic": true,
+  "answers": [
+    {
+      "question_id": "Q_CASH",
+      "source": "01_奖金制度.docx 发放条款",
+      "approved": true,
+      "answer": "先计算应得，再按员工归属的本期销售单截至截止日的回款比例计算可发上限。回款按sales_id关联。只选recognition_date在期间内的销售单，累计截至截止日到账金额。个人销售额和回款额均按share归属，先汇总再求比例，最高100%，销售额为零则比例为零。可发上限ROUND(应得乘比例,2)。季度和过程奖本次可发等于可发上限，暂缓等于应得减上限。迟到回款不计入原快照，暂缓不重新分配。各层可发由下级合计。季度和过程奖使用Q3销售单，年度使用全年销售单。",
+      "policy_code": "accrue_then_pay_by_employee_attributed_receipt_ratio"
+    },
+    {
+      "question_id": "Q_OFFSET",
+      "source": "01_奖金制度.docx 发放条款",
+      "approved": true,
+      "answer": "年度在员工粒度抵扣prior_paid中的本年度预付与季度R2最终可发金额。为测试，另行模拟确认季度R2已全部支付；这不是一般计算任务自动视为支付。R0、R1不重复计入，过程奖独立。本次可发MAX(年度可发上限减已发抵扣,0)，超发待核对MAX(已发抵扣减年度可发上限,0)，只登记不自动追回。年度暂缓等于年度应得减年度可发上限。",
+      "policy_code": "Q1_Q2_advances_plus_Q3_R2_paid_only_exclude_process"
+    }
+  ]
+}

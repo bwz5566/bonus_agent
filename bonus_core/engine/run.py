@@ -53,11 +53,14 @@ class NodeResult:
 @dataclass
 class PayoutResult:
     node_id: str
-    final: str
-    held: str
-    paid: str
+    final: str                  # 应得
+    held: str                   # 暂缓（挂起）
+    paid: str                   # 本次实发 = MAX(可发上限 − 已发抵扣, 0)
     holds: dict[str, str]       # 条件 id -> 挂起金额
     hold_ratios: dict[str, str]
+    cap: str = ""               # 可发上限 = 应得 − 暂缓
+    offset: str = "0"           # 已发抵扣
+    overpaid: str = "0"         # 超发待核对 = MAX(已发抵扣 − 可发上限, 0)，只登记不追回
 
 
 @dataclass
@@ -100,7 +103,7 @@ def input_hash(rs: RuleSet, data: Datasets) -> str:
 class Engine:
     """一次计算的上下文：建树、求权重和奖金池，然后按调整事件分配。"""
 
-    def __init__(self, rs: RuleSet, data: Datasets):
+    def __init__(self, rs: RuleSet, data: Datasets, refs: dict | None = None):
         issues = [i for i in validate(rs) if i.severity == "blocking"]
         if issues:
             raise EngineError(issues)
@@ -111,7 +114,7 @@ class Engine:
         if blocking:
             raise EngineError(blocking)
         self.root, self.by_level, self.issues = root, by_level, issues
-        self.ev = Evaluator(rs, root, by_level)
+        self.ev = Evaluator(rs, root, by_level, refs)
         self.nodes: dict[str, Node] = {n.id: n for n in root.walk()}
         try:
             self.issues += self._checks()
@@ -238,19 +241,35 @@ class Engine:
             holds, ratios = {}, {}
             remaining = n.final
             for cond in self.rs.payout:
+                pay = bool(cond.pay_ratio.strip())
                 try:
-                    r = self.ev.evaluate(cond.hold_ratio, n, f"{n.id}/挂起比例/{cond.id}", f"payout.{cond.id}")
+                    r = self.ev.evaluate(cond.pay_ratio if pay else cond.hold_ratio, n,
+                                         f"{n.id}/{'可发比例' if pay else '挂起比例'}/{cond.id}", f"payout.{cond.id}")
                 except EvalError as e:
                     raise EngineError([Issue.block("eval_error", str(e), e.where)]) from None
                 if r < 0 or r > 1:
-                    raise EngineError([Issue.block("hold_ratio_range", f"{cond.id} 的挂起比例 {r} 不在 0~1 之间", n.id)])
-                h = min((n.final * r).quantize(CENT, ROUND_HALF_UP), remaining)
+                    raise EngineError([Issue.block("hold_ratio_range", f"{cond.id} 的比例 {r} 不在 0~1 之间", n.id)])
+                if pay:   # 可发上限 = ROUND(应得 × 比例, 2)，挂起 = 应得 − 上限
+                    h = min(n.final - (n.final * r).quantize(CENT, ROUND_HALF_UP), remaining)
+                else:
+                    h = min((n.final * r).quantize(CENT, ROUND_HALF_UP), remaining)
                 remaining -= h
                 holds[cond.id], ratios[cond.id] = str(h), str(r)
+            offset = Decimal(0)
+            for o in self.rs.offsets:
+                try:
+                    v = self.ev.evaluate(o.expr, n, f"{n.id}/已发抵扣/{o.id}", f"offsets.{o.id}")
+                except EvalError as e:
+                    raise EngineError([Issue.block("eval_error", str(e), e.where)]) from None
+                if v < 0:
+                    raise EngineError([Issue.block("offset_negative", f"{o.id} 的已发金额为负：{v}", n.id)])
+                offset += v.quantize(CENT, ROUND_HALF_UP)
             held = n.final - remaining
-            out[n.id] = PayoutResult(n.id, str(n.final), str(held), str(remaining), holds, ratios)
+            paid, over = max(remaining - offset, Decimal(0)), max(offset - remaining, Decimal(0))
+            out[n.id] = PayoutResult(n.id, str(n.final), str(held), str(paid), holds, ratios,
+                                     cap=str(remaining), offset=str(offset), overpaid=str(over))
         return out
 
 
-def compute(rs: RuleSet, data: Datasets, adjustments: list[Adjustment] = (), actor_scopes=None) -> Result:
-    return Engine(rs, data).compute(adjustments, actor_scopes)
+def compute(rs: RuleSet, data: Datasets, adjustments: list[Adjustment] = (), actor_scopes=None, refs=None) -> Result:
+    return Engine(rs, data, refs).compute(adjustments, actor_scopes)

@@ -1,0 +1,30 @@
+# 标准答案用的数据字典（智能体自己定义数据表，不读这个文件）
+部门: {key: dept_id, fields: {dept_id: {type: id}, dept_name: {type: text}}}
+小组:
+  key: group_id
+  fields: {group_id: {type: id}, dept_id: {type: id}, group_name: {type: text}, perf_q3: {type: number}, perf_fy: {type: number}}
+员工: {key: employee_id, fields: {employee_id: {type: id}, group_id: {type: id}, employee_name: {type: text}, join_date: {type: date}}}
+项目:
+  key: project_id
+  fields: {project_id: {type: id}, group_id: {type: id}, region: {type: text}, contract_date: {type: date}, difficulty: {type: int}}
+销售明细:
+  key: sales_id
+  fields: {sales_id: {type: id}, project_id: {type: id}, recognition_date: {type: date},
+           sales_amount: {type: money, unit: 元}, cost_amount: {type: money, unit: 元}, expense_amount: {type: money, unit: 元}}
+回款明细:
+  link: sales_id
+  fields: {receipt_id: {type: id}, sales_id: {type: id}, receipt_date: {type: date}, receipt_amount: {type: money, unit: 元}}
+项目参与: {link: employee_id, fields: {employee_id: {type: id}, project_id: {type: id}, share: {type: ratio}}}
+绩效评分:
+  link: employee_id
+  fields: {employee_id: {type: id}, period: {type: text}, contribution_score: {type: number}, output_score: {type: number},
+           approved: {type: bool}}
+部门目标: {link: dept_id, fields: {dept_id: {type: id}, period: {type: text}, sales_target: {type: money, unit: 元}}}
+小组目标: {link: group_id, fields: {group_id: {type: id}, period: {type: text}, sales_target: {type: money, unit: 元}}}
+个人目标: {link: employee_id, fields: {employee_id: {type: id}, period: {type: text}, sales_target: {type: money, unit: 元}}}
+里程碑:
+  link: project_id
+  fields: {project_id: {type: id}, acceptance_date: {type: date}, status: {type: text}, base_bonus: {type: money, unit: 元}}
+历史已发:
+  link: employee_id
+  fields: {employee_id: {type: id}, annual_bonus_year: {type: int}, bonus_item: {type: text}, paid_amount: {type: money, unit: 元}}

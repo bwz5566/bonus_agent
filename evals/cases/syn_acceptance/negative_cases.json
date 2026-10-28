@@ -1,0 +1,166 @@
+[
+  {
+    "case_id": "N001",
+    "name": "销售主键重复",
+    "patch": {
+      "target": "data",
+      "op": "append_copy",
+      "table": "sales",
+      "index": 0
+    },
+    "expected_status": "BLOCKED",
+    "expected_error_code": "DUPLICATE_KEY",
+    "expected_location": "sales[432].sales_id",
+    "expected_message": "主键重复",
+    "actual_matches_expected": true
+  },
+  {
+    "case_id": "N002",
+    "name": "未知区域",
+    "patch": {
+      "target": "data",
+      "op": "set",
+      "table": "projects",
+      "index": 0,
+      "field": "region",
+      "value": "未知区域"
+    },
+    "expected_status": "BLOCKED",
+    "expected_error_code": "UNKNOWN_REGION",
+    "expected_location": "projects[0].region",
+    "expected_message": "区域缺少系数映射",
+    "actual_matches_expected": true
+  },
+  {
+    "case_id": "N003",
+    "name": "参与比例不合计为1",
+    "patch": {
+      "target": "data",
+      "op": "set",
+      "table": "participation",
+      "index": 0,
+      "field": "share",
+      "value": ".90"
+    },
+    "expected_status": "BLOCKED",
+    "expected_error_code": "SHARE_SUM_NOT_ONE",
+    "expected_location": "participation:P001",
+    "expected_message": "项目参与比例合计须为1",
+    "actual_matches_expected": true
+  },
+  {
+    "case_id": "N004",
+    "name": "回款单找不到销售单",
+    "patch": {
+      "target": "data",
+      "op": "set",
+      "table": "receipts",
+      "index": 0,
+      "field": "sales_id",
+      "value": "S_NOT_EXISTS"
+    },
+    "expected_status": "BLOCKED",
+    "expected_error_code": "UNKNOWN_SALES",
+    "expected_location": "receipts[0].sales_id",
+    "expected_message": "回款未匹配销售单",
+    "actual_matches_expected": true
+  },
+  {
+    "case_id": "N005",
+    "name": "AI评分未审批",
+    "patch": {
+      "target": "data",
+      "op": "set",
+      "table": "scores",
+      "index": 0,
+      "field": "approved",
+      "value": false
+    },
+    "expected_status": "BLOCKED",
+    "expected_error_code": "SCORE_NOT_APPROVED",
+    "expected_location": "scores[0].approved",
+    "expected_message": "评分尚未人工确认",
+    "actual_matches_expected": true
+  },
+  {
+    "case_id": "N006",
+    "name": "目标值为零",
+    "patch": {
+      "target": "data",
+      "op": "set",
+      "table": "targets",
+      "index": 0,
+      "field": "sales_target",
+      "value": "0"
+    },
+    "expected_status": "BLOCKED",
+    "expected_error_code": "NONPOSITIVE_TARGET",
+    "expected_location": "targets[0].sales_target",
+    "expected_message": "目标值必须大于零",
+    "actual_matches_expected": true
+  },
+  {
+    "case_id": "N007",
+    "name": "回款超出销售额",
+    "patch": {
+      "target": "data",
+      "op": "set",
+      "table": "receipts",
+      "index": 0,
+      "field": "receipt_amount",
+      "value": "999999999"
+    },
+    "expected_status": "BLOCKED",
+    "expected_error_code": "RECEIPT_EXCEEDS_SALES",
+    "expected_location": "receipts[0]",
+    "expected_message": "回款合计超过销售额或存在负回款",
+    "actual_matches_expected": true
+  },
+  {
+    "case_id": "N008",
+    "name": "收款政策未确认",
+    "patch": {
+      "target": "rules",
+      "op": "set",
+      "field": "cash_policy",
+      "value": null
+    },
+    "expected_status": "BLOCKED",
+    "expected_error_code": "POLICY_UNCONFIRMED",
+    "expected_location": "rules.cash_policy",
+    "expected_message": "未收款政策尚未确认",
+    "actual_matches_expected": true
+  },
+  {
+    "case_id": "N009",
+    "name": "跨期政策未确认",
+    "patch": {
+      "target": "rules",
+      "op": "set",
+      "field": "annual_offset_policy",
+      "value": null
+    },
+    "expected_status": "BLOCKED",
+    "expected_error_code": "POLICY_UNCONFIRMED",
+    "expected_location": "rules.annual_offset_policy",
+    "expected_message": "跨期抵扣口径尚未确认",
+    "actual_matches_expected": true
+  },
+  {
+    "case_id": "N010",
+    "name": "人工评分超出量表",
+    "patch": {
+      "target": "data",
+      "op": "set",
+      "table": "scores",
+      "index": 0,
+      "field": "contribution_score",
+      "value": "101"
+    },
+    "expected_status": "BLOCKED",
+    "expected_error_code": "SCORE_OUT_OF_RANGE",
+    "expected_location": "scores[0]",
+    "expected_message": "评分必须在0至100",
+    "actual_matches_expected": true
+  }
+]

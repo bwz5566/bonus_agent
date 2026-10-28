@@ -1,0 +1,14 @@
+name: QUARTER 季度奖
+version: '2026Q3'
+tables:
+  R_Q_TIER: {kind: tier, mode: whole, steps: [[0, 0.08], [10000000, 0.10], [20000000, 0.12]]}
+pool: {scope: 部门, expr: 'round((tier(R_Q_TIER, d_eff_q) + max(d_net_q, 0) * 5%) * d_coef_q, 2)'}
+allocation:
+  - {level: 部门, key: dept_id}
+  - {level: 小组, key: group_id, parent_key: dept_id, weight: g_w_q}
+  - {level: 个人, key: employee_id, parent_key: group_id, weight: e_w_q}
+payout:   # 财务确认单 Q_CASH：可发上限 = ROUND(应得 × MIN(归属回款 ÷ 归属销售, 1), 2)
+  - {id: cash, scope: 个人, pay_ratio: 'min(ratio(attrib_recv_q, attrib_q, zero: 0), 1)'}
+revisions:   # 同一次计算的修订，后一个包含前面的调整（R2 = ADJ001 + ADJ002）
+  - {name: R1, adjust: [{node: '小组:G01', amount: 900000, reason: ADJ001 样例部门内小组奖金包调整}]}
+  - {name: R2, adjust: [{node: '个人:E001', amount: 150000, reason: ADJ002 样例个人专项贡献调整}]}

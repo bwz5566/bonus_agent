@@ -205,9 +205,11 @@ def _agent(a, cfg) -> int:
         for ln in lines:
             print(f"  {ln}")
     if ar.questions:
-        print(f"\n【待确认问题】{len(ar.questions)} 个（已按建议理解先算，答复后用 --answers 重跑）：")
+        print(f"\n【待确认问题】{len(ar.questions)} 个（一般问题已按建议理解先算，答复后用 --answers 重跑）：")
         for q in ar.questions:
-            print(f"  {q.id}. {q.text}  选项：{' / '.join(q.options)}")
+            print(f"  {q.id}. {'【阻断】' if q.blocking else ''}{q.text}  选项：{' / '.join(q.options)}")
+    if ar.pending:
+        print(f"\n【状态】NEEDS_CONFIRMATION：{len(ar.pending)} 个阻断问题未答复，结果只是草稿、不得发放")
     if ar.error:
         print(f"\n未完成：{ar.error}")
     print(f"\n输出目录：{a.out}（result*.xlsx、rules*.yaml、mapping.yaml、questions.yaml、agent_log.json）")
@@ -215,7 +217,7 @@ def _agent(a, cfg) -> int:
     cached = f"（其中命中缓存 {u.cached_tokens}）" if u.cached_tokens else ""
     print(f"共 {len(ar.steps)} 步，调用模型 {u.calls} 次，输入 {u.prompt_tokens} tokens{cached}，输出 {u.completion_tokens} tokens，"
           f"平均每次输入 {u.prompt_tokens // max(u.calls, 1)}，耗时 {u.latency_s:.0f} 秒")
-    return 0 if ar.ok else 1
+    return {"OK": 0, "NEEDS_CONFIRMATION": 3}.get(ar.status, 1)
 
 
 if __name__ == "__main__":

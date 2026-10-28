@@ -1,0 +1,72 @@
+# 三个方案共用的系数表、变量和数据校验（标准答案，按 01 制度、02 补充、04 参数和财务确认单手写）
+# Q3 = 2026-07-01 至 09-30（季度奖、过程奖），FY = 2026-01-01 至 12-31（年度奖）
+tables:
+  R_REGION: {kind: lookup, mapping: {华东: 1.10, 华南: 1.00, 华北: 0.90, 西部: 1.20}}
+  R_MARGIN: {kind: tier, mode: whole, steps: [[0, 0], [0.15, 0.8], [0.25, 1.0], [0.35, 1.2]]}
+  R_COMPLETION: {kind: tier, mode: whole, steps: [[0, 0.8], [0.8, 1.0], [1, 1.1]]}
+variables:
+  # ---- 项目：期间销售、成本、费用、回款（回款只算期间内销售单、截止日前到账） ----
+  new_coef: {scope: 项目, expr: 'if(contract_date >= "2026-01-01", 1.10, 0.95)', desc: 新老项目系数}
+  q_sales: {scope: 项目, expr: 'sum(sales_amount, of: "销售明细", where: between(recognition_date, "2026-07-01", "2026-09-30"))'}
+  q_cost: {scope: 项目, expr: 'sum(cost_amount, of: "销售明细", where: between(recognition_date, "2026-07-01", "2026-09-30"))'}
+  q_net: {scope: 项目, expr: 'sum(sales_amount - cost_amount - expense_amount, of: "销售明细", where: between(recognition_date, "2026-07-01", "2026-09-30"))'}
+  q_recv: {scope: 项目, expr: 'sum(receipt_amount, of: "回款明细", where: between(recognition_date, "2026-07-01", "2026-09-30") and receipt_date <= "2026-09-30")'}
+  q_eff: {scope: 项目, expr: 'q_sales * lookup(R_REGION, region) * new_coef * tier_rate(R_MARGIN, ratio(q_sales - q_cost, q_sales, zero: 0))', desc: 项目 Q3 有效销售额}
+  fy_sales: {scope: 项目, expr: 'sum(sales_amount, of: "销售明细", where: between(recognition_date, "2026-01-01", "2026-12-31"))'}
+  fy_cost: {scope: 项目, expr: 'sum(cost_amount, of: "销售明细", where: between(recognition_date, "2026-01-01", "2026-12-31"))'}
+  fy_net: {scope: 项目, expr: 'sum(sales_amount - cost_amount - expense_amount, of: "销售明细", where: between(recognition_date, "2026-01-01", "2026-12-31"))'}
+  fy_recv: {scope: 项目, expr: 'sum(receipt_amount, of: "回款明细", where: between(recognition_date, "2026-01-01", "2026-12-31") and receipt_date <= "2026-12-31")'}
+  fy_eff: {scope: 项目, expr: 'fy_sales * lookup(R_REGION, region) * new_coef * tier_rate(R_MARGIN, ratio(fy_sales - fy_cost, fy_sales, zero: 0))', desc: 项目全年有效销售额}
+  # ---- 部门 ----
+  d_eff_q: {scope: 部门, expr: 'sum(q_eff, of: "项目")'}
+  d_sales_q: {scope: 部门, expr: 'sum(q_sales, of: "项目")', desc: 实际销售额，含低毛利项目}
+  d_net_q: {scope: 部门, expr: 'sum(q_net, of: "项目")'}
+  d_coef_q: {scope: 部门, expr: 'tier_rate(R_COMPLETION, ratio(d_sales_q, sum(sales_target, of: "部门目标", where: period == "Q3")))'}
+  d_eff_fy: {scope: 部门, expr: 'sum(fy_eff, of: "项目")'}
+  d_sales_fy: {scope: 部门, expr: 'sum(fy_sales, of: "项目")'}
+  d_net_fy: {scope: 部门, expr: 'sum(fy_net, of: "项目")'}
+  d_coef_fy: {scope: 部门, expr: 'tier_rate(R_COMPLETION, ratio(d_sales_fy, sum(sales_target, of: "部门目标", where: period == "FY")))'}
+  # ---- 小组权重 ----
+  g_w_q: {scope: 小组, expr: 'round(perf_q3 / 100 * min(ratio(sum(q_sales, of: "项目"), sum(sales_target, of: "小组目标", where: period == "Q3")), 1.2), 6)'}
+  g_w_fy: {scope: 小组, expr: 'round(perf_fy / 100 * min(ratio(sum(fy_sales, of: "项目"), sum(sales_target, of: "小组目标", where: period == "FY")), 1.2), 6)'}
+  # ---- 个人：归属销售与回款按 share，先汇总再求比例 ----
+  avg_diff: {scope: 个人, expr: 'ratio(sum(share * difficulty, of: "项目参与"), sum(share, of: "项目参与"))', desc: 按参与比例加权的项目难度}
+  n_proj: {scope: 个人, expr: 'count_distinct(project_id, of: "项目参与")'}
+  attrib_q: {scope: 个人, expr: 'sum(q_sales * share, of: "项目参与")', desc: 个人归属 Q3 销售额}
+  attrib_recv_q: {scope: 个人, expr: 'sum(q_recv * share, of: "项目参与")', desc: 个人归属 Q3 回款额}
+  attrib_fy: {scope: 个人, expr: 'sum(fy_sales * share, of: "项目参与")'}
+  attrib_recv_fy: {scope: 个人, expr: 'sum(fy_recv * share, of: "项目参与")'}
+  e_w_q:
+    scope: 个人
+    desc: 个人 Q3 原始权重
+    expr: >-
+      round(0.1 * min(years_between(join_date, "2026-09-30"), 5) / 5
+      + 0.2 * sum(contribution_score, of: "绩效评分", where: period == "Q3" and approved) / 100
+      + 0.15 * avg_diff / 3
+      + 0.3 * min(ratio(attrib_q, sum(sales_target, of: "个人目标", where: period == "Q3")), 1.5) / 1.5
+      + 0.1 * min(n_proj, 8) / 8
+      + 0.15 * sum(output_score, of: "绩效评分", where: period == "Q3" and approved) / 100, 6)
+  e_w_fy:
+    scope: 个人
+    desc: 个人全年原始权重
+    expr: >-
+      round(0.1 * min(years_between(join_date, "2026-12-31"), 5) / 5
+      + 0.2 * sum(contribution_score, of: "绩效评分", where: period == "FY" and approved) / 100
+      + 0.15 * avg_diff / 3
+      + 0.3 * min(ratio(attrib_fy, sum(sales_target, of: "个人目标", where: period == "FY")), 1.5) / 1.5
+      + 0.1 * min(n_proj, 8) / 8
+      + 0.15 * sum(output_score, of: "绩效评分", where: period == "FY" and approved) / 100, 6)
+checks:
+  - {id: share_sum, scope: 项目, expr: 'abs(sum(share, of: "项目参与") - 1) < 0.000001', message: 项目参与比例合计须为 1}
+  - {id: score_approved, scope: 个人, expr: 'count(of: "绩效评分", where: not approved) == 0', message: 评分尚未人工确认}
+  - id: score_range
+    scope: 个人
+    expr: 'count(of: "绩效评分", where: contribution_score < 0 or contribution_score > 100 or output_score < 0 or output_score > 100) == 0'
+    message: 评分必须在 0 至 100
+  - {id: target_dept, scope: 部门, expr: 'count(of: "部门目标", where: sales_target <= 0) == 0', message: 目标值必须大于零}
+  - {id: target_group, scope: 小组, expr: 'count(of: "小组目标", where: sales_target <= 0) == 0', message: 目标值必须大于零}
+  - {id: target_emp, scope: 个人, expr: 'count(of: "个人目标", where: sales_target <= 0) == 0', message: 目标值必须大于零}
+  - id: receipt_le_sales
+    scope: 销售明细
+    expr: 'sum(receipt_amount, of: "回款明细") <= sales_amount and count(of: "回款明细", where: receipt_amount < 0) == 0'
+    message: 回款合计超过销售额或存在负回款

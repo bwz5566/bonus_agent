@@ -1,0 +1,110 @@
+# 标准答案用的列映射
+部门:
+  file: 03_业务输入.xlsx
+  sheet: 部门
+  columns:
+    dept_id: dept_id
+    dept_name: dept_name
+小组:
+  file: 03_业务输入.xlsx
+  sheet: 小组
+  columns:
+    group_id: group_id
+    dept_id: dept_id
+    group_name: group_name
+    perf_q3: perf_q3
+    perf_fy: perf_fy
+员工:
+  file: 03_业务输入.xlsx
+  sheet: 员工
+  columns:
+    employee_id: employee_id
+    group_id: group_id
+    employee_name: employee_name
+    join_date: join_date
+项目:
+  file: 03_业务输入.xlsx
+  sheet: 项目
+  columns:
+    project_id: project_id
+    group_id: group_id
+    region: region
+    contract_date: contract_date
+    difficulty: difficulty
+销售明细:
+  file: 03_业务输入.xlsx
+  sheet: 销售明细
+  columns:
+    sales_id: sales_id
+    project_id: project_id
+    recognition_date: recognition_date
+    sales_amount: sales_amount
+    cost_amount: cost_amount
+    expense_amount: expense_amount
+回款明细:
+  file: 03_业务输入.xlsx
+  sheet: 回款明细
+  columns:
+    receipt_id: receipt_id
+    sales_id: sales_id
+    receipt_date: receipt_date
+    receipt_amount: receipt_amount
+项目参与:
+  file: 03_业务输入.xlsx
+  sheet: 项目参与
+  columns:
+    employee_id: employee_id
+    project_id: project_id
+    share: share
+绩效评分:
+  file: 03_业务输入.xlsx
+  sheet: 绩效评分
+  columns:
+    employee_id: employee_id
+    period: period
+    contribution_score: contribution_score
+    output_score: output_score
+    approved: approved
+部门目标:
+  file: 03_业务输入.xlsx
+  sheet: 目标值
+  columns:
+    dept_id: entity_id
+    period: period
+    sales_target: sales_target
+  filter:
+    entity_type: department
+小组目标:
+  file: 03_业务输入.xlsx
+  sheet: 目标值
+  columns:
+    group_id: entity_id
+    period: period
+    sales_target: sales_target
+  filter:
+    entity_type: group
+个人目标:
+  file: 03_业务输入.xlsx
+  sheet: 目标值
+  columns:
+    employee_id: entity_id
+    period: period
+    sales_target: sales_target
+  filter:
+    entity_type: employee
+里程碑:
+  file: 03_业务输入.xlsx
+  sheet: 里程碑
+  columns:
+    project_id: project_id
+    acceptance_date: acceptance_date
+    status: status
+    base_bonus: base_bonus
+历史已发:
+  file: 03_业务输入.xlsx
+  sheet: 历史已发
+  columns:
+    employee_id: employee_id
+    annual_bonus_year: annual_bonus_year
+    bonus_item: bonus_item
+    paid_amount: paid_amount

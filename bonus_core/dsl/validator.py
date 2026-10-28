@@ -18,7 +18,11 @@ def _exprs(rs: RuleSet):
     for lv in _weighted(rs):
         yield f"allocation.{lv.level}.weight", lv.weight, lv.level
     for p in rs.payout:
-        yield f"payout.{p.id}.hold_ratio", p.hold_ratio, p.scope
+        for k in ("hold_ratio", "pay_ratio"):
+            if getattr(p, k).strip():
+                yield f"payout.{p.id}.{k}", getattr(p, k), p.scope
+    for o in rs.offsets:
+        yield f"offsets.{o.id}", o.expr, o.scope
     for c in rs.checks:
         yield f"checks.{c.id}", c.expr, None if c.scope == "global" else c.scope
 
@@ -96,6 +100,11 @@ def validate(rs: RuleSet) -> list[Issue]:
     for p in rs.payout:
         if rs.allocation and p.scope != rs.leaf.level:
             issues.append(Issue.block("payout_scope", f"发放条件 {p.id} 目前只支持最末层「{rs.leaf.level}」", f"payout.{p.id}"))
+        if bool(p.hold_ratio.strip()) == bool(p.pay_ratio.strip()):
+            issues.append(Issue.block("payout_ratio", f"发放条件 {p.id} 要在 hold_ratio（挂起比例）和 pay_ratio（可发比例）中写且只写一个", f"payout.{p.id}"))
+    for o in rs.offsets:
+        if rs.allocation and o.scope != rs.leaf.level:
+            issues.append(Issue.block("payout_scope", f"抵扣 {o.id} 目前只支持最末层「{rs.leaf.level}」", f"offsets.{o.id}"))
 
     # ---- 表达式 ----
     deps: dict[str, set[str]] = {}
@@ -122,6 +131,8 @@ def validate(rs: RuleSet) -> list[Issue]:
                         issues.append(Issue.block("fn_kwarg", f"{node.fn} 不支持参数 {k}", where))
                     if k == "of" and not (isinstance(val, Str) and val.value in rs.datasets):
                         issues.append(Issue.block("fn_of", f"{node.fn} 的 of 必须是数据表名字符串", where))
+                if node.fn == "scheme_paid" and not all(isinstance(a, Str) for a in node.args):
+                    issues.append(Issue.block("fn_args", 'scheme_paid 的参数是方案名和修订名字符串，如 scheme_paid("QUARTER", "R2")', where))
                 if node.fn in ("tier", "tier_rate", "lookup") and node.args:
                     a0 = node.args[0]
                     want = "tier" if node.fn != "lookup" else "lookup"
@@ -252,6 +263,8 @@ def _items(rs: RuleSet):
         yield f"allocation.{lv.level}", lv
     for p in rs.payout:
         yield f"payout.{p.id}", p
+    for o in rs.offsets:
+        yield f"offsets.{o.id}", o
     for c in rs.checks:
         yield f"checks.{c.id}", c
 

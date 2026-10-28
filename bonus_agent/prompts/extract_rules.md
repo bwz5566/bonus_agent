@@ -21,7 +21,8 @@
 - variables：中间变量，{"scope": "global"、分配层级名或关联实体表名, "expr": 表达式, "desc": 说明}。
 - pool：奖金池（激励总包），{"expr": 表达式, "scope": "global"}。奖金包按部门（或其他层级）各自计算时，scope 写该层级名，见下文。
 - allocation：分配层级列表，从上到下，每层 {"level": 层级名, "key": 主键字段, "parent_key": 指向上一层的字段（第一层为 null）, "weight": 权重表达式}。pool 按层计算时，该层及以上不需要 weight。
-- payout：发放条件列表，{"id": 名称, "scope": 最末层级名, "hold_ratio": 挂起比例表达式（0~1）}。
+- payout：发放条件列表，{"id": 名称, "scope": 最末层级名, "hold_ratio": 挂起比例表达式（0~1）} 或 {"id", "scope", "pay_ratio": 可发比例表达式（0~1）}，见下文“发放与抵扣”。
+- offsets：已发抵扣列表，{"id": 名称, "scope": 最末层级名, "expr": 已发金额表达式}，见下文。
 - checks：数据校验列表，{"id": 名称, "scope": "global"、层级名或关联实体表名, "expr": 必须成立的条件, "message": 说明}，不成立时阻止计算。文件要求“参与比例合计为 1”“目标值不能为 0”之类时使用。
 - questions：需要财务确认的问题列表，{"id": "q1", "text": 问题, "options": [选项...], "suggested": 建议选项下标, "related": 相关规则位置如 "tables.sales_tier"}。
 
@@ -60,6 +61,16 @@
 - 文件规定“每个部门先算部门奖金包，再分到小组、个人”时，pool 的 scope 写 "部门"，expr 在每个部门上求值（四舍五入到分），全部的奖金池是各部门之和；部门层不需要 weight。
 - 过程奖这类“逐条计算再合计”的金额，写成对明细的聚合：sum(round(base_bonus * 系数..., 2), where: status == "已验收" and between(...))。
 
+## 发放与抵扣
+- 应得金额由分配算出；发放规则只决定本次发多少，暂缓的部分不重新分配。
+- 按比例暂缓：hold_ratio，暂缓 = ROUND(应得 × 比例, 2)。
+- 按比例可发（如按回款比例发放）：pay_ratio，可发上限 = ROUND(应得 × 比例, 2)，暂缓 = 应得 − 可发上限。
+  个人回款比例按参与比例先归属再求比例：min(ratio(sum(q_recv * share), sum(q_sales * share), zero: 0), 1)。
+- 扣减以前已发的金额（如年度奖扣预付、扣已发的季度奖）用 offsets：本次实发 = MAX(可发上限 − 已发, 0)，
+  超发待核对 = MAX(已发 − 可发上限, 0)，只登记、不追回。已发金额可以对历史发放表聚合，
+  也可以用 scheme_paid("QUARTER", "R2") 引用同一批另一个方案某修订的本次实发（按同一个人取值）。
+- 抵扣口径（扣哪些项目、哪个修订、哪个层级）必须有文件或财务答复依据，不能自己定。
+
 # 数据字典
 {data_dictionary}
 
@@ -67,4 +78,4 @@
 {example}
 
 # 输出
-只输出一个 JSON 对象，键为 tables、variables、pool、allocation、payout、questions。不要输出其他文字。
+只输出一个 JSON 对象，键为 tables、variables、pool、allocation、payout、offsets、questions。不要输出其他文字。

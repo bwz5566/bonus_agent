@@ -78,8 +78,9 @@ def _merge(*vals: Val) -> tuple[frozenset, tuple]:
 
 
 class Evaluator:
-    def __init__(self, rs: RuleSet, root: Node, by_level: dict[str, list[Node]]):
+    def __init__(self, rs: RuleSet, root: Node, by_level: dict[str, list[Node]], refs: dict | None = None):
         self.rs = rs
+        self.refs = refs or {}          # "方案/修订" -> 同一批里已算出的其他方案结果（scheme_paid 用）
         self.root = root
         self.by_level = by_level
         self.traces: dict[str, Trace] = {}
@@ -333,6 +334,16 @@ class Evaluator:
                 r = Decimal(d2.year - d1.year - ((d2.month, d2.day) < (d1.month, d1.day)))
             deps, rows = _merge(a, b)
             return Val(r, f"{fn}({a.text}, {b.text})", deps, rows)
+        if fn == "scheme_paid":
+            key = "/".join([c.args[0].value, c.args[1].value if len(c.args) > 1 else "R0"])
+            ref = self.refs.get(key)
+            if ref is None:
+                raise EvalError(f"scheme_paid 需要方案 {key} 的结果，请先计算该方案", ctx.where)
+            p = ref.payouts.get(ctx.node.id)
+            if p is None:
+                raise EvalError(f"方案 {key} 的结果里没有 {ctx.node.id} 的发放记录（只能在最末层使用）", ctx.where)
+            r = Decimal(p.paid)
+            return Val(r, f"{key} 实发 {fmt(r)}", frozenset({f"{key}:{ctx.node.id}"}))
         if fn in ("year", "month", "quarter"):
             a = self.ev(c.args[0], ctx)
             d = self._date(a, ctx)

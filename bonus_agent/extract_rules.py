@@ -20,7 +20,8 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from bonus_agent.llm import LLM, LLMError, Usage, image_part, parse_json
 from bonus_agent.parsing.docs import Block, ParsedDoc, parse_any
 from bonus_core.dsl.functions import describe as describe_functions
-from bonus_core.dsl.models import AllocationLevel, Check, DatasetDef, PayoutCondition, Pool, RuleSet, Table, Variable
+from bonus_core.dsl.models import (AllocationLevel, Check, DatasetDef, Offset, PayoutCondition, Pool, RuleSet, Table,
+                                   Variable)
 from bonus_core.dsl.validator import validate
 from bonus_core.engine.issues import Issue
 
@@ -38,6 +39,7 @@ class Question(BaseModel):
     options: list[str] = []
     suggested: int | None = None
     related: str = ""
+    blocking: bool = False     # 材料要求确认前不得计算或发放的口径
 
 
 class Extraction(BaseModel):
@@ -48,6 +50,7 @@ class Extraction(BaseModel):
     pool: Pool
     allocation: list[AllocationLevel]
     payout: list[PayoutCondition] = []
+    offsets: list[Offset] = []
     checks: list[Check] = []
     questions: list[Question] = []
 

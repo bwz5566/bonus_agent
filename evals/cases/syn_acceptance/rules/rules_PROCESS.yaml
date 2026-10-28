@@ -1,0 +1,15 @@
+name: PROCESS 过程奖
+version: '2026Q3'
+tables:
+  R_DIFF: {kind: lookup, mapping: {'1': 1.00, '2': 1.10, '3': 1.25}}
+pool:
+  scope: 部门
+  expr: >-
+    sum(round(base_bonus * lookup(R_REGION, region) * new_coef * lookup(R_DIFF, difficulty), 2), of: "里程碑",
+    where: status == "已验收" and between(acceptance_date, "2026-07-01", "2026-09-30"))
+allocation:
+  - {level: 部门, key: dept_id}
+  - {level: 小组, key: group_id, parent_key: dept_id, weight: g_w_q}
+  - {level: 个人, key: employee_id, parent_key: group_id, weight: e_w_q}
+payout:
+  - {id: cash, scope: 个人, pay_ratio: 'min(ratio(attrib_recv_q, attrib_q, zero: 0), 1)'}

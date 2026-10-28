@@ -106,7 +106,8 @@ def used_fields(rs: RuleSet) -> set[str]:
     """规则表达式里实际用到的字段，加上主键和关联键。"""
     used = set()
     exprs = [v.expr for v in rs.variables.values()] + [rs.pool.expr] + [lv.weight for lv in rs.allocation if lv.weight.strip()]
-    exprs += [p.hold_ratio for p in rs.payout] + [c.expr for c in rs.checks]
+    exprs += [e for p in rs.payout for e in (p.hold_ratio, p.pay_ratio) if e.strip()]
+    exprs += [c.expr for c in rs.checks] + [o.expr for o in rs.offsets]
     for e in exprs:
         used |= names(parse(e))
     for d in rs.datasets.values():

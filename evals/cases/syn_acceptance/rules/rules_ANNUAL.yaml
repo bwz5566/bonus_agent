@@ -1,0 +1,15 @@
+name: ANNUAL 年度奖
+version: '2026FY'
+tables:
+  R_A_TIER: {kind: tier, mode: excess, steps: [[0, 0.05], [10000000, 0.08], [20000000, 0.10]]}
+pool: {scope: 部门, expr: 'round((tier(R_A_TIER, d_eff_fy) + max(d_net_fy, 0) * 5%) * d_coef_fy, 2)'}
+allocation:
+  - {level: 部门, key: dept_id}
+  - {level: 小组, key: group_id, parent_key: dept_id, weight: g_w_fy}
+  - {level: 个人, key: employee_id, parent_key: group_id, weight: e_w_fy}
+payout:   # Q_CASH：年度用全年销售单
+  - {id: cash, scope: 个人, pay_ratio: 'min(ratio(attrib_recv_fy, attrib_fy, zero: 0), 1)'}
+offsets:  # Q_OFFSET：本年度预付 + 季度 R2 最终可发；过程奖不抵扣
+  - id: prior
+    scope: 个人
+    expr: 'sum(paid_amount, of: "历史已发", where: annual_bonus_year == 2026 and bonus_item == "年度奖金预付") + scheme_paid("QUARTER", "R2")'

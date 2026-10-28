@@ -77,6 +77,13 @@ bonus-agent auto --answers 输出目录/questions.yaml --out 输出目录2 本�
 
 多表关联：项目、销售单这类被其他表按编号引用的对象建成“关联实体”，可以定义项目层变量（如项目毛利率、有效销售额）；其他表的行按编号直接取到项目的字段和变量（参与比例表 → 项目，回款 → 销售单 → 项目）；按日期期间筛选（`between(recognition_date, "2026-07-01", "2026-09-30")`、`years_between`）；一张表混放多类数据时按列筛选拆成几张表；数据校验规则（如参与比例合计为 1）不通过时阻止计算。样例见 `evals/cases/acceptance_q3`，结果与独立的参考实现逐分一致。
 
+发放与抵扣：按回款比例发放（`pay_ratio`，可发上限 = ROUND(应得 × 比例, 2)，其余暂缓、不重新分配）；扣减已发金额（`offsets`，本次实发 = MAX(可发上限 − 已发, 0)，超发只登记不追回）；一个方案扣另一个方案某修订的实发用 `scheme_paid("QUARTER", "R2")`，试算时自动先算被引用的方案，被引用的方案改过后引用它的方案要重算。
+
+材料要求“确认前不得计算 / 发放”的口径找不到财务答复时，智能体记为阻断问题，结果标为 `NEEDS_CONFIRMATION`（命令返回码 3），只是草稿、不得发放；在 `questions.yaml` 填写答复后重跑。
+
+完整验收样例见 `evals/cases/syn_acceptance`（季度 R0/R1/R2、过程奖、年度奖扣预付和季度 R2）：`rules/` 是手写的标准规则，`reference.py` 是不经过引擎的独立实现，`run_case.py` 用引擎算并核对；
+`python evals/cases/syn_acceptance/reference.py evals/cases/syn_acceptance/expected/05_期望奖金结果.xlsx` 可独立验证期望结果本身。
+
 ## 一、计算引擎（不需要大模型）
 
 ```bash
