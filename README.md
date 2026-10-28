@@ -22,6 +22,7 @@ evals/                 模型选型评测
   run_eval.py          命令行 bonus-eval
 config/models.yaml     模型与服务商配置
 examples/sales_q3/     示例：规则、示例数据（格式故意不规整）、字段映射、调整记录
+examples/auth/         服务间鉴权签名头示例（Python 签名与校验、Java 签名），给前后端对接用
 tests/                 单元测试、属性测试、端到端测试
 ```
 
@@ -29,7 +30,7 @@ tests/                 单元测试、属性测试、端到端测试
 
 ```bash
 pip install -e ".[agent,dev]"
-python -m pytest          # 20 个测试，应全部通过
+python -m pytest          # 21 个测试，应全部通过
 ```
 
 ## 一、计算引擎（不需要大模型）
