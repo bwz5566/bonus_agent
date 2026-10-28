@@ -44,7 +44,7 @@ models:
     model: qwen3.6-35b-a3b
     json_mode: json_object
     extra_body: {enable_thinking: false}
-    max_history_chars: 120000
+    max_history_chars: 60000
   qwen3.6-27b:                  # 稠密模型，对标 32B 的下一代
     provider: dashscope
     model: qwen3.6-27b

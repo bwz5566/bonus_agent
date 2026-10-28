@@ -34,6 +34,7 @@ from bonus_core.engine.tree import ROOT_LEVEL, build_tree
 from bonus_core.report.excel import write_excel
 
 MAX_RESULT_CHARS = 6000
+READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate"}
 
 
 class ToolError(Exception):
@@ -62,6 +63,10 @@ TOOLS: list[dict] = [
                         ["file", "index"])},
     {"name": "read_sheet", "description": "查看 Excel 工作表的原始内容（带 Excel 行号），用于判断表头位置、合计行、说明文字等。",
      "parameters": _obj({"file": _S, "sheet": _S, "start_row": _I, "rows": _I}, ["file", "sheet"])},
+    {"name": "note",
+     "description": "把读到的关键信息记在工作区（如某条规则、某个参数、文件用途、待核对事项）。笔记每轮都会附给你，"
+                    "较早的对话会被裁剪，重要内容请及时记下。同一 topic 再次记录会覆盖，text 为空则删除。",
+     "parameters": _obj({"topic": _S, "text": _S}, ["topic", "text"])},
     {"name": "define_dataset",
      "description": "定义（或重新定义）一张数据表。实体表写 key（每行一个对象）；明细表写 link（每行挂到某层级对象上）；"
                     "公司级表 key、link 都不写。同名字段表示关联。返回校验结果和换算后的样例行。",
@@ -119,7 +124,9 @@ class Workspace:
     dirty: bool = True                                     # 最近一次修改后是否还没试算成功
     summary: str = ""
     ignored: list[dict] = field(default_factory=list)
+    notes: dict[str, str] = field(default_factory=dict)
     done: bool = False
+    budget: str = ""
 
     @property
     def data_files(self) -> list[Path]:
@@ -184,27 +191,36 @@ class Workspace:
         self.transcripts[f"{d.name}#{index}"] = text
         return text
 
-    def read_sheet(self, file: str, sheet: str, start_row: int = 1, rows: int = 30) -> str:
+    def read_sheet(self, file: str, sheet: str, start_row: int = 1, rows: int = 40) -> str:
         f = self._file(file)
-        body = self.inv.sheet_text.get(f"{f.name}/{sheet}")
-        if body is None:
-            raise ToolError(f"{f.name} 中没有工作表「{sheet}」")
+        if f"{f.name}/{sheet}" not in self.inv.sheet_text:
+            sheets = [r.split("/", 1)[1] for r in self.inv.sheet_text if r.startswith(f.name + "/")]
+            raise ToolError(f"{f.name} 中没有工作表「{sheet}」，可选：{sheets}")
         import openpyxl
         ws = openpyxl.load_workbook(f, data_only=True, read_only=True)[sheet]
-        out = []
+        start_row, rows = max(1, start_row), max(1, min(rows, 80))
+        out, total = [], 0
         for i, r in enumerate(ws.iter_rows(values_only=True), start=1):
-            if i < start_row:
-                continue
-            if i >= start_row + min(rows, 80):
-                out.append("……")
-                break
-            cells = ["" if v is None else str(v).replace("\n", " ")[:30] for v in r]
-            while cells and cells[-1] == "":
-                cells.pop()
-            out.append(f"第{i}行 | " + " | ".join(cells))
+            total = i
+            if start_row <= i < start_row + rows:
+                cells = ["" if v is None else str(v).replace("\n", " ")[:30] for v in r]
+                while cells and cells[-1] == "":
+                    cells.pop()
+                out.append(f"第{i}行 | " + " | ".join(cells))
         st = self.inv.sheet(f"{f.name}/{sheet}")
-        guess = f"（自动识别：表头在第 {st.header_row} 行）" if st else "（未自动识别出表格）"
-        return guess + "\n" + "\n".join(out)
+        head = (f"工作表共 {total} 行" + (f"，自动识别表头在第 {st.header_row} 行、{len(st.rows)} 行数据" if st else "，未自动识别出表格")
+                + f"；以下为第 {start_row}~{min(start_row + rows - 1, total)} 行")
+        end = start_row + rows - 1
+        tail = (f"\n（还有第 {end + 1}~{total} 行，用 start_row={end + 1} 继续；数据表不必读完，define_dataset 会读取全部行）"
+                if end < total else "\n（已到末尾）")
+        return head + "\n" + "\n".join(out) + tail
+
+    def note(self, topic: str, text: str) -> str:
+        if text.strip():
+            self.notes[topic] = text.strip()
+        else:
+            self.notes.pop(topic, None)
+        return f"已记录「{topic}」（共 {len(self.notes)} 条笔记，每轮都会附在工作区状态里）"
 
     # ---- 数据表 ----
     def define_dataset(self, name: str, file: str, sheet: str, fields: dict, key: str | None = None,
@@ -362,7 +378,10 @@ class Workspace:
 
     def state(self) -> str:
         """每轮附在请求末尾的工作区摘要。"""
-        lines = ["【当前工作区状态】"]
+        lines = ["【当前工作区状态】" + (f"（{self.budget}）" if self.budget else "")]
+        if self.notes:
+            lines.append("- 笔记：")
+            lines += [f"  · {k}：{v}" for k, v in self.notes.items()]
         if self.datasets:
             for n, d in self.datasets.items():
                 m = self.mapping[n]
@@ -444,14 +463,14 @@ def _answers_text(answers: list[dict] | None) -> str:
 
 
 def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = None, *,
-              answers: list[dict] | None = None, max_steps: int = 40, max_history_chars: int = 60000,
+              answers: list[dict] | None = None, max_steps: int = 80, max_history_chars: int = 60000,
               max_files: int = MAX_FILES, on_step: Callable[[int, Step], None] | None = None) -> AgentResult:
     try:
         files = collect_files(paths, exclude=[out_dir] if out_dir else [], max_files=max_files)
     except TooManyFiles as e:
         raise ToolError(str(e)) from None
     if not files:
-        raise ToolError("没有找到可处理的文件（支持 .docx .pptx .xlsx .xlsm .png .jpg）")
+        raise ToolError("没有找到可处理的文件（支持 .docx .pptx .xlsx .xlsm .png .jpg .txt .md .json .csv）")
     ws = Workspace(llm, build_inventory(files))
     handlers = {t["name"]: getattr(ws, t["name"]) for t in TOOLS}
     task = ("请完成本批次的奖金计算。文件清单：\n" + ws.list_files() + _answers_text(answers)
@@ -462,7 +481,10 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     steps: list[Step] = []
     error = ""
     nudges = 0
+    seen: dict[str, int] = {}          # 只读工具的调用 -> 第几步，用来发现原地打转
+    repeats = 0
     for turn in range(max_steps):
+        ws.budget = f"已用 {len(steps)} 步，上限 {max_steps} 步"
         tail = [{"role": "user", "content": ws.state()}]
         if mode == "json":
             msgs = [{"role": "system", "content": sys + JSON_PROTOCOL + json.dumps(TOOLS, ensure_ascii=False)},
@@ -504,6 +526,17 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 continue
         for c in calls:
             args = {}
+            sig = f"{c['name']}:{c['arguments']}"
+            if c["name"] in READ_ONLY and sig in seen:
+                repeats += 1
+                result = (f"这次调用与第 {seen[sig]} 步完全相同，内容没有变化，已跳过。不要重复调用；"
+                          f"需要更多内容请换参数（如 start_row、offset），否则根据已有信息进行下一步（定义数据表、写规则、试算）。")
+                steps.append(Step(c["name"], {}, result, False))
+                if on_step:
+                    on_step(len(steps), steps[-1])
+                history.append({"role": "user", "content": f"【{c['name']} 的结果】\n{result}"} if mode == "json"
+                               else {"role": "tool", "tool_call_id": c["id"], "content": result})
+                continue
             try:
                 args = json.loads(c["arguments"] or "{}")
                 fn = handlers.get(c["name"])
@@ -521,6 +554,10 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             if len(result) > MAX_RESULT_CHARS:
                 result = result[:MAX_RESULT_CHARS] + "……（已截断）"
             step = Step(c["name"], args if isinstance(args, dict) else {}, result, ok)
+            if c["name"] in READ_ONLY and ok:
+                seen[sig] = len(steps) + 1
+            elif c["name"] not in READ_ONLY:
+                seen.clear()   # 工作区变了，重新读取是合理的
             steps.append(step)
             if on_step:
                 on_step(len(steps), step)
@@ -529,6 +566,9 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             else:
                 history.append({"role": "tool", "tool_call_id": c["id"], "content": result})
         if ws.done:
+            break
+        if repeats >= 6:
+            error = "智能体反复重复相同的调用，已停止"
             break
     else:
         error = f"达到最大步数 {max_steps} 仍未完成"

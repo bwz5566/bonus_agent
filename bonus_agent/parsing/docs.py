@@ -129,8 +129,23 @@ def parse_image(path: Path) -> ParsedDoc:
     return ParsedDoc(path.name, [Block(path.name, None, "image", image=path.read_bytes(), mime=mime)])
 
 
+def parse_text(path: Path) -> ParsedDoc:
+    """纯文本类文件（txt / md / json / csv），如财务确认答复、参数说明。"""
+    raw = path.read_bytes()
+    for enc in ("utf-8-sig", "gbk"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        text = raw.decode("utf-8", errors="replace")
+    return ParsedDoc(path.name, [Block(path.name, None, "text", text)])
+
+
 PARSERS = {".docx": parse_docx, ".pptx": parse_pptx, ".xlsx": parse_xlsx, ".xlsm": parse_xlsx,
-           ".png": parse_image, ".jpg": parse_image, ".jpeg": parse_image}
+           ".png": parse_image, ".jpg": parse_image, ".jpeg": parse_image,
+           ".txt": parse_text, ".md": parse_text, ".json": parse_text, ".csv": parse_text}
 
 
 def parse_any(path: str | Path) -> ParsedDoc:

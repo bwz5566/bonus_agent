@@ -144,7 +144,7 @@ def test_collect_files_skips_program_and_output_dirs(tmp_path):
     (tmp_path / "out" / "result.xlsx").write_bytes(b"")
     (tmp_path / "~$temp.docx").write_bytes(b"")
     (tmp_path / "方案.docx").write_bytes(b"")
-    (tmp_path / "说明.txt").write_text("x")
+    (tmp_path / "说明.exe").write_text("x")
     assert [f.name for f in collect_files([tmp_path], exclude=[tmp_path / "out"])] == ["方案.docx"]
     for i in range(5):
         (tmp_path / f"{i}.png").write_bytes(b"")
@@ -215,3 +215,15 @@ def test_agent_history_trim_keeps_tool_pairs():
               {"role": "tool", "tool_call_id": str(i), "content": "x" * 1000}]
     t = _trim(h, 5000)
     assert t[0]["role"] == "assistant" and len(t) < len(h)
+
+
+def test_agent_stops_looping_and_paginates():
+    from bonus_agent.agent import run_agent
+    same = {"tool": "read_sheet", "args": {"file": "年度数据.xlsx", "sheet": "员工花名册", "rows": 5}}
+    llm = FakeLLM([{"tool": "note", "args": {"topic": "总包", "text": "净利润 8%"}}] + [same] * 10)
+    ar = run_agent(llm, [ANNUAL], max_steps=30)
+    assert not ar.ok and "重复" in ar.error and len(ar.steps) < 12
+    first = ar.steps[1].result
+    assert "start_row=6" in first and "共 28 行" in first
+    assert "已跳过" in ar.steps[2].result
+    assert "净利润 8%" in llm.calls[-1][-1]["content"]       # 笔记每轮附在状态里

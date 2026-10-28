@@ -48,7 +48,7 @@ def main(argv=None) -> int:
     p.add_argument("--answers", help="上一次输出的 questions.yaml，填写 answer 后传入重算")
     p.add_argument("--out", required=True, help="输出目录")
     p.add_argument("--max-files", type=int, default=30, help="一批最多处理的文件数，防止误传整个目录")
-    p.add_argument("--max-steps", type=int, default=40, help="智能体最多调用工具的轮数")
+    p.add_argument("--max-steps", type=int, default=80, help="智能体最多调用工具的轮数")
     p.add_argument("--pipeline", action="store_true", help="使用固定流程（规划 → 抽取 → 计算），不让模型自主调度")
     p.add_argument("paths", nargs="+", help="本批次的规则文档、Excel 数据，或只包含它们的文件夹")
     a = ap.parse_args(argv)
