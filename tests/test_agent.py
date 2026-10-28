@@ -66,3 +66,19 @@ def test_eval_pipeline_with_fake_model(tmp_path):
     assert row["ok"] and row["check_score"] == 1.0 and row["leaf_match_rate"] == 1.0
     assert eval_main(["--fake", "--out", str(tmp_path)]) == 0
     assert list(tmp_path.glob("*.md"))
+
+
+def test_secrets_file_and_model_groups(tmp_path, monkeypatch):
+    from bonus_agent.llm import LLM, load_config, resolve_models
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    (tmp_path / "models.yaml").write_text((ROOT / "config" / "models.yaml").read_text(encoding="utf-8"), encoding="utf-8")
+    (tmp_path / "secrets.yaml").write_text("providers:\n  dashscope:\n    api_key: sk-from-file\n", encoding="utf-8")
+    cfg = load_config(tmp_path / "models.yaml")
+    llm = LLM.from_config("qwen3.6-35b-a3b", cfg)
+    assert llm.api_key == "sk-from-file" and llm.extra_body == {"enable_thinking": False}
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-from-env")
+    assert LLM.from_config("qwen3-vl-8b", cfg).api_key == "sk-from-env"
+    assert resolve_models(None, cfg) == cfg["candidates"]
+    assert resolve_models("next,qwen3-vl-8b", cfg)[-1] == "qwen3-vl-8b"
+    with pytest.raises(LLMError):
+        resolve_models("no-such-model", cfg)

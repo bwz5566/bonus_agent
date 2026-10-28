@@ -1,6 +1,6 @@
 """智能体命令行：python -m bonus_agent.cli <命令> ...
 
-  models                                   列出已配置的模型
+  models [--remote]                        列出已配置的模型；--remote 用 Key 查询服务商实际可用的模型
   extract --datasets D.yaml [--model M] --out draft.yaml 文档...
                                            从规则文档抽取规则草稿和问题卡
   map --rules R.yaml [--model M] 数据.xlsx 推荐字段映射（启发式 + 大模型）
@@ -15,7 +15,7 @@ from pathlib import Path
 import yaml
 
 from bonus_agent.extract_rules import extract, load_datasets
-from bonus_agent.llm import LLM, load_config
+from bonus_agent.llm import LLM, LLMError, list_remote, load_config
 from bonus_agent.suggest_mapping import suggest
 from bonus_core.data.table_detect import detect
 from bonus_core.dsl.models import RuleSet
@@ -24,7 +24,8 @@ from bonus_core.dsl.models import RuleSet
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="bonus-agent")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("models")
+    p = sub.add_parser("models")
+    p.add_argument("--remote", action="store_true", help="调用服务商 /models 接口，核对已配置模型能否调用")
     p = sub.add_parser("extract")
     p.add_argument("--datasets", required=True, help="数据字典 YAML，或任意一份含 datasets 的规则文件")
     p.add_argument("--model")
@@ -42,10 +43,28 @@ def main(argv=None) -> int:
 
     cfg = load_config()
     if a.cmd == "models":
+        remote: dict[str, set[str] | str] = {}
+        if a.remote:
+            for prov in sorted({m["provider"] for m in cfg["models"].values()}):
+                try:
+                    remote[prov] = set(list_remote(prov, cfg))
+                except LLMError as e:
+                    remote[prov] = str(e)
         for name, m in cfg["models"].items():
             mark = "（默认）" if name == cfg["default"] else ""
-            cand = "  [候选]" if name in cfg.get("candidates", []) else ""
-            print(f"{name}{mark}: {m['provider']} / {m['model']}{cand}")
+            tags = [g for g, ms in [("候选", cfg.get("candidates", []))] + list(cfg.get("groups", {}).items())
+                    if name in ms]
+            line = f"{name}{mark}: {m['provider']} / {m['model']}" + (f"  [{', '.join(tags)}]" if tags else "")
+            if a.remote:
+                r = remote[m["provider"]]
+                line += "  无法查询" if isinstance(r, str) else ("  可用" if m["model"] in r else "  不可用")
+            print(line)
+        for prov, r in remote.items():
+            if isinstance(r, str):
+                print(f"\n{r}")
+            else:
+                print(f"\n{prov} 共返回 {len(r)} 个模型，其中名字含 vl / 3.5 / 3.6 的：")
+                print("  " + ", ".join(x for x in sorted(r) if any(k in x for k in ("vl", "3.5", "3.6", "omni"))))
         return 0
 
     if a.cmd == "extract":

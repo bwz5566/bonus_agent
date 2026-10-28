@@ -5,3 +5,5 @@ __pycache__/
 evals/reports/
 result.xlsx
 *.questions.json
+config/secrets.yaml
+.env

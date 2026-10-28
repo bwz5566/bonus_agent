@@ -2,6 +2,8 @@
 
     # 真实调用（需要设置 DASHSCOPE_API_KEY）
     python -m evals.run_eval --repeats 3
+    # 测千问 3.5/3.6 开源多模态模型这一组
+    python -m evals.run_eval --models next --repeats 3
     # 只测其中两个模型、对比“先转写再抽取”和“直接看图”两种方式
     python -m evals.run_eval --models qwen3-vl-32b,qwen3-vl-8b --modes two_step,direct
     # 不调用模型，用标准答案演练整条评测流程
@@ -23,7 +25,7 @@ from pathlib import Path
 import yaml
 
 from bonus_agent.extract_rules import extract
-from bonus_agent.llm import LLM, FakeLLM, load_config
+from bonus_agent.llm import LLM, FakeLLM, load_config, resolve_models
 from bonus_agent.parsing.docs import parse_any
 from bonus_core.data.mapping import apply_mapping, load_mapping
 from bonus_core.dsl.models import RuleSet
@@ -181,7 +183,7 @@ def write_report(rows, summary, out_dir: Path, cases: list[Case]) -> Path:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="bonus-eval")
-    ap.add_argument("--models", help="逗号分隔，默认用配置里的 candidates")
+    ap.add_argument("--models", help="逗号分隔的模型名或分组名（next / open / reference），默认用配置里的 candidates")
     ap.add_argument("--cases", help="逗号分隔的样例目录名，默认全部")
     ap.add_argument("--modes", default="two_step", help="two_step（先转写图片再抽取）, direct（直接看图）")
     ap.add_argument("--repeats", type=int, default=1)
@@ -192,7 +194,7 @@ def main(argv=None) -> int:
     case_dirs = [CASES / c for c in a.cases.split(",")] if a.cases else sorted(p for p in CASES.iterdir() if (p / "case.yaml").exists())
     cases = [load_case(d) for d in case_dirs]
     cfg = load_config()
-    models = ["fake"] if a.fake else (a.models.split(",") if a.models else cfg["candidates"])
+    models = ["fake"] if a.fake else resolve_models(a.models, cfg)
     rows = []
     for m in models:
         for case in cases:

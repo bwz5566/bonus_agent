@@ -29,7 +29,7 @@ tests/                 单元测试、属性测试、端到端测试
 
 ```bash
 pip install -e ".[agent,dev]"
-python -m pytest          # 19 个测试，应全部通过
+python -m pytest          # 20 个测试，应全部通过
 ```
 
 ## 一、计算引擎（不需要大模型）
@@ -58,16 +58,28 @@ bonus run --rules rules.yaml --mapping mapping.yaml \
 
 ## 二、模型选型
 
-1. 在阿里云百炼开通服务，拿到 API Key，并在控制台核对三个模型的 ID（默认写的是 `qwen3-vl-32b-instruct`、`qwen3-vl-30b-a3b-instruct`、`qwen3-vl-8b-instruct`，不一致就改 `config/models.yaml`）。
-2. 设置环境变量：`export DASHSCOPE_API_KEY=sk-...`
-3. 生成评测样例文档并运行评测：
+1. 在阿里云百炼开通服务，拿到 API Key。
+2. 写入 Key：`cp config/secrets.example.yaml config/secrets.yaml`，填 `api_key`（该文件已加入 .gitignore，不会提交）；也可以设置环境变量 `DASHSCOPE_API_KEY`，环境变量优先。
+3. 核对模型能否调用：`bonus-agent models --remote`，每个已配置模型后面会标“可用 / 不可用”，并列出账号下所有 VL、3.5、3.6 相关的模型 ID。
+4. 生成评测样例文档并运行评测：
 
 ```bash
 python evals/cases/sales_q3/make_case.py
 bonus-eval --fake                                     # 先不调模型，演练整条流程
-bonus-eval --repeats 3                                # 三个候选模型各跑 3 次
+bonus-eval --repeats 3                                # 最初指定的三个 Qwen3-VL 模型各跑 3 次
+bonus-eval --models next --repeats 3                  # 千问 3.5/3.6 开源多模态模型
+bonus-eval --models open,reference --repeats 3        # 全部开源模型 + 商业版上限参考
 bonus-eval --modes two_step,direct --repeats 3        # 同时对比“先转写图片”和“直接看图”
 ```
+
+已配置的模型分组（`config/models.yaml`）：
+
+| 分组 | 模型 | 说明 |
+| --- | --- | --- |
+| candidates（默认） | qwen3-vl-32b / qwen3-vl-30b-a3b / qwen3-vl-8b | 最初指定的三个；2026-10 百炼文档已不再列出这几个开源版 ID，需用 `--remote` 确认 |
+| next | qwen3.6-35b-a3b / qwen3.5-35b-a3b / qwen3.5-27b | 百炼在售、权重开源的原生多模态模型，可私有化部署 |
+| open | 以上全部 + qwen3.5-122b-a10b | 开源模型全集 |
+| reference | qwen3-vl-plus / qwen3.6-flash | 商业版，不能私有化，只看效果上限 |
 
 报告在 `evals/reports/`：Markdown 汇总、CSV 明细，以及每次调用的原始输出、图片转写和抽取出的规则。
 
