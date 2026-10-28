@@ -1,0 +1,88 @@
+# 标准答案：公司年终奖（对应 make_case.py 生成的文档）
+name: 2026 年度年终奖
+version: 2026-ref
+
+datasets:
+  部门:
+    key: dept_id
+    fields:
+      dept_id: {type: id, desc: 部门编码}
+      dept_name: {type: text, desc: 部门名称}
+      kpi_score: {type: number, desc: 年度 KPI 得分}
+  员工:
+    key: employee_id
+    fields:
+      employee_id: {type: id, desc: 员工编号}
+      name: {type: text, desc: 姓名}
+      dept_id: {type: id, desc: 所在部门}
+      monthly_salary: {type: money, unit: 元, desc: 月薪}
+      grade: {type: enum, values: [A, B, C, D], desc: 绩效等级}
+      probation: {type: enum, values: [是, 否], desc: 是否试用期}
+      months: {type: int, desc: 本年在职月数}
+  月度利润:
+    desc: 公司级数据
+    fields:
+      month: {type: text, desc: 月份}
+      net_profit: {type: money, unit: 万元, desc: 净利润}
+
+tables:
+  profit_tier:
+    kind: tier
+    mode: whole
+    steps: [[0, 0.05], [30000000, 0.08]]
+    desc: 全年净利润达 3000 万按 8%，否则 5%
+  grade_coef:
+    kind: lookup
+    mapping: {A: 1.5, B: 1.2, C: 1.0, D: 0.5}
+    desc: 绩效系数
+  dept_coef:
+    kind: lookup
+    mapping: {研发中心: 1.1}
+    default: 1.0
+    desc: 研发中心 KPI 按 1.1 倍计入
+
+variables:
+  total_profit: {scope: global, expr: "sum(net_profit)", desc: 全年净利润}
+
+pool:
+  expr: "tier(profit_tier, total_profit)"
+
+allocation:
+  - level: 部门
+    key: dept_id
+    weight: "kpi_score * lookup(dept_coef, dept_name)"
+  - level: 个人
+    key: employee_id
+    parent_key: dept_id
+    weight: 'if(probation == "是", 0, monthly_salary * lookup(grade_coef, grade) * months / 12)'
+
+payout:
+  - id: 次年发放部分
+    scope: 个人
+    hold_ratio: "0.3"
+
+tests:
+  - name: 手算样例：两个部门三个人
+    datasets:
+      部门:
+        - {dept_id: D1, dept_name: 研发中心, kpi_score: 100}
+        - {dept_id: D2, dept_name: 销售中心, kpi_score: 90}
+      员工:
+        - {employee_id: E1, name: 甲, dept_id: D1, monthly_salary: 10000, grade: A, probation: 否, months: 12}
+        - {employee_id: E2, name: 乙, dept_id: D1, monthly_salary: 10000, grade: C, probation: 否, months: 6}
+        - {employee_id: E3, name: 丙, dept_id: D1, monthly_salary: 9000, grade: B, probation: 是, months: 12}
+        - {employee_id: E4, name: 丁, dept_id: D2, monthly_salary: 20000, grade: B, probation: 否, months: 12}
+      月度利润:
+        - {month: "2026-01", net_profit: 1000}
+        - {month: "2026-02", net_profit: 1000}
+        - {month: "2026-03", net_profit: 1000}
+    # 净利润 3000 万 → 8% → 240 万；部门权重 110 : 90 → 132 万 / 108 万；
+    # D1 内：甲 15000，乙 5000，丙试用期 0 → 99 万 / 33 万 / 0
+    expect:
+      pool: "2400000.00"
+      部门:D1: "1320000.00"
+      部门:D2: "1080000.00"
+      个人:E1: "990000.00"
+      个人:E2: "330000.00"
+      个人:E3: "0.00"
+      个人:E4: "1080000.00"

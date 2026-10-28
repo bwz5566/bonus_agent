@@ -14,11 +14,12 @@ bonus_core/            核心库：纯计算，不依赖大模型和网络
   report/excel.py      结果 Excel（含计算链、调整记录、未发放台账）
   golden.py            金标样例（财务手算）回归
   cli.py               命令行 bonus
-bonus_agent/           智能体：文档解析、规则抽取、字段映射推荐
+bonus_agent/           智能体：文档解析、统筹规划（auto.py）、规则抽取、字段映射推荐
   prompts/             提示词模板
   cli.py               命令行 bonus-agent
 evals/                 模型选型评测
-  cases/sales_q3/      评测样例：Word + 阶梯图片 + PPT 表格 + PPT 系数图片
+  cases/sales_q3/      评测样例：销售季度奖金，Word + 阶梯图片 + PPT 表格 + PPT 系数图片
+  cases/annual_2026/   评测样例：公司年终奖，PPT + Word 补充通知 + 含说明页和公司级利润表的 Excel
   run_eval.py          命令行 bonus-eval
 config/models.yaml     模型与服务商配置
 examples/sales_q3/     示例：规则、示例数据（格式故意不规整）、字段映射、调整记录
@@ -30,8 +31,34 @@ tests/                 单元测试、属性测试、端到端测试
 
 ```bash
 pip install -e ".[agent,dev]"
-python -m pytest          # 27 个测试，应全部通过
+python -m pytest          # 31 个测试，应全部通过
 ```
+
+## 零、全自动模式（推荐先试这个）
+
+把规则文档（Word / PPT / 图片）和 Excel 数据放进一个文件夹，内容和格式不限：
+
+```bash
+bonus-agent auto --out 输出目录 文件夹或文件...
+# 例：python evals/cases/annual_2026/make_case.py && bonus-agent auto --out out/annual evals/cases/annual_2026
+```
+
+智能体会：
+
+1. **统筹规划**：判断哪些是规则、哪些是数据、哪些该忽略；为数据表建立字段字典和列映射（含万元换算），判断表之间怎么关联、分几层分配。程序会核对工作表和列是否存在、类型能否转换、层级能否串起来，有错就让模型修正；
+2. **抽取规则**：在规划好的字段上抽取阶梯、系数、分配权重、发放条件；静态校验通过后**用本期真实数据试算**，报错同样交给模型修正；
+3. **计算**：由引擎完成，每一分钱可追溯；
+4. **输出**：`result.xlsx`（结果 + 「待确认问题」+ 「智能体规划」两页说明）、`rules.yaml`、`mapping.yaml`、`questions.yaml`、`agent_log.json`（模型原始输出）。
+
+文档没写清楚的地方先按模型建议的理解计算，问题列在「待确认问题」里。财务在 `questions.yaml` 的 `answer` 填写答复（选项序号或文字）后重跑：
+
+```bash
+bonus-agent auto --answers 输出目录/questions.yaml --out 输出目录2 文件夹
+```
+
+确认无误后，`rules.yaml` + `mapping.yaml` 就是可以固定下来的计算模板，以后每期换数据直接用 `bonus run` 计算，不再调用大模型。
+
+支持的方案结构：奖金池 + 多层按权重分配；“每人按公式直接算”的方案（总包 = 各人金额之和）；公司级数据表（如各月利润）；某些人不参与（权重为 0）；按比例暂缓发放。
 
 ## 一、计算引擎（不需要大模型）
 
@@ -70,6 +97,7 @@ bonus-eval --fake                                     # 先不调模型，演练
 bonus-eval --repeats 3                                # 四个候选各跑 3 次
 bonus-eval --models open,reference --repeats 3        # 全部开源模型 + 商业版上限参考
 bonus-eval --modes two_step,direct --repeats 3        # 同时对比“先转写图片”和“直接看图”
+bonus-eval --modes auto --repeats 3                   # 全自动模式：不给数据字典，从原始文件开始
 ```
 
 已配置的模型分组（`config/models.yaml`，2026-10-28 用 `--remote` 实测）：

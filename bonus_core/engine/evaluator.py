@@ -12,6 +12,7 @@ from decimal import ROUND_HALF_UP, Decimal, localcontext
 from bonus_core.data.table import Row
 from bonus_core.dsl.models import LookupTable, RuleSet, TierTable
 from bonus_core.dsl.parser import BinOp, BoolOp, Call, Cmp, Name, Neg, Not, Num, Str, names, parse
+from bonus_core.dsl.scope import Layout, is_aggregate
 from bonus_core.engine.tree import Node
 
 PREC = 28
@@ -84,14 +85,9 @@ class Evaluator:
         self._values: dict[str, object] = {}
         self._cache: dict[tuple[str, str], Val] = {}
         self._busy: set[tuple[str, str]] = set()
-        owners = rs.field_owner()
-        detail = {n for n, d in rs.datasets.items() if d.link}
-        link_keys = {d.link for d in rs.datasets.values() if d.link} | {d.key for d in rs.datasets.values() if d.key}
-        # 明细字段 -> 拥有它的明细表（不含主键/关联键）
-        self.detail_fields = {
-            f: {o for o in os if o in detail} for f, os in owners.items()
-            if f not in link_keys and any(o in detail for o in os)
-        }
+        self.layout = Layout(rs)
+        # 只能在聚合里使用的字段 -> 所在的明细表/公司级表（不含主键/关联键）
+        self.detail_fields = self.layout.row_only
 
     # ---------------- 对外接口 ----------------
     def evaluate(self, expr: str, node: Node, trace_id: str, rule_item: str) -> Decimal:
@@ -221,7 +217,7 @@ class Evaluator:
             deps, rows = _merge(*vals)
             r = min(nums) if fn == "min" else max(nums)
             return Val(r, f"{fn}({', '.join(v.text for v in vals)})", deps, rows)
-        if fn in ("sum", "avg", "count", "count_distinct", "min", "max"):
+        if is_aggregate(c):
             return self._aggregate(c, ctx)
         if fn == "if":
             cond = self.ev(c.args[0], ctx)
@@ -305,27 +301,10 @@ class Evaluator:
         return Val(r, fmt(r), frozenset(deps), tuple(rows))
 
     def _agg_dataset(self, c: Call, ctx: Ctx) -> str:
-        kw = c.kw()
-        if "of" in kw:
-            of = kw["of"]
-            if not isinstance(of, Str) or of.value not in self.rs.datasets:
-                raise EvalError(f"{c.fn} 的 of 参数必须是明细表名字符串", ctx.where)
-            return of.value
-        refs = set()
-        for a in list(c.args) + [v for k, v in c.kwargs if k == "where"]:
-            refs |= names(a)
-        cands = None
-        for n in refs:
-            if n in self.detail_fields:
-                cands = self.detail_fields[n] if cands is None else cands & self.detail_fields[n]
-        if not cands:
-            detail = [n for n, d in self.rs.datasets.items() if d.link]
-            if len(detail) == 1:
-                return detail[0]
-            raise EvalError(f"{c.fn} 无法确定聚合哪张明细表，请用 of: \"表名\" 指定", ctx.where)
-        if len(cands) > 1:
-            raise EvalError(f"{c.fn} 引用的字段同时存在于 {sorted(cands)}，请用 of 指定", ctx.where)
-        return next(iter(cands))
+        ds, err = self.layout.agg_dataset(c)
+        if ds is None:
+            raise EvalError(err, ctx.where)
+        return ds
 
     def _sibling(self, c: Call, ctx: Ctx) -> Val:
         node = ctx.node

@@ -4,6 +4,8 @@
     python -m evals.run_eval --repeats 3
     # 全部开源模型 + 商业版上限参考
     python -m evals.run_eval --models open,reference --repeats 3
+    # 全自动模式：不给数据字典，从原始文件开始统筹规划、抽取、计算
+    python -m evals.run_eval --modes auto --repeats 3
     # 只测其中两个模型、对比“先转写再抽取”和“直接看图”两种方式
     python -m evals.run_eval --models qwen3-vl-32b,qwen3-vl-8b --modes two_step,direct
     # 不调用模型，用标准答案演练整条评测流程
@@ -24,13 +26,14 @@ from pathlib import Path
 
 import yaml
 
-from bonus_agent.extract_rules import extract
+from bonus_agent.auto import run_auto
+from bonus_agent.extract_rules import ExtractResult, extract
 from bonus_agent.llm import LLM, FakeLLM, LLMError, load_config, resolve_models
 from bonus_agent.parsing.docs import parse_any
 from bonus_core.data.mapping import apply_mapping, load_mapping
 from bonus_core.dsl.models import RuleSet
 from bonus_core.engine.run import compute
-from evals.scoring import numeric_score, run_check
+from evals.scoring import compare_results, numeric_score, run_check
 
 ROOT = Path(__file__).parent
 CASES = ROOT / "cases"
@@ -49,17 +52,37 @@ class Case:
     def docs(self) -> list[Path]:
         return [self.dir / d for d in self.spec["docs"]]
 
+    @property
+    def data_files(self) -> list[Path]:
+        return [self.dir / d for d in self.spec["data"]]
+
 
 def load_case(d: Path) -> Case:
     spec = yaml.safe_load((d / "case.yaml").read_text(encoding="utf-8"))
     ref = RuleSet.load(d / spec["reference_rules"])
+    missing = [p for p in spec["docs"] + spec["data"] if not (d / p).exists()]
+    if missing:
+        raise RuntimeError(f"样例 {d.name} 缺少文件 {missing}，请先运行 {d / 'make_case.py'}")
     data, issues = apply_mapping(ref, [d / p for p in spec["data"]], load_mapping(d / spec["mapping"]))
     if any(i.severity == "blocking" for i in issues):
         raise RuntimeError(f"样例 {d.name} 的数据有阻断问题：{issues}")
-    missing = [p for p in spec["docs"] if not (d / p).exists()]
-    if missing:
-        raise RuntimeError(f"样例 {d.name} 缺少文档 {missing}，请先运行 {d / 'make_case.py'}")
     return Case(d.name, d, spec, ref, data, compute(ref, data))
+
+
+def fake_plan(case: Case) -> dict:
+    """标准答案对应的统筹规划结果（演练 auto 模式用）。"""
+    mapping = load_mapping(case.dir / case.spec["mapping"])
+    default_file = Path(case.spec["data"][0]).name
+    datasets = {}
+    for n, d in case.reference.datasets.items():
+        m = mapping[n]
+        datasets[n] = {"sheet": f"{m.file or default_file}/{m.sheet}", "key": d.key, "link": d.link, "desc": d.desc,
+                       "fields": {f: {"column": m.columns[f], "type": fd.type, "unit": fd.unit, "desc": fd.desc}
+                                  for f, fd in d.fields.items() if f in m.columns}}
+    return {"summary": case.reference.name, "rule_files": case.spec["docs"], "rule_sheets": [],
+            "datasets": datasets,
+            "hierarchy": [{"level": lv.level, "key": lv.key, "parent_key": lv.parent_key} for lv in case.reference.allocation],
+            "ignored": [], "questions": []}
 
 
 def fake_llm_for(case: Case) -> FakeLLM:
@@ -71,12 +94,18 @@ def fake_llm_for(case: Case) -> FakeLLM:
         "pool": ref.pool.model_dump(mode="json"),
         "allocation": [a.model_dump(mode="json") for a in ref.allocation],
         "payout": [p.model_dump(mode="json") for p in ref.payout],
-        "questions": [{"id": "q1", "text": "净利润达到1千万按5%计提，是全额累进还是超额累进？",
-                       "options": ["全额累进", "超额累进"], "suggested": 0, "related": "tables.profit_tier"}],
+        "questions": [{"id": "q1", "text": "请确认：" + "、".join(map(str, kws)), "options": ["全额累进", "超额累进"],
+                       "suggested": 0, "related": ""}
+                      for kws in [c["keywords"] for c in case.spec["checks"] if c["type"] == "question"]],
     }
+
+
+    plan = fake_plan(case)
 
     def respond(messages):
         sys = messages[0]["content"] if isinstance(messages[0]["content"], str) else ""
+        if "统筹规划助手" in sys:
+            return json.dumps(plan, ensure_ascii=False)
         if "转写" in sys and "规则 DSL" not in sys:
             return "| 档位 | 比例 |\n| --- | --- |\n| 示例 | 示例 |"
         return json.dumps(answer, ensure_ascii=False)
@@ -85,12 +114,20 @@ def fake_llm_for(case: Case) -> FakeLLM:
 
 
 def run_one(llm, case: Case, mode: str) -> dict:
+    """mode：two_step / direct 用固定的数据字典只测规则抽取；auto 从原始文件开始走完整的统筹规划流程。"""
     t0 = time.monotonic()
-    docs = [parse_any(p) for p in case.docs]
-    ex = extract(llm, [], case.reference.datasets, docs=docs, direct_images=(mode == "direct"))
+    ar = None
+    if mode == "auto":
+        ar = run_auto(llm, case.docs + case.data_files)
+        ex = ar.extraction
+        if ex is None:  # 规划阶段就失败了
+            ex = ExtractResult(llm.name, None, [], [], [], [], 0, llm.usage, error=ar.error)
+    else:
+        docs = [parse_any(p) for p in case.docs]
+        ex = extract(llm, [], case.reference.datasets, docs=docs, direct_images=(mode == "direct"))
     row = {
         "model": llm.name, "case": case.name, "mode": mode,
-        "ok": ex.ok, "error": ex.error, "attempts": ex.attempts,
+        "ok": ex.ok if ar is None else ar.ok, "error": ex.error if ar is None else ar.error, "attempts": ex.attempts,
         "latency_s": round(time.monotonic() - t0, 1),
         "prompt_tokens": ex.usage.prompt_tokens, "completion_tokens": ex.usage.completion_tokens,
         "quote_hit_rate": round(ex.quote_hits / ex.quote_total, 3) if ex.quote_total else None,
@@ -104,7 +141,12 @@ def run_one(llm, case: Case, mode: str) -> dict:
                 checks[chk["name"]] = run_check(chk, ex.ruleset, ex)
             except Exception:  # 单项检查出错按未通过处理
                 checks[chk["name"]] = False
-        row.update(numeric_score(ex.ruleset, case.data, case.ref_result))
+        if ar is None:
+            row.update(numeric_score(ex.ruleset, case.data, case.ref_result))
+        elif ar.result is not None:
+            row.update(compare_results(ar.result, case.ref_result))
+        else:
+            row.update({"computed": False, "pool_match": False, "leaf_match_rate": 0.0, "held_match": False})
     else:
         checks = {c["name"]: False for c in case.spec["checks"]}
         row.update({"computed": False, "pool_match": False, "leaf_match_rate": 0.0, "held_match": False})
@@ -114,6 +156,11 @@ def run_one(llm, case: Case, mode: str) -> dict:
     row["_transcripts"] = ex.transcripts
     row["_ruleset"] = ex.ruleset.dump_yaml() if ex.ruleset else None
     row["_questions"] = [q.model_dump() for q in ex.questions]
+    if ar is not None:
+        row["plan_attempts"] = ar.plan.attempts
+        row["_plan"] = ar.plan.plan.model_dump() if ar.plan.plan else None
+        row["_plan_raw"] = ar.plan.raw_outputs
+        row["_plan_errors"] = ar.plan.errors
     row["_issues"] = [str(i) for i in ex.issues]
     return row
 
@@ -185,7 +232,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="bonus-eval")
     ap.add_argument("--models", help="逗号分隔的模型名或分组名（candidates / open / reference / legacy），默认用配置里的 candidates")
     ap.add_argument("--cases", help="逗号分隔的样例目录名，默认全部")
-    ap.add_argument("--modes", default="two_step", help="two_step（先转写图片再抽取）, direct（直接看图）")
+    ap.add_argument("--modes", default="two_step",
+                    help="two_step（固定数据字典，先转写图片再抽取）, direct（固定数据字典，直接看图）, auto（从原始文件开始全自动）")
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--fake", action="store_true", help="不调用模型，用标准答案演练")
     ap.add_argument("--out", default=str(ROOT / "reports"))

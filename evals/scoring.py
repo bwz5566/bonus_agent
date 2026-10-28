@@ -33,10 +33,12 @@ def run_check(chk: dict, rs: RuleSet, ex: ExtractResult) -> bool:
         return False
     if t == "levels":
         return [lv.key for lv in rs.allocation] == chk["keys"]
+    if t == "level_count":
+        return len(rs.allocation) == chk["count"]
     if t == "payout_exists":
         return bool(rs.payout)
     if t == "question":
-        kws = chk["keywords"]
+        kws = [str(k) for k in chk["keywords"]]
         # 至少命中两个关键词，避免泛泛的提问被算作命中
         return any(sum(k in q.text + " ".join(q.options) for k in kws) >= 2 for q in ex.questions)
     raise ValueError(f"未知检查类型 {t}")
@@ -53,6 +55,11 @@ def numeric_score(rs: RuleSet, data, reference: Result) -> dict:
         got = compute(rs, data)
     except (EngineError, AdjustConflict, EvalError, ValueError) as e:
         return {"computed": False, "error": str(e)[:300], "pool_match": False, "leaf_match_rate": 0.0}
+    return compare_results(got, reference)
+
+
+def compare_results(got: Result, reference: Result) -> dict:
+    """按最末层主键逐个比对金额（auto 模式下层级名、字段名可能和标准答案不同，主键取值相同即可）。"""
     want, have = leaf_amounts(reference), leaf_amounts(got)
     hits = sum(1 for k, v in want.items() if have.get(k) == v)
     def held(res: Result) -> dict:

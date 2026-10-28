@@ -1,0 +1,14 @@
+# 评测样例：公司年终奖（结构与 sales_q3 不同，主要用于 auto 模式）
+desc: PPT（文字 + 绩效系数图片）+ Word 补充通知 + Excel（含应忽略的说明页、公司级月度利润表）；净利润阶梯故意没写全额还是超额
+docs: [年终奖方案.pptx, 补充通知.docx]
+reference_rules: rules.yaml
+data: [年度数据.xlsx]
+mapping: mapping.yaml
+
+checks:
+  - {name: 净利润阶梯档位, type: tier, steps: [[0, 0.05], [30000000, 0.08]]}
+  - {name: 绩效系数（图片）, type: lookup, mapping: {A: 1.5, B: 1.2, C: 1.0, D: 0.5}}
+  - {name: 研发中心系数（另一份文件）, type: lookup, mapping: {研发中心: 1.1}}
+  - {name: 分配层级数, type: level_count, count: 2}
+  - {name: 有分期发放挂起条件, type: payout_exists}
+  - {name: 对全额/超额提问, type: question, keywords: [净利润, 8%, 全额, 超额, 累进, "3000"]}

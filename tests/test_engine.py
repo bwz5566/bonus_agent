@@ -219,3 +219,17 @@ def test_scope_check_allows_valid_patterns():
     rs = _variant(allocation__0__weight="group_score * sum(sales_amount * lookup(region_coef, region))",
                   payout__0__hold_ratio="1 - min(collected_ratio, 1) + 0 * seniority * group_score")
     assert not [i for i in validate(rs) if i.severity == "blocking"]
+
+
+def test_company_table_and_entity_aggregate_scope():
+    rs = RuleSet.load(Path(__file__).parent.parent / "evals" / "cases" / "annual_2026" / "rules.yaml")
+    data = rs.model_dump(mode="json")
+    # 部门层对员工实体表聚合：合法
+    data["allocation"][0]["weight"] = "kpi_score * sum(monthly_salary)"
+    assert not [i for i in validate(RuleSet.model_validate(data)) if i.severity == "blocking"]
+    # 个人层聚合公司级表：聚合不到行
+    data["allocation"][1]["weight"] = "sum(net_profit)"
+    assert any(i.code == "agg_above" for i in validate(RuleSet.model_validate(data)))
+    # 公司级表字段不聚合直接用
+    data["allocation"][1]["weight"] = "net_profit"
+    assert any(i.code == "detail_outside_agg" for i in validate(RuleSet.model_validate(data)))

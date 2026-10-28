@@ -40,6 +40,7 @@ SYNONYMS: dict[str, list[str]] = {
 
 class DatasetMapping(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    file: str | None = None            # 多个文件里有同名 sheet 时用文件名区分
     sheet: str | None = None
     columns: dict[str, str]            # 标准字段 -> 列名
     confidence: dict[str, float] = {}  # 推荐时填写
@@ -124,7 +125,7 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping) -> tup
         if m is None:
             issues.append(Issue.block("mapping_missing", f"数据表「{ds_name}」没有映射"))
             continue
-        st = next((s for s in sheets if s.sheet == m.sheet), None) if m.sheet else None
+        st = next((s for s in sheets if s.sheet == m.sheet and (m.file is None or s.file == m.file)), None) if m.sheet else None
         if st is None:
             st = next((s for s in sheets if all(c in s.headers for c in m.columns.values())), None)
         if st is None:

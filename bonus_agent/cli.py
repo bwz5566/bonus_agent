@@ -4,6 +4,8 @@
   extract --datasets D.yaml [--model M] --out draft.yaml 文档...
                                            从规则文档抽取规则草稿和问题卡
   map --rules R.yaml [--model M] 数据.xlsx 推荐字段映射（启发式 + 大模型）
+  auto [--model M] [--answers Q.yaml] --out 目录 文件或文件夹...
+                                           全自动：统筹规划 → 抽取规则 → 计算 → 输出 Excel
 """
 from __future__ import annotations
 
@@ -39,6 +41,11 @@ def main(argv=None) -> int:
     p.add_argument("--model")
     p.add_argument("--no-llm", action="store_true")
     p.add_argument("data", nargs="+")
+    p = sub.add_parser("auto")
+    p.add_argument("--model")
+    p.add_argument("--answers", help="上一次输出的 questions.yaml，填写 answer 后传入重算")
+    p.add_argument("--out", required=True, help="输出目录")
+    p.add_argument("paths", nargs="+", help="规则文档、Excel 数据，或包含它们的文件夹")
     a = ap.parse_args(argv)
 
     cfg = load_config()
@@ -103,6 +110,35 @@ def main(argv=None) -> int:
         m = suggest(rs, [s for f in a.data for s in detect(f)], llm)
         print(yaml.safe_dump({k: v.model_dump(exclude_none=True) for k, v in m.items()}, allow_unicode=True, sort_keys=False))
         return 0
+    if a.cmd == "auto":
+        from bonus_agent.auto import run_auto
+        answers = yaml.safe_load(Path(a.answers).read_text(encoding="utf-8")) if a.answers else None
+        llm = LLM.from_config(a.model, cfg)
+        print(f"使用模型 {llm.name}，处理 {len(a.paths)} 个路径 ...", flush=True)
+        ar = run_auto(llm, a.paths, a.out, answers=answers)
+        po = ar.plan
+        if po.plan:
+            print(f"\n【规划】{po.plan.summary}")
+            print("  分配层级：" + " → ".join(lv.level for lv in po.plan.hierarchy))
+            for n, m in po.mapping.items():
+                print(f"  数据表 {n} ← {m.file}/{m.sheet}（{len(m.columns)} 个字段）")
+            for w in po.warnings:
+                print(f"  注意：{w}")
+        if ar.result is not None:
+            print(f"\n【结果】奖金池 {ar.result.pool:,}，结果已写入 {ar.outputs.get('excel')}")
+        if ar.questions:
+            print(f"\n【待确认问题】{len(ar.questions)} 个（已按建议理解先算，答复后用 --answers 重跑）：")
+            for stage, q in ar.questions:
+                print(f"  [{stage}] {q.text}  选项：{' / '.join(q.options)}")
+        for i in ar.issues:
+            if i.severity == "warning":
+                print(f"  {i}")
+        if ar.error:
+            print(f"\n失败：{ar.error}")
+        print(f"\n输出目录：{a.out}（规则 rules.yaml、映射 mapping.yaml、问题 questions.yaml、日志 agent_log.json）")
+        u = llm.usage
+        print(f"调用 {u.calls} 次，输入 {u.prompt_tokens} tokens，输出 {u.completion_tokens} tokens，耗时 {u.latency_s:.0f} 秒")
+        return 0 if ar.ok else 1
     return 2
 
 

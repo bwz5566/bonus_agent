@@ -1,0 +1,13 @@
+部门:
+  file: 年度数据.xlsx
+  sheet: 部门KPI
+  columns: {dept_id: 部门编码, dept_name: 部门名称, kpi_score: KPI得分}
+员工:
+  file: 年度数据.xlsx
+  sheet: 员工花名册
+  columns: {employee_id: 员工编号, name: 姓名, dept_id: 所在部门, monthly_salary: 月薪（元）, grade: 绩效等级,
+            probation: 是否试用期, months: 本年在职月数}
+月度利润:
+  file: 年度数据.xlsx
+  sheet: 月度利润
+  columns: {month: 月份, net_profit: 净利润（万元）}

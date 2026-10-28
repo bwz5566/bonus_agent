@@ -6,6 +6,7 @@ from graphlib import CycleError, TopologicalSorter
 from bonus_core.dsl.functions import FUNCTIONS
 from bonus_core.dsl.models import RuleSet, TierTable
 from bonus_core.dsl.parser import BinOp, BoolOp, Call, Cmp, ExprError, Name, Neg, Not, Str, names, parse, walk
+from bonus_core.dsl.scope import Layout, is_aggregate
 from bonus_core.engine.issues import Issue
 
 
@@ -43,8 +44,10 @@ def validate(rs: RuleSet) -> list[Issue]:
     if rs.allocation and rs.entity_dataset(rs.leaf.key) is None:
         issues.append(Issue.block("leaf_no_entity", f"最末层「{rs.leaf.level}」必须有实体表"))
     for n, d in rs.datasets.items():
-        if bool(d.key) == bool(d.link):
-            issues.append(Issue.block("dataset_kind", f"数据表「{n}」必须且只能设置 key 或 link 之一", f"datasets.{n}"))
+        if d.key and d.link:
+            issues.append(Issue.block("dataset_kind", f"数据表「{n}」不能同时设置 key 和 link", f"datasets.{n}"))
+        if d.key and d.key not in {lv.key for lv in rs.allocation}:
+            issues.append(Issue.warn("entity_unused", f"实体表「{n}」的主键 {d.key} 不是任何分配层级的主键，表中数据不会被使用", f"datasets.{n}"))
         for k in (d.key, d.link):
             if k and k not in d.fields:
                 issues.append(Issue.block("dataset_key_field", f"数据表「{n}」的字段列表里没有 {k}", f"datasets.{n}"))
@@ -124,39 +127,22 @@ def validate(rs: RuleSet) -> list[Issue]:
 
 
 class _ScopeCheck:
-    """静态检查表达式在所处层级能否求值，与求值器的名字解析规则一致：
+    """静态检查表达式在所处层级能否求值，规则与求值器一致（见 bonus_core.dsl.scope）：
 
-    - 层级变量只能在本层或更下层引用（上层要用下层的数，只能对明细行聚合）；
-    - 实体表字段只能在其所属层级或更下层直接使用；
-    - 明细字段只能出现在聚合函数里，且明细必须挂在当前层或更下层（否则聚合不到行）。
+    - 层级变量只能在本层或更下层引用（上层要用下层的数，只能对数据表聚合）；
+    - 实体表字段只能在其所属层级或更下层直接使用，上层要用就聚合；
+    - 明细表、公司级表的字段只能出现在聚合函数里，且表的行必须挂在当前层或更下层（否则聚合不到行）。
     """
 
     def __init__(self, rs: RuleSet, where: str):
         self.rs, self.where = rs, where
-        self.index = {lv.level: i for i, lv in enumerate(rs.allocation)}
-        self.entity: dict[str, int] = {}          # 实体字段 -> 所属层级下标
-        self.link: dict[str, int] = {}            # 明细表 -> 挂靠层级下标
-        for i, lv in enumerate(rs.allocation):
-            ent = rs.entity_dataset(lv.key)
-            if ent:
-                for f in ent[1].fields:
-                    self.entity.setdefault(f, i)
-        key_level = {lv.key: i for i, lv in enumerate(rs.allocation)}
-        self.detail: dict[str, set[str]] = {}
-        for n, d in rs.datasets.items():
-            if d.link:
-                self.link[n] = key_level.get(d.link, len(rs.allocation) - 1)
-                for f in d.fields:
-                    self.detail.setdefault(f, set()).add(n)
+        self.lay = Layout(rs)
         self.issues: list[Issue] = []
         self.seen: set[str] = set()
 
     def run(self, ast, scope: str | None) -> list[Issue]:
-        self._visit(ast, -1 if scope is None else self.index.get(scope, -1), None)
+        self._visit(ast, -1 if scope is None else self.lay.index.get(scope, -1), None)
         return self.issues
-
-    def _label(self, i: int) -> str:
-        return "global（全部）" if i < 0 else self.rs.allocation[i].level
 
     def _block(self, code: str, msg: str):
         if msg not in self.seen:
@@ -164,21 +150,22 @@ class _ScopeCheck:
             self.issues.append(Issue.block(code, msg, self.where))
 
     def _visit(self, node, ctx: int, agg: str | None):
+        lab = self.lay.level_label
         match node:
             case Name(id=n):
                 self._name(n, ctx, agg)
-            case Call(fn=fn, args=args, kwargs=kws):
-                spec = FUNCTIONS.get(fn)
-                if spec is not None and spec.aggregate:
-                    ds = self._agg_dataset(node)
-                    if ds is None:
-                        return
-                    if self.link[ds] < ctx:
-                        self._block("agg_above", f"{fn}(...) 聚合的明细表「{ds}」挂在「{self._label(self.link[ds])}」层，"
-                                                 f"在「{self._label(ctx)}」层聚合不到任何行；请把这个计算放到「{self._label(self.link[ds])}」层或更上层")
-                    for a in list(args) + [v for k, v in kws if k == "where"]:
-                        self._visit(a, ctx, ds)
+            case Call(args=args, kwargs=kws) if is_aggregate(node):
+                ds, err = self.lay.agg_dataset(node)
+                if ds is None:
+                    self._block("agg_dataset", err)
                     return
+                tl = self.lay.table_level[ds]
+                if tl < ctx:
+                    self._block("agg_above", f"{node.fn}(...) 聚合的数据表「{ds}」挂在「{lab(tl)}」层，在「{lab(ctx)}」层"
+                                             f"聚合不到任何行；请把这个计算放到「{lab(tl)}」层或更上层")
+                for a in list(args) + [v for k, v in kws if k == "where"]:
+                    self._visit(a, ctx, ds)
+            case Call(args=args, kwargs=kws):
                 for a in list(args) + [v for k, v in kws]:
                     self._visit(a, ctx, agg)
             case BinOp(left=l, right=r) | Cmp(left=l, right=r) | BoolOp(left=l, right=r):
@@ -188,47 +175,26 @@ class _ScopeCheck:
                 self._visit(o, ctx, agg)
 
     def _name(self, n: str, ctx: int, agg: str | None):
-        rs = self.rs
+        rs, lab = self.rs, self.lay.level_label
         if agg is not None and n in rs.datasets[agg].fields:
             return
         if n in rs.variables:
             sc = rs.variables[n].scope
-            si = -1 if sc == "global" else self.index.get(sc, -1)
+            si = -1 if sc == "global" else self.lay.index.get(sc, -1)
             if si > ctx:
-                self._block("scope_var", f"变量 {n} 属于「{sc}」层级，不能在「{self._label(ctx)}」层引用。"
-                                         f"上层需要下层的数时，请在上层直接对明细字段聚合（如 sum(...)），不要引用下层变量")
+                self._block("scope_var", f"变量 {n} 属于「{sc}」层级，不能在「{lab(ctx)}」层引用。"
+                                         f"上层需要下层的数时，请在上层直接对数据表聚合（如 sum(...)），不要引用下层变量")
             return
         if n in rs.tables:
             return
-        if n in self.entity and self.entity[n] <= ctx:
+        if n in self.lay.entity_level and self.lay.entity_level[n] <= ctx:
             return
-        if n in self.detail:
+        if n in self.lay.row_only:
             self._block("detail_outside_agg", f"{n} 是明细表字段（每行一个值），必须放在 sum/avg/count 等聚合函数里使用；"
                                               f"逐行乘系数要写在聚合里面，如 sum({n} * lookup(表, 字段))")
-        elif n in self.entity:
-            self._block("scope_field", f"字段 {n} 属于「{self._label(self.entity[n])}」层的实体表，不能在「{self._label(ctx)}」层直接使用")
-
-    def _agg_dataset(self, c: Call) -> str | None:
-        kw = c.kw()
-        if "of" in kw:
-            of = kw["of"]
-            return of.value if isinstance(of, Str) and of.value in self.link else None
-        refs = set()
-        for a in list(c.args) + [v for k, v in c.kwargs if k == "where"]:
-            refs |= names(a)
-        cands = None
-        for n in refs:
-            if n in self.detail:
-                cands = self.detail[n] if cands is None else cands & self.detail[n]
-        if not cands:
-            if len(self.link) == 1:
-                return next(iter(self.link))
-            self._block("agg_dataset", f"{c.fn}(...) 无法确定聚合哪张明细表，请用 of: \"表名\" 指定")
-            return None
-        if len(cands) > 1:
-            self._block("agg_dataset", f"{c.fn}(...) 引用的字段同时存在于 {sorted(cands)}，请用 of 指定")
-            return None
-        return next(iter(cands))
+        elif n in self.lay.entity_level:
+            self._block("scope_field", f"字段 {n} 属于「{lab(self.lay.entity_level[n])}」层的实体表，不能在「{lab(ctx)}」层直接使用，"
+                                       f"需要时用聚合，如 sum({n})")
 
 
 def _items(rs: RuleSet):

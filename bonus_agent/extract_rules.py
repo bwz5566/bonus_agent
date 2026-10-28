@@ -12,6 +12,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -85,7 +86,10 @@ class ExtractResult:
 def data_dictionary(datasets: dict[str, DatasetDef]) -> str:
     lines = []
     for n, d in datasets.items():
-        kind = f"实体表，主键 {d.key}" if d.key else f"明细表，每行通过 {d.link} 关联"
+        kind = (f"实体表，主键 {d.key}" if d.key else f"明细表，每行通过 {d.link} 关联" if d.link
+                else "公司级表，行属于“全部”，只能在 global 作用域聚合")
+        if d.desc:
+            kind += f"；{d.desc}"
         lines.append(f"## {n}（{kind}）")
         for f, fd in d.fields.items():
             extra = f"，取值 {fd.values}" if fd.values else ""
@@ -154,12 +158,19 @@ def check_quotes(rs: RuleSet, docs: list[ParsedDoc]) -> tuple[int, int, list[Iss
 
 def extract(llm: LLM, files: list[str | Path], datasets: dict[str, DatasetDef], *, name: str = "草稿",
             version: str = "draft", max_repairs: int = 2, docs: list[ParsedDoc] | None = None,
-            direct_images: bool = False) -> ExtractResult:
-    """direct_images=True 时不做单独转写，直接把图片和文字一起交给模型（用于对比两种方式）。"""
+            direct_images: bool = False, hint: str = "",
+            check: Callable[[RuleSet], list[str]] | None = None) -> ExtractResult:
+    """direct_images=True 时不做单独转写，直接把图片和文字一起交给模型（用于对比两种方式）。
+
+    hint：附加给模型的背景（如统筹规划的结论、财务已确认的答案）。
+    check：静态校验通过后的额外检查（如用真实数据试算），返回的错误同样交给模型修正。
+    """
     docs = docs if docs is not None else [parse_any(f) for f in files]
     start_usage = Usage(**vars(llm.usage))
     transcripts = [] if direct_images else transcribe(llm, docs)
     user_content: list = [{"type": "text", "text": "以下是奖金规则文档的内容：\n\n" + render_docs(docs)}]
+    if hint:
+        user_content.append({"type": "text", "text": "\n\n# 补充说明\n" + hint})
     if direct_images:
         for d in docs:
             for b in d.blocks:
@@ -185,6 +196,9 @@ def extract(llm: LLM, files: list[str | Path], datasets: dict[str, DatasetDef], 
             questions = ext.questions
             issues = validate(rs)
             errors = [str(i) for i in issues if i.severity == "blocking"]
+            if not errors and check is not None:
+                errors = check(rs)
+                issues += [Issue.block("trial_run", e) for e in errors]
         except (LLMError, ValidationError, ValueError) as e:
             rs, errors = None, [f"输出不符合格式：{e}"[:3000]]
         if not errors:

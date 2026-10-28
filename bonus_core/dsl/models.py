@@ -64,6 +64,7 @@ class DatasetDef(_Base):
 
     - 有 key：实体表，每行一个实体（如人员表 key=employee_id）。
     - 有 link：明细表，每行通过 link 字段挂到某一层级的实体上（如销售明细 link=employee_id）。
+    - 都没有：公司级表，行属于“全部”，只能在 global 作用域聚合（如各月净利润）。
     """
     desc: str = ""
     key: str | None = None

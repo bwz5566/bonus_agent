@@ -51,7 +51,8 @@ class Node:
 
     @property
     def label(self) -> str:
-        return str(self.attrs.get("name") or self.key or self.id)
+        name = self.attrs.get("name") or next((v for k, v in self.attrs.items() if k.endswith("_name") and v), None)
+        return str(name or self.key or self.id)
 
 
 def node_id(level: str, key) -> str:
@@ -92,6 +93,7 @@ def build_tree(rs: RuleSet, data: Datasets) -> tuple[Node, dict[str, list[Node]]
             seen.add(k)
             n = get(lv.level, k)
             n.attrs, n.attr_src = dict(row.values), row.src
+            n.own_rows.setdefault(name, []).append(row)   # 上层可以对实体表聚合
 
     # 2. 自下而上连父节点；没有实体表的上层由下层的 parent_key 推导出来
     for i in range(len(levels) - 1, 0, -1):
@@ -113,10 +115,13 @@ def build_tree(rs: RuleSet, data: Datasets) -> tuple[Node, dict[str, list[Node]]
     # 3. 明细表：按 link 字段挂到对应层级的节点上
     level_by_key = {lv.key: lv.level for lv in levels}
     for name, ds in rs.datasets.items():
-        if ds.link is None:
+        if ds.key is not None:
             continue
         if name not in data:
             issues.append(Issue.block("dataset_missing", f"缺少数据表「{name}」", where=name))
+            continue
+        if ds.link is None:                     # 公司级表：行属于“全部”
+            root.own_rows[name] = list(data[name].rows)
             continue
         level = level_by_key.get(ds.link)
         if level is None:

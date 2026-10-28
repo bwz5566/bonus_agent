@@ -83,3 +83,54 @@ def test_secrets_file_and_model_groups(tmp_path, monkeypatch):
     assert resolve_models("reference,qwen3.6-27b", cfg) == ["qwen3-vl-plus", "qwen3.6-flash", "qwen3.6-27b"]
     with pytest.raises(LLMError):
         resolve_models("no-such-model", cfg)
+
+
+ANNUAL = ROOT / "evals" / "cases" / "annual_2026"
+
+
+def test_annual_reference_golden():
+    from bonus_core.golden import run_golden
+    rs = RuleSet.load(ANNUAL / "rules.yaml")
+    assert all(r.passed for r in run_golden(rs))
+
+
+def test_auto_end_to_end_and_rerun(tmp_path):
+    import openpyxl
+    import yaml as _yaml
+    from bonus_agent.auto import run_auto
+    from bonus_core.cli import main as bonus_main
+
+    case = load_case(ANNUAL)
+    ar = run_auto(fake_llm_for(case), [ANNUAL], tmp_path)   # 传文件夹，自动区分规则和数据
+    assert ar.ok, ar.error
+    assert ar.result.pool == case.ref_result.pool
+    wb = openpyxl.load_workbook(ar.outputs["excel"])
+    assert {"待确认问题", "智能体规划", "汇总"} <= set(wb.sheetnames)
+    qs = _yaml.safe_load(ar.outputs["questions"].read_text(encoding="utf-8"))
+    assert qs and qs[0]["answer"] is None
+    # 输出的规则和映射可以直接用计算引擎复算
+    out = tmp_path / "rerun.xlsx"
+    assert bonus_main(["run", "--rules", str(ar.outputs["rules"]), "--mapping", str(ar.outputs["mapping"]),
+                       "--out", str(out), str(ANNUAL / "年度数据.xlsx")]) == 0
+    # 带答复重跑：答复进入提示词
+    qs[0]["answer"] = 1
+    llm = fake_llm_for(case)
+    run_auto(llm, [ANNUAL], tmp_path / "2", answers=qs)
+    assert any("财务已确认" in json.dumps(m, ensure_ascii=False) for c in llm.calls for m in c)
+
+
+def test_plan_errors_are_repaired():
+    from bonus_agent.auto import build_inventory, collect_files, make_plan
+    from evals.run_eval import fake_plan
+    case = load_case(ANNUAL)
+    good = fake_plan(case)
+    bad = json.loads(json.dumps(good, ensure_ascii=False))
+    bad["datasets"]["员工"]["fields"]["monthly_salary"]["column"] = "工资"          # 不存在的列
+    bad["datasets"]["员工"]["fields"]["name"]["type"] = "money"                    # 类型与数据不符
+    bad["datasets"]["员工"]["fields"]["months"]["column"] = "本年在职 月数"         # 空格差异，应自动更正
+    inv = build_inventory(collect_files([ANNUAL]))
+    llm = FakeLLM([json.dumps(bad, ensure_ascii=False), json.dumps(good, ensure_ascii=False)])
+    po = make_plan(llm, inv)
+    assert po.attempts == 2 and not po.errors
+    feedback = llm.calls[1][-1]["content"]
+    assert "工资" in feedback and "name" in feedback and "本年在职 月数" not in feedback

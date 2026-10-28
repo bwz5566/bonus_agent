@@ -38,7 +38,9 @@ def _d(s) -> Decimal:
     return Decimal(str(s))
 
 
-def write_excel(rs: RuleSet, res: Result, path: str | Path, ledger: list[dict] | None = None) -> Path:
+def write_excel(rs: RuleSet, res: Result, path: str | Path, ledger: list[dict] | None = None,
+                extra_sheets: list[tuple[str, list[str], list[list], dict]] | None = None) -> Path:
+    """extra_sheets：(标题, 表头, 行, 列宽) 列表，放在「汇总」之后（如智能体的规划说明、待确认问题）。"""
     path = Path(path)
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
@@ -61,6 +63,8 @@ def write_excel(rs: RuleSet, res: Result, path: str | Path, ledger: list[dict] |
     ws = _sheet(wb, "汇总", ["项目", "值"], rows, widths={"项目": 22, "值": 30})
     for r in (3, 4, 5, 6):
         ws.cell(r, 2).number_format = MONEY
+    for title, headers, extra_rows, widths in extra_sheets or []:
+        _sheet(wb, title, headers, extra_rows, widths=widths)
 
     # 各层级明细
     for lv in res.levels:
