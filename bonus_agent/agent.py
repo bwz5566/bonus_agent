@@ -469,7 +469,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     """max_steps 和 max_tokens 都是安全上限：模型调用 finish 就结束，正常不会用满。"""
     try:
         files = collect_files(paths, exclude=[out_dir] if out_dir else [], max_files=max_files)
-    except TooManyFiles as e:
+    except (TooManyFiles, FileNotFoundError) as e:
         raise ToolError(str(e)) from None
     if not files:
         raise ToolError("没有找到可处理的文件（支持 .docx .pptx .xlsx .xlsm .png .jpg .txt .md .json .csv）")

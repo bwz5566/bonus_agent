@@ -53,11 +53,17 @@ def collect_files(paths: list[str | Path], exclude: list[str | Path] = (), max_f
     """展开文件夹，跳过临时文件、程序目录和输出目录。一批计算应只包含本批次的文件。"""
     skip = [Path(e).resolve() for e in exclude]
     out: list[Path] = []
+    unsupported: list[str] = []
     for p in map(Path, paths):
+        if not p.exists():
+            raise FileNotFoundError(f"路径不存在：{p}")
         cands = sorted(x for x in p.rglob("*") if x.is_file()) if p.is_dir() else [p]
         for f in cands:
             rel = f.relative_to(p).parts[:-1] if p.is_dir() else ()
-            if f.name.startswith(("~$", ".")) or f.suffix.lower() not in PARSERS:
+            if f.name.startswith(("~$", ".")):
+                continue
+            if f.suffix.lower() not in PARSERS:
+                unsupported.append(f.name)
                 continue
             if any(part in SKIP_DIRS or part.endswith(".egg-info") for part in rel):
                 continue
@@ -65,6 +71,12 @@ def collect_files(paths: list[str | Path], exclude: list[str | Path] = (), max_f
             if any(rf.is_relative_to(e) for e in skip) or rf in out:
                 continue
             out.append(rf)
+    if not out and unsupported:
+        old = [n for n in unsupported if Path(n).suffix.lower() in (".doc", ".xls", ".ppt")]
+        raise FileNotFoundError(f"找到 {len(unsupported)} 个文件，但格式都不支持：{unsupported[:10]}"
+                                + ("。.doc / .xls / .ppt 是旧格式，请在 Office 里另存为 .docx / .xlsx / .pptx" if old else ""))
+    if not out:
+        raise FileNotFoundError(f"文件夹里没有文件：{[str(p) for p in paths]}")
     if len(out) > max_files:
         raise TooManyFiles(f"找到 {len(out)} 个文件，超过上限 {max_files}。一次只放一个批次（一个部门、一期）的规则和数据，"
                            f"不要传整个项目目录；确实需要更多文件可加 --max-files。前几个文件：{[f.name for f in out[:8]]}")
@@ -429,7 +441,7 @@ def run_auto(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = Non
              on_files=None) -> AutoResult:
     try:
         files = collect_files(paths, exclude=[out_dir] if out_dir else [], max_files=max_files)
-    except TooManyFiles as e:
+    except (TooManyFiles, FileNotFoundError) as e:
         return AutoResult(PlanOutcome(None, {}, {}, [], [], [], 0), error=str(e))
     if on_files:
         on_files(files)
