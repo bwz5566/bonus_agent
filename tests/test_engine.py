@@ -185,3 +185,37 @@ def test_trace_links_to_rows():
     t = res.traces["个人:E1/eff_sales"]
     assert t.rows and "销售明细" in t.rows[0]
     assert res.traces["全部/奖金池"].inputs == ("全部/total_profit", "全部/total_sales")
+
+
+def _variant(**changes):
+    rs = RuleSet.load(Path(__file__).parent.parent / "examples" / "sales_q3" / "rules.yaml")
+    data = rs.model_dump(mode="json")
+    for path, value in changes.items():
+        obj = data
+        *head, last = path.split("__")
+        for k in head:
+            obj = obj[int(k)] if k.isdigit() else obj[k]
+        obj[last] = value
+    return RuleSet.model_validate(data)
+
+
+@pytest.mark.parametrize("changes, code", [
+    # 模型真实犯过的错：小组权重引用个人层变量
+    ({"allocation__0__weight": "group_score * eff_sales"}, "scope_var"),
+    # 奖金池（global）引用个人层变量
+    ({"pool__expr": "tier(sales_tier, eff_sales)"}, "scope_var"),
+    # 逐行系数写在聚合外面
+    ({"variables__eff_sales__expr": "sum(sales_amount) * lookup(region_coef, region)"}, "detail_outside_agg"),
+    ({"variables__eff_sales__expr": "sales_amount * 1.2"}, "detail_outside_agg"),
+    # 上层直接用下层实体字段
+    ({"allocation__0__weight": "seniority"}, "scope_field"),
+])
+def test_scope_errors_caught_statically(changes, code):
+    issues = validate(_variant(**changes))
+    assert any(i.code == code and i.severity == "blocking" for i in issues), issues
+
+
+def test_scope_check_allows_valid_patterns():
+    rs = _variant(allocation__0__weight="group_score * sum(sales_amount * lookup(region_coef, region))",
+                  payout__0__hold_ratio="1 - min(collected_ratio, 1) + 0 * seniority * group_score")
+    assert not [i for i in validate(rs) if i.severity == "blocking"]

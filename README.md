@@ -30,7 +30,7 @@ tests/                 单元测试、属性测试、端到端测试
 
 ```bash
 pip install -e ".[agent,dev]"
-python -m pytest          # 21 个测试，应全部通过
+python -m pytest          # 27 个测试，应全部通过
 ```
 
 ## 一、计算引擎（不需要大模型）

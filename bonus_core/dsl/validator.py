@@ -5,7 +5,7 @@ from graphlib import CycleError, TopologicalSorter
 
 from bonus_core.dsl.functions import FUNCTIONS
 from bonus_core.dsl.models import RuleSet, TierTable
-from bonus_core.dsl.parser import Call, ExprError, Name, Str, names, parse, walk
+from bonus_core.dsl.parser import BinOp, BoolOp, Call, Cmp, ExprError, Name, Neg, Not, Str, names, parse, walk
 from bonus_core.engine.issues import Issue
 
 
@@ -75,7 +75,7 @@ def validate(rs: RuleSet) -> list[Issue]:
     # ---- 表达式 ----
     deps: dict[str, set[str]] = {}
     known = set(rs.variables) | set(rs.tables) | all_fields
-    for where, src, _ in _exprs(rs):
+    for where, src, scope in _exprs(rs):
         try:
             ast = parse(src)
         except ExprError as e:
@@ -101,8 +101,11 @@ def validate(rs: RuleSet) -> list[Issue]:
                     t = rs.tables.get(a0.id) if isinstance(a0, Name) else None
                     if t is None or t.kind != want:
                         issues.append(Issue.block("fn_table", f"{node.fn} 的第一个参数必须是{'阶梯表' if want == 'tier' else '查找表'}名", where))
-        for n in names(ast) - known:
+        unknown = names(ast) - known
+        for n in unknown:
             issues.append(Issue.block("name_unknown", f"无法识别的名字 {n}", where))
+        if not unknown and levels:
+            issues += _ScopeCheck(rs, where).run(ast, scope)
         if where.startswith("variables."):
             deps[where.split(".", 1)[1]] = names(ast) & set(rs.variables)
 
@@ -118,6 +121,114 @@ def validate(rs: RuleSet) -> list[Issue]:
     for where in unconfirmed:
         issues.append(Issue.warn("no_source", "智能体生成的规则元素缺少原文出处", where))
     return issues
+
+
+class _ScopeCheck:
+    """静态检查表达式在所处层级能否求值，与求值器的名字解析规则一致：
+
+    - 层级变量只能在本层或更下层引用（上层要用下层的数，只能对明细行聚合）；
+    - 实体表字段只能在其所属层级或更下层直接使用；
+    - 明细字段只能出现在聚合函数里，且明细必须挂在当前层或更下层（否则聚合不到行）。
+    """
+
+    def __init__(self, rs: RuleSet, where: str):
+        self.rs, self.where = rs, where
+        self.index = {lv.level: i for i, lv in enumerate(rs.allocation)}
+        self.entity: dict[str, int] = {}          # 实体字段 -> 所属层级下标
+        self.link: dict[str, int] = {}            # 明细表 -> 挂靠层级下标
+        for i, lv in enumerate(rs.allocation):
+            ent = rs.entity_dataset(lv.key)
+            if ent:
+                for f in ent[1].fields:
+                    self.entity.setdefault(f, i)
+        key_level = {lv.key: i for i, lv in enumerate(rs.allocation)}
+        self.detail: dict[str, set[str]] = {}
+        for n, d in rs.datasets.items():
+            if d.link:
+                self.link[n] = key_level.get(d.link, len(rs.allocation) - 1)
+                for f in d.fields:
+                    self.detail.setdefault(f, set()).add(n)
+        self.issues: list[Issue] = []
+        self.seen: set[str] = set()
+
+    def run(self, ast, scope: str | None) -> list[Issue]:
+        self._visit(ast, -1 if scope is None else self.index.get(scope, -1), None)
+        return self.issues
+
+    def _label(self, i: int) -> str:
+        return "global（全部）" if i < 0 else self.rs.allocation[i].level
+
+    def _block(self, code: str, msg: str):
+        if msg not in self.seen:
+            self.seen.add(msg)
+            self.issues.append(Issue.block(code, msg, self.where))
+
+    def _visit(self, node, ctx: int, agg: str | None):
+        match node:
+            case Name(id=n):
+                self._name(n, ctx, agg)
+            case Call(fn=fn, args=args, kwargs=kws):
+                spec = FUNCTIONS.get(fn)
+                if spec is not None and spec.aggregate:
+                    ds = self._agg_dataset(node)
+                    if ds is None:
+                        return
+                    if self.link[ds] < ctx:
+                        self._block("agg_above", f"{fn}(...) 聚合的明细表「{ds}」挂在「{self._label(self.link[ds])}」层，"
+                                                 f"在「{self._label(ctx)}」层聚合不到任何行；请把这个计算放到「{self._label(self.link[ds])}」层或更上层")
+                    for a in list(args) + [v for k, v in kws if k == "where"]:
+                        self._visit(a, ctx, ds)
+                    return
+                for a in list(args) + [v for k, v in kws]:
+                    self._visit(a, ctx, agg)
+            case BinOp(left=l, right=r) | Cmp(left=l, right=r) | BoolOp(left=l, right=r):
+                self._visit(l, ctx, agg)
+                self._visit(r, ctx, agg)
+            case Not(operand=o) | Neg(operand=o):
+                self._visit(o, ctx, agg)
+
+    def _name(self, n: str, ctx: int, agg: str | None):
+        rs = self.rs
+        if agg is not None and n in rs.datasets[agg].fields:
+            return
+        if n in rs.variables:
+            sc = rs.variables[n].scope
+            si = -1 if sc == "global" else self.index.get(sc, -1)
+            if si > ctx:
+                self._block("scope_var", f"变量 {n} 属于「{sc}」层级，不能在「{self._label(ctx)}」层引用。"
+                                         f"上层需要下层的数时，请在上层直接对明细字段聚合（如 sum(...)），不要引用下层变量")
+            return
+        if n in rs.tables:
+            return
+        if n in self.entity and self.entity[n] <= ctx:
+            return
+        if n in self.detail:
+            self._block("detail_outside_agg", f"{n} 是明细表字段（每行一个值），必须放在 sum/avg/count 等聚合函数里使用；"
+                                              f"逐行乘系数要写在聚合里面，如 sum({n} * lookup(表, 字段))")
+        elif n in self.entity:
+            self._block("scope_field", f"字段 {n} 属于「{self._label(self.entity[n])}」层的实体表，不能在「{self._label(ctx)}」层直接使用")
+
+    def _agg_dataset(self, c: Call) -> str | None:
+        kw = c.kw()
+        if "of" in kw:
+            of = kw["of"]
+            return of.value if isinstance(of, Str) and of.value in self.link else None
+        refs = set()
+        for a in list(c.args) + [v for k, v in c.kwargs if k == "where"]:
+            refs |= names(a)
+        cands = None
+        for n in refs:
+            if n in self.detail:
+                cands = self.detail[n] if cands is None else cands & self.detail[n]
+        if not cands:
+            if len(self.link) == 1:
+                return next(iter(self.link))
+            self._block("agg_dataset", f"{c.fn}(...) 无法确定聚合哪张明细表，请用 of: \"表名\" 指定")
+            return None
+        if len(cands) > 1:
+            self._block("agg_dataset", f"{c.fn}(...) 引用的字段同时存在于 {sorted(cands)}，请用 of 指定")
+            return None
+        return next(iter(cands))
 
 
 def _items(rs: RuleSet):

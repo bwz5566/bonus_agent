@@ -33,7 +33,9 @@
 要点：
 - 明细表字段（如每个合同的销售额）必须放在聚合函数里：sum(sales_amount)、sum(sales_amount, where: project_type == "新项目")。
 - 聚合发生在“当前节点”下的明细行上：在 global 作用域是全部明细，在“个人”层就是该员工的明细。
-- 实体表字段（如员工的工龄）在对应层级可以直接使用。
+- 逐行的系数（区域系数、毛利率系数、新老项目系数等）要写在聚合里面，按行先乘再求和：sum(sales_amount * lookup(region_coef, region) * tier_rate(margin_coef, gross_margin))；不能先 sum 再乘某一行的系数，也不能在聚合外面直接用明细字段。
+- 实体表字段（如员工的工龄）在对应层级及其下层可以直接使用。
+- 变量只能在它自己的层级或更下层引用。上层（如“小组”权重、global 的奖金池）需要用到个人业绩时，在上层直接对明细聚合，例如小组层定义 group_sales: sum(sales_amount * ...)，不要引用“个人”层的变量。
 - share(x) 表示本节点在同级中的占比，常用于组合多项指标的权重，如 0.3*share(seniority) + 0.7*share(my_sales)。
 - 变量名使用英文小写加下划线，不能与字段名、参数表名重名。
 
