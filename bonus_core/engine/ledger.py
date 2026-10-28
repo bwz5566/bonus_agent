@@ -40,9 +40,17 @@ def release(rs_then: RuleSet, entries: list[dict], updated: Datasets) -> list[di
         if n is None:
             out.append({**e, "release_now": "0.00", "note": "最新数据中找不到该人员"})
             continue
-        r = ev.evaluate(conds[e["condition"]].hold_ratio, n, f"{n.id}/补发挂起比例/{e['condition']}", f"payout.{e['condition']}")
-        still_held = (Decimal(e["due"]) * r).quantize(CENT, ROUND_HALF_UP)
-        outstanding = Decimal(e["held"]) - Decimal(e["released"])
-        now = max(Decimal(0), min(outstanding, Decimal(e["held"]) - still_held - Decimal(e["released"])))
-        out.append({**e, "release_now": str(now), "still_held": str(min(still_held, Decimal(e["held"])))})
+        cond = conds.get(e["condition"])
+        if cond is None:
+            raise EngineError([Issue.block("condition_missing", f"规则 {rs_then.version} 中没有发放条件 {e['condition']}", e["node_id"])])
+        pay = bool(cond.pay_ratio.strip())
+        r = ev.evaluate(cond.pay_ratio if pay else cond.hold_ratio, n,
+                        f"{n.id}/补发{'可发' if pay else '挂起'}比例/{e['condition']}", f"payout.{e['condition']}")
+        if r < 0 or r > 1:      # 与首次计算同样的范围校验，不能算出负的挂起
+            raise EngineError([Issue.block("hold_ratio_range", f"{e['condition']} 的比例 {r} 不在 0~1 之间", n.id)])
+        due, held, released = Decimal(e["due"]), Decimal(e["held"]), Decimal(e["released"])
+        still = due - (due * r).quantize(CENT, ROUND_HALF_UP) if pay else (due * r).quantize(CENT, ROUND_HALF_UP)
+        still = min(max(still, Decimal(0)), held)       # 挂起只会减少，不会超过当初挂起的金额
+        now = max(Decimal(0), held - still - released)
+        out.append({**e, "release_now": str(now), "still_held": str(max(held - released - now, Decimal(0)))})
     return out

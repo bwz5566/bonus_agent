@@ -13,7 +13,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from bonus_core.data.table import Datasets
 from bonus_core.dsl.models import RuleSet
 from bonus_core.dsl.validator import _weighted, validate
-from bonus_core.engine.allocation import CENT, AdjustConflict, allocate, max_allowed, round_pool, round_tree
+from bonus_core.engine.allocation import CENT, AdjustConflict, allocate, max_allowed, round_pool
 from bonus_core.engine.evaluator import EvalError, Evaluator, Trace
 from bonus_core.engine.issues import EngineError, Issue
 from bonus_core.engine.tree import ROOT_LEVEL, Node, build_tree
@@ -77,6 +77,7 @@ class Result:
     traces: dict[str, Trace]
     adjustments: list[Adjustment]
     issues: list[Issue] = field(default_factory=list)
+    data_hash: str = ""         # 只含规则和数据；input_hash 另含人工调整和引用的其他方案结果
 
     def node(self, node_id: str) -> NodeResult:
         return self.nodes[node_id]
@@ -100,6 +101,16 @@ def input_hash(rs: RuleSet, data: Datasets) -> str:
     return h.hexdigest()
 
 
+def run_hash(base: str, adjustments: list[Adjustment], refs: dict | None) -> str:
+    """一次结果的输入哈希：规则 + 数据 + 生效的人工调整（节点、金额、顺序）+ 引用的其他方案结果。"""
+    h = hashlib.sha256(base.encode())
+    for a in adjustments:
+        h.update(json.dumps([a.node_id, str(a.amount), a.created_at, a.id], ensure_ascii=False).encode())
+    for k in sorted(refs or {}):
+        h.update(f"{k}={refs[k].input_hash}".encode())
+    return h.hexdigest()
+
+
 class Engine:
     """一次计算的上下文：建树、求权重和奖金池，然后按调整事件分配。"""
 
@@ -114,6 +125,7 @@ class Engine:
         if blocking:
             raise EngineError(blocking)
         self.root, self.by_level, self.issues = root, by_level, issues
+        self.refs = refs or {}
         self.ev = Evaluator(rs, root, by_level, refs)
         self.nodes: dict[str, Node] = {n.id: n for n in root.walk()}
         try:
@@ -193,13 +205,12 @@ class Engine:
             if actor_scopes is not None and n.parent.id not in actor_scopes.get(a.actor, set()):
                 raise PermissionError(f"{a.actor} 无权调整 {a.node_id}（只能调整自己管辖节点的下级）")
             n.lock = a.amount.quantize(CENT)  # 同一节点多次调整，以最后一次为准
-        allocate(self.root, self.pool_exact)
-        round_tree(self.root, round_pool(self.pool_exact))
+        allocate(self.root, round_pool(self.pool_exact), self.pool_exact)
         return active
 
     def compute(self, adjustments: list[Adjustment] = (), actor_scopes=None) -> Result:
         adjustments = list(adjustments)
-        self._apply(adjustments, actor_scopes)
+        active = self._apply(adjustments, actor_scopes)
         payouts = self._payouts()
         nodes = {
             n.id: NodeResult(
@@ -211,7 +222,7 @@ class Engine:
         }
         return Result(
             rule_set=self.rs.name, rule_version=self.rs.version, engine_version=ENGINE_VERSION,
-            input_hash=self.hash, pool_exact=str(self.pool_exact), pool=str(self.root.final),
+            input_hash=run_hash(self.hash, active, self.refs), data_hash=self.hash, pool_exact=str(self.pool_exact), pool=str(self.root.final),
             levels=[lv.level for lv in self.rs.allocation], nodes=nodes, payouts=payouts,
             traces=dict(self.ev.traces), adjustments=adjustments, issues=list(self.issues),
         )

@@ -97,7 +97,7 @@ def _patched(case, tmp_path) -> Path:
             except ValueError:
                 pass
         ws.cell(r, head.index(p["field"]) + 1).value = v
-    out = tmp_path / f"{case['case_id']}.xlsx"
+    out = tmp_path / run_case.XLSX.name      # 文件名要和映射里指定的一致
     wb.save(out)
     return out
 

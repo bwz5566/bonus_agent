@@ -51,6 +51,7 @@ def main(argv=None) -> int:
     p.add_argument("--max-steps", type=int, default=80, help="安全上限：智能体最多调用工具的轮数，完成即停，正常用不满")
     p.add_argument("--max-tokens", type=int, default=1_000_000, help="安全上限：本次最多消耗的 tokens，超过即停止")
     p.add_argument("--expected", help="期望结果 Excel，只在算完后用来逐个对象核对，不会交给智能体；不要放在输入文件夹里")
+    p.add_argument("--expected-column", help="期望结果中应得金额的列名（自动识别不出或有几列时指定）")
     p.add_argument("--pipeline", action="store_true", help="使用固定流程（规划 → 抽取 → 计算），不让模型自主调度")
     p.add_argument("paths", nargs="+", help="本批次的规则文档、Excel 数据，或只包含它们的文件夹")
     a = ap.parse_args(argv)
@@ -199,7 +200,7 @@ def _agent(a, cfg) -> int:
         print(f"【复算核对】{ar.recheck}")
     if a.expected and ar.results:
         from bonus_agent.compare import compare_expected, report
-        lines = report(compare_expected(ar.results, a.expected))
+        lines = report(compare_expected(ar.results, a.expected, a.expected_column))
         (Path(a.out) / "expected_check.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
         print("\n【与期望结果核对】（已写入 expected_check.txt）")
         for ln in lines:

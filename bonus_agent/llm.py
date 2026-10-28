@@ -13,7 +13,12 @@ from typing import Callable
 
 import yaml
 
-DEFAULT_CONFIG = Path(__file__).parent.parent / "config" / "models.yaml"
+DEFAULT_CONFIG = Path(__file__).parent / "config" / "models.yaml"      # 随安装包发布的默认配置
+REPO_CONFIG = Path(__file__).parent.parent / "config"                   # 源码目录下的 config/（放 secrets.yaml）
+
+
+def _first(paths) -> Path | None:
+    return next((Path(p) for p in paths if p and Path(p).exists()), None)
 
 
 @dataclass
@@ -38,12 +43,27 @@ class LLMError(RuntimeError):
 
 
 def load_config(path: str | Path | None = None, secrets: str | Path | None = None) -> dict:
-    """读取模型配置，并合并同目录下的 secrets.yaml（API Key、专属域名等，不入库）。"""
-    path = Path(path or os.environ.get("BONUS_MODELS_CONFIG") or DEFAULT_CONFIG)
+    """读取模型配置，并合并 secrets.yaml（API Key、专属域名等，不入库）。
+
+    模型配置依次找：参数、环境变量 BONUS_MODELS_CONFIG、当前目录 config/models.yaml、源码目录 config/models.yaml、
+    安装包自带的默认配置。secrets.yaml 依次找：参数、环境变量 BONUS_SECRETS、模型配置同目录、当前目录 config/、
+    源码目录 config/、用户目录 ~/.bonus-agent/。
+    """
+    explicit = path or os.environ.get("BONUS_MODELS_CONFIG")
+    if explicit and not Path(explicit).exists():
+        raise LLMError(f"找不到模型配置文件 {explicit}")
+    path = Path(explicit) if explicit else _first([Path.cwd() / "config" / "models.yaml", REPO_CONFIG / "models.yaml",
+                                                     DEFAULT_CONFIG])
+    if path is None:
+        raise LLMError(f"找不到模型配置文件（安装包应自带 {DEFAULT_CONFIG}），请用 BONUS_MODELS_CONFIG 指定")
     with open(path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
-    sp = Path(secrets or os.environ.get("BONUS_SECRETS") or path.with_name("secrets.yaml"))
-    if sp.exists():
+    explicit = secrets or os.environ.get("BONUS_SECRETS")
+    if explicit and not Path(explicit).exists():
+        raise LLMError(f"找不到密钥文件 {explicit}")
+    sp = Path(explicit) if explicit else _first([path.with_name("secrets.yaml"), Path.cwd() / "config" / "secrets.yaml",
+                                                   REPO_CONFIG / "secrets.yaml", Path.home() / ".bonus-agent" / "secrets.yaml"])
+    if sp is not None:
         with open(sp, encoding="utf-8") as f:
             sec = yaml.safe_load(f) or {}
         for name, over in (sec.get("providers") or {}).items():

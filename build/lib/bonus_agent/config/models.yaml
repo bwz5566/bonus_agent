@@ -1,0 +1,97 @@
+# 模型配置。选型阶段通过云端 API 调用候选模型；确定后改为本地 vLLM，只需切换 provider。
+# API Key 不写在这里：复制 config/secrets.example.yaml 为 config/secrets.yaml（或 ~/.bonus-agent/secrets.yaml）填入（已加入 .gitignore），
+# 或设置 api_key_env 指定的环境变量（环境变量优先）。
+# 模型是否可用以控制台为准，可运行 `bonus-agent models --remote` 用你的 Key 实际查询。
+# 注意：调用云端 API 时，只使用脱敏后的规则文档和数据。
+
+providers:
+  dashscope:        # 阿里云百炼，中国内地（北京）地域，OpenAI 兼容模式
+    # 官方建议迁移到业务空间专属域名：https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+    # 可在 secrets.yaml 里用 base_url 覆盖，旧域名目前仍可用。
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key_env: DASHSCOPE_API_KEY
+  local_vllm:       # 自建 vLLM，部署后使用
+    base_url: http://127.0.0.1:8000/v1
+    api_key_env: VLLM_API_KEY
+
+default: qwen3.6-35b-a3b
+
+# 智能体相关的可选项（写在每个模型下）：
+#   tool_mode: native | json      native 为原生工具调用（默认）；服务不支持时会自动改用 json
+#   max_history_chars: 24000      智能体对话历史的上限（字符）。超过时整理一次，压到一半；加大会让每步输入变多
+#   cache: explicit               百炼显式缓存（命中部分按输入价 10% 计费，5 分钟有效）。只对支持的模型开启，
+#                                 目前候选开源模型都不支持；私有化 vLLM 自带前缀缓存，无需配置
+# 千问 3.5 及以后的模型默认可能开启思考模式，抽取时统一关闭（enable_thinking: false），
+# 否则耗时和 tokens 会明显增加，且部分模型思考模式下不支持 JSON 输出。
+models:
+  # ---- 已下线：最初指定的三个 Qwen3-VL 开源模型 ----
+  # 2026-10-28 用 `bonus-agent models --remote` 实测，百炼已不提供这三个 ID，保留仅作记录，不参与选型。
+  qwen3-vl-32b:
+    provider: dashscope
+    model: qwen3-vl-32b-instruct
+    json_mode: json_object      # 云端用 json_object；vLLM 可用 json_schema 做约束解码
+  qwen3-vl-30b-a3b:
+    provider: dashscope
+    model: qwen3-vl-30b-a3b-instruct
+    json_mode: json_object
+  qwen3-vl-8b:
+    provider: dashscope
+    model: qwen3-vl-8b-instruct
+    json_mode: json_object
+
+  # ---- 选型候选：百炼在售、权重开源（可私有化部署）的原生多模态模型（2026-10-28 实测可用）----
+  # 输入支持文本、图像、视频。
+  qwen3.6-35b-a3b:              # 2026-04 开源，MoE，激活约 3B，对标 30B-A3B 的下一代；上下文 256k
+    provider: dashscope
+    model: qwen3.6-35b-a3b
+    json_mode: json_object
+    extra_body: {enable_thinking: false}
+  qwen3.6-27b:                  # 稠密模型，对标 32B 的下一代
+    provider: dashscope
+    model: qwen3.6-27b
+    json_mode: json_object
+    extra_body: {enable_thinking: false}
+  qwen3.5-35b-a3b:
+    provider: dashscope
+    model: qwen3.5-35b-a3b
+    json_mode: json_object
+    extra_body: {enable_thinking: false}
+  qwen3.5-27b:
+    provider: dashscope
+    model: qwen3.5-27b
+    json_mode: json_object
+    extra_body: {enable_thinking: false}
+  qwen3.5-122b-a10b:            # 更大的 MoE，部署成本高，作为开源上限参考
+    provider: dashscope
+    model: qwen3.5-122b-a10b
+    json_mode: json_object
+    extra_body: {enable_thinking: false}
+
+  # ---- 第三组：商业版（不能私有化），只用来看效果上限 ----
+  qwen3-vl-plus:
+    provider: dashscope
+    model: qwen3-vl-plus
+    json_mode: json_object
+    extra_body: {enable_thinking: false}
+    cache: explicit
+  qwen3.6-flash:
+    provider: dashscope
+    model: qwen3.6-flash
+    json_mode: json_object
+    extra_body: {enable_thinking: false}
+    cache: explicit
+
+  # ---- 私有化部署后 ----
+  # 部署时把 model 改成选型胜出的模型（vLLM 启动时的 --served-model-name 或权重路径）
+  local:
+    provider: local_vllm
+    model: Qwen/Qwen3.6-35B-A3B
+    json_mode: json_schema
+
+# 选型时参与对比的模型（bonus-eval 默认跑 candidates，也可用 --models open,reference 等指定分组）
+# 3.6 和 3.5 同尺寸各一个，用来看新一代是否明显更好；稠密 27B 和 MoE 35B-A3B 部署成本不同。
+candidates: [qwen3.6-35b-a3b, qwen3.6-27b, qwen3.5-35b-a3b, qwen3.5-27b]
+groups:
+  open: [qwen3.6-35b-a3b, qwen3.6-27b, qwen3.5-35b-a3b, qwen3.5-27b, qwen3.5-122b-a10b]
+  reference: [qwen3-vl-plus, qwen3.6-flash]
+  legacy: [qwen3-vl-32b, qwen3-vl-30b-a3b, qwen3-vl-8b]

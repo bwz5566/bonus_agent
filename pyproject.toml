@@ -27,7 +27,7 @@ bonus-eval = "evals.run_eval:main"
 include = ["bonus_core*", "bonus_agent*", "evals*"]
 
 [tool.setuptools.package-data]
-bonus_agent = ["prompts/*.md"]
+bonus_agent = ["prompts/*.md", "config/*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

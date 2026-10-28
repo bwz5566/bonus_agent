@@ -1,0 +1,992 @@
+"""大模型主导的奖金计算智能体：不写死流程，模型通过工具自己决定看什么、怎么建模、怎么核对。
+
+模型能做的事都封装成工具（看文件、看表、看图、定义数据表、写规则、试算、查算式、算表达式、提问、完成），
+程序只负责：执行工具、校验输入、保存工作区状态。金额始终由计算引擎按模型写的规则算出。
+
+长任务的上下文控制：工作区状态（笔记、已定义的数据表、规则、问题、试算结论）每轮重新附在请求末尾，
+所以模型不会因为对话变长而“忘记”已经做过的事。对话历史超过上限时才整理一次：较早的工具结果只留摘要，
+仍然太长就丢弃最早的几轮。两次整理之间历史只追加、不改动，请求前缀保持不变，便于前缀缓存命中
+（私有化部署的 vLLM 自动缓存；百炼部分模型可在配置里开启显式缓存）。
+"""
+from __future__ import annotations
+
+import json
+import re
+from decimal import Decimal
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable
+
+import yaml
+from pydantic import ValidationError
+
+from bonus_agent.auto import (DATA_SUFFIXES, MAX_FILES, Inventory, PlanDataset, TooManyFiles, build_inventory,
+                              check_dataset, collect_files, filter_sheet)
+from bonus_agent.extract_rules import Extraction, Question, check_quotes, prompt
+from bonus_agent.llm import LLM, LLMError, image_part, parse_json
+from bonus_core.data.mapping import DatasetMapping, apply_mapping
+from bonus_core.data.table_detect import table_at
+from bonus_core.dsl.functions import describe as describe_functions
+from bonus_core.dsl.models import DatasetDef, RuleSet
+from bonus_core.dsl.validator import validate
+from bonus_core.engine.allocation import AdjustConflict
+from bonus_core.engine.evaluator import EvalError, Evaluator, fmt
+from bonus_core.engine.issues import EngineError
+from bonus_core.engine.run import Adjustment, Engine, Result, compute
+from bonus_core.engine.tree import ROOT_LEVEL, build_tree
+from bonus_core.report.excel import write_excel
+
+MAX_RESULT_CHARS = 6000
+DEFAULT_SCHEME = "默认"        # 只有一个方案时的方案名
+SCHEME_REF = re.compile(r"""scheme_paid\(\s*["']([^"']+)["']\s*(?:,\s*["']([^"']+)["']\s*)?\)""")   # 规则里引用别的方案
+SHARED = "共用"                # 多个方案共用的部分（权重、校验、共用变量），合并进每个方案
+KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保留全文
+BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
+READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate"}
+
+
+class ToolError(Exception):
+    """工具参数或执行出错，错误信息原样返回给模型。"""
+
+
+# ---------------- 工具定义 ----------------
+def _obj(props: dict, required: list[str] = ()) -> dict:
+    return {"type": "object", "properties": props, "required": list(required)}
+
+
+_S = {"type": "string"}
+_I = {"type": "integer"}
+FIELD_SCHEMA = _obj({"column": {**_S, "description": "Excel 表头原文"},
+                     "type": {"type": "string", "enum": ["money", "number", "int", "ratio", "text", "enum", "date", "id"]},
+                     "unit": {"type": "string", "enum": ["元", "万元"], "description": "money 字段必填"},
+                     "desc": _S}, ["column", "type"])
+
+TOOLS: list[dict] = [
+    {"name": "list_files", "description": "列出本批次所有文件；Excel 列出每个工作表及自动识别的表头。",
+     "parameters": _obj({})},
+    {"name": "read_document", "description": "读取 Word / PPT / 图片文件的文字和表格（图片显示为占位符，用 view_image 查看）。",
+     "parameters": _obj({"file": _S, "offset": {**_I, "description": "从第几个字符开始，默认 0"}}, ["file"])},
+    {"name": "view_image", "description": "查看文件中的第 index 张图片（从 1 开始，默认 1），返回图片内容的逐字转写。",
+     "parameters": _obj({"file": _S, "index": _I, "focus": {**_S, "description": "可选：希望重点看清的内容"}},
+                        ["file"])},
+    {"name": "read_sheet", "description": "查看 Excel 工作表的原始内容（带 Excel 行号），用于判断表头位置、合计行、说明文字等。",
+     "parameters": _obj({"file": _S, "sheet": _S, "start_row": _I, "rows": _I}, ["file", "sheet"])},
+    {"name": "note",
+     "description": "把读到的关键信息记在工作区（如某条规则、某个参数、文件用途、待核对事项）。笔记每轮都会附给你，"
+                    "较早的对话会被裁剪，重要内容请及时记下。同一 topic 再次记录会覆盖，text 为空则删除。",
+     "parameters": _obj({"topic": _S, "text": _S}, ["topic", "text"])},
+    {"name": "define_dataset",
+     "description": "定义（或重新定义）一张数据表。实体表写 key（每行一个对象，如员工、小组，以及被别的表按编号引用的项目、销售单）；"
+                    "明细表写 link（每行挂到某层级对象或某个实体上，如回款 link=sales_id）；公司级表 key、link 都不写。"
+                    "同名字段表示关联。一张工作表混放多类数据时（如目标值表按 entity_type 区分部门/小组/个人），"
+                    "用 filter 只取其中一类，并把编号列映射成对应的字段名（如 group_id ← entity_id）。返回校验结果和换算后的样例行。",
+     "parameters": _obj({"name": {**_S, "description": "中文表名，如 人员、销售明细"}, "file": _S, "sheet": _S,
+                         "header_rows": {"type": "array", "items": _I, "description": "可选：表头所在的 Excel 行号，多行表头写多个"},
+                         "key": _S, "link": _S, "desc": _S,
+                         "filter": {"type": "object", "description": '可选：只取这些行，{"列名": "取值"} 或 {"列名": ["取值1", "取值2"]}'},
+                         "fields": {"type": "object", "additionalProperties": FIELD_SCHEMA,
+                                    "description": "字段名（英文小写加下划线） -> 定义"}},
+                        ["name", "file", "sheet", "fields"])},
+    {"name": "remove_dataset", "description": "删除一张已定义的数据表。", "parameters": _obj({"name": _S}, ["name"])},
+    {"name": "set_rules",
+     "description": "写入或修改计算规则。只给出要改的部分：tables / variables 按名字合并（值为 null 表示删除），"
+                    "pool、allocation、payout、offsets、checks、revisions 整体替换。返回静态校验结果。"
+                    "一批文件里有多个方案（如季度奖、过程奖、年度奖）时，每个方案用 scheme 分别写 pool 等；"
+                    "各方案相同的部分（分配层级与权重、数据校验、共用的参数表和变量）写到 scheme=\"共用\"，会合并进每个方案。"
+                    "只有一个方案时不写 scheme。",
+     "parameters": _obj({"scheme": {**_S, "description": "方案名，如 QUARTER；共用部分写 共用"},
+                         "tables": {"type": "object"}, "variables": {"type": "object"}, "pool": {"type": "object"},
+                         "allocation": {"type": "array", "items": {"type": "object"}},
+                         "payout": {"type": "array", "items": {"type": "object"},
+                                    "description": '发放条件：[{"id": "cash", "scope": "个人", "pay_ratio": "可发比例表达式"}] '
+                                                   '或 hold_ratio（挂起比例）'},
+                         "offsets": {"type": "array", "items": {"type": "object"},
+                                     "description": '已发抵扣：[{"id": "prior", "scope": "个人", "expr": "已发金额表达式"}]，'
+                                                    '可用 scheme_paid("QUARTER", "R2") 引用另一个方案某修订的本次实发'},
+                         "checks": {"type": "array", "items": {"type": "object"}},
+                         "revisions": {"type": "array", "items": {"type": "object"},
+                                       "description": '人工调整的修订版本，后一个包含前面的调整：[{"name": "R1", "adjust": '
+                                                      '[{"node": "小组:G01", "amount": 900000, "reason": "..."}]}]；R0 为不调整的基准'}})},
+    {"name": "trial_run", "description": "用当前数据表和规则试算，返回奖金池、各层级金额分布、各修订的变化和提示。不写 scheme 时试算全部方案。",
+     "parameters": _obj({"scheme": _S})},
+    {"name": "explain", "description": "查看计算链：节点 id（如 个人:E1001、项目:P001、全部）或变量追踪 id 的公式、代入数值后的算式和结果。",
+     "parameters": _obj({"id": _S, "scheme": _S, "revision": {**_S, "description": "默认 R0"}}, ["id"])},
+    {"name": "evaluate", "description": "在某个节点上用引擎计算任意表达式（如 sum(net_profit)），用于核对数据和规则。"
+                                        "节点可以是层级对象或关联实体（如 项目:P001）。需要先在 set_rules 里设定 allocation。",
+     "parameters": _obj({"expr": _S, "node": {**_S, "description": "节点 id，默认 全部"}, "scheme": _S}, ["expr"])},
+    {"name": "ask_question",
+     "description": "记录需要财务确认的问题（不会中断工作）。一般问题按 suggested 的理解继续计算；"
+                    "blocking=true 表示材料要求确认前不得计算或发放的口径（如未收款政策、跨期抵扣），"
+                    "结果会标为待确认，相关条款不要自行补出算法。",
+     "parameters": _obj({"text": _S, "options": {"type": "array", "items": _S}, "suggested": _I, "related": _S,
+                         "blocking": {"type": "boolean"}}, ["text", "options"])},
+    {"name": "finish", "description": "完成。要求每个方案在最近一次修改之后都已成功试算。",
+     "parameters": _obj({"summary": {**_S, "description": "两三句话说明：什么奖金、奖金池怎么来、怎么分、发放条件"},
+                         "ignored": {"type": "array", "items": _obj({"ref": _S, "reason": _S})}}, ["summary"])},
+]
+
+
+def openai_tools() -> list[dict]:
+    return [{"type": "function", "function": t} for t in TOOLS]
+
+
+# ---------------- 工作区 ----------------
+@dataclass
+class Step:
+    tool: str
+    args: dict
+    result: str
+    ok: bool
+
+
+@dataclass
+class Workspace:
+    llm: LLM
+    inv: Inventory
+    datasets: dict[str, DatasetDef] = field(default_factory=dict)
+    mapping: dict[str, DatasetMapping] = field(default_factory=dict)
+    drafts: dict[str, dict] = field(default_factory=dict)  # 方案 -> 规则草稿（tables / variables / pool / allocation ...）
+    questions: list[Question] = field(default_factory=list)
+    transcripts: dict[str, str] = field(default_factory=dict)
+    results: dict[str, dict[str, Result]] = field(default_factory=dict)   # 方案 -> 修订（R0 为基准）-> 结果
+    untested: set[str] = field(default_factory=set)        # 最近修改后还没试算成功的方案
+    summary: str = ""
+    ignored: list[dict] = field(default_factory=list)
+    notes: dict[str, str] = field(default_factory=dict)
+    done: bool = False
+    budget: str = ""
+
+    @property
+    def data_files(self) -> list[Path]:
+        return [f for f in self.inv.files if f.suffix.lower() in DATA_SUFFIXES]
+
+    # ---- 文件 ----
+    def _file(self, name: str) -> Path:
+        hit = [f for f in self.inv.files if f.name == name or str(f) == name]
+        if not hit:
+            raise ToolError(f"没有文件「{name}」，可用文件：{[f.name for f in self.inv.files]}")
+        return hit[0]
+
+    def list_files(self) -> str:
+        lines = []
+        for f in self.inv.files:
+            if f.suffix.lower() in DATA_SUFFIXES:
+                lines.append(f"- {f.name}（Excel）")
+                for ref, body in self.inv.sheet_text.items():
+                    if ref.startswith(f.name + "/"):
+                        st = self.inv.sheet(ref)
+                        if st is None:
+                            lines.append(f"  · 工作表「{ref.split('/', 1)[1]}」：未识别出规整表格（{body.count(chr(10)) + 1} 行），可用 read_sheet 查看")
+                        else:
+                            lines.append(f"  · 工作表「{st.sheet}」：表头在第 {st.header_row} 行，{len(st.rows)} 行数据"
+                                         + (f"，{len(st.totals)} 行合计" if st.totals else "")
+                                         + f"；表头 {[h for h in st.headers if h]}")
+            else:
+                d = next(d for d in self.inv.docs if d.name == f.name)
+                imgs = sum(1 for b in d.blocks if b.kind == "image")
+                lines.append(f"- {f.name}（{f.suffix[1:]}，约 {len(d.full_text())} 字" + (f"，{imgs} 张图片" if imgs else "") + "）")
+        return "\n".join(lines)
+
+    def read_document(self, file: str, offset: int = 0) -> str:
+        f = self._file(file)
+        d = next((d for d in self.inv.docs if d.name == f.name), None)
+        if d is None:
+            raise ToolError(f"{file} 是 Excel，请用 read_sheet")
+        parts, k = [], 0
+        for b in d.blocks:
+            if b.kind == "image":
+                k += 1
+                t = self.transcripts.get(f"{d.name}#{k}")
+                parts.append(f"{b.label()} 图片 #{k}" + (f"（已转写）\n{t}" if t else "（用 view_image 查看）"))
+            elif b.text:
+                parts.append(f"{b.label()}\n{b.text}")
+        text = "\n\n".join(parts)
+        chunk = text[offset:offset + MAX_RESULT_CHARS - 200]
+        more = len(text) - offset - len(chunk)
+        return chunk + (f"\n\n……还有 {more} 字，用 offset={offset + len(chunk)} 继续读取" if more > 0 else "")
+
+    def view_image(self, file: str, index: int = 1, focus: str = "") -> str:
+        f = self._file(file)
+        d = next((d for d in self.inv.docs if d.name == f.name), None)
+        imgs = [b for b in d.blocks if b.kind == "image"] if d else []
+        if not 1 <= index <= len(imgs):
+            raise ToolError(f"{file} 中有 {len(imgs)} 张图片，index 应在 1~{len(imgs)}")
+        b = imgs[index - 1]
+        ask = "请转写这张图片。" + (f"重点看清：{focus}" if focus else "")
+        text = self.llm.chat([{"role": "system", "content": prompt("transcribe")},
+                              {"role": "user", "content": [image_part(b.image, b.mime), {"type": "text", "text": ask}]}],
+                             temperature=0).strip()
+        self.transcripts[f"{d.name}#{index}"] = text
+        return text
+
+    def read_sheet(self, file: str, sheet: str, start_row: int = 1, rows: int = 40) -> str:
+        f = self._file(file)
+        if f"{f.name}/{sheet}" not in self.inv.sheet_text:
+            sheets = [r.split("/", 1)[1] for r in self.inv.sheet_text if r.startswith(f.name + "/")]
+            raise ToolError(f"{f.name} 中没有工作表「{sheet}」，可选：{sheets}")
+        import openpyxl
+        ws = openpyxl.load_workbook(f, data_only=True, read_only=True)[sheet]
+        start_row, rows = max(1, start_row), max(1, min(rows, 80))
+        out, total = [], 0
+        for i, r in enumerate(ws.iter_rows(values_only=True), start=1):
+            total = i
+            if start_row <= i < start_row + rows:
+                cells = ["" if v is None else str(v).replace("\n", " ")[:30] for v in r]
+                while cells and cells[-1] == "":
+                    cells.pop()
+                out.append(f"第{i}行 | " + " | ".join(cells))
+        st = self.inv.sheet(f"{f.name}/{sheet}")
+        head = (f"工作表共 {total} 行" + (f"，自动识别表头在第 {st.header_row} 行、{len(st.rows)} 行数据" if st else "，未自动识别出表格")
+                + f"；以下为第 {start_row}~{min(start_row + rows - 1, total)} 行")
+        end = start_row + rows - 1
+        tail = (f"\n（还有第 {end + 1}~{total} 行，用 start_row={end + 1} 继续；数据表不必读完，define_dataset 会读取全部行）"
+                if end < total else "\n（已到末尾）")
+        return head + "\n" + "\n".join(out) + tail
+
+    def note(self, topic: str, text: str) -> str:
+        if text.strip():
+            self.notes[topic] = text.strip()
+        else:
+            self.notes.pop(topic, None)
+        return f"已记录「{topic}」（共 {len(self.notes)} 条笔记，每轮都会附在工作区状态里）"
+
+    # ---- 数据表 ----
+    def define_dataset(self, name: str, file: str, sheet: str, fields: dict, key: str | None = None,
+                       link: str | None = None, desc: str = "", header_rows: list[int] | None = None,
+                       filter: dict | None = None) -> str:
+        f = self._file(file)
+        try:
+            st = table_at(f, sheet, header_rows) if header_rows else self.inv.sheet(f"{f.name}/{sheet}")
+        except (KeyError, ValueError) as e:
+            raise ToolError(str(e)) from None
+        if st is None:
+            raise ToolError(f"{f.name}/{sheet} 没有自动识别出表格，请先 read_sheet 查看，再用 header_rows 指定表头行")
+        try:
+            pd = PlanDataset(sheet=sheet, key=key or None, link=link or None, desc=desc, fields=fields)
+        except ValidationError as e:
+            raise ToolError(f"参数格式不对：{e}") from None
+        types = {fn: (fd.type, n) for n, d in self.datasets.items() if n != name for fn, fd in d.fields.items()}
+        if filter is not None and not (isinstance(filter, dict) and all(isinstance(v, (str, int, float, list))
+                                                                         for v in filter.values())):
+            raise ToolError('filter 的格式是 {"列名": "取值"} 或 {"列名": ["取值1", "取值2"]}')
+        flt = {str(k): ([str(x) for x in v] if isinstance(v, list) else str(v)) for k, v in (filter or {}).items()}
+        d, m, warnings, errors = check_dataset(name, pd, st, types, header_rows, flt)
+        if errors:
+            raise ToolError("未保存，请修正：\n" + "\n".join(f"- {e}" for e in errors))
+        self.datasets[name], self.mapping[name] = d, m
+        self.untested |= set(self.schemes)
+        kind = f"实体表，主键 {d.key}" if d.key else f"明细表，关联 {d.link}" if d.link else "公司级表"
+        sample = []
+        from bonus_core.data.table import convert
+        st, _ = filter_sheet(st, flt)
+        for _, vals in st.rows[:3]:
+            sample.append({fn: fmt(convert(vals[st.headers.index(c)], d.fields[fn])) for fn, c in m.columns.items()})
+        lines = [f"已保存「{name}」（{kind}），{len(st.rows)} 行" + (f"，另有 {len(st.totals)} 行合计（不计入）" if st.totals else "")]
+        lines += [f"注意：{w}" for w in warnings]
+        lines.append("前 3 行（金额已换算为元）：" + json.dumps(sample, ensure_ascii=False))
+        return "\n".join(lines)
+
+    def remove_dataset(self, name: str) -> str:
+        if name not in self.datasets:
+            raise ToolError(f"没有数据表「{name}」")
+        del self.datasets[name], self.mapping[name]
+        self.untested |= set(self.schemes)
+        return f"已删除「{name}」"
+
+    # ---- 规则（可以有多个方案，"共用" 方案合并进每个方案） ----
+    def _scheme(self, scheme: str | None, *, for_write: bool = False) -> str:
+        if scheme:
+            if not for_write and scheme not in self.schemes:
+                raise ToolError(f"没有方案「{scheme}」，已有方案：{self.schemes or '无'}")
+            return scheme
+        if for_write or not self.schemes:
+            return self.schemes[0] if len(self.schemes) == 1 else DEFAULT_SCHEME
+        if len(self.schemes) == 1:
+            return self.schemes[0]
+        raise ToolError(f"有多个方案 {self.schemes}，请用 scheme 指定")
+
+    @property
+    def schemes(self) -> list[str]:
+        """要计算的方案（不含共用部分）。"""
+        return [s for s in self.drafts if s != SHARED]
+
+    def set_rules(self, scheme: str | None = None, **parts) -> str:
+        name = self._scheme(scheme, for_write=True)
+        if name == SHARED and parts.get("pool") is not None:
+            raise ToolError("pool 是每个方案自己的，不能写在共用部分")
+        draft = json.loads(json.dumps(self.drafts.get(name, {})))
+        for k in ("tables", "variables"):
+            for n, v in (parts.get(k) or {}).items():
+                if v is None:
+                    draft.setdefault(k, {}).pop(n, None)
+                else:
+                    draft.setdefault(k, {})[n] = v
+        for k in ("pool", "allocation", "payout", "offsets", "checks", "revisions"):
+            if parts.get(k) is not None:
+                draft[k] = parts[k]
+        try:
+            _revisions(draft.get("revisions"))
+            targets = self.schemes if name == SHARED else [name]
+            rss = {t: self._ruleset(t, {**self.drafts, name: draft}) for t in targets}
+        except (ValidationError, ValueError) as e:
+            raise ToolError(f"规则格式不对，未保存：{str(e)[:2500]}") from None
+        self.drafts[name] = draft
+        self.untested |= set(targets)
+        out = [f"已保存{'共用部分' if name == SHARED else f'方案「{name}」'}。"]
+        for t, rs in rss.items():
+            full = self._merged(t)
+            issues = validate(rs)
+            if "pool" not in full:
+                issues = [i for i in issues if i.where != "pool"]
+            blocking = [str(i) for i in issues if i.severity == "blocking"]
+            warns = [str(i) for i in issues if i.severity == "warning"]
+            head = f"「{t}」" + ("（尚未设定 pool）" if "pool" not in full else "")
+            if blocking:
+                out.append(head + "静态校验发现问题，需要修正：\n" + "\n".join(f"- {e}" for e in blocking))
+            else:
+                out.append(head + "静态校验通过。" + ("\n提示：\n" + "\n".join(f"- {w}" for w in warns) if warns else ""))
+        if not rss:
+            out.append("还没有具体方案；用 set_rules(scheme=方案名, pool=...) 写入各方案后再校验。")
+        return "\n".join(out)
+
+    def _merged(self, scheme: str, drafts: dict | None = None) -> dict:
+        drafts = self.drafts if drafts is None else drafts
+        base, own = drafts.get(SHARED, {}), drafts.get(scheme, {})
+        out = {k: v for k, v in base.items() if k not in ("tables", "variables")}
+        for k in ("tables", "variables"):
+            if base.get(k) or own.get(k):
+                out[k] = {**base.get(k, {}), **own.get(k, {})}
+        out.update({k: v for k, v in own.items() if k not in ("tables", "variables")})
+        return out
+
+    def _ruleset(self, scheme: str | None = None, drafts: dict | None = None) -> RuleSet:
+        scheme = scheme or self._scheme(None)
+        draft = {k: v for k, v in self._merged(scheme, drafts).items() if k != "revisions"}
+        ext = Extraction.model_validate({"pool": {"expr": "0"}, "allocation": [], **draft})
+        return RuleSet(name=scheme if scheme != DEFAULT_SCHEME else (self.summary[:30] or "智能体草稿"),
+                       version="agent-draft", datasets=self.datasets, **ext.model_dump(exclude={"questions"}))
+
+    def _data(self, rs: RuleSet):
+        data, issues = apply_mapping(rs, self.data_files, self.mapping)
+        blocking = [i for i in issues if i.severity == "blocking"]
+        if blocking:
+            raise ToolError("数据问题：\n" + "\n".join(f"- {i}" for i in blocking[:8]))
+        return data, issues
+
+    def trial_run(self, scheme: str | None = None) -> str:
+        if not self.datasets:
+            raise ToolError("还没有定义数据表")
+        names = [self._scheme(scheme)] if scheme or len(self.schemes) <= 1 else self._order(self.schemes)
+        out = []
+        for name in names:
+            if "pool" not in self._merged(name) or not self._merged(name).get("allocation"):
+                raise ToolError(f"方案「{name}」的规则还缺 pool 或 allocation")
+            out.append(self._trial(name))
+        return "\n\n".join(out)
+
+    def _deps(self, name: str) -> set[tuple[str, str]]:
+        """方案引用的其他方案（修订）：规则里 scheme_paid("方案", "修订") 的参数。"""
+        out: set[tuple[str, str]] = set()
+
+        def walk(v):
+            if isinstance(v, str):
+                out.update((m[0], m[1] or "R0") for m in SCHEME_REF.findall(v))
+            elif isinstance(v, dict):
+                for x in v.values():
+                    walk(x)
+            elif isinstance(v, list):
+                for x in v:
+                    walk(x)
+        walk(self._merged(name))
+        return out
+
+    def _order(self, names: list[str]) -> list[str]:
+        """被引用的方案排在前面。"""
+        out: list[str] = []
+
+        def visit(n, path):
+            if n in out:
+                return
+            if n in path:
+                raise ToolError(f"方案之间循环引用：{' → '.join(path + [n])}")
+            for d, _ in sorted(self._deps(n)):
+                if d in self.schemes:
+                    visit(d, path + [n])
+            out.append(n)
+        for n in names:
+            visit(n, [])
+        return [n for n in out if n in names]
+
+    def _refs(self, name: str, _path: tuple = ()) -> dict[str, Result]:
+        """本方案引用的其他方案结果；还没试算或改过的，先试算。"""
+        refs = {}
+        for s, rev in sorted(self._deps(name)):
+            if s == name or s in _path:
+                raise ToolError(f"方案「{name}」不能引用自己或形成循环引用（{s}）")
+            if s not in self.schemes:
+                raise ToolError(f"方案「{name}」引用了不存在的方案「{s}」，现有方案：{self.schemes}")
+            if s in self.untested or s not in self.results:
+                self._trial(s, _path + (name,))
+            if rev not in self.results[s]:
+                raise ToolError(f"方案「{name}」引用了「{s}」的修订 {rev}，但该方案只有 {list(self.results[s])}")
+            refs[f"{s}/{rev}"] = self.results[s][rev]
+        return refs
+
+    def _trial(self, name: str, _path: tuple = ()) -> str:
+        rs = self._ruleset(name)
+        data, issues = self._data(rs)
+        refs = self._refs(name, _path)
+        try:
+            eng = Engine(rs, data, refs)
+            res = {"R0": eng.compute()}
+            done: list[Adjustment] = []
+            for rev in _revisions(self._merged(name).get("revisions")):
+                done += [Adjustment(a["node"], Decimal(str(a["amount"])), reason=a.get("reason", ""), id=a.get("id", ""),
+                                    created_at=f"{len(done) + i:06d}") for i, a in enumerate(rev["adjust"])]
+                res[rev["name"]] = eng.compute(list(done))
+        except EngineError as e:
+            raise ToolError(f"方案「{name}」试算失败：\n" + "\n".join(f"- {i}" for i in e.issues[:8])) from None
+        except (EvalError, AdjustConflict, ValueError) as e:
+            raise ToolError(f"方案「{name}」试算失败：{e}") from None
+        self.results[name] = res
+        self.untested.discard(name)
+        self.untested |= {s for s in self.schemes if s != name and name in {d for d, _ in self._deps(s)}}  # 引用本方案的要重算
+        base = res["R0"]
+        lines = [f"方案「{name}」试算成功。奖金池 {fmt(Decimal(base.pool))} 元（精确值 {base.pool_exact}）"]
+        for lv in base.levels:
+            ns = sorted((n for n in base.nodes.values() if n.level == lv), key=lambda n: -float(n.final))
+            total = sum(float(n.final) for n in ns)
+            zero = sum(1 for n in ns if float(n.final) == 0)
+            top = "，".join(f"{n.id}（{n.label}）{fmt(Decimal(n.final))}" for n in ns[:8])
+            lines.append(f"「{lv}」{len(ns)} 个，合计 {total:,.2f}，为 0 的 {zero} 个；最多的：{top}"
+                         + ("……" if len(ns) > 8 else "") + f"；最少的：{ns[-1].id} {fmt(Decimal(ns[-1].final))}")
+        for rev, r in list(res.items())[1:]:
+            changed = [k for k, n in r.nodes.items() if n.final != base.nodes[k].final]
+            lines.append(f"修订 {rev}：{len(changed)} 个对象金额变化，奖金池 {fmt(Decimal(r.pool))}；"
+                         + "，".join(f"{k} {fmt(Decimal(base.nodes[k].final))}→{fmt(Decimal(r.nodes[k].final))}"
+                                    for k in changed[:6]))
+        held = sum(float(p.held) for p in base.payouts.values())
+        if base.payouts:
+            paid = sum(Decimal(p.paid) for p in base.payouts.values())
+            off = sum(Decimal(p.offset or 0) for p in base.payouts.values())
+            over = sum(Decimal(p.overpaid or 0) for p in base.payouts.values())
+            lines.append(f"发放：本次实发合计 {paid:,.2f}，暂缓合计 {held:,.2f}"
+                         + (f"，已发抵扣 {off:,.2f}，超发待核对 {over:,.2f}" if off or over else ""))
+        if refs:
+            lines.append("引用：" + "、".join(refs))
+        warns = [str(i) for i in list(issues) + list(base.issues) if i.severity == "warning"]
+        if warns:
+            lines.append("数据提示：\n" + "\n".join(f"- {w}" for w in warns[:8]))
+        return "\n".join(lines)
+
+    @property
+    def result(self) -> Result | None:
+        """第一个方案的基准结果（兼容只有一个方案的情况）。"""
+        s = self.schemes[0] if self.schemes else None
+        return self.results.get(s, {}).get("R0") if s else None
+
+    @property
+    def dirty(self) -> bool:
+        return bool(self.untested) or not self.schemes or any(s not in self.results for s in self.schemes)
+
+    def explain(self, id: str, scheme: str | None = None, revision: str = "R0") -> str:
+        name = self._scheme(scheme)
+        res = self.results.get(name, {}).get(revision)
+        if res is None:
+            raise ToolError(f"方案「{name}」{revision} 还没有试算结果，先 trial_run")
+        tr = res.traces
+        keys = [k for k in tr if k == id or k.startswith(id + "/")] or [k for k in tr if id in k]
+        if not keys:
+            raise ToolError(f"没有找到「{id}」的计算链，节点 id 形如 {next(iter(res.nodes), '')}")
+        out = []
+        for k in keys[:12]:
+            t = tr[k]
+            out.append(f"{t.id}：{t.expr}\n  = {t.rendered}\n  = {t.value}" + (f"\n  明细行：{', '.join(t.rows[:5])}" if t.rows else ""))
+        if id in res.nodes:
+            n = res.nodes[id]
+            out.append(f"{id} 最终金额 {fmt(Decimal(n.final))}（权重 {n.weight}，上级 {n.parent}）")
+        return "\n".join(out)
+
+    def evaluate(self, expr: str, node: str = ROOT_LEVEL, scheme: str | None = None) -> str:
+        name = self._scheme(scheme) if self.schemes else self._scheme(None, for_write=True)
+        if not self._merged(name).get("allocation"):
+            raise ToolError("需要先用 set_rules 设定 allocation（pool 可以先写 0）")
+        rs = self._ruleset(name)
+        data, _ = self._data(rs)
+        root, by_level, issues = build_tree(rs, data)
+        blocking = [i for i in issues if i.severity == "blocking"]
+        if blocking:
+            raise ToolError("建树失败：" + "；".join(str(i) for i in blocking[:5]))
+        nodes = {n.id: n for n in root.walk()}
+        nodes.update({n.id: n for tbl in (root.index or {}).values() for n in tbl.values()})
+        if node not in nodes:
+            raise ToolError(f"没有节点「{node}」，例：{list(nodes)[:5]}")
+        ev = Evaluator(rs, root, by_level)
+        try:
+            v = ev.evaluate(expr, nodes[node], "probe", "probe")
+        except (EvalError, ValueError) as e:
+            raise ToolError(f"计算失败：{e}") from None
+        return f"{expr} = {ev.traces['probe'].rendered} = {fmt(v)}"
+
+    # ---- 问题与完成 ----
+    def ask_question(self, text: str, options: list[str], suggested: int | None = 0, related: str = "",
+                     blocking: bool = False) -> str:
+        q = Question(id=f"q{len(self.questions) + 1}", text=text, options=options, suggested=suggested, related=related,
+                     blocking=blocking)
+        self.questions.append(q)
+        if blocking:
+            return (f"已记录阻断问题 {q.id}：财务确认前结果只是草稿、不得发放。不要自行选择口径，"
+                    "相关条款先不写进规则，其余部分照常完成并试算")
+        return f"已记录问题 {q.id}，请按「{options[suggested] if suggested is not None and 0 <= suggested < len(options) else '最可能的理解'}」继续"
+
+    def finish(self, summary: str, ignored: list[dict] | None = None) -> str:
+        if not self.schemes:
+            raise ToolError("还没有写入规则")
+        pending = [s for s in self.schemes if s in self.untested or s not in self.results]
+        if pending:
+            raise ToolError(f"方案 {pending} 最近一次修改之后还没有成功试算，请先 trial_run")
+        self.summary, self.ignored, self.done = summary, ignored or [], True
+        return "已完成"
+
+    def state(self) -> str:
+        """每轮附在请求末尾的工作区摘要。"""
+        lines = ["【当前工作区状态】" + (f"（{self.budget}）" if self.budget else "")]
+        if self.notes:
+            lines.append("- 笔记：")
+            lines += [f"  · {k}：{v}" for k, v in self.notes.items()]
+        if self.datasets:
+            for n, d in self.datasets.items():
+                m = self.mapping[n]
+                kind = (f"key={d.key}" + (f", link={d.link}" if d.link else "")) if d.key else f"link={d.link}" if d.link else "公司级"
+                flt = f" 筛选 {m.filter}" if m.filter else ""
+                lines.append(f"- 数据表「{n}」← {m.file}/{m.sheet}{flt}（{kind}）字段：{', '.join(d.fields)}")
+        else:
+            lines.append("- 尚未定义数据表")
+        if self.drafts:
+            for s, d in self.drafts.items():
+                title = "共用部分（合并进每个方案）" if s == SHARED else f"方案「{s}」"
+                lines.append(f"- {title}规则摘要（不含出处；修改时按名字只传要改的部分）：\n" + _rules_brief(d))
+        else:
+            lines.append("- 尚未写入规则")
+        if self.questions:
+            lines.append("- 已记录问题：" + "；".join(q.text for q in self.questions))
+        if self.transcripts:
+            lines.append(f"- 已查看图片：{', '.join(self.transcripts)}")
+        for s in self.schemes:
+            r = self.results.get(s, {})
+            lines.append(f"- 试算「{s}」：" + ("最近修改后尚未试算" if s in self.untested or not r else
+                                             f"已试算，奖金池 {fmt(Decimal(r['R0'].pool))}" + (f"，修订 {list(r)[1:]}" if len(r) > 1 else "")))
+        return "\n".join(lines)
+
+
+def _revisions(revs) -> list[dict]:
+    """修订版本：[{"name": "R1", "adjust": [{"node": "小组:G01", "amount": 900000, "reason": ...}]}, ...]。
+    后一个修订包含前面所有修订的调整（逐步累加），R0 是不做调整的基准。"""
+    out = []
+    for r in revs or []:
+        if not isinstance(r, dict) or not r.get("name") or not isinstance(r.get("adjust"), list):
+            raise ValueError('revisions 的每一项应为 {"name": "R1", "adjust": [{"node": "小组:G01", "amount": 900000}]}')
+        if r["name"] == "R0":
+            raise ValueError("R0 是不做调整的基准结果，修订从 R1 开始命名")
+        for a in r["adjust"]:
+            if not isinstance(a, dict) or "node" not in a or "amount" not in a:
+                raise ValueError(f"修订 {r['name']} 的调整项应为 {{\"node\": 节点 id, \"amount\": 金额}}，得到 {a}")
+        out.append(r)
+    return out
+
+
+def _rules_brief(draft: dict, limit: int = 3000) -> str:
+    out = []
+    for n, t in (draft.get("tables") or {}).items():
+        if t.get("kind") == "lookup" or "mapping" in t:
+            out.append(f"  表 {n}：查找表 {json.dumps(t.get('mapping'), ensure_ascii=False)}")
+        else:
+            out.append(f"  表 {n}：{t.get('mode', '')} 阶梯 {json.dumps(t.get('steps'), ensure_ascii=False)}")
+    for n, v in (draft.get("variables") or {}).items():
+        out.append(f"  变量 {n}[{v.get('scope', 'global')}] = {v.get('expr')}")
+    if "pool" in draft:
+        p = draft["pool"] or {}
+        out.append(f"  pool[{p.get('scope', 'global')}] = {p.get('expr')}")
+    for lv in draft.get("allocation") or []:
+        out.append(f"  分配 {lv.get('level')}（key={lv.get('key')}, parent_key={lv.get('parent_key')}）权重 = {lv.get('weight')}")
+    for p in draft.get("payout") or []:
+        out.append(f"  发放 {p.get('id')}[{p.get('scope')}] 暂缓比例 = {p.get('hold_ratio')}")
+    for c in draft.get("checks") or []:
+        out.append(f"  校验 {c.get('id')}[{c.get('scope', 'global')}]：{c.get('expr')}")
+    for r in draft.get("revisions") or []:
+        out.append(f"  修订 {r.get('name')}：" + "，".join(f"{a.get('node')}={a.get('amount')}" for a in r.get("adjust") or []))
+    text = "\n".join(out)
+    return text if len(text) <= limit else text[:limit] + "……"
+
+
+# ---------------- 主循环 ----------------
+def system_prompt() -> str:
+    dsl = prompt("extract_rules")
+    dsl = dsl[dsl.index("# 规则 DSL") + len("# 规则 DSL"):dsl.index("# 数据字典")]
+    dsl = dsl.replace("数据字典（datasets）已固定，见下文，你**只能引用其中的字段名**，不能自造字段。你需要输出：",
+                      "表达式只能引用你用 define_dataset 定义过的字段名。规则包括：")
+    dsl = dsl.replace("{functions}", describe_functions())
+    return prompt("agent").replace("{dsl}", dsl.strip())
+
+
+JSON_PROTOCOL = """
+# 回复格式（本模型不使用原生工具调用）
+每次只输出一个 JSON 对象，不要输出其他文字：{"thought": "简短的思考", "tool": "工具名", "args": {参数}}
+可用工具（JSON Schema）：
+"""
+
+
+@dataclass
+class AgentResult:
+    ws: Workspace
+    steps: list[Step]
+    ruleset: RuleSet | None
+    result: Result | None
+    error: str = ""
+    outputs: dict[str, Path] = field(default_factory=dict)
+    quote_hits: int = 0
+    quote_total: int = 0
+    recheck: str = ""
+    rulesets: dict[str, RuleSet] = field(default_factory=dict)          # 方案 -> 规则
+    pending: list[dict] = field(default_factory=list)                   # 尚未答复的阻断问题
+    results: dict[str, dict[str, Result]] = field(default_factory=dict)  # 方案 -> 修订 -> 结果
+
+    @property
+    def single(self) -> bool:
+        """只有一个默认方案、没有修订：输出文件和以前一样（rules.yaml、result.xlsx）。"""
+        return list(self.results) == [DEFAULT_SCHEME] and list(self.results[DEFAULT_SCHEME]) == ["R0"]
+
+    @property
+    def ok(self) -> bool:
+        return self.ws.done and self.result is not None
+
+    @property
+    def questions(self) -> list[Question]:
+        return self.ws.questions
+
+    @property
+    def status(self) -> str:
+        """OK：可交财务复核；NEEDS_CONFIRMATION：有阻断问题未答复，结果只是草稿、不得发放；FAILED：未完成。"""
+        return "FAILED" if not self.ok else "NEEDS_CONFIRMATION" if self.pending else "OK"
+
+
+def _size(ms: list[dict]) -> int:
+    return sum(len(json.dumps(m, ensure_ascii=False)) for m in ms)
+
+
+def _is_result(m: dict) -> bool:
+    return m["role"] == "tool" or (m["role"] == "user" and str(m.get("content", "")).startswith("【") and "的结果】" in
+                                   str(m.get("content", "")).split("\n", 1)[0])
+
+
+def _shrink(history: list[dict], max_chars: int, keep: int = KEEP_FULL_RESULTS) -> bool:
+    """历史超过 max_chars 时整理一次（原地修改），返回是否整理过。
+
+    先把较早的工具结果改成摘要、较早的长参数省略；仍超过上限的一半，就从最早的一轮开始丢弃，
+    直到不超过一半，留出空间让之后多轮只追加不改动（前缀不变，缓存可以命中）。
+    丢弃时保证剩下的历史以 assistant 消息开头（工具结果不落单）。"""
+    if _size(history) <= max_chars:
+        return False
+    results = [i for i, m in enumerate(history) if _is_result(m)]
+    cut = results[-keep] if len(results) >= keep else 0
+    for i in results[:-keep] if len(results) > keep else []:
+        c = history[i]["content"]
+        if len(c) > BRIEF_CHARS + 60:
+            history[i] = {**history[i], "content": c[:BRIEF_CHARS] + "\n……（较早的结果已省略。关键信息应已记在笔记里，确需原文可重新调用）"}
+    for i, m in enumerate(history[:cut]):
+        for tc in m.get("tool_calls") or []:
+            if len(tc["function"]["arguments"]) > 600:
+                tc["function"]["arguments"] = json.dumps({"省略": "较早的参数已省略，当前规则见工作区状态"}, ensure_ascii=False)
+    starts = [i for i, m in enumerate(history) if m["role"] == "assistant"]
+    for i in starts:
+        if _size(history[i:]) <= max_chars // 2:
+            del history[:i]
+            return True
+    if starts:
+        del history[:starts[-1]]
+    return True
+
+
+def _answers_text(answers: list[dict] | None) -> str:
+    done = [a for a in answers or [] if a.get("answer") not in (None, "")]
+    if not done:
+        return ""
+    lines = ["\n财务已确认的答复（必须按此处理，不要再就这些问题提问）："]
+    for a in done:
+        ans = a["answer"]
+        if isinstance(ans, int) and 0 <= ans < len(a.get("options") or []):
+            ans = a["options"][ans]
+        lines.append(f"- {a.get('text', '')} → {ans}")
+    return "\n".join(lines)
+
+
+def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = None, *,
+              answers: list[dict] | None = None, max_steps: int = 80, max_history_chars: int = 24000,
+              max_files: int = MAX_FILES, max_tokens: int | None = 1_000_000, exclude: list[str | Path] = (),
+              on_step: Callable[[int, Step], None] | None = None) -> AgentResult:
+    """max_steps 和 max_tokens 都是安全上限：模型调用 finish 就结束，正常不会用满。"""
+    try:
+        files = collect_files(paths, exclude=([out_dir] if out_dir else []) + list(exclude), max_files=max_files)
+    except (TooManyFiles, FileNotFoundError) as e:
+        raise ToolError(str(e)) from None
+    if not files:
+        raise ToolError("没有找到可处理的文件（支持 .docx .pptx .xlsx .xlsm .png .jpg .txt .md .json .csv）")
+    ws = Workspace(llm, build_inventory(files))
+    handlers = {t["name"]: getattr(ws, t["name"]) for t in TOOLS}
+    task = ("请完成本批次的奖金计算。文件清单：\n" + ws.list_files() + _answers_text(answers)
+            + "\n\n完成后调用 finish。")
+    mode = llm.tool_mode
+    sys = system_prompt()
+    history: list[dict] = []
+    steps: list[Step] = []
+    error = ""
+    nudges = 0
+    seen: dict[str, int] = {}          # 只读工具的调用 -> 第几步，用来发现原地打转
+    repeats = 0
+    for turn in range(max_steps):
+        used = llm.usage.prompt_tokens + llm.usage.completion_tokens
+        if max_tokens and used >= max_tokens:
+            error = f"tokens 用量 {used} 达到上限 {max_tokens}，已停止"
+            break
+        ws.budget = f"已用 {len(steps)} 步，上限 {max_steps} 步" + (f"；tokens 已用 {used}，上限 {max_tokens}" if max_tokens else "")
+        if _shrink(history, max_history_chars):
+            seen.clear()       # 较早的结果已省略，重新读取是合理的
+        tail = [{"role": "user", "content": ws.state()}]
+        # 缓存标记：系统提示 + 任务固定不变；历史在两次整理之间只追加，标在历史最后一条上
+        body = [{"role": "user", "content": task, "_cache": True}] + history[:-1] \
+            + ([{**history[-1], "_cache": True}] if history else [])
+        if mode == "json":
+            msgs = [{"role": "system", "content": sys + JSON_PROTOCOL + json.dumps(TOOLS, ensure_ascii=False)}] + body + tail
+            try:
+                text = llm.chat(msgs, json_out=True, temperature=0.1)
+            except LLMError as e:
+                error = str(e)
+                break
+            history.append({"role": "assistant", "content": text})
+            try:
+                act = parse_json(text)
+                calls = [{"id": "", "name": act["tool"], "arguments": json.dumps(act.get("args") or {}, ensure_ascii=False)}]
+            except (LLMError, KeyError, TypeError, ValueError):
+                history.append({"role": "user", "content": '格式不对：请只输出 {"thought": ..., "tool": ..., "args": {...}}'})
+                continue
+        else:
+            msgs = [{"role": "system", "content": sys}] + body + tail
+            try:
+                reply = llm.chat_tools(msgs, openai_tools())
+            except LLMError as e:
+                if turn == 0:  # 模型或服务不支持原生工具调用，改用 JSON 协议
+                    mode = "json"
+                    continue
+                error = str(e)
+                break
+            calls = reply["tool_calls"]
+            history.append({"role": "assistant", "content": reply["content"],
+                            **({"tool_calls": [{"id": c["id"], "type": "function",
+                                                "function": {"name": c["name"], "arguments": c["arguments"]}}
+                                               for c in calls]} if calls else {})})
+            if not calls:
+                nudges += 1
+                if nudges > 3:
+                    error = "模型多次没有调用工具"
+                    break
+                history.append({"role": "user", "content": "请调用工具继续工作；全部完成后调用 finish。"})
+                continue
+        for c in calls:
+            args = {}
+            sig = f"{c['name']}:{c['arguments']}"
+            if c["name"] in READ_ONLY and sig in seen:
+                repeats += 1
+                result = (f"这次调用与第 {seen[sig]} 步完全相同，内容没有变化，已跳过。不要重复调用；"
+                          f"需要更多内容请换参数（如 start_row、offset），否则根据已有信息进行下一步（定义数据表、写规则、试算）。")
+                steps.append(Step(c["name"], {}, result, False))
+                if on_step:
+                    on_step(len(steps), steps[-1])
+                history.append({"role": "user", "content": f"【{c['name']} 的结果】\n{result}"} if mode == "json"
+                               else {"role": "tool", "tool_call_id": c["id"], "content": result})
+                continue
+            try:
+                args = json.loads(c["arguments"] or "{}")
+                fn = handlers.get(c["name"])
+                if not isinstance(args, dict):
+                    raise ToolError("参数必须是 JSON 对象")
+                if fn is None:
+                    raise ToolError(f"没有工具 {c['name']}，可用：{list(handlers)}")
+                result, ok = str(fn(**args)), True
+            except ToolError as e:
+                result, ok = f"错误：{e}", False
+            except json.JSONDecodeError as e:
+                result, ok = f"错误：参数不是合法 JSON：{e}", False
+            except TypeError as e:
+                result, ok = f"错误：参数不对：{e}", False
+            if len(result) > MAX_RESULT_CHARS:
+                result = result[:MAX_RESULT_CHARS] + "……（已截断）"
+            step = Step(c["name"], args if isinstance(args, dict) else {}, result, ok)
+            if c["name"] in READ_ONLY and ok:
+                seen[sig] = len(steps) + 1
+            elif c["name"] not in READ_ONLY:
+                seen.clear()   # 工作区变了，重新读取是合理的
+            steps.append(step)
+            if on_step:
+                on_step(len(steps), step)
+            if mode == "json":
+                history.append({"role": "user", "content": f"【{c['name']} 的结果】\n{result}"})
+            else:
+                history.append({"role": "tool", "tool_call_id": c["id"], "content": result})
+        if ws.done:
+            break
+        if repeats >= 6:
+            error = "智能体反复重复相同的调用，已停止"
+            break
+    else:
+        error = f"达到最大步数 {max_steps} 仍未完成"
+
+    tested = {s: ws.results[s] for s in ws.schemes if s in ws.results and s not in ws.untested}
+    rss = {s: ws._ruleset(s) for s in tested}
+    first = next(iter(rss), None)
+    ar = AgentResult(ws, steps, rss.get(first), tested[first]["R0"] if first else None, error, rulesets=rss, results=tested)
+    for rs in rss.values():
+        h, t, _ = check_quotes(rs, ws.inv.docs)
+        ar.quote_hits, ar.quote_total = ar.quote_hits + h, ar.quote_total + t
+    if out_dir is not None:
+        ar.outputs = write_agent_outputs(ar, Path(out_dir), answers)
+    return ar
+
+
+# ---------------- 输出 ----------------
+def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None) -> dict[str, Path]:
+    out.mkdir(parents=True, exist_ok=True)
+    ws, paths = ar.ws, {}
+    if ws.mapping:
+        paths["mapping"] = out / "mapping.yaml"
+        paths["mapping"].write_text(yaml.safe_dump({k: v.model_dump(exclude_none=True, exclude_defaults=True)
+                                                    for k, v in ws.mapping.items()}, allow_unicode=True, sort_keys=False),
+                                    encoding="utf-8")
+    for name, rs in ar.rulesets.items():
+        key = "rules" if ar.single else f"rules:{name}"
+        paths[key] = out / ("rules.yaml" if ar.single else f"rules_{_safe(name)}.yaml")
+        paths[key].write_text(rs.dump_yaml(), encoding="utf-8")
+        done = []
+        for rev in _revisions(ws._merged(name).get("revisions")):
+            done += [{"node_id": a["node"], "amount": str(a["amount"]), "reason": a.get("reason", ""), "id": a.get("id", ""),
+                      "created_at": f"{len(done) + i:06d}"} for i, a in enumerate(rev["adjust"])]
+            paths[f"adjust:{name}:{rev['name']}"] = out / f"adjust_{_safe(name)}_{_safe(rev['name'])}.yaml"
+            paths[f"adjust:{name}:{rev['name']}"].write_text(yaml.safe_dump(list(done), allow_unicode=True, sort_keys=False),
+                                                             encoding="utf-8")
+    prev = {a.get("text"): a.get("answer") for a in answers or []}
+    qrows = [{"id": q.id, "text": q.text, "options": q.options, "suggested": q.suggested, "related": q.related,
+              "blocking": q.blocking, "answer": prev.get(q.text)} for q in ws.questions]
+    asked = {r["text"] for r in qrows}
+    qrows += [dict(a) for a in answers or [] if a.get("text") not in asked]
+    ar.pending = [r for r in qrows if r.get("blocking") and r.get("answer") in (None, "")]
+    paths["questions"] = out / "questions.yaml"
+    paths["questions"].write_text(
+        "# 财务答复：在 answer 里填选项序号（从 0 开始）或直接写文字，然后用 --answers 这个文件重跑\n"
+        + yaml.safe_dump(qrows, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    paths["log"] = out / "agent_log.json"
+    paths["log"].write_text(json.dumps({"summary": ws.summary, "error": ar.error, "transcripts": ws.transcripts,
+                                        "steps": [vars(s) for s in ar.steps]}, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+    if not ar.results:
+        return paths
+    ar.recheck = "；".join(_recheck(ar, paths, name, rev) for name, revs in ar.results.items() for rev in revs)
+    if ar.single:
+        paths["excel"] = out / "result.xlsx"
+        write_excel(ar.ruleset, ar.result, paths["excel"], extra_sheets=_sheets(ar, qrows))
+        return paths
+    for name, revs in ar.results.items():
+        for rev, res in revs.items():
+            k = f"excel:{name}:{rev}"
+            paths[k] = out / (f"result_{_safe(name)}.xlsx" if rev == "R0" else f"result_{_safe(name)}_{_safe(rev)}.xlsx")
+            write_excel(ar.rulesets[name], res, paths[k])
+    paths["excel"] = out / "result.xlsx"
+    _overview(ar, qrows, paths["excel"])
+    return paths
+
+
+def _safe(s: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in s)
+
+
+def _overview(ar: AgentResult, qrows: list[dict], path: Path):
+    """多个方案 / 修订时的总览：每个对象一行，每个方案（修订）一列。修订是同一方案的不同版本，不能相加。"""
+    import openpyxl
+    from bonus_core.report.excel import MONEY, _sheet
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    cols = [(n, r) for n, revs in ar.results.items() for r in revs]
+    heads = [n if r == "R0" else f"{n} {r}" for n, r in cols]
+    rows, seen = [], set()
+    for n, revs in ar.results.items():
+        for node in revs["R0"].nodes.values():
+            if node.id in seen:
+                continue
+            seen.add(node.id)
+            rows.append([node.level, node.key or "", node.label]
+                        + [float(ar.results[c][r].nodes[node.id].final) if node.id in ar.results[c][r].nodes else None
+                           for c, r in cols])
+    _sheet(wb, "各方案结果", ["层级", "编号", "名称"] + heads, rows, money_cols=range(4, 4 + len(cols)))
+    summary = [[h, float(Decimal(ar.results[c][r].pool)), f"result_{_safe(c)}" + ("" if r == "R0" else f"_{_safe(r)}") + ".xlsx"]
+               for h, (c, r) in zip(heads, cols)]
+    ws = _sheet(wb, "方案汇总", ["方案", "奖金池", "明细文件（含计算链）"], summary, money_cols=[2])
+    ws.append([])
+    ws.append(["说明：同一方案的 R1、R2 是人工调整后的修订版本，与 R0 是同一笔奖金的不同版本，不能相加。"])
+    for title, headers, data, widths in _sheets(ar, qrows):
+        _sheet(wb, title, headers, data, widths=widths)
+    for w in wb.worksheets:
+        for row in w.iter_rows(min_row=2):
+            for c in row:
+                if isinstance(c.value, float):
+                    c.number_format = MONEY
+    wb.save(path)
+
+
+def _recheck(ar: AgentResult, paths: dict[str, Path], name: str, rev: str) -> str:
+    """从写出的规则、映射（和调整）文件重新读入并重算，逐个对象核对金额，证明结果只来自引擎、可复算。"""
+    from bonus_core.data.mapping import load_mapping
+    label = "" if ar.single else f"{name}{'' if rev == 'R0' else ' ' + rev}："
+    want = ar.results[name][rev]
+    try:
+        rs = RuleSet.load(paths["rules" if ar.single else f"rules:{name}"])
+        data, _ = apply_mapping(rs, ar.ws.data_files, load_mapping(paths["mapping"]))
+        adj = []
+        if rev != "R0":
+            adj = [Adjustment(**a) for a in yaml.safe_load(paths[f"adjust:{name}:{rev}"].read_text(encoding="utf-8"))]
+        refs = {f"{s}/{r}": res for s, revs in ar.results.items() for r, res in revs.items() if s != name}
+        again = compute(rs, data, adj, refs=refs)
+    except Exception as e:  # 复算失败要如实写进结果，不能当作通过
+        return f"{label}复算失败：{e}"
+    diff = [i for i, n in want.nodes.items() if i not in again.nodes or again.nodes[i].final != n.final]
+    if again.pool != want.pool or diff:
+        return f"{label}复算不一致：奖金池 {again.pool} / {want.pool}，不一致的对象 {diff[:10]}"
+    files = "rules.yaml + mapping.yaml" if ar.single else f"规则、映射{'和调整' if rev != 'R0' else ''}文件"
+    return f"{label}一致：按 {files} 重新计算，奖金池和 {len(again.nodes)} 个对象的金额逐分相同"
+
+
+def _sheets(ar: AgentResult, qrows: list[dict]):
+    ws = ar.ws
+    status = (f"未完成：{ar.error}" if not ar.ok else
+              "待财务确认（NEEDS_CONFIRMATION）：有阻断问题未答复，以下结果只是草稿，不得发放。问题："
+              + "；".join(r["text"] for r in ar.pending) if ar.pending else
+              "智能体草稿：规则和数据映射由大模型生成，尚未经财务确认。请先处理「待确认问题」，确认后重算。")
+    plan = [["状态", status],
+            ["方案概述", ws.summary],
+            ["计算方案", "、".join(f"{n}（{'、'.join(r)}）" for n, r in ar.results.items()) or "无"],
+            ["规则来源", "、".join(d.name for d in ws.inv.docs)]]
+    for n, d in ws.datasets.items():
+        m = ws.mapping[n]
+        kind = f"实体表，主键 {d.key}" if d.key else f"明细表，关联 {d.link}" if d.link else "公司级表"
+        plan.append([f"数据表：{n}", f"{m.file}/{m.sheet}" + (f"，筛选 {m.filter}" if m.filter else "") + f"（{kind}）"])
+        plan += [[f"  {f}", f"← 「{c}」 {d.fields[f].type}" + (f"，{d.fields[f].unit}" if d.fields[f].unit else "")]
+                 for f, c in m.columns.items()]
+    plan += [["已忽略", f"{i.get('ref')}：{i.get('reason', '')}"] for i in ws.ignored]
+    plan.append(["原文引用命中", f"{ar.quote_hits}/{ar.quote_total}"])
+    plan.append(["复算核对", ar.recheck])
+    q = [[r["id"], "是" if r.get("blocking") else "", r["text"], " / ".join(r.get("options") or []),
+          (r["options"][r["suggested"]] if isinstance(r.get("suggested"), int)
+           and 0 <= r["suggested"] < len(r.get("options") or []) else ""), "" if r.get("answer") is None else str(r["answer"])]
+         for r in qrows]
+    log = [[i, s.tool, json.dumps(s.args, ensure_ascii=False)[:300], ("" if s.ok else "失败：") + s.result[:500]]
+           for i, s in enumerate(ar.steps, start=1)]
+    return [("待确认问题", ["编号", "阻断", "问题", "选项", "本次计算采用", "财务答复"], q, {"问题": 60, "选项": 40, "本次计算采用": 20}),
+            ("智能体规划", ["项目", "内容"], plan, {"项目": 22, "内容": 100}),
+            ("智能体工作记录", ["步骤", "工具", "参数", "结果"], log, {"参数": 60, "结果": 90})]

@@ -2,7 +2,7 @@
 
 为财务部提供季度奖金、年度奖金、过程奖金等场景的计算服务。核心原则：**大模型只负责读懂规则、匹配表头，所有金额由确定性的计算引擎算出**，每一分钱都能追溯到规则原文和数据行。
 
-当前处于**模型选型阶段**：智能体通过百炼 API 调用千问 3.6 / 3.5 的开源多模态模型（最初计划的 Qwen3-VL 32B / 30B-A3B / 8B 已在百炼下线），用评测脚本对比效果，确定后再私有化部署（只改 `config/models.yaml` 的 provider）。
+当前处于**模型选型阶段**：智能体通过百炼 API 调用千问 3.6 / 3.5 的开源多模态模型（最初计划的 Qwen3-VL 32B / 30B-A3B / 8B 已在百炼下线），用评测脚本对比效果，确定后再私有化部署（只改 `bonus_agent/config/models.yaml` 的 provider）。
 
 ## 目录
 
@@ -21,7 +21,7 @@ evals/                 模型选型评测
   cases/sales_q3/      评测样例：销售季度奖金，Word + 阶梯图片 + PPT 表格 + PPT 系数图片
   cases/annual_2026/   评测样例：公司年终奖，PPT + Word 补充通知 + 含说明页和公司级利润表的 Excel
   run_eval.py          命令行 bonus-eval
-config/models.yaml     模型与服务商配置
+bonus_agent/config/models.yaml  模型与服务商配置（随安装包发布；当前目录有 config/models.yaml 时优先用它）
 examples/sales_q3/     示例：规则、示例数据（格式故意不规整）、字段映射、调整记录
 examples/auth/         服务间鉴权签名头示例（Python 签名与校验、Java 签名），给前后端对接用
 tests/                 单元测试、属性测试、端到端测试
@@ -125,7 +125,7 @@ bonus-eval --modes agent --repeats 3                  # 大模型主导的智能
 bonus-eval --modes agent,auto --repeats 3             # 对比智能体和固定流程
 ```
 
-已配置的模型分组（`config/models.yaml`，2026-10-28 用 `--remote` 实测）：
+已配置的模型分组（`bonus_agent/config/models.yaml`，2026-10-28 用 `--remote` 实测）：
 
 | 分组 | 模型 | 说明 |
 | --- | --- | --- |
@@ -165,7 +165,7 @@ bonus-agent map --model qwen3-vl-32b --rules draft.yaml 数据.xlsx
 
 ## 三、私有化部署（选型之后）
 
-在 `config/models.yaml` 的 `local_vllm` 里填 vLLM 地址，把 `default` 改成本地模型即可；本地 vLLM 支持 `json_mode: json_schema` 约束解码，输出更稳定。
+在 `bonus_agent/config/models.yaml`（或自己的 `config/models.yaml`）的 `local_vllm` 里填 vLLM 地址，把 `default` 改成本地模型即可；本地 vLLM 支持 `json_mode: json_schema` 约束解码，输出更稳定。
 
 ## 下一步
 

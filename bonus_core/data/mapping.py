@@ -129,6 +129,10 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping) -> tup
             issues.append(Issue.block("mapping_missing", f"数据表「{ds_name}」没有映射"))
             continue
         st = None
+        # 指定了文件或工作表就只认指定的，找不到时报错；不能静默改读别的表（如“旧数据”）
+        if m.file is not None and not any(Path(x).name == m.file for x in files):
+            issues.append(Issue.block("file_missing", f"「{ds_name}」指定的文件「{m.file}」不在本批输入中", ds_name))
+            continue
         if m.header_rows and m.sheet:
             f = next((Path(x) for x in files if m.file is None or Path(x).name == m.file), None)
             try:
@@ -136,11 +140,25 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping) -> tup
             except (KeyError, ValueError):
                 st = None
         elif m.sheet:
-            st = next((s for s in sheets if s.sheet == m.sheet and (m.file is None or s.file == m.file)), None)
+            hits = [s for s in sheets if s.sheet == m.sheet and (m.file is None or s.file == m.file)]
+            if len(hits) > 1:
+                issues.append(Issue.block("sheet_ambiguous", f"「{ds_name}」的工作表「{m.sheet}」在多个文件中都有："
+                                          + "、".join(s.file for s in hits) + "，请指定文件", ds_name))
+                continue
+            st = hits[0] if hits else None
+        elif m.file is None:      # 没指定位置时才按表头找，且只能有一张表匹配
+            hits = [s for s in sheets if all(c in s.headers for c in m.columns.values())]
+            if len(hits) > 1:
+                issues.append(Issue.block("sheet_ambiguous", f"「{ds_name}」按表头能匹配多张表："
+                                          + "、".join(f"{s.file}/{s.sheet}" for s in hits) + "，请指定文件和工作表", ds_name))
+                continue
+            st = hits[0] if hits else None
+        else:
+            hits = [s for s in sheets if s.file == m.file]
+            st = hits[0] if len(hits) == 1 else None
         if st is None:
-            st = next((s for s in sheets if all(c in s.headers for c in m.columns.values())), None)
-        if st is None:
-            issues.append(Issue.block("sheet_missing", f"找不到「{ds_name}」对应的 sheet（{m.sheet}）"))
+            where = "/".join(x for x in (m.file, m.sheet) if x) or "按表头查找"
+            issues.append(Issue.block("sheet_missing", f"找不到「{ds_name}」对应的工作表（{where}）", ds_name))
             continue
         for f in ds.fields:
             if f not in m.columns and f in needed:

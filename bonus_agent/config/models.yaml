@@ -1,5 +1,5 @@
 # 模型配置。选型阶段通过云端 API 调用候选模型；确定后改为本地 vLLM，只需切换 provider。
-# API Key 不写在这里：复制 config/secrets.example.yaml 为 config/secrets.yaml 填入（已加入 .gitignore），
+# API Key 不写在这里：复制 config/secrets.example.yaml 为 config/secrets.yaml（或 ~/.bonus-agent/secrets.yaml）填入（已加入 .gitignore），
 # 或设置 api_key_env 指定的环境变量（环境变量优先）。
 # 模型是否可用以控制台为准，可运行 `bonus-agent models --remote` 用你的 Key 实际查询。
 # 注意：调用云端 API 时，只使用脱敏后的规则文档和数据。

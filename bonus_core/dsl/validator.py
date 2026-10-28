@@ -87,6 +87,8 @@ def validate(rs: RuleSet) -> list[Issue]:
     for n, v in rs.variables.items():
         if v.scope != "global" and v.scope not in levels and v.scope not in lay.aux:
             issues.append(Issue.block("scope_bad", f"变量 {n} 的 scope「{v.scope}」不是 global、分配层级或关联实体表名", f"variables.{n}"))
+        if n in all_fields:
+            issues.append(Issue.block("name_clash", f"变量 {n} 与数据字段重名", f"variables.{n}"))
     if rs.pool.scope != "global" and rs.pool.scope not in levels:
         issues.append(Issue.block("scope_bad", f"pool 的 scope「{rs.pool.scope}」不是 global 或分配层级", "pool"))
     for lv in _weighted(rs):
@@ -95,8 +97,14 @@ def validate(rs: RuleSet) -> list[Issue]:
     for c in rs.checks:
         if c.scope != "global" and c.scope not in levels and c.scope not in lay.aux:
             issues.append(Issue.block("scope_bad", f"校验 {c.id} 的 scope「{c.scope}」不是 global、分配层级或关联实体表名", f"checks.{c.id}"))
-        if n in all_fields:
-            issues.append(Issue.block("name_clash", f"变量 {n} 与数据字段重名", f"variables.{n}"))
+    # 编号重复：发放条件按编号记台账，重复会互相覆盖、漏记
+    for what, items in (("发放条件", rs.payout), ("抵扣", rs.offsets), ("校验", rs.checks),
+                        ("分配层级", [type("L", (), {"id": lv.level}) for lv in rs.allocation])):
+        seen: set[str] = set()
+        for it in items:
+            if it.id in seen:
+                issues.append(Issue.block("id_duplicate", f"{what}编号「{it.id}」重复，每条要用不同的编号", it.id))
+            seen.add(it.id)
     for p in rs.payout:
         if rs.allocation and p.scope != rs.leaf.level:
             issues.append(Issue.block("payout_scope", f"发放条件 {p.id} 目前只支持最末层「{rs.leaf.level}」", f"payout.{p.id}"))

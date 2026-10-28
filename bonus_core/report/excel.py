@@ -121,7 +121,8 @@ def write_excel(rs: RuleSet, res: Result, path: str | Path, ledger: list[dict] |
            [[i.severity, i.code, i.message, i.where] for i in res.issues], widths={"说明": 70, "位置": 40})
     _sheet(wb, "规则与数据版本", ["项目", "值"], [
         ["规则集", res.rule_set], ["规则版本", res.rule_version], ["引擎版本", res.engine_version],
-        ["输入哈希", res.input_hash],
+        ["输入哈希（规则+数据+调整）", res.input_hash],
+        ["数据哈希（规则+数据）", res.data_hash],
     ], widths={"项目": 14, "值": 70})
 
     wb.save(path)

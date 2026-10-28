@@ -71,7 +71,7 @@ def test_eval_pipeline_with_fake_model(tmp_path):
 def test_secrets_file_and_model_groups(tmp_path, monkeypatch):
     from bonus_agent.llm import LLM, load_config, resolve_models
     monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
-    (tmp_path / "models.yaml").write_text((ROOT / "config" / "models.yaml").read_text(encoding="utf-8"), encoding="utf-8")
+    (tmp_path / "models.yaml").write_text((ROOT / "bonus_agent" / "config" / "models.yaml").read_text(encoding="utf-8"), encoding="utf-8")
     (tmp_path / "secrets.yaml").write_text("providers:\n  dashscope:\n    api_key: sk-from-file\n", encoding="utf-8")
     cfg = load_config(tmp_path / "models.yaml")
     llm = LLM.from_config("qwen3.6-35b-a3b", cfg)
