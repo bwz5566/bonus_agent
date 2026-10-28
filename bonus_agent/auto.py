@@ -212,6 +212,67 @@ def _fix_column(col: str, headers: list[str]) -> str | None:
     return norm[close[0]] if close else None
 
 
+def check_dataset(name: str, pd: PlanDataset, st: SheetTable, field_types: dict[str, tuple[str, str]] | None = None,
+                  header_rows: list[int] | None = None) -> tuple[DatasetDef | None, DatasetMapping | None, list[str], list[str]]:
+    """校验一张数据表的定义：列是否存在、字段名是否合法、类型能否转换。返回 (数据表, 映射, 警告, 错误)。"""
+    errors, warnings = [], []
+    field_types = {} if field_types is None else field_types
+    if pd.key and pd.link:
+        errors.append(f"数据表「{name}」不能同时有 key 和 link")
+    cols, fields = {}, {}
+    if not pd.fields:
+        errors.append(f"数据表「{name}」没有字段")
+    for f, pf in pd.fields.items():
+        if not FIELD_NAME.match(f) or f in RESERVED:
+            errors.append(f"「{name}」的字段名 {f} 不合法：只能用英文小写字母、数字和下划线，且不能是函数名或 and/or/not")
+            continue
+        col = _fix_column(pf.column, st.headers)
+        if col is None:
+            errors.append(f"「{name}」字段 {f} 的列「{pf.column}」不在工作表 {sheet_ref(st)} 的表头中，"
+                          f"可选表头：{[h for h in st.headers if h]}")
+            continue
+        if col != pf.column:
+            warnings.append(f"「{name}」字段 {f} 的列名「{pf.column}」已自动更正为「{col}」")
+        unit = pf.unit if pf.unit in ("元", "万元") else None
+        if pf.type == "money" and unit is None:
+            unit = "万元" if "万" in col else "元"
+            warnings.append(f"「{name}」字段 {f} 未给出单位，按表头判断为{unit}")
+        values = None
+        if pf.type == "enum":
+            i = st.headers.index(col)
+            values = sorted({str(v).strip() for _, vals in st.rows if (v := vals[i]) not in (None, "")})
+            if len(values) > 30:
+                errors.append(f"「{name}」字段 {f} 有 {len(values)} 种取值，不适合作为 enum，请改为 text")
+                continue
+        prev = field_types.get(f)
+        if prev and prev[1] != name and prev[0] != pf.type:
+            errors.append(f"字段 {f} 在「{prev[1]}」里是 {prev[0]}，在「{name}」里是 {pf.type}；同名字段类型必须一致")
+        field_types.setdefault(f, (pf.type, name))
+        fields[f] = FieldDef(type=pf.type, desc=pf.desc or col, unit=unit if pf.type == "money" else None,
+                             values=values)
+        cols[f] = col
+    for k in (pd.key, pd.link):
+        if k and k not in fields:
+            errors.append(f"数据表「{name}」的 {'key' if k == pd.key else 'link'} 字段 {k} 不在它的 fields 里")
+    # 试转换全部行，类型判断错了（如把文字当成金额）尽早发现
+    bad = []
+    for f, fd in fields.items():
+        i = st.headers.index(cols[f])
+        for excel_row, vals in st.rows:
+            try:
+                convert(vals[i], fd)
+            except Exception as e:  # 任何转换失败都反馈给模型，而不是中断
+                bad.append(f"{f}（{fd.type}）第 {excel_row} 行：{e}")
+                break
+    if bad:
+        errors.append(f"「{name}」有字段类型与数据不符：" + "；".join(bad[:5])
+                      + "。请改成与数据相符的类型；月份、期间这类标签如果不参与日期计算，用 text 即可")
+    if errors:
+        return None, None, warnings, errors
+    return (DatasetDef(desc=pd.desc, key=pd.key, link=pd.link, fields=fields),
+            DatasetMapping(file=st.file, sheet=st.sheet, header_rows=header_rows, columns=cols), warnings, [])
+
+
 def check_plan(plan: Plan, inv: Inventory) -> tuple[dict[str, DatasetDef], Mapping, list[str], list[str]]:
     """程序校验规划结果，并生成数据字典和列映射。返回 (数据字典, 映射, 警告, 错误)。"""
     errors, warnings = [], []
@@ -223,58 +284,11 @@ def check_plan(plan: Plan, inv: Inventory) -> tuple[dict[str, DatasetDef], Mappi
         if st is None:
             errors.append(f"数据表「{name}」的 sheet「{pd.sheet}」不存在或有重名，请写成清单里的「文件/工作表」原样")
             continue
-        if pd.key and pd.link:
-            errors.append(f"数据表「{name}」不能同时有 key 和 link")
-        cols, fields = {}, {}
-        if not pd.fields:
-            errors.append(f"数据表「{name}」没有字段")
-        for f, pf in pd.fields.items():
-            if not FIELD_NAME.match(f) or f in RESERVED:
-                errors.append(f"「{name}」的字段名 {f} 不合法：只能用英文小写字母、数字和下划线，且不能是函数名或 and/or/not")
-                continue
-            col = _fix_column(pf.column, st.headers)
-            if col is None:
-                errors.append(f"「{name}」字段 {f} 的列「{pf.column}」不在工作表 {sheet_ref(st)} 的表头中，"
-                              f"可选表头：{[h for h in st.headers if h]}")
-                continue
-            if col != pf.column:
-                warnings.append(f"「{name}」字段 {f} 的列名「{pf.column}」已自动更正为「{col}」")
-            unit = pf.unit if pf.unit in ("元", "万元") else None
-            if pf.type == "money" and unit is None:
-                unit = "万元" if "万" in col else "元"
-                warnings.append(f"「{name}」字段 {f} 未给出单位，按表头判断为{unit}")
-            values = None
-            if pf.type == "enum":
-                i = st.headers.index(col)
-                values = sorted({str(v).strip() for _, vals in st.rows if (v := vals[i]) not in (None, "")})
-                if len(values) > 30:
-                    errors.append(f"「{name}」字段 {f} 有 {len(values)} 种取值，不适合作为 enum，请改为 text")
-                    continue
-            prev = field_types.get(f)
-            if prev and prev[0] != pf.type:
-                errors.append(f"字段 {f} 在「{prev[1]}」里是 {prev[0]}，在「{name}」里是 {pf.type}；同名字段类型必须一致")
-            field_types.setdefault(f, (pf.type, name))
-            fields[f] = FieldDef(type=pf.type, desc=pf.desc or col, unit=unit if pf.type == "money" else None,
-                                 values=values)
-            cols[f] = col
-        for k in (pd.key, pd.link):
-            if k and k not in fields:
-                errors.append(f"数据表「{name}」的 {'key' if k == pd.key else 'link'} 字段 {k} 不在它的 fields 里")
-        # 试转换全部行，类型判断错了（如把文字当成金额）尽早发现
-        bad = []
-        for f, fd in fields.items():
-            i = st.headers.index(cols[f])
-            for excel_row, vals in st.rows:
-                try:
-                    convert(vals[i], fd)
-                except Exception as e:  # 任何转换失败都反馈给模型，而不是中断规划
-                    bad.append(f"{f}（{fd.type}）第 {excel_row} 行：{e}")
-                    break
-        if bad:
-            errors.append(f"「{name}」有字段类型与数据不符：" + "；".join(bad[:5])
-                          + "。请改成与数据相符的类型；月份、期间这类标签如果不参与日期计算，用 text 即可")
-        datasets[name] = DatasetDef(desc=pd.desc, key=pd.key, link=pd.link, fields=fields)
-        mapping[name] = DatasetMapping(file=st.file, sheet=st.sheet, columns=cols)
+        d, m, w, e = check_dataset(name, pd, st, field_types)
+        warnings += w
+        errors += e
+        if d is not None:
+            datasets[name], mapping[name] = d, m
 
     # 层级与关联
     if not plan.hierarchy:

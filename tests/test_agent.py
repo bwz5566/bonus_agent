@@ -159,3 +159,59 @@ def test_plan_accepts_month_labels_as_dates():
     plan["datasets"]["月度利润"]["fields"]["month"]["type"] = "date"   # 数据是 "2026-01" 这样的年月
     po = make_plan(FakeLLM([json.dumps(plan, ensure_ascii=False)]), build_inventory(collect_files([ANNUAL])))
     assert not po.errors, po.errors
+
+
+def _agent_case():
+    from evals.run_eval import fake_agent_script
+    case = load_case(ANNUAL)
+    return case, fake_agent_script(case)
+
+
+def test_agent_native_end_to_end(tmp_path):
+    import openpyxl
+    from bonus_agent.agent import run_agent
+    case, script = _agent_case()
+    # 模型先犯错再自己修正：列名写错、没试算就 finish
+    bad = json.loads(json.dumps(next(s for s in script if s["tool"] == "define_dataset"), ensure_ascii=False))
+    first_field = next(iter(bad["args"]["fields"]))
+    bad["args"]["fields"][first_field]["column"] = "不存在的列"
+    i = script.index(next(s for s in script if s["tool"] == "define_dataset"))
+    script = script[:i] + [bad] + script[i:]
+    j = next(k for k, s in enumerate(script) if s["tool"] == "trial_run")
+    script = script[:j] + [{"tool": "finish", "args": {"summary": "x"}}] + script[j:]
+    script.insert(j + 2, {"tool": "evaluate", "args": {"expr": "sum(net_profit)"}})
+    script.insert(j + 3, {"tool": "explain", "args": {"id": "个人:E2001"}})
+    steps = []
+    ar = run_agent(FakeLLM(script), [ANNUAL], tmp_path, on_step=lambda n, s: steps.append(s))
+    assert ar.ok, ar.error
+    assert ar.result.pool == case.ref_result.pool
+    failed = [s for s in steps if not s.ok]
+    assert [s.tool for s in failed] == ["define_dataset", "finish"]
+    assert "不存在的列" in failed[0].result and "trial_run" in failed[1].result
+    ev = next(s for s in steps if s.tool == "evaluate")
+    assert "35,877,700.00" in ev.result or "35877700" in ev.result.replace(",", "")
+    assert "权重" in next(s for s in steps if s.tool == "explain").result
+    wb = openpyxl.load_workbook(ar.outputs["excel"])
+    assert {"待确认问题", "智能体规划", "智能体工作记录"} <= set(wb.sheetnames)
+
+
+def test_agent_json_mode_and_state_in_every_turn():
+    from bonus_agent.agent import run_agent
+    case, script = _agent_case()
+    texts = [json.dumps({"thought": "", "tool": s["tool"], "args": s.get("args", {})}, ensure_ascii=False) for s in script]
+    llm = FakeLLM(["这不是 JSON"] + texts)
+    llm.tool_mode = "json"
+    ar = run_agent(llm, [ANNUAL])
+    assert ar.ok, ar.error
+    assert all("【当前工作区状态】" in c[-1]["content"] for c in llm.calls)
+    assert "格式不对" in json.dumps(llm.calls[1], ensure_ascii=False)
+
+
+def test_agent_history_trim_keeps_tool_pairs():
+    from bonus_agent.agent import _trim
+    h = []
+    for i in range(30):
+        h += [{"role": "assistant", "content": "", "tool_calls": [{"id": str(i)}]},
+              {"role": "tool", "tool_call_id": str(i), "content": "x" * 1000}]
+    t = _trim(h, 5000)
+    assert t[0]["role"] == "assistant" and len(t) < len(h)

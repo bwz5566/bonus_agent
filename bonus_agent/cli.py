@@ -4,13 +4,15 @@
   extract --datasets D.yaml [--model M] --out draft.yaml 文档...
                                            从规则文档抽取规则草稿和问题卡
   map --rules R.yaml [--model M] 数据.xlsx 推荐字段映射（启发式 + 大模型）
-  auto [--model M] [--answers Q.yaml] --out 目录 文件或文件夹...
-                                           全自动：统筹规划 → 抽取规则 → 计算 → 输出 Excel
+  auto [--model M] [--answers Q.yaml] [--pipeline] --out 目录 文件或文件夹...
+                                           全自动：大模型自主调用工具完成建模和试算，引擎计算，输出 Excel
+                                           （--pipeline 改用固定流程：规划 → 抽取 → 计算）
 """
 from __future__ import annotations
 
 import argparse
 import json
+from decimal import Decimal
 import sys
 from pathlib import Path
 
@@ -46,6 +48,8 @@ def main(argv=None) -> int:
     p.add_argument("--answers", help="上一次输出的 questions.yaml，填写 answer 后传入重算")
     p.add_argument("--out", required=True, help="输出目录")
     p.add_argument("--max-files", type=int, default=30, help="一批最多处理的文件数，防止误传整个目录")
+    p.add_argument("--max-steps", type=int, default=40, help="智能体最多调用工具的轮数")
+    p.add_argument("--pipeline", action="store_true", help="使用固定流程（规划 → 抽取 → 计算），不让模型自主调度")
     p.add_argument("paths", nargs="+", help="本批次的规则文档、Excel 数据，或只包含它们的文件夹")
     a = ap.parse_args(argv)
 
@@ -111,11 +115,13 @@ def main(argv=None) -> int:
         m = suggest(rs, [s for f in a.data for s in detect(f)], llm)
         print(yaml.safe_dump({k: v.model_dump(exclude_none=True) for k, v in m.items()}, allow_unicode=True, sort_keys=False))
         return 0
+    if a.cmd == "auto" and not a.pipeline:
+        return _agent(a, cfg)
     if a.cmd == "auto":
         from bonus_agent.auto import run_auto
         answers = yaml.safe_load(Path(a.answers).read_text(encoding="utf-8")) if a.answers else None
         llm = LLM.from_config(a.model, cfg)
-        print(f"使用模型 {llm.name}", flush=True)
+        print(f"使用模型 {llm.name}（固定流程）", flush=True)
 
         def show(files):
             print(f"本批次共 {len(files)} 个文件：", flush=True)
@@ -133,7 +139,7 @@ def main(argv=None) -> int:
             for w in po.warnings:
                 print(f"  注意：{w}")
         if ar.result is not None:
-            print(f"\n【结果】奖金池 {ar.result.pool:,}，结果已写入 {ar.outputs.get('excel')}")
+            print(f"\n【结果】奖金池 {Decimal(ar.result.pool):,}，结果已写入 {ar.outputs.get('excel')}")
         if ar.questions:
             print(f"\n【待确认问题】{len(ar.questions)} 个（已按建议理解先算，答复后用 --answers 重跑）：")
             for stage, q in ar.questions:
@@ -150,6 +156,42 @@ def main(argv=None) -> int:
         print(f"调用 {u.calls} 次，输入 {u.prompt_tokens} tokens，输出 {u.completion_tokens} tokens，耗时 {u.latency_s:.0f} 秒")
         return 0 if ar.ok else 1
     return 2
+
+
+def _agent(a, cfg) -> int:
+    from bonus_agent.agent import ToolError, run_agent
+    answers = yaml.safe_load(Path(a.answers).read_text(encoding="utf-8")) if a.answers else None
+    llm = LLM.from_config(a.model, cfg)
+    hist = cfg["models"][llm.name].get("max_history_chars", 30000)
+    print(f"使用模型 {llm.name}，智能体开始工作 ...", flush=True)
+
+    def show(n, step):
+        args = json.dumps(step.args, ensure_ascii=False)
+        first = step.result.splitlines()[0] if step.result else ""
+        print(f"  [{n:02d}] {step.tool} {args[:100]}{'…' if len(args) > 100 else ''}", flush=True)
+        print(f"       {'✓' if step.ok else '✗'} {first[:150]}", flush=True)
+
+    try:
+        ar = run_agent(llm, a.paths, a.out, answers=answers, max_steps=a.max_steps, max_history_chars=hist,
+                       max_files=a.max_files, on_step=show)
+    except ToolError as e:
+        print(f"失败：{e}")
+        return 1
+    if ar.ws.summary:
+        print(f"\n【方案】{ar.ws.summary}")
+    if ar.result is not None:
+        print(f"【结果】奖金池 {Decimal(ar.result.pool):,}，结果已写入 {ar.outputs.get('excel')}")
+    if ar.questions:
+        print(f"\n【待确认问题】{len(ar.questions)} 个（已按建议理解先算，答复后用 --answers 重跑）：")
+        for q in ar.questions:
+            print(f"  {q.id}. {q.text}  选项：{' / '.join(q.options)}")
+    if ar.error:
+        print(f"\n未完成：{ar.error}")
+    print(f"\n输出目录：{a.out}（result.xlsx、rules.yaml、mapping.yaml、questions.yaml、agent_log.json）")
+    u = llm.usage
+    print(f"共 {len(ar.steps)} 步，调用模型 {u.calls} 次，输入 {u.prompt_tokens} tokens，输出 {u.completion_tokens} tokens，"
+          f"耗时 {u.latency_s:.0f} 秒")
+    return 0 if ar.ok else 1
 
 
 if __name__ == "__main__":

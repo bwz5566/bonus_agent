@@ -4,7 +4,9 @@
     python -m evals.run_eval --repeats 3
     # 全部开源模型 + 商业版上限参考
     python -m evals.run_eval --models open,reference --repeats 3
-    # 全自动模式：不给数据字典，从原始文件开始统筹规划、抽取、计算
+    # 大模型主导的智能体：从原始文件开始，自己决定步骤
+    python -m evals.run_eval --modes agent --repeats 3
+    # 固定流程的全自动模式（对比用）
     python -m evals.run_eval --modes auto --repeats 3
     # 只测其中两个模型、对比“先转写再抽取”和“直接看图”两种方式
     python -m evals.run_eval --models qwen3-vl-32b,qwen3-vl-8b --modes two_step,direct
@@ -26,6 +28,7 @@ from pathlib import Path
 
 import yaml
 
+from bonus_agent.agent import run_agent
 from bonus_agent.auto import run_auto
 from bonus_agent.extract_rules import ExtractResult, extract
 from bonus_agent.llm import LLM, FakeLLM, LLMError, load_config, resolve_models
@@ -85,6 +88,30 @@ def fake_plan(case: Case) -> dict:
             "ignored": [], "questions": []}
 
 
+def fake_agent_script(case: Case) -> list:
+    """标准答案对应的一串工具调用（演练 agent 模式用）。"""
+    ref, plan = case.reference, fake_plan(case)
+    script = [{"tool": "list_files"}]
+    script += [{"tool": "read_document", "args": {"file": Path(d).name}} for d in case.spec["docs"]]
+    for n, d in plan["datasets"].items():
+        file, sheet = d["sheet"].split("/", 1)
+        script.append({"tool": "define_dataset", "args": {"name": n, "file": file, "sheet": sheet, "key": d["key"],
+                                                         "link": d["link"], "fields": d["fields"]}})
+    script.append({"tool": "set_rules", "args": {
+        "tables": {k: v.model_dump(mode="json") for k, v in ref.tables.items()},
+        "variables": {k: v.model_dump(mode="json") for k, v in ref.variables.items()},
+        "pool": ref.pool.model_dump(mode="json"),
+        "allocation": [a.model_dump(mode="json") for a in ref.allocation],
+        "payout": [p.model_dump(mode="json") for p in ref.payout]}})
+    script.append({"tool": "trial_run"})
+    for c in case.spec["checks"]:
+        if c["type"] == "question":
+            script.append({"tool": "ask_question", "args": {"text": "请确认：" + "、".join(map(str, c["keywords"])),
+                                                           "options": ["全额累进", "超额累进"], "suggested": 0}})
+    script.append({"tool": "finish", "args": {"summary": ref.name}})
+    return script
+
+
 def fake_llm_for(case: Case) -> FakeLLM:
     """演练用：转写请求返回固定文字，抽取请求返回标准答案。"""
     ref = case.reference
@@ -101,8 +128,14 @@ def fake_llm_for(case: Case) -> FakeLLM:
 
 
     plan = fake_plan(case)
+    script = fake_agent_script(case)
+    state = {"i": 0}
 
-    def respond(messages):
+    def respond(messages, tools=None):
+        if tools is not None:  # agent 模式：按顺序返回工具调用
+            item = script[min(state["i"], len(script) - 1)]
+            state["i"] += 1
+            return item
         sys = messages[0]["content"] if isinstance(messages[0]["content"], str) else ""
         if "统筹规划助手" in sys:
             return json.dumps(plan, ensure_ascii=False)
@@ -117,6 +150,33 @@ def run_one(llm, case: Case, mode: str) -> dict:
     """mode：two_step / direct 用固定的数据字典只测规则抽取；auto 从原始文件开始走完整的统筹规划流程。"""
     t0 = time.monotonic()
     ar = None
+    if mode == "agent":
+        ag = run_agent(llm, case.docs + case.data_files)
+        ex = ExtractResult(llm.name, ag.ruleset, ag.questions, [], [], list(ag.ws.transcripts.values()),
+                           len(ag.steps), llm.usage, ag.quote_hits, ag.quote_total, ag.error)
+        row = {"model": llm.name, "case": case.name, "mode": mode, "ok": ag.ok, "error": ag.error,
+               "attempts": len(ag.steps), "latency_s": round(time.monotonic() - t0, 1),
+               "prompt_tokens": llm.usage.prompt_tokens, "completion_tokens": llm.usage.completion_tokens,
+               "quote_hit_rate": round(ag.quote_hits / ag.quote_total, 3) if ag.quote_total else None,
+               "questions": len(ag.questions), "blocking_issues": 0}
+        checks = {}
+        if ag.ruleset is not None:
+            for chk in case.spec["checks"]:
+                try:
+                    checks[chk["name"]] = run_check(chk, ag.ruleset, ex)
+                except Exception:
+                    checks[chk["name"]] = False
+        else:
+            checks = {c["name"]: False for c in case.spec["checks"]}
+        row.update(compare_results(ag.result, case.ref_result) if ag.result is not None else
+                   {"computed": False, "pool_match": False, "leaf_match_rate": 0.0, "held_match": False})
+        row["checks"] = checks
+        row["check_score"] = round(sum(checks.values()) / len(checks), 3) if checks else 0
+        row["_steps"] = [vars(s) for s in ag.steps]
+        row["_ruleset"] = ag.ruleset.dump_yaml() if ag.ruleset else None
+        row["_questions"] = [q.model_dump() for q in ag.questions]
+        row["_transcripts"] = ag.ws.transcripts
+        return row
     if mode == "auto":
         ar = run_auto(llm, case.docs + case.data_files)
         ex = ar.extraction
@@ -233,7 +293,7 @@ def main(argv=None) -> int:
     ap.add_argument("--models", help="逗号分隔的模型名或分组名（candidates / open / reference / legacy），默认用配置里的 candidates")
     ap.add_argument("--cases", help="逗号分隔的样例目录名，默认全部")
     ap.add_argument("--modes", default="two_step",
-                    help="two_step（固定数据字典，先转写图片再抽取）, direct（固定数据字典，直接看图）, auto（从原始文件开始全自动）")
+                    help="two_step / direct（固定数据字典，只测规则抽取）；agent（大模型主导，从原始文件开始）；auto（固定流程全自动）")
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--fake", action="store_true", help="不调用模型，用标准答案演练")
     ap.add_argument("--out", default=str(ROOT / "reports"))

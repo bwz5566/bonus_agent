@@ -17,7 +17,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict
 
 from bonus_core.data.table import ConvertError, Datasets, Row, RowRef, StdTable, convert
-from bonus_core.data.table_detect import SheetTable, detect
+from bonus_core.data.table_detect import SheetTable, detect, table_at
 from bonus_core.dsl.models import RuleSet
 from bonus_core.dsl.parser import names, parse
 from bonus_core.engine.issues import Issue
@@ -42,6 +42,7 @@ class DatasetMapping(BaseModel):
     model_config = ConfigDict(extra="forbid")
     file: str | None = None            # 多个文件里有同名 sheet 时用文件名区分
     sheet: str | None = None
+    header_rows: list[int] | None = None  # 自动识别的表头不对时，指定 Excel 表头行号
     columns: dict[str, str]            # 标准字段 -> 列名
     confidence: dict[str, float] = {}  # 推荐时填写
     confirmed_by: str | None = None
@@ -125,7 +126,15 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping) -> tup
         if m is None:
             issues.append(Issue.block("mapping_missing", f"数据表「{ds_name}」没有映射"))
             continue
-        st = next((s for s in sheets if s.sheet == m.sheet and (m.file is None or s.file == m.file)), None) if m.sheet else None
+        st = None
+        if m.header_rows and m.sheet:
+            f = next((Path(x) for x in files if m.file is None or Path(x).name == m.file), None)
+            try:
+                st = table_at(f, m.sheet, m.header_rows) if f else None
+            except (KeyError, ValueError):
+                st = None
+        elif m.sheet:
+            st = next((s for s in sheets if s.sheet == m.sheet and (m.file is None or s.file == m.file)), None)
         if st is None:
             st = next((s for s in sheets if all(c in s.headers for c in m.columns.values())), None)
         if st is None:

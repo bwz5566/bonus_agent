@@ -126,6 +126,7 @@ class LLM:
     api_key: str
     json_mode: str = "json_object"
     extra_body: dict | None = None
+    tool_mode: str = "native"         # native：OpenAI 兼容的工具调用；json：模型输出 JSON 动作（不支持工具调用时用）
     timeout: float = 300
     usage: Usage = field(default_factory=Usage)
 
@@ -138,7 +139,7 @@ class LLM:
         m = cfg["models"][name]
         prov = cfg["providers"][m["provider"]]
         return cls(name, m["model"], prov["base_url"], provider_key(prov), m.get("json_mode", "json_object"),
-                   m.get("extra_body"))
+                   m.get("extra_body"), m.get("tool_mode", "native"))
 
     def _client(self):
         from openai import OpenAI
@@ -168,6 +169,26 @@ class LLM:
     def chat_json(self, messages: list[dict], **kw):
         return parse_json(self.chat(messages, json_out=True, **kw))
 
+    def chat_tools(self, messages: list[dict], tools: list[dict], *, temperature: float = 0.1,
+                   max_tokens: int = 8192) -> dict:
+        """工具调用。返回 {"content": 文本, "tool_calls": [{"id", "name", "arguments"(JSON 字符串)}]}。"""
+        kwargs = dict(model=self.model, messages=messages, tools=tools, temperature=temperature, max_tokens=max_tokens)
+        if self.extra_body:
+            kwargs["extra_body"] = self.extra_body
+        t0 = time.monotonic()
+        try:
+            resp = self._client().chat.completions.create(**kwargs)
+        except Exception as e:
+            raise LLMError(f"{self.name} 调用失败：{e}") from e
+        u = Usage(calls=1, latency_s=time.monotonic() - t0)
+        if resp.usage:
+            u.prompt_tokens, u.completion_tokens = resp.usage.prompt_tokens, resp.usage.completion_tokens
+        self.usage += u
+        msg = resp.choices[0].message
+        calls = [{"id": c.id, "name": c.function.name, "arguments": c.function.arguments or "{}"}
+                 for c in (msg.tool_calls or [])]
+        return {"content": msg.content or "", "tool_calls": calls}
+
 
 class FakeLLM(LLM):
     """测试和演练用：按调用顺序返回预设回答，或由函数根据消息生成回答。"""
@@ -178,11 +199,26 @@ class FakeLLM(LLM):
         self._i = 0
         self.calls: list[list[dict]] = []
 
-    def chat(self, messages, **kw) -> str:
-        self.calls.append(messages)
-        self.usage += Usage(calls=1)
+    def _next(self, *args):
         if callable(self._responder):
-            return self._responder(messages)
+            return self._responder(*args)
         out = self._responder[min(self._i, len(self._responder) - 1)]
         self._i += 1
         return out
+
+    def chat(self, messages, **kw) -> str:
+        self.calls.append(messages)
+        self.usage += Usage(calls=1)
+        return self._next(messages) if callable(self._responder) else self._next()
+
+    def chat_tools(self, messages, tools, **kw) -> dict:
+        """预设回答为 {"tool": 名称, "args": {...}}、它们的列表，或纯文本。"""
+        self.calls.append(messages)
+        self.usage += Usage(calls=1)
+        out = self._next(messages, tools) if callable(self._responder) else self._next()
+        if isinstance(out, str):
+            return {"content": out, "tool_calls": []}
+        items = out if isinstance(out, list) else [out]
+        return {"content": "", "tool_calls": [
+            {"id": f"call_{self.usage.calls}_{i}", "name": it["tool"],
+             "arguments": json.dumps(it.get("args", {}), ensure_ascii=False)} for i, it in enumerate(items)]}

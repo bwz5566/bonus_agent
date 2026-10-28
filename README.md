@@ -14,7 +14,7 @@ bonus_core/            核心库：纯计算，不依赖大模型和网络
   report/excel.py      结果 Excel（含计算链、调整记录、未发放台账）
   golden.py            金标样例（财务手算）回归
   cli.py               命令行 bonus
-bonus_agent/           智能体：文档解析、统筹规划（auto.py）、规则抽取、字段映射推荐
+bonus_agent/           智能体：工具调用主循环（agent.py）、固定流程（auto.py）、文档解析、规则抽取、字段映射推荐
   prompts/             提示词模板
   cli.py               命令行 bonus-agent
 evals/                 模型选型评测
@@ -31,32 +31,43 @@ tests/                 单元测试、属性测试、端到端测试
 
 ```bash
 pip install -e ".[agent,dev]"
-python -m pytest          # 33 个测试，应全部通过
+python -m pytest          # 36 个测试，应全部通过
 ```
 
 ## 零、全自动模式（推荐先试这个）
 
-把规则文档（Word / PPT / 图片）和 Excel 数据放进一个文件夹，内容和格式不限：
+把一个批次的规则文档（Word / PPT / 图片）和 Excel 数据放进一个文件夹，内容、格式、文件数量都不限：
 
 ```bash
-bonus-agent auto --out 输出目录 文件夹或文件...
+bonus-agent auto --out 输出目录 本批次文件夹
 # 例：python evals/cases/annual_2026/make_case.py && bonus-agent auto --out out/annual evals/cases/annual_2026
 ```
 
-智能体会：
+**由大模型主导，不写死流程。** 智能体拿到一套工具，自己决定先看什么、怎么建模、哪里要回头核对：
 
-1. **统筹规划**：判断哪些是规则、哪些是数据、哪些该忽略；为数据表建立字段字典和列映射（含万元换算），判断表之间怎么关联、分几层分配。程序会核对工作表和列是否存在、类型能否转换、层级能否串起来，有错就让模型修正；
-2. **抽取规则**：在规划好的字段上抽取阶梯、系数、分配权重、发放条件；静态校验通过后**用本期真实数据试算**，报错同样交给模型修正；
-3. **计算**：由引擎完成，每一分钱可追溯；
-4. **输出**：`result.xlsx`（结果 + 「待确认问题」+ 「智能体规划」两页说明）、`rules.yaml`、`mapping.yaml`、`questions.yaml`、`agent_log.json`（模型原始输出）。
+| 工具 | 作用 |
+| --- | --- |
+| list_files / read_document / read_sheet / view_image | 看文件清单、文档文字、Excel 原始内容（带行号）、图片（逐字转写） |
+| define_dataset / remove_dataset | 定义数据表：选工作表和表头行、命名字段、判断类型和单位；程序会校验列是否存在、数据能否转换 |
+| set_rules | 写入或修改规则（阶梯、系数、变量、奖金池、分配层级和权重、发放条件），返回静态校验结果 |
+| trial_run / explain / evaluate | 用真实数据试算、查看某人的算式、计算任意表达式来核对 |
+| ask_question | 记录需要财务确认的问题，按建议理解继续 |
+| finish | 完成（要求最近一次修改后已成功试算） |
 
-文档没写清楚的地方先按模型建议的理解计算，问题列在「待确认问题」里。财务在 `questions.yaml` 的 `answer` 填写答复（选项序号或文字）后重跑：
+工作区状态（数据表、规则、问题、试算结论）每轮都会附给模型，对话变长时只保留最近的历史，模型不会忘记已经做过的事。
+金额始终由计算引擎按模型写的规则算出，每一分钱可追溯；模型只负责“读懂并建模”。
+
+命令行会实时打印每一步。输出目录里有：`result.xlsx`（结果 +「待确认问题」「智能体规划」「智能体工作记录」）、`rules.yaml`、`mapping.yaml`、`questions.yaml`、`agent_log.json`。
+
+文档没写清楚的地方先按模型建议的理解计算。财务在 `questions.yaml` 的 `answer` 填写答复（选项序号或文字）后重跑：
 
 ```bash
-bonus-agent auto --answers 输出目录/questions.yaml --out 输出目录2 文件夹
+bonus-agent auto --answers 输出目录/questions.yaml --out 输出目录2 本批次文件夹
 ```
 
-确认无误后，`rules.yaml` + `mapping.yaml` 就是可以固定下来的计算模板，以后每期换数据直接用 `bonus run` 计算，不再调用大模型。
+确认无误后，`rules.yaml` + `mapping.yaml` 就是固定的计算模板，以后每期换数据直接 `bonus run`，不再调用大模型。
+
+其他：`--max-steps` 限制智能体轮数（默认 40）；`--pipeline` 改用固定流程（规划 → 抽取 → 计算），给工具调用能力弱的模型用；模型不支持原生工具调用时会自动改用 JSON 动作协议。
 
 支持的方案结构：奖金池 + 多层按权重分配；“每人按公式直接算”的方案（总包 = 各人金额之和）；公司级数据表（如各月利润）；某些人不参与（权重为 0）；按比例暂缓发放。
 
@@ -97,7 +108,8 @@ bonus-eval --fake                                     # 先不调模型，演练
 bonus-eval --repeats 3                                # 四个候选各跑 3 次
 bonus-eval --models open,reference --repeats 3        # 全部开源模型 + 商业版上限参考
 bonus-eval --modes two_step,direct --repeats 3        # 同时对比“先转写图片”和“直接看图”
-bonus-eval --modes auto --repeats 3                   # 全自动模式：不给数据字典，从原始文件开始
+bonus-eval --modes agent --repeats 3                  # 大模型主导的智能体，从原始文件开始
+bonus-eval --modes agent,auto --repeats 3             # 对比智能体和固定流程
 ```
 
 已配置的模型分组（`config/models.yaml`，2026-10-28 用 `--remote` 实测）：

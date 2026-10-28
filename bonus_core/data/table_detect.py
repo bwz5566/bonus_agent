@@ -78,26 +78,45 @@ def detect_sheet(ws, file: str) -> SheetTable | None:
             best, best_score = i, score
     if best is None:
         return None
-    header = [str(v).strip() if v is not None else "" for v in grid[best]]
-    start = best + 1
+    rows = [best]
     # 两行表头：上一行是分组标题（如「金额（万元）」跨两列），下一行是具体列名
     if best + 1 < len(grid):
         nxt = grid[best + 1]
         if _filled(nxt) >= 2 and all(_is_text(v) or v in (None, "") for v in nxt):
-            header = [
-                f"{a}_{str(b).strip()}" if b not in (None, "") and str(b).strip() != a else a
-                for a, b in zip(header, nxt + [None] * (len(header) - len(nxt)))
-            ]
-            start = best + 2
+            rows.append(best + 1)
+    t = _build(grid, file, ws.title, rows)
+    t.confidence = min(1.0, best_score / max(len(t.headers), 1))
+    return t
+
+
+def _build(grid, file: str, title: str, header_idx: list[int]) -> SheetTable:
+    """按指定的表头行（0 起的下标，可多行）组装表格；多行表头用“上级_下级”合并。"""
+    header = [str(v).strip() if v is not None else "" for v in grid[header_idx[0]]]
+    for i in header_idx[1:]:
+        nxt = list(grid[i]) + [None] * max(0, len(header) - len(grid[i]))
+        header = [f"{a}_{str(b).strip()}" if b not in (None, "") and str(b).strip() != a else a
+                  for a, b in zip(header, nxt)]
+    start = header_idx[-1] + 1
     width = len(header)
-    t = SheetTable(file, ws.title, best + 1, header)
+    t = SheetTable(file, title, header_idx[0] + 1, header)
     for j, row in enumerate(grid[start:], start=start + 1):
         row = (list(row) + [None] * width)[:width]
         if _filled(row) == 0:
             continue
         (t.totals if _is_total(row) else t.rows).append((j, row))
-    t.confidence = min(1.0, best_score / max(width, 1))
     return t
+
+
+def table_at(path: str | Path, sheet: str, header_rows: list[int]) -> SheetTable:
+    """按人工（或智能体）指定的表头行读取工作表，header_rows 为 Excel 行号，如 [3] 或 [3, 4]。"""
+    path = Path(path)
+    wb = openpyxl.load_workbook(path, data_only=True)
+    if sheet not in wb.sheetnames:
+        raise KeyError(f"{path.name} 中没有工作表「{sheet}」")
+    grid = _grid(wb[sheet])
+    if not header_rows or max(header_rows) > len(grid) or min(header_rows) < 1:
+        raise ValueError(f"表头行 {header_rows} 超出范围（工作表共 {len(grid)} 行）")
+    return _build(grid, path.name, sheet, [r - 1 for r in sorted(header_rows)])
 
 
 def detect(path: str | Path) -> list[SheetTable]:
