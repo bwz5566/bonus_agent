@@ -52,17 +52,16 @@ def load_config(path: str | Path | None = None, secrets: str | Path | None = Non
 
 
 def resolve_models(spec: str | None, cfg: dict) -> list[str]:
-    """把 "a,b"、分组名（如 next）或空（= candidates）展开成模型名列表。"""
-    if not spec:
-        return list(cfg["candidates"])
+    """把 "a,b"、分组名（candidates / open / reference ...）或空（= candidates）展开成模型名列表。"""
+    groups = {"candidates": cfg["candidates"], **cfg.get("groups", {})}
     out: list[str] = []
-    for part in spec.split(","):
+    for part in (spec or "candidates").split(","):
         part = part.strip()
-        names = cfg.get("groups", {}).get(part, [part])
+        names = groups.get(part, [part])
         out += [n for n in names if n not in out]
     unknown = [n for n in out if n not in cfg["models"]]
     if unknown:
-        raise LLMError(f"未配置的模型 {', '.join(unknown)}，可选：{', '.join(cfg['models'])}")
+        raise LLMError(f"未配置的模型或分组 {', '.join(unknown)}。分组：{', '.join(groups)}；模型：{', '.join(cfg['models'])}")
     return out
 
 

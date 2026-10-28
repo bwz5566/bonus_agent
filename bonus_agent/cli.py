@@ -46,6 +46,12 @@ def main(argv=None) -> int:
         remote: dict[str, set[str] | str] = {}
         if a.remote:
             for prov in sorted({m["provider"] for m in cfg["models"].values()}):
+                if prov == "local_vllm":   # 选型阶段还没部署，查不到是正常的
+                    try:
+                        remote[prov] = set(list_remote(prov, cfg))
+                    except LLMError:
+                        remote[prov] = "本地 vLLM 还未部署（选型完成、部署后才需要），已跳过"
+                    continue
                 try:
                     remote[prov] = set(list_remote(prov, cfg))
                 except LLMError as e:

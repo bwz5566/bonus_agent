@@ -2,7 +2,7 @@
 
 为财务部提供季度奖金、年度奖金、过程奖金等场景的计算服务。核心原则：**大模型只负责读懂规则、匹配表头，所有金额由确定性的计算引擎算出**，每一分钱都能追溯到规则原文和数据行。
 
-当前处于**模型选型阶段**：智能体通过云端 API 调用 Qwen3-VL 32B / 30B-A3B / 8B 三个候选模型，用评测脚本对比效果，确定后再私有化部署（只改 `config/models.yaml` 的 provider）。
+当前处于**模型选型阶段**：智能体通过百炼 API 调用千问 3.6 / 3.5 的开源多模态模型（最初计划的 Qwen3-VL 32B / 30B-A3B / 8B 已在百炼下线），用评测脚本对比效果，确定后再私有化部署（只改 `config/models.yaml` 的 provider）。
 
 ## 目录
 
@@ -67,20 +67,19 @@ bonus run --rules rules.yaml --mapping mapping.yaml \
 ```bash
 python evals/cases/sales_q3/make_case.py
 bonus-eval --fake                                     # 先不调模型，演练整条流程
-bonus-eval --repeats 3                                # 最初指定的三个 Qwen3-VL 模型各跑 3 次
-bonus-eval --models next --repeats 3                  # 千问 3.5/3.6 开源多模态模型
+bonus-eval --repeats 3                                # 四个候选各跑 3 次
 bonus-eval --models open,reference --repeats 3        # 全部开源模型 + 商业版上限参考
 bonus-eval --modes two_step,direct --repeats 3        # 同时对比“先转写图片”和“直接看图”
 ```
 
-已配置的模型分组（`config/models.yaml`）：
+已配置的模型分组（`config/models.yaml`，2026-10-28 用 `--remote` 实测）：
 
 | 分组 | 模型 | 说明 |
 | --- | --- | --- |
-| candidates（默认） | qwen3-vl-32b / qwen3-vl-30b-a3b / qwen3-vl-8b | 最初指定的三个；2026-10 百炼文档已不再列出这几个开源版 ID，需用 `--remote` 确认 |
-| next | qwen3.6-35b-a3b / qwen3.5-35b-a3b / qwen3.5-27b | 百炼在售、权重开源的原生多模态模型，可私有化部署 |
-| open | 以上全部 + qwen3.5-122b-a10b | 开源模型全集 |
+| candidates（默认） | qwen3.6-35b-a3b / qwen3.6-27b / qwen3.5-35b-a3b / qwen3.5-27b | 百炼在售、权重开源，可私有化部署 |
+| open | 以上 + qwen3.5-122b-a10b | 开源模型全集 |
 | reference | qwen3-vl-plus / qwen3.6-flash | 商业版，不能私有化，只看效果上限 |
+| legacy | qwen3-vl-32b / 30b-a3b / 8b | 已在百炼下线，仅作记录 |
 
 报告在 `evals/reports/`：Markdown 汇总、CSV 明细，以及每次调用的原始输出、图片转写和抽取出的规则。
 

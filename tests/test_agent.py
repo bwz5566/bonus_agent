@@ -77,8 +77,9 @@ def test_secrets_file_and_model_groups(tmp_path, monkeypatch):
     llm = LLM.from_config("qwen3.6-35b-a3b", cfg)
     assert llm.api_key == "sk-from-file" and llm.extra_body == {"enable_thinking": False}
     monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-from-env")
-    assert LLM.from_config("qwen3-vl-8b", cfg).api_key == "sk-from-env"
-    assert resolve_models(None, cfg) == cfg["candidates"]
-    assert resolve_models("next,qwen3-vl-8b", cfg)[-1] == "qwen3-vl-8b"
+    assert LLM.from_config("qwen3.5-27b", cfg).api_key == "sk-from-env"
+    assert resolve_models(None, cfg) == resolve_models("candidates", cfg) == cfg["candidates"]
+    assert resolve_models("candidates,open", cfg) == cfg["groups"]["open"]
+    assert resolve_models("reference,qwen3.6-27b", cfg) == ["qwen3-vl-plus", "qwen3.6-flash", "qwen3.6-27b"]
     with pytest.raises(LLMError):
         resolve_models("no-such-model", cfg)
