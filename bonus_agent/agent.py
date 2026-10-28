@@ -3,8 +3,10 @@
 模型能做的事都封装成工具（看文件、看表、看图、定义数据表、写规则、试算、查算式、算表达式、提问、完成），
 程序只负责：执行工具、校验输入、保存工作区状态。金额始终由计算引擎按模型写的规则算出。
 
-长任务的上下文控制：工作区状态（已定义的数据表、规则、问题、试算结论）每轮重新附在请求末尾，
-对话历史只保留最近的若干轮，所以模型不会因为对话变长而“忘记”已经做过的事。
+长任务的上下文控制：工作区状态（笔记、已定义的数据表、规则、问题、试算结论）每轮重新附在请求末尾，
+所以模型不会因为对话变长而“忘记”已经做过的事。对话历史超过上限时才整理一次：较早的工具结果只留摘要，
+仍然太长就丢弃最早的几轮。两次整理之间历史只追加、不改动，请求前缀保持不变，便于前缀缓存命中
+（私有化部署的 vLLM 自动缓存；百炼部分模型可在配置里开启显式缓存）。
 """
 from __future__ import annotations
 
@@ -34,6 +36,8 @@ from bonus_core.engine.tree import ROOT_LEVEL, build_tree
 from bonus_core.report.excel import write_excel
 
 MAX_RESULT_CHARS = 6000
+KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保留全文
+BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
 READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate"}
 
 
@@ -58,9 +62,9 @@ TOOLS: list[dict] = [
      "parameters": _obj({})},
     {"name": "read_document", "description": "读取 Word / PPT / 图片文件的文字和表格（图片显示为占位符，用 view_image 查看）。",
      "parameters": _obj({"file": _S, "offset": {**_I, "description": "从第几个字符开始，默认 0"}}, ["file"])},
-    {"name": "view_image", "description": "查看文件中的第 index 张图片（从 1 开始），返回图片内容的逐字转写。",
+    {"name": "view_image", "description": "查看文件中的第 index 张图片（从 1 开始，默认 1），返回图片内容的逐字转写。",
      "parameters": _obj({"file": _S, "index": _I, "focus": {**_S, "description": "可选：希望重点看清的内容"}},
-                        ["file", "index"])},
+                        ["file"])},
     {"name": "read_sheet", "description": "查看 Excel 工作表的原始内容（带 Excel 行号），用于判断表头位置、合计行、说明文字等。",
      "parameters": _obj({"file": _S, "sheet": _S, "start_row": _I, "rows": _I}, ["file", "sheet"])},
     {"name": "note",
@@ -177,7 +181,7 @@ class Workspace:
         more = len(text) - offset - len(chunk)
         return chunk + (f"\n\n……还有 {more} 字，用 offset={offset + len(chunk)} 继续读取" if more > 0 else "")
 
-    def view_image(self, file: str, index: int, focus: str = "") -> str:
+    def view_image(self, file: str, index: int = 1, focus: str = "") -> str:
         f = self._file(file)
         d = next((d for d in self.inv.docs if d.name == f.name), None)
         imgs = [b for b in d.blocks if b.kind == "image"] if d else []
@@ -390,7 +394,7 @@ class Workspace:
         else:
             lines.append("- 尚未定义数据表")
         if self.draft:
-            lines.append("- 规则：" + json.dumps(self.draft, ensure_ascii=False)[:3000])
+            lines.append("- 规则（摘要，不含出处；修改时按名字只传要改的部分）：\n" + _rules_brief(self.draft))
         else:
             lines.append("- 尚未写入规则")
         if self.questions:
@@ -399,6 +403,25 @@ class Workspace:
             lines.append(f"- 已查看图片：{', '.join(self.transcripts)}")
         lines.append("- 试算：" + ("最近修改后尚未试算" if self.dirty else f"已试算，奖金池 {fmt(Decimal(self.result.pool))}"))
         return "\n".join(lines)
+
+
+def _rules_brief(draft: dict, limit: int = 3000) -> str:
+    out = []
+    for n, t in (draft.get("tables") or {}).items():
+        if t.get("kind") == "lookup" or "mapping" in t:
+            out.append(f"  表 {n}：查找表 {json.dumps(t.get('mapping'), ensure_ascii=False)}")
+        else:
+            out.append(f"  表 {n}：{t.get('mode', '')} 阶梯 {json.dumps(t.get('steps'), ensure_ascii=False)}")
+    for n, v in (draft.get("variables") or {}).items():
+        out.append(f"  变量 {n}[{v.get('scope', 'global')}] = {v.get('expr')}")
+    if "pool" in draft:
+        out.append(f"  pool = {(draft['pool'] or {}).get('expr')}")
+    for lv in draft.get("allocation") or []:
+        out.append(f"  分配 {lv.get('level')}（key={lv.get('key')}, parent_key={lv.get('parent_key')}）权重 = {lv.get('weight')}")
+    for p in draft.get("payout") or []:
+        out.append(f"  发放 {p.get('id')}[{p.get('scope')}] 暂缓比例 = {p.get('hold_ratio')}")
+    text = "\n".join(out)
+    return text if len(text) <= limit else text[:limit] + "……"
 
 
 # ---------------- 主循环 ----------------
@@ -428,6 +451,7 @@ class AgentResult:
     outputs: dict[str, Path] = field(default_factory=dict)
     quote_hits: int = 0
     quote_total: int = 0
+    recheck: str = ""
 
     @property
     def ok(self) -> bool:
@@ -438,15 +462,41 @@ class AgentResult:
         return self.ws.questions
 
 
-def _trim(history: list[dict], max_chars: int) -> list[dict]:
-    """从最早的一轮开始丢弃，直到总长度在限制内；保证保留的历史以 assistant 消息开头（工具结果不落单）。"""
-    def size(ms):
-        return sum(len(json.dumps(m, ensure_ascii=False)) for m in ms)
+def _size(ms: list[dict]) -> int:
+    return sum(len(json.dumps(m, ensure_ascii=False)) for m in ms)
+
+
+def _is_result(m: dict) -> bool:
+    return m["role"] == "tool" or (m["role"] == "user" and str(m.get("content", "")).startswith("【") and "的结果】" in
+                                   str(m.get("content", "")).split("\n", 1)[0])
+
+
+def _shrink(history: list[dict], max_chars: int, keep: int = KEEP_FULL_RESULTS) -> bool:
+    """历史超过 max_chars 时整理一次（原地修改），返回是否整理过。
+
+    先把较早的工具结果改成摘要、较早的长参数省略；仍超过上限的一半，就从最早的一轮开始丢弃，
+    直到不超过一半，留出空间让之后多轮只追加不改动（前缀不变，缓存可以命中）。
+    丢弃时保证剩下的历史以 assistant 消息开头（工具结果不落单）。"""
+    if _size(history) <= max_chars:
+        return False
+    results = [i for i, m in enumerate(history) if _is_result(m)]
+    cut = results[-keep] if len(results) >= keep else 0
+    for i in results[:-keep] if len(results) > keep else []:
+        c = history[i]["content"]
+        if len(c) > BRIEF_CHARS + 60:
+            history[i] = {**history[i], "content": c[:BRIEF_CHARS] + "\n……（较早的结果已省略。关键信息应已记在笔记里，确需原文可重新调用）"}
+    for i, m in enumerate(history[:cut]):
+        for tc in m.get("tool_calls") or []:
+            if len(tc["function"]["arguments"]) > 600:
+                tc["function"]["arguments"] = json.dumps({"省略": "较早的参数已省略，当前规则见工作区状态"}, ensure_ascii=False)
     starts = [i for i, m in enumerate(history) if m["role"] == "assistant"]
     for i in starts:
-        if size(history[i:]) <= max_chars:
-            return history[i:]
-    return history[starts[-1]:] if starts else history
+        if _size(history[i:]) <= max_chars // 2:
+            del history[:i]
+            return True
+    if starts:
+        del history[:starts[-1]]
+    return True
 
 
 def _answers_text(answers: list[dict] | None) -> str:
@@ -463,7 +513,7 @@ def _answers_text(answers: list[dict] | None) -> str:
 
 
 def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = None, *,
-              answers: list[dict] | None = None, max_steps: int = 80, max_history_chars: int = 60000,
+              answers: list[dict] | None = None, max_steps: int = 80, max_history_chars: int = 24000,
               max_files: int = MAX_FILES, max_tokens: int | None = 1_000_000,
               on_step: Callable[[int, Step], None] | None = None) -> AgentResult:
     """max_steps 和 max_tokens 都是安全上限：模型调用 finish 就结束，正常不会用满。"""
@@ -491,10 +541,14 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             error = f"tokens 用量 {used} 达到上限 {max_tokens}，已停止"
             break
         ws.budget = f"已用 {len(steps)} 步，上限 {max_steps} 步" + (f"；tokens 已用 {used}，上限 {max_tokens}" if max_tokens else "")
+        if _shrink(history, max_history_chars):
+            seen.clear()       # 较早的结果已省略，重新读取是合理的
         tail = [{"role": "user", "content": ws.state()}]
+        # 缓存标记：系统提示 + 任务固定不变；历史在两次整理之间只追加，标在历史最后一条上
+        body = [{"role": "user", "content": task, "_cache": True}] + history[:-1] \
+            + ([{**history[-1], "_cache": True}] if history else [])
         if mode == "json":
-            msgs = [{"role": "system", "content": sys + JSON_PROTOCOL + json.dumps(TOOLS, ensure_ascii=False)},
-                    {"role": "user", "content": task}] + _trim(history, max_history_chars) + tail
+            msgs = [{"role": "system", "content": sys + JSON_PROTOCOL + json.dumps(TOOLS, ensure_ascii=False)}] + body + tail
             try:
                 text = llm.chat(msgs, json_out=True, temperature=0.1)
             except LLMError as e:
@@ -508,8 +562,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 history.append({"role": "user", "content": '格式不对：请只输出 {"thought": ..., "tool": ..., "args": {...}}'})
                 continue
         else:
-            msgs = [{"role": "system", "content": sys}, {"role": "user", "content": task}] \
-                + _trim(history, max_history_chars) + tail
+            msgs = [{"role": "system", "content": sys}] + body + tail
             try:
                 reply = llm.chat_tools(msgs, openai_tools())
             except LLMError as e:
@@ -614,9 +667,25 @@ def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None) 
                                         "steps": [vars(s) for s in ar.steps]}, ensure_ascii=False, indent=2),
                             encoding="utf-8")
     if ar.result is not None and ar.ruleset is not None:
+        ar.recheck = _recheck(ar, paths)
         paths["excel"] = out / "result.xlsx"
         write_excel(ar.ruleset, ar.result, paths["excel"], extra_sheets=_sheets(ar, qrows))
     return paths
+
+
+def _recheck(ar: AgentResult, paths: dict[str, Path]) -> str:
+    """从写出的 rules.yaml、mapping.yaml 重新读入并重算，逐个对象核对金额，证明结果只来自引擎、可复算。"""
+    from bonus_core.data.mapping import load_mapping
+    try:
+        rs = RuleSet.load(paths["rules"])
+        data, _ = apply_mapping(rs, ar.ws.data_files, load_mapping(paths["mapping"]))
+        again = compute(rs, data)
+    except Exception as e:  # 复算失败要如实写进结果，不能当作通过
+        return f"复算失败：{e}"
+    diff = [i for i, n in ar.result.nodes.items() if i not in again.nodes or again.nodes[i].final != n.final]
+    if again.pool != ar.result.pool or diff:
+        return f"复算不一致：奖金池 {again.pool} / {ar.result.pool}，不一致的对象 {diff[:10]}"
+    return f"一致：按 rules.yaml + mapping.yaml 重新计算，奖金池和 {len(again.nodes)} 个对象的金额逐分相同"
 
 
 def _sheets(ar: AgentResult, qrows: list[dict]):
@@ -633,6 +702,7 @@ def _sheets(ar: AgentResult, qrows: list[dict]):
                  for f, c in m.columns.items()]
     plan += [["已忽略", f"{i.get('ref')}：{i.get('reason', '')}"] for i in ws.ignored]
     plan.append(["原文引用命中", f"{ar.quote_hits}/{ar.quote_total}"])
+    plan.append(["复算核对", ar.recheck])
     q = [[r["id"], r["text"], " / ".join(r.get("options") or []),
           (r["options"][r["suggested"]] if isinstance(r.get("suggested"), int)
            and 0 <= r["suggested"] < len(r.get("options") or []) else ""), "" if r.get("answer") is None else str(r["answer"])]

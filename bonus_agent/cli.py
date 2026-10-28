@@ -163,14 +163,21 @@ def _agent(a, cfg) -> int:
     from bonus_agent.agent import ToolError, run_agent
     answers = yaml.safe_load(Path(a.answers).read_text(encoding="utf-8")) if a.answers else None
     llm = LLM.from_config(a.model, cfg)
-    hist = cfg["models"][llm.name].get("max_history_chars", 30000)
+    hist = cfg["models"][llm.name].get("max_history_chars", 24000)
     print(f"使用模型 {llm.name}，智能体开始工作 ...", flush=True)
 
     def show(n, step):
         args = json.dumps(step.args, ensure_ascii=False)
-        first = step.result.splitlines()[0] if step.result else ""
         print(f"  [{n:02d}] {step.tool} {args[:100]}{'…' if len(args) > 100 else ''}", flush=True)
-        print(f"       {'✓' if step.ok else '✗'} {first[:150]}", flush=True)
+        lines = step.result.splitlines() or [""]
+        if step.ok:
+            print(f"       ✓ {lines[0][:150]}", flush=True)
+        else:   # 失败时显示完整原因，方便判断是模型的问题还是规则表达不了
+            print(f"       ✗ {lines[0][:300]}", flush=True)
+            for ln in lines[1:20]:
+                print(f"         {ln[:300]}", flush=True)
+            if len(lines) > 20:
+                print(f"         ……共 {len(lines)} 行，完整内容见 agent_log.json", flush=True)
 
     try:
         ar = run_agent(llm, a.paths, a.out, answers=answers, max_steps=a.max_steps, max_tokens=a.max_tokens,
@@ -183,6 +190,7 @@ def _agent(a, cfg) -> int:
         print(f"\n【方案】{ar.ws.summary}")
     if ar.result is not None:
         print(f"【结果】奖金池 {Decimal(ar.result.pool):,}，结果已写入 {ar.outputs.get('excel')}")
+        print(f"【复算核对】{ar.recheck}")
     if ar.questions:
         print(f"\n【待确认问题】{len(ar.questions)} 个（已按建议理解先算，答复后用 --answers 重跑）：")
         for q in ar.questions:
@@ -191,8 +199,9 @@ def _agent(a, cfg) -> int:
         print(f"\n未完成：{ar.error}")
     print(f"\n输出目录：{a.out}（result.xlsx、rules.yaml、mapping.yaml、questions.yaml、agent_log.json）")
     u = llm.usage
-    print(f"共 {len(ar.steps)} 步，调用模型 {u.calls} 次，输入 {u.prompt_tokens} tokens，输出 {u.completion_tokens} tokens，"
-          f"耗时 {u.latency_s:.0f} 秒")
+    cached = f"（其中命中缓存 {u.cached_tokens}）" if u.cached_tokens else ""
+    print(f"共 {len(ar.steps)} 步，调用模型 {u.calls} 次，输入 {u.prompt_tokens} tokens{cached}，输出 {u.completion_tokens} tokens，"
+          f"平均每次输入 {u.prompt_tokens // max(u.calls, 1)}，耗时 {u.latency_s:.0f} 秒")
     return 0 if ar.ok else 1
 
 

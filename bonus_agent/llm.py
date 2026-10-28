@@ -22,9 +22,11 @@ class Usage:
     completion_tokens: int = 0
     latency_s: float = 0.0
     calls: int = 0
+    cached_tokens: int = 0            # 输入中命中前缀缓存的部分（服务端返回才有）
 
     def __iadd__(self, o: "Usage"):
         self.prompt_tokens += o.prompt_tokens
+        self.cached_tokens += o.cached_tokens
         self.completion_tokens += o.completion_tokens
         self.latency_s += o.latency_s
         self.calls += o.calls
@@ -128,6 +130,7 @@ class LLM:
     extra_body: dict | None = None
     tool_mode: str = "native"         # native：OpenAI 兼容的工具调用；json：模型输出 JSON 动作（不支持工具调用时用）
     timeout: float = 300
+    cache: str | None = None          # explicit：在消息上加 cache_control 标记（百炼显式缓存）；不写则不加
     usage: Usage = field(default_factory=Usage)
 
     @classmethod
@@ -139,7 +142,28 @@ class LLM:
         m = cfg["models"][name]
         prov = cfg["providers"][m["provider"]]
         return cls(name, m["model"], prov["base_url"], provider_key(prov), m.get("json_mode", "json_object"),
-                   m.get("extra_body"), m.get("tool_mode", "native"))
+                   m.get("extra_body"), m.get("tool_mode", "native"), cache=m.get("cache"))
+
+    def _usage(self, resp, t0: float):
+        u = Usage(calls=1, latency_s=time.monotonic() - t0)
+        if resp.usage:
+            u.prompt_tokens, u.completion_tokens = resp.usage.prompt_tokens, resp.usage.completion_tokens
+            details = getattr(resp.usage, "prompt_tokens_details", None)
+            u.cached_tokens = (getattr(details, "cached_tokens", None) or 0) if details else 0
+        self.usage += u
+
+    def _prepare(self, messages: list[dict]) -> list[dict]:
+        """去掉内部用的 _cache 标记；开启显式缓存时，把标记换成 cache_control（缓存到该消息为止的前缀）。"""
+        out = []
+        for m in messages:
+            if "_cache" not in m:
+                out.append(m)
+                continue
+            m = {k: v for k, v in m.items() if k != "_cache"}
+            if self.cache == "explicit" and isinstance(m.get("content"), str) and m["content"]:
+                m["content"] = [{"type": "text", "text": m["content"], "cache_control": {"type": "ephemeral"}}]
+            out.append(m)
+        return out
 
     def _client(self):
         from openai import OpenAI
@@ -147,7 +171,7 @@ class LLM:
 
     def chat(self, messages: list[dict], *, schema: dict | None = None, json_out: bool = False,
              temperature: float = 0.1, max_tokens: int = 8192) -> str:
-        kwargs = dict(model=self.model, messages=messages, temperature=temperature, max_tokens=max_tokens)
+        kwargs = dict(model=self.model, messages=self._prepare(messages), temperature=temperature, max_tokens=max_tokens)
         if self.extra_body:
             kwargs["extra_body"] = self.extra_body
         if json_out or schema:
@@ -160,10 +184,7 @@ class LLM:
             resp = self._client().chat.completions.create(**kwargs)
         except Exception as e:  # 网络、鉴权、限流等
             raise LLMError(f"{self.name} 调用失败：{e}") from e
-        u = Usage(calls=1, latency_s=time.monotonic() - t0)
-        if resp.usage:
-            u.prompt_tokens, u.completion_tokens = resp.usage.prompt_tokens, resp.usage.completion_tokens
-        self.usage += u
+        self._usage(resp, t0)
         return resp.choices[0].message.content or ""
 
     def chat_json(self, messages: list[dict], **kw):
@@ -172,7 +193,8 @@ class LLM:
     def chat_tools(self, messages: list[dict], tools: list[dict], *, temperature: float = 0.1,
                    max_tokens: int = 8192) -> dict:
         """工具调用。返回 {"content": 文本, "tool_calls": [{"id", "name", "arguments"(JSON 字符串)}]}。"""
-        kwargs = dict(model=self.model, messages=messages, tools=tools, temperature=temperature, max_tokens=max_tokens)
+        kwargs = dict(model=self.model, messages=self._prepare(messages), tools=tools, temperature=temperature,
+                      max_tokens=max_tokens)
         if self.extra_body:
             kwargs["extra_body"] = self.extra_body
         t0 = time.monotonic()
@@ -180,10 +202,7 @@ class LLM:
             resp = self._client().chat.completions.create(**kwargs)
         except Exception as e:
             raise LLMError(f"{self.name} 调用失败：{e}") from e
-        u = Usage(calls=1, latency_s=time.monotonic() - t0)
-        if resp.usage:
-            u.prompt_tokens, u.completion_tokens = resp.usage.prompt_tokens, resp.usage.completion_tokens
-        self.usage += u
+        self._usage(resp, t0)
         msg = resp.choices[0].message
         calls = [{"id": c.id, "name": c.function.name, "arguments": c.function.arguments or "{}"}
                  for c in (msg.tool_calls or [])]

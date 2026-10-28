@@ -193,6 +193,7 @@ def test_agent_native_end_to_end(tmp_path):
     assert "权重" in next(s for s in steps if s.tool == "explain").result
     wb = openpyxl.load_workbook(ar.outputs["excel"])
     assert {"待确认问题", "智能体规划", "智能体工作记录"} <= set(wb.sheetnames)
+    assert ar.recheck.startswith("一致"), ar.recheck            # 从写出的文件复算，逐分一致
 
 
 def test_agent_json_mode_and_state_in_every_turn():
@@ -207,14 +208,28 @@ def test_agent_json_mode_and_state_in_every_turn():
     assert "格式不对" in json.dumps(llm.calls[1], ensure_ascii=False)
 
 
-def test_agent_history_trim_keeps_tool_pairs():
-    from bonus_agent.agent import _trim
+def test_agent_history_shrink_keeps_prefix_until_needed():
+    from bonus_agent.agent import _shrink, _size
     h = []
     for i in range(30):
-        h += [{"role": "assistant", "content": "", "tool_calls": [{"id": str(i)}]},
-              {"role": "tool", "tool_call_id": str(i), "content": "x" * 1000}]
-    t = _trim(h, 5000)
-    assert t[0]["role"] == "assistant" and len(t) < len(h)
+        h += [{"role": "assistant", "content": "", "tool_calls": [
+                  {"id": str(i), "type": "function", "function": {"name": "set_rules", "arguments": "{" + "a" * 800 + "}"}}]},
+              {"role": "tool", "tool_call_id": str(i), "content": f"结果{i}" + "x" * 1000}]
+    small = [dict(m) for m in h[:4]]
+    assert not _shrink(small, 100000) and small == h[:4]     # 未超限：不动，前缀保持不变
+    assert _shrink(h, 40000)
+    assert h[0]["role"] == "assistant" and _size(h) <= 20000
+    assert h[-1]["content"].endswith("x" * 100)              # 最近的结果保留全文
+    assert sum("已省略" in m.get("content", "") for m in h) > 0
+
+
+def test_explicit_cache_markers():
+    from bonus_agent.llm import LLM
+    llm = LLM("m", "m", "", "", cache="explicit")
+    out = llm._prepare([{"role": "user", "content": "任务", "_cache": True}, {"role": "user", "content": "状态"}])
+    assert out[0]["content"][0]["cache_control"] == {"type": "ephemeral"} and out[1]["content"] == "状态"
+    plain = LLM("m", "m", "", "")._prepare([{"role": "user", "content": "任务", "_cache": True}])
+    assert plain == [{"role": "user", "content": "任务"}]
 
 
 def test_agent_stops_looping_and_paginates():

@@ -18,7 +18,9 @@ default: qwen3.6-35b-a3b
 
 # 智能体相关的可选项（写在每个模型下）：
 #   tool_mode: native | json      native 为原生工具调用（默认）；服务不支持时会自动改用 json
-#   max_history_chars: 30000      智能体保留的对话历史长度，上下文 32k 的模型保持默认，256k 以上可加大
+#   max_history_chars: 24000      智能体对话历史的上限（字符）。超过时整理一次，压到一半；加大会让每步输入变多
+#   cache: explicit               百炼显式缓存（命中部分按输入价 10% 计费，5 分钟有效）。只对支持的模型开启，
+#                                 目前候选开源模型都不支持；私有化 vLLM 自带前缀缓存，无需配置
 # 千问 3.5 及以后的模型默认可能开启思考模式，抽取时统一关闭（enable_thinking: false），
 # 否则耗时和 tokens 会明显增加，且部分模型思考模式下不支持 JSON 输出。
 models:
@@ -44,7 +46,6 @@ models:
     model: qwen3.6-35b-a3b
     json_mode: json_object
     extra_body: {enable_thinking: false}
-    max_history_chars: 60000
   qwen3.6-27b:                  # 稠密模型，对标 32B 的下一代
     provider: dashscope
     model: qwen3.6-27b
@@ -72,11 +73,13 @@ models:
     model: qwen3-vl-plus
     json_mode: json_object
     extra_body: {enable_thinking: false}
+    cache: explicit
   qwen3.6-flash:
     provider: dashscope
     model: qwen3.6-flash
     json_mode: json_object
     extra_body: {enable_thinking: false}
+    cache: explicit
 
   # ---- 私有化部署后 ----
   # 部署时把 model 改成选型胜出的模型（vLLM 启动时的 --served-model-name 或权重路径）
