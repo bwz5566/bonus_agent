@@ -464,7 +464,9 @@ def _answers_text(answers: list[dict] | None) -> str:
 
 def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = None, *,
               answers: list[dict] | None = None, max_steps: int = 80, max_history_chars: int = 60000,
-              max_files: int = MAX_FILES, on_step: Callable[[int, Step], None] | None = None) -> AgentResult:
+              max_files: int = MAX_FILES, max_tokens: int | None = 1_000_000,
+              on_step: Callable[[int, Step], None] | None = None) -> AgentResult:
+    """max_steps 和 max_tokens 都是安全上限：模型调用 finish 就结束，正常不会用满。"""
     try:
         files = collect_files(paths, exclude=[out_dir] if out_dir else [], max_files=max_files)
     except TooManyFiles as e:
@@ -484,7 +486,11 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     seen: dict[str, int] = {}          # 只读工具的调用 -> 第几步，用来发现原地打转
     repeats = 0
     for turn in range(max_steps):
-        ws.budget = f"已用 {len(steps)} 步，上限 {max_steps} 步"
+        used = llm.usage.prompt_tokens + llm.usage.completion_tokens
+        if max_tokens and used >= max_tokens:
+            error = f"tokens 用量 {used} 达到上限 {max_tokens}，已停止"
+            break
+        ws.budget = f"已用 {len(steps)} 步，上限 {max_steps} 步" + (f"；tokens 已用 {used}，上限 {max_tokens}" if max_tokens else "")
         tail = [{"role": "user", "content": ws.state()}]
         if mode == "json":
             msgs = [{"role": "system", "content": sys + JSON_PROTOCOL + json.dumps(TOOLS, ensure_ascii=False)},

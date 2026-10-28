@@ -48,7 +48,8 @@ def main(argv=None) -> int:
     p.add_argument("--answers", help="上一次输出的 questions.yaml，填写 answer 后传入重算")
     p.add_argument("--out", required=True, help="输出目录")
     p.add_argument("--max-files", type=int, default=30, help="一批最多处理的文件数，防止误传整个目录")
-    p.add_argument("--max-steps", type=int, default=80, help="智能体最多调用工具的轮数")
+    p.add_argument("--max-steps", type=int, default=80, help="安全上限：智能体最多调用工具的轮数，完成即停，正常用不满")
+    p.add_argument("--max-tokens", type=int, default=1_000_000, help="安全上限：本次最多消耗的 tokens，超过即停止")
     p.add_argument("--pipeline", action="store_true", help="使用固定流程（规划 → 抽取 → 计算），不让模型自主调度")
     p.add_argument("paths", nargs="+", help="本批次的规则文档、Excel 数据，或只包含它们的文件夹")
     a = ap.parse_args(argv)
@@ -172,7 +173,8 @@ def _agent(a, cfg) -> int:
         print(f"       {'✓' if step.ok else '✗'} {first[:150]}", flush=True)
 
     try:
-        ar = run_agent(llm, a.paths, a.out, answers=answers, max_steps=a.max_steps, max_history_chars=hist,
+        ar = run_agent(llm, a.paths, a.out, answers=answers, max_steps=a.max_steps, max_tokens=a.max_tokens,
+                       max_history_chars=hist,
                        max_files=a.max_files, on_step=show)
     except ToolError as e:
         print(f"失败：{e}")

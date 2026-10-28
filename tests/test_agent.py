@@ -227,3 +227,11 @@ def test_agent_stops_looping_and_paginates():
     assert "start_row=6" in first and "共 28 行" in first
     assert "已跳过" in ar.steps[2].result
     assert "净利润 8%" in llm.calls[-1][-1]["content"]       # 笔记每轮附在状态里
+
+
+def test_agent_token_budget():
+    from bonus_agent.agent import run_agent
+    llm = FakeLLM([{"tool": "list_files"}])
+    llm.usage.prompt_tokens = 2_000_000
+    ar = run_agent(llm, [ANNUAL], max_tokens=1_000_000)
+    assert not ar.ok and "tokens" in ar.error and not ar.steps
