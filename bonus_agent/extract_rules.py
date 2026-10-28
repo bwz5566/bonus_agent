@@ -43,6 +43,8 @@ class Question(BaseModel):
     answer: str | None = None  # 财务答复
     round: int = 1             # 第几轮提出的
     withdrawn: str = ""        # 程序撤回的原因（如冲突所依据的材料已修改）
+    answered_by: str = ""      # 答复人（网页答复时记录）
+    answered_at: str = ""
 
 
 class Extraction(BaseModel):

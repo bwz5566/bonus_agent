@@ -106,3 +106,21 @@ class Template:
             out[s["name"]] = res
             refs.update({f"{s['name']}/{k}": v for k, v in res.items()})
         return out, warnings
+
+    def write(self, results: dict[str, dict[str, Result]], out: str | Path) -> list[tuple[Path, tuple[str, str, Result]]]:
+        """每个方案（修订）写一个结果 Excel，附「确认信息」。返回 [(文件, (方案, 修订, 结果))]。"""
+        from bonus_core.engine.ledger import ledger_entries
+        from bonus_core.report.excel import write_excel
+        c = self.manifest["confirmed"]
+        info = [("确认信息", ["项目", "值"], [["确认人", c["by"]], ["确认时间", c["at"]], ["确认的轮次", f"第 {c['round']} 轮"],
+                                           ["说明", c.get("note", "")], ["模板目录", str(self.dir)]], {"项目": 14, "值": 70})]
+        out = Path(out)
+        out.mkdir(parents=True, exist_ok=True)
+        rules = {s["name"]: RuleSet.load(self.dir / s["rules"]) for s in self.manifest["schemes"]}
+        written = []
+        for name, revs in results.items():
+            for rev, res in revs.items():
+                f = out / (f"result_{name}.xlsx" if rev == "R0" else f"result_{name}_{rev}.xlsx")
+                write_excel(rules[name], res, f, ledger_entries(res), extra_sheets=info)
+                written.append((f, (name, rev, res)))
+        return written

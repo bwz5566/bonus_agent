@@ -189,10 +189,29 @@ bonus-agent map --model qwen3-vl-32b --rules draft.yaml 数据.xlsx
 
 ## 三、私有化部署（选型之后）
 
+### 内网网页服务
+
+财务不用编辑 yaml、不用命令行：在网页上建案卷、传材料、看问题、填答复，点“运行下一轮”；审批人确认结果后，每期上传本期数据按模板计算。
+
+```bash
+pip install -e ".[agent,web]"
+bonus-agent user add --data /srv/bonus 张会计账号 --roles editor --display 张会计       # 口令在终端输入，只存 PBKDF2 哈希
+bonus-agent user add --data /srv/bonus 李经理账号 --roles approver --display 李经理
+bonus-agent serve --data /srv/bonus --host 127.0.0.1 --port 8000 [--model 本地模型]
+```
+
+- 角色：`editor`（经办）传材料、答复问题、运行、按模板计算；`approver`（审批）确认结果；其他登录用户只读。
+- 答复记录答复人和时间（写进 questions.yaml）；新建、上传（含 sha256）、删除、答复、运行、确认、按模板计算、下载都记入案卷的 `audit.jsonl`，页面上可查。
+- 每个案卷同时只跑一轮，运行中不能改材料和答复；全局最多同时跑 `--max-parallel` 轮。
+- 安全：默认只监听本机，内网访问请放在 HTTPS 反向代理（nginx 等）后面；HTTP Basic 登录，表单带防伪码；上传只收支持的格式、只取文件名、单个不超过 50 MB；下载限制在案卷目录内，不提供 case.json；不开放 API 文档页。
+- 数据目录结构见 `bonus_agent/web.py` 开头的说明；材料、结果都只存在这台服务器上。生产环境请在 `models.yaml` 里把默认模型改成本地 vLLM，数据不出内网。
+
+### 本地模型
+
 在 `bonus_agent/config/models.yaml`（或自己的 `config/models.yaml`）的 `local_vllm` 里填 vLLM 地址，把 `default` 改成本地模型即可；本地 vLLM 支持 `json_mode: json_schema` 约束解码，输出更稳定。
 
 ## 下一步
 
 - 计算说明 Word 生成（模板 + 数字占位符校验）
-- FastAPI 服务与数据库（按技术方案的接口和表结构）
+- 问题分工（按类型指定答复人）、更细的权限
 - LangGraph 状态机与人工确认节点

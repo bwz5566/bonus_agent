@@ -1059,7 +1059,9 @@ def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None =
                                                              encoding="utf-8")
     qrows = [{"id": q.id, "round": q.round, "text": q.text, "options": q.options, "suggested": q.suggested,
               "related": q.related, "blocking": q.blocking, "answer": q.answer,
-              **({"withdrawn": q.withdrawn} if q.withdrawn else {})} for q in ws.questions]
+              **({"withdrawn": q.withdrawn} if q.withdrawn else {}),
+              **({"answered_by": q.answered_by, "answered_at": q.answered_at} if q.answered_by else {})}
+             for q in ws.questions]
     paths["questions"] = out / "questions.yaml"
     paths["questions"].write_text(
         "# 财务答复：在 answer 里填选项序号（从 0 开始）或直接写文字；有补充材料放进材料文件夹，\n"

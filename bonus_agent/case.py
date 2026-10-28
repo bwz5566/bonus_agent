@@ -79,6 +79,7 @@ def apply_answers(questions: list[Question], answers: list[dict] | None) -> list
             ans = q.options[ans]
         if q.answer != str(ans):
             q.answer = str(ans)
+            q.answered_by, q.answered_at = str(a.get("answered_by") or ""), str(a.get("answered_at") or "")
             fresh.append(q)
     return fresh
 

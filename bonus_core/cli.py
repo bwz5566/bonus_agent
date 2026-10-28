@@ -121,17 +121,8 @@ def _run_template(a) -> int:
         return 1
     for i in warnings:
         print(i)
-    c = tpl.manifest["confirmed"]
-    info = [("确认信息", ["项目", "值"], [["确认人", c["by"]], ["确认时间", c["at"]], ["确认的轮次", f"第 {c['round']} 轮"],
-                                       ["说明", c.get("note", "")], ["模板目录", str(tpl.dir)]], {"项目": 14, "值": 70})]
-    out = Path(a.out)
-    out.mkdir(parents=True, exist_ok=True)
-    rules = {s["name"]: RuleSet.load(tpl.dir / s["rules"]) for s in tpl.manifest["schemes"]}
-    for name, revs in results.items():
-        for rev, res in revs.items():
-            f = out / (f"result_{name}.xlsx" if rev == "R0" else f"result_{name}_{rev}.xlsx")
-            write_excel(rules[name], res, f, ledger_entries(res), extra_sheets=info)
-            print(f"{name}{'' if rev == 'R0' else ' ' + rev}：奖金池 {res.pool}，已写出 {f}")
+    for f, (name, rev, res) in tpl.write(results, a.out):
+        print(f"{name}{'' if rev == 'R0' else ' ' + rev}：奖金池 {res.pool}，已写出 {f}")
     return 0
 
 

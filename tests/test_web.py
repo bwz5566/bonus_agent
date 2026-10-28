@@ -1,0 +1,137 @@
+"""内网网页服务：登录、角色、防伪码、上传、答复、多轮运行、确认、按模板计算、下载和操作记录。"""
+from pathlib import Path
+
+import pytest
+import yaml
+
+pytest.importorskip("fastapi")
+from fastapi.testclient import TestClient  # noqa: E402
+
+from bonus_agent.llm import FakeLLM  # noqa: E402
+from bonus_agent.web import create_app, safe_name  # noqa: E402
+from tests.test_conflicts import DATASET, F5, F6, _materials, rules  # noqa: E402
+
+PW = "password-123"
+
+
+@pytest.fixture
+def env(tmp_path):
+    scripts = []
+    app = create_app(tmp_path / "data", lambda: FakeLLM(scripts.pop(0)))
+    store = app.state.store
+    store.users.add("alice", PW, ["editor"], "张会计")
+    store.users.add("bob", PW, ["approver"], "李经理")
+    store.users.add("carol", PW, [])
+    c = TestClient(app)
+    return app, store, scripts, c, _materials(tmp_path / "m")
+
+
+def as_(c, name):
+    c.auth = (name, PW)
+    return c
+
+
+def post(c, store, url, data=None, files=None, user="alice"):
+    as_(c, user)
+    return c.post(url, data={"csrf": store.csrf(user), **(data or {})}, files=files, follow_redirects=False)
+
+
+def wait(app, cid):
+    app.state.runner.jobs[cid].thread.join(30)
+    return app.state.runner.jobs[cid]
+
+
+def test_web_rounds_confirm_and_template(env):
+    app, store, scripts, c, m = env
+    assert c.get("/").status_code == 401
+    c.auth = ("alice", "wrong-password")
+    assert c.get("/").status_code == 401
+    assert as_(c, "carol").get("/").status_code == 200                       # 只读用户能看
+    assert post(c, store, "/cases", {"name": "Q3"}, user="carol").status_code == 403
+    as_(c, "alice")
+    assert c.post("/cases", data={"name": "Q3", "csrf": "x"}).status_code == 403   # 防伪码不对
+    r = post(c, store, "/cases", {"name": "2026 Q3 季度奖"})
+    cid = r.headers["location"].split("/")[-1].split("?")[0]
+    files = [("files", (p.name, p.read_bytes())) for p in sorted(m.iterdir())]
+    assert post(c, store, f"/cases/{cid}/materials", files=files).status_code == 303
+    assert post(c, store, f"/cases/{cid}/materials", files=[("files", ("a.exe", b"x"))]).status_code == 400
+    # 第 1 轮：材料冲突，程序提问，不出结果
+    scripts.append([{"tool": "record_facts", "args": {"facts": [F5, F6]}}, DATASET,
+                    {"tool": "finish", "args": {"summary": "季度奖"}}])
+    assert post(c, store, f"/cases/{cid}/run").status_code == 303
+    job = wait(app, cid)
+    assert job.status == "done" and "等答复" in job.message, job.message
+    page = c.get(f"/cases/{cid}").text
+    assert "等待答复" in page and "季度奖-计提比例" in page and "运行下一轮" in page
+    r = post(c, store, f"/cases/{cid}/confirm", user="bob")      # 没有正式结果不能确认
+    assert "不能确认" in c.get(r.headers["location"]).text
+    as_(c, "alice")
+    # 网页答复：选 6%，记录答复人
+    post(c, store, f"/cases/{cid}/answers", {"ans_q1": "1"})
+    q = yaml.safe_load((store.dir(cid) / "out" / "questions.yaml").read_text(encoding="utf-8"))
+    assert q[0]["answer"].startswith("6%") and q[0]["answered_by"] == "张会计"
+    # 第 2 轮：按答复写规则，出结果
+    scripts.append([rules("6%"), {"tool": "trial_run"}, {"tool": "finish", "args": {"summary": "季度奖"}}])
+    post(c, store, f"/cases/{cid}/run")
+    job = wait(app, cid)
+    assert "已出结果" in job.message, job.message
+    page = c.get(f"/cases/{cid}").text
+    assert "result.xlsx" in page and "第 2 轮" in page
+    # 只有 approver 能确认
+    assert post(c, store, f"/cases/{cid}/confirm").status_code == 403
+    r = post(c, store, f"/cases/{cid}/confirm", {"note": "已核对"}, user="bob")
+    assert "已确认" in c.get(r.headers["location"]).text
+    assert (store.dir(cid) / "out" / "template" / "manifest.yaml").exists()
+    # 按模板计算本期数据（不调用大模型）
+    data = [("files", ("数据.xlsx", (m / "数据.xlsx").read_bytes()))]
+    r = post(c, store, f"/cases/{cid}/template", files=data)
+    assert "已算出 1 个结果" in c.get(r.headers["location"]).text
+    run = next((store.dir(cid) / "runs").iterdir())
+    out = next(run.glob("result_*.xlsx"))
+    assert c.get(f"/cases/{cid}/dl/runs/{run.name}/{out.name}").status_code == 200
+    # 越界路径、案卷内部状态不能下载
+    assert c.get(f"/cases/{cid}/dl/out/..%2Fmeta.json").status_code == 404
+    assert c.get(f"/cases/{cid}/dl/out/case.json").status_code == 404
+    assert c.get("/cases/../../etc").status_code == 404
+    acts = [a["action"] for a in store.audit_log(cid)]
+    for want in ("新建案卷", "上传材料", "运行下一轮", "本轮结束", "答复问题", "确认结果", "按模板计算", "下载"):
+        assert want in acts, (want, acts)
+    ans = next(a for a in store.audit_log(cid) if a["action"] == "答复问题")
+    assert ans["user"] == "张会计" and ans["question"] == "q1"
+
+
+def test_running_case_is_locked(env):
+    app, store, scripts, c, m = env
+    import threading
+    gate = threading.Event()
+
+    def slow():
+        gate.wait(10)
+        return FakeLLM([{"tool": "finish", "args": {"summary": "x"}}])
+    app.state.runner.llm_factory = slow
+    cid = store.create("t", "x")
+    (store.dir(cid) / "materials" / "数据.xlsx").write_bytes((m / "数据.xlsx").read_bytes())
+    post(c, store, f"/cases/{cid}/run")
+    assert post(c, store, f"/cases/{cid}/run").status_code == 409
+    assert post(c, store, f"/cases/{cid}/answers", {"ans_q1": "0"}).status_code == 409
+    files = [("files", ("x.docx", b"x"))]
+    assert post(c, store, f"/cases/{cid}/materials", files=files).status_code == 409
+    gate.set()
+    assert wait(app, cid).status in ("done", "failed")
+
+
+def test_safe_name_and_passwords(tmp_path):
+    assert safe_name("../../etc/方案.docx") == "方案.docx" and safe_name("C:\\x\\数据.xlsx") == "数据.xlsx"
+    for bad in (".env.docx", "~$tmp.docx", "run.sh", ""):
+        with pytest.raises(ValueError):
+            safe_name(bad)
+    from bonus_agent.web import Users
+    u = Users(tmp_path / "users.yaml")
+    u.add("a", PW, ["editor"])
+    assert PW not in (tmp_path / "users.yaml").read_text(encoding="utf-8")
+    assert u.check("a", PW)["roles"] == ["editor"] and u.check("a", "x") is None and u.check("b", PW) is None
+    with pytest.raises(ValueError):
+        u.add("a", "short", ["editor"])
+    with pytest.raises(ValueError):
+        u.add("a", PW, ["root"])
+    assert oct(Path(tmp_path / "users.yaml").stat().st_mode)[-3:] == "600"

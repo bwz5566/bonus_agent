@@ -12,6 +12,10 @@
   confirm --out 案卷目录 --by 确认人 [--note 说明] [数据文件...]
                                            财务确认最新一轮结果：复算核对后把规则、映射和调整冻结为 案卷目录/template/，
                                            以后每期用 bonus run-template 计算，不再调用大模型
+  serve --data 数据目录 [--host 127.0.0.1] [--port 8000] [--model M]
+                                           内网网页服务：看问题、填答复、传材料、运行下一轮、确认、按模板计算
+  user add --data 数据目录 用户名 --roles editor,approver [--display 姓名]
+                                           添加或修改网页用户（口令从终端输入，只存哈希）
 """
 from __future__ import annotations
 
@@ -53,6 +57,19 @@ def main(argv=None) -> int:
     p.add_argument("--by", required=True, help="确认人")
     p.add_argument("--note", default="", help="确认说明")
     p.add_argument("data", nargs="*", help="复算用的数据文件（默认用该轮的输入文件）")
+    p = sub.add_parser("serve")
+    p.add_argument("--data", required=True, help="数据目录：用户、案卷、材料和结果都在这里")
+    p.add_argument("--host", default="127.0.0.1", help="默认只监听本机；内网访问请放在 HTTPS 反向代理后面")
+    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--model")
+    p.add_argument("--max-parallel", type=int, default=2, help="同时最多运行几个案卷")
+    p = sub.add_parser("user")
+    p.add_argument("action", choices=["add"])
+    p.add_argument("--data", required=True)
+    p.add_argument("name")
+    p.add_argument("--roles", default="editor", help="逗号分隔：editor（传材料、答复、运行）、approver（确认结果）")
+    p.add_argument("--display", default="", help="显示的姓名（记入答复人、确认人）")
+    p.add_argument("--password-stdin", action="store_true", help="从标准输入读口令（脚本用）")
     p = sub.add_parser("auto")
     p.add_argument("--model")
     p.add_argument("--answers", help="财务答复文件（默认读案卷目录里的 questions.yaml）")
@@ -67,6 +84,28 @@ def main(argv=None) -> int:
     p.add_argument("paths", nargs="+", help="本批次的规则文档、Excel 数据，或只包含它们的文件夹")
     a = ap.parse_args(argv)
 
+    if a.cmd == "user":
+        import getpass
+
+        from bonus_agent.web import Users
+        if a.password_stdin:
+            pw = sys.stdin.readline().rstrip("\n")
+        else:
+            pw = getpass.getpass("口令（至少 8 位）：")
+            if pw != getpass.getpass("再输一次："):
+                print("两次输入不一致")
+                return 1
+        try:
+            Users(Path(a.data) / "users.yaml").add(a.name, pw, [r for r in a.roles.split(",") if r], a.display)
+        except ValueError as e:
+            print(f"失败：{e}")
+            return 1
+        print(f"已保存用户 {a.name}（{a.roles}）")
+        return 0
+    if a.cmd == "serve":
+        from bonus_agent.web import serve
+        serve(a.data, a.host, a.port, a.model, max_parallel=a.max_parallel)
+        return 0
     cfg = load_config()
     if a.cmd == "models":
         remote: dict[str, set[str] | str] = {}
