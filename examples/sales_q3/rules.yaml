@@ -1,0 +1,107 @@
+# 示例规则：销售部季度奖金（对应需求中的例子，数字仅作示意）
+name: 销售部季度奖金
+version: 2026Q3-v1
+effective_from: 2026-07-01
+effective_to: 2026-09-30
+
+datasets:
+  人员:
+    key: employee_id
+    fields:
+      employee_id: {type: id, desc: 工号}
+      name: {type: text, desc: 姓名}
+      group_id: {type: id, desc: 所属小组}
+      seniority: {type: number, desc: 工龄（年）}
+      effort: {type: number, desc: 付出程度评分 1~5}
+  小组:
+    key: group_id
+    fields:
+      group_id: {type: id, desc: 小组编号}
+      name: {type: text, desc: 小组名称}
+      group_score: {type: number, desc: 部门绩效评分}
+  销售明细:
+    link: employee_id
+    fields:
+      project_id: {type: id, desc: 合同/项目编号}
+      employee_id: {type: id, desc: 负责人工号}
+      project_type: {type: enum, values: [新项目, 老项目], desc: 新老项目}
+      region: {type: text, desc: 区域}
+      sales_amount: {type: money, unit: 万元, desc: 合同销售额}
+      net_profit: {type: money, unit: 万元, desc: 净利润}
+      gross_margin: {type: ratio, desc: 毛利率}
+      collected: {type: money, unit: 万元, desc: 已回款}
+
+tables:
+  sales_tier:
+    kind: tier
+    mode: whole
+    steps: [[0, 0], [10000000, 0.10], [20000000, 0.12]]
+    desc: 销售额达 1 千万提 10%，达 2 千万提 12%
+  profit_tier:
+    kind: tier
+    mode: whole
+    steps: [[0, 0], [10000000, 0.05]]
+    desc: 净利润达 1 千万提 5%
+  region_coef:
+    kind: lookup
+    mapping: {华东: 1.0, 华南: 0.9, 西北: 1.2}
+    default: 1.0
+    desc: 区域系数
+  margin_coef:
+    kind: tier
+    mode: whole
+    steps: [[0, 0.8], [0.2, 1.0], [0.35, 1.2]]
+    desc: 毛利率系数（用 tier_rate 取系数）
+
+variables:
+  total_sales: {scope: global, expr: "sum(sales_amount)", desc: 部门销售额}
+  total_profit: {scope: global, expr: "sum(net_profit)", desc: 部门净利润}
+  eff_sales:
+    scope: 个人
+    desc: 折算销售额 = 销售额 × 区域系数 × 新项目系数 × 毛利率系数
+    expr: >-
+      sum(sales_amount * lookup(region_coef, region)
+          * if(project_type == "新项目", 1.2, 1) * tier_rate(margin_coef, gross_margin))
+  project_count: {scope: 个人, expr: "count_distinct(project_id)", desc: 处理的项目数}
+  collected_ratio: {scope: 个人, expr: "ratio(sum(collected), sum(sales_amount), zero: 1)", desc: 回款比例}
+
+pool:
+  expr: "tier(sales_tier, total_sales) + tier(profit_tier, total_profit)"
+  desc: 激励总包 = 销售额阶梯奖金 + 净利润阶梯奖金
+
+allocation:
+  - level: 小组
+    key: group_id
+    weight: "group_score"
+    desc: 按部门绩效评分分到小组
+  - level: 个人
+    key: employee_id
+    parent_key: group_id
+    weight: "0.2*share(seniority) + 0.2*share(effort) + 0.4*share(eff_sales) + 0.2*share(project_count)"
+    desc: 工龄 20%、付出程度 20%、折算销售额 40%、项目数 20%
+
+payout:
+  - id: 未收款不发放
+    scope: 个人
+    hold_ratio: "1 - min(collected_ratio, 1)"
+    desc: 按未回款比例挂起，回款后按本版本规则补发
+
+tests:
+  - name: 手算样例：两个小组三个人
+    datasets:
+      人员:
+        - {employee_id: E1, name: 甲, group_id: G1, seniority: 3, effort: 4}
+        - {employee_id: E2, name: 乙, group_id: G1, seniority: 1, effort: 3}
+        - {employee_id: E3, name: 丙, group_id: G2, seniority: 5, effort: 5}
+      小组:
+        - {group_id: G1, name: 一组, group_score: 60}
+        - {group_id: G2, name: 二组, group_score: 40}
+      销售明细:
+        - {project_id: P1, employee_id: E1, project_type: 新项目, region: 华东, sales_amount: 600, net_profit: 120, gross_margin: 0.3, collected: 600}
+        - {project_id: P2, employee_id: E2, project_type: 老项目, region: 华东, sales_amount: 500, net_profit: 100, gross_margin: 0.3, collected: 250}
+        - {project_id: P3, employee_id: E3, project_type: 老项目, region: 华南, sales_amount: 100, net_profit: 20, gross_margin: 0.3, collected: 100}
+    expect:
+      pool: "1200000.00"        # 销售额 1200 万 × 10%；净利润 240 万未达档
+      小组:G1: "720000.00"
+      小组:G2: "480000.00"
+      个人:E3: "480000.00"

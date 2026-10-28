@@ -1,0 +1,45 @@
+人员:
+  sheet: 人员名单
+  columns:
+    employee_id: 工号
+    name: 姓名
+    group_id: 所属小组
+    seniority: 工龄（年）
+    effort: 付出程度评分
+  confidence:
+    employee_id: 1.0
+    name: 1.0
+    group_id: 1.0
+    seniority: 1.0
+    effort: 0.85
+小组:
+  sheet: 小组绩效
+  columns:
+    group_id: 小组编号
+    name: 小组名称
+    group_score: 部门绩效得分
+  confidence:
+    group_id: 1.0
+    name: 1.0
+    group_score: 0.67
+销售明细:
+  sheet: 销售明细
+  columns:
+    project_id: 合同编号
+    employee_id: 负责人工号
+    project_type: 项目类型
+    region: 区域
+    sales_amount: 合同金额
+    net_profit: 净利润
+    gross_margin: 毛利率
+    collected: 已回款
+  confidence:
+    project_id: 1.0
+    employee_id: 1.0
+    project_type: 1.0
+    region: 1.0
+    sales_amount: 1.0
+    net_profit: 1.0
+    gross_margin: 1.0
+    collected: 1.0
+

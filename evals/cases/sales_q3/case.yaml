@@ -1,0 +1,16 @@
+# 评测样例：销售部季度奖金
+desc: Word 正文 + 阶梯图片 + PPT 原生表格 + PPT 系数图片；净利润一条故意有歧义
+docs: [激励方案.docx, 系数表.pptx]
+# 数据字典、标准答案和计算数据都复用 examples/sales_q3
+reference_rules: ../../../examples/sales_q3/rules.yaml
+data: [../../../examples/sales_q3/data.xlsx]
+mapping: ../../../examples/sales_q3/mapping.yaml
+
+checks:
+  - {name: 销售额阶梯档位, type: tier, steps: [[0, 0], [10000000, 0.10], [20000000, 0.12]], mode: whole}
+  - {name: 净利润阶梯档位, type: tier, steps: [[0, 0], [10000000, 0.05]]}
+  - {name: 毛利率系数（图片）, type: tier, steps: [[0, 0.8], [0.2, 1.0], [0.35, 1.2]]}
+  - {name: 区域系数（PPT 表格）, type: lookup, mapping: {华东: 1.0, 华南: 0.9, 西北: 1.2}, default: 1.0}
+  - {name: 分配层级, type: levels, keys: [group_id, employee_id]}
+  - {name: 有未收款挂起条件, type: payout_exists}
+  - {name: 对净利润全额/超额提问, type: question, keywords: [净利润, 5%, 全额, 超额, 累进]}

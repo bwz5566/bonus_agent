@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bonus-agent"
+version = "0.1.0"
+description = "奖金计算智能体：规则 DSL、确定性计算引擎、规则抽取智能体与模型评测"
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.6",
+  "lark>=1.1",
+  "openpyxl>=3.1",
+  "PyYAML>=6",
+]
+
+[project.optional-dependencies]
+agent = ["openai>=1.40", "python-docx>=1.1", "python-pptx>=0.6", "Pillow>=10"]
+dev = ["pytest>=8", "hypothesis>=6"]
+
+[project.scripts]
+bonus = "bonus_core.cli:main"
+bonus-agent = "bonus_agent.cli:main"
+bonus-eval = "evals.run_eval:main"
+
+[tool.setuptools.packages.find]
+include = ["bonus_core*", "bonus_agent*", "evals*"]
+
+[tool.setuptools.package-data]
+bonus_agent = ["prompts/*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
