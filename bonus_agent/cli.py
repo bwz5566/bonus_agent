@@ -4,8 +4,10 @@
   extract --datasets D.yaml [--model M] --out draft.yaml 文档...
                                            从规则文档抽取规则草稿和问题卡
   map --rules R.yaml [--model M] 数据.xlsx 推荐字段映射（启发式 + 大模型）
-  auto [--model M] [--answers Q.yaml] [--expected 期望结果.xlsx] [--pipeline] --out 目录 文件或文件夹...
+  auto [--model M] [--new] [--expected 期望结果.xlsx] [--pipeline] --out 案卷目录 文件或文件夹...
                                            全自动：大模型自主调用工具完成建模和试算，引擎计算，输出 Excel
+                                           --out 是案卷目录：有问题时本轮停下等答复；在 questions.yaml 填答复、
+                                           补充材料后用同一个目录再运行，从上一轮接着做（--new 从头开始）
                                            （--pipeline 改用固定流程：规划 → 抽取 → 计算）
 """
 from __future__ import annotations
@@ -45,8 +47,9 @@ def main(argv=None) -> int:
     p.add_argument("data", nargs="+")
     p = sub.add_parser("auto")
     p.add_argument("--model")
-    p.add_argument("--answers", help="上一次输出的 questions.yaml，填写 answer 后传入重算")
-    p.add_argument("--out", required=True, help="输出目录")
+    p.add_argument("--answers", help="财务答复文件（默认读案卷目录里的 questions.yaml）")
+    p.add_argument("--out", required=True, help="案卷目录：每轮的输出、问题和工作区都在这里，下一轮接着用")
+    p.add_argument("--new", action="store_true", help="忽略案卷目录里上一轮的工作，从头开始")
     p.add_argument("--max-files", type=int, default=30, help="一批最多处理的文件数，防止误传整个目录")
     p.add_argument("--max-steps", type=int, default=80, help="安全上限：智能体最多调用工具的轮数，完成即停，正常用不满")
     p.add_argument("--max-tokens", type=int, default=1_000_000, help="安全上限：本次最多消耗的 tokens，超过即停止")
@@ -184,7 +187,7 @@ def _agent(a, cfg) -> int:
     try:
         ar = run_agent(llm, a.paths, a.out, answers=answers, max_steps=a.max_steps, max_tokens=a.max_tokens,
                        exclude=[a.expected] if a.expected else [],
-                       max_history_chars=hist,
+                       max_history_chars=hist, resume=not a.new,
                        max_files=a.max_files, on_step=show)
     except ToolError as e:
         print(f"失败：{e}")
@@ -205,12 +208,20 @@ def _agent(a, cfg) -> int:
         print("\n【与期望结果核对】（已写入 expected_check.txt）")
         for ln in lines:
             print(f"  {ln}")
+    if ar.round > 1:
+        ch = "；".join(f"{k} {'、'.join(v)}" for k, v in (ar.changes or {}).items() if v) or "无"
+        print(f"\n【第 {ar.round} 轮】文件变化：{ch}；规则改动：{'；'.join(ar.rule_changes) or '无'}")
+        if ar.compared:
+            print(f"  与上一轮相比金额变化的对象 {len(ar.diff_rows)} 个（见 result.xlsx「与上一轮对比」）")
     if ar.questions:
-        print(f"\n【待确认问题】{len(ar.questions)} 个（一般问题已按建议理解先算，答复后用 --answers 重跑）：")
+        print(f"\n【问题】{len(ar.questions)} 个：")
         for q in ar.questions:
-            print(f"  {q.id}. {'【阻断】' if q.blocking else ''}{q.text}  选项：{' / '.join(q.options)}")
-    if ar.pending:
-        print(f"\n【状态】NEEDS_CONFIRMATION：{len(ar.pending)} 个阻断问题未答复，结果只是草稿、不得发放")
+            state = f"已答复：{q.answer}" if q.answer else "等待答复" if q.blocking else "提示"
+            print(f"  {q.id}. {q.text}  选项：{' / '.join(q.options) or '无'}  [{state}]")
+    if ar.status == "NEEDS_CONFIRMATION":
+        print(f"\n【状态】NEEDS_CONFIRMATION：{len(ar.pending)} 个问题等财务答复，本轮不出结果。")
+        print(f"  下一步：在 {Path(a.out) / 'questions.yaml'} 的 answer 填写答复（有补充材料放进材料文件夹），"
+              f"然后用同一个 --out 再运行一次，会从这一轮接着做。")
     if ar.error:
         print(f"\n未完成：{ar.error}")
     print(f"\n输出目录：{a.out}（result*.xlsx、rules*.yaml、mapping.yaml、questions.yaml、agent_log.json）")

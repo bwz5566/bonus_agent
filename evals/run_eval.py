@@ -146,19 +146,36 @@ def fake_llm_for(case: Case) -> FakeLLM:
     return FakeLLM(respond, name="fake")
 
 
+def answer_pending(out: Path, answers: dict[str, str]) -> None:
+    """评测时扮演财务：给案卷里未答复的问题填答复。answers 是 关键字 -> 答复（问题里含关键字就用它）。"""
+    p = out / "questions.yaml"
+    qs = yaml.safe_load(p.read_text(encoding="utf-8")) or []
+    for q in qs:
+        if q.get("answer") in (None, ""):
+            q["answer"] = next((a for k, a in answers.items() if k in q["text"]), "按文件原意，以参考口径为准")
+    p.write_text(yaml.safe_dump(qs, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+
 def run_one(llm, case: Case, mode: str) -> dict:
     """mode：two_step / direct 用固定的数据字典只测规则抽取；auto 从原始文件开始走完整的统筹规划流程。"""
     t0 = time.monotonic()
     ar = None
     if mode == "agent":
-        ag = run_agent(llm, case.docs + case.data_files)
+        import tempfile
+        with tempfile.TemporaryDirectory() as out:
+            ag = run_agent(llm, case.docs + case.data_files, out)
+            rounds = 1
+            while ag.status == "NEEDS_CONFIRMATION" and rounds < 3:   # 模拟财务答复，下一轮接着做
+                answer_pending(Path(out), case.spec.get("finance_answers", {}))
+                ag = run_agent(llm, case.docs + case.data_files, out)
+                rounds += 1
         ex = ExtractResult(llm.name, ag.ruleset, ag.questions, [], [], list(ag.ws.transcripts.values()),
                            len(ag.steps), llm.usage, ag.quote_hits, ag.quote_total, ag.error)
         row = {"model": llm.name, "case": case.name, "mode": mode, "ok": ag.ok, "error": ag.error,
                "attempts": len(ag.steps), "latency_s": round(time.monotonic() - t0, 1),
                "prompt_tokens": llm.usage.prompt_tokens, "completion_tokens": llm.usage.completion_tokens,
                "quote_hit_rate": round(ag.quote_hits / ag.quote_total, 3) if ag.quote_total else None,
-               "questions": len(ag.questions), "blocking_issues": 0}
+               "questions": len(ag.questions), "rounds": rounds, "blocking_issues": 0}
         checks = {}
         if ag.ruleset is not None:
             for chk in case.spec["checks"]:

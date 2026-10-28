@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from bonus_agent.extract_rules import check_quotes, extract
 from bonus_agent.llm import FakeLLM, LLMError, parse_json
@@ -183,10 +184,21 @@ def test_agent_native_end_to_end(tmp_path):
     script.insert(j + 3, {"tool": "explain", "args": {"id": "个人:E2001"}})
     steps = []
     ar = run_agent(FakeLLM(script), [ANNUAL], tmp_path, on_step=lambda n, s: steps.append(s))
-    assert ar.ok, ar.error
-    assert ar.result.pool == case.ref_result.pool
+    # 第 1 轮：对全额 / 超额提了问题，等财务答复，不出结果
+    assert ar.status == "NEEDS_CONFIRMATION" and not ar.results and ar.draft_results, ar.error
+    assert not (tmp_path / "result.xlsx").exists() and (tmp_path / "待确认问题.xlsx").exists()
     failed = [s for s in steps if not s.ok]
     assert [s.tool for s in failed] == ["define_dataset", "finish"]
+    # 财务在 questions.yaml 填答复后，用同一个目录再跑：从上一轮接着做，只需试算和完成
+    q = yaml.safe_load((tmp_path / "questions.yaml").read_text(encoding="utf-8"))
+    q[0]["answer"] = 0
+    (tmp_path / "questions.yaml").write_text(yaml.safe_dump(q, allow_unicode=True), encoding="utf-8")
+    llm2 = FakeLLM([{"tool": "trial_run"}, {"tool": "finish", "args": {"summary": "x"}}])
+    ar = run_agent(llm2, [ANNUAL], tmp_path)
+    assert ar.ok and ar.status == "OK" and ar.round == 2, ar.error
+    task = llm2.calls[0][1]["content"]
+    assert "第 2 轮" in task and "全额累进" in task and "没有变化的材料不必重读" in task
+    assert ar.result.pool == case.ref_result.pool
     assert "不存在的列" in failed[0].result and "trial_run" in failed[1].result
     ev = next(s for s in steps if s.tool == "evaluate")
     assert "35,877,700.00" in ev.result or "35877700" in ev.result.replace(",", "")
@@ -202,7 +214,8 @@ def test_agent_json_mode_and_state_in_every_turn():
     texts = [json.dumps({"thought": "", "tool": s["tool"], "args": s.get("args", {})}, ensure_ascii=False) for s in script]
     llm = FakeLLM(["这不是 JSON"] + texts)
     llm.tool_mode = "json"
-    ar = run_agent(llm, [ANNUAL])
+    q = next(s["args"] for s in script if s["tool"] == "ask_question")      # 财务已答复过同一个问题
+    ar = run_agent(llm, [ANNUAL], answers=[{"text": q["text"], "options": q["options"], "answer": 0}])
     assert ar.ok, ar.error
     assert all("【当前工作区状态】" in c[-1]["content"] for c in llm.calls)
     assert "格式不对" in json.dumps(llm.calls[1], ensure_ascii=False)

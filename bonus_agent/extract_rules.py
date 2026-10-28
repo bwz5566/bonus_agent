@@ -39,7 +39,9 @@ class Question(BaseModel):
     options: list[str] = []
     suggested: int | None = None
     related: str = ""
-    blocking: bool = False     # 材料要求确认前不得计算或发放的口径
+    blocking: bool = True      # 未答复前不出正式结果（冲突、缺失、理解不明确都要等财务答复，不自行假设）
+    answer: str | None = None  # 财务答复
+    round: int = 1             # 第几轮提出的
 
 
 class Extraction(BaseModel):

@@ -22,6 +22,7 @@ from pydantic import ValidationError
 
 from bonus_agent.auto import (DATA_SUFFIXES, MAX_FILES, Inventory, PlanDataset, TooManyFiles, build_inventory,
                               check_dataset, collect_files, filter_sheet)
+from bonus_agent import case as cs
 from bonus_agent.extract_rules import Extraction, Question, check_quotes, prompt
 from bonus_agent.llm import LLM, LLMError, image_part, parse_json
 from bonus_core.data.mapping import DatasetMapping, apply_mapping
@@ -115,9 +116,10 @@ TOOLS: list[dict] = [
                                         "节点可以是层级对象或关联实体（如 项目:P001）。需要先在 set_rules 里设定 allocation。",
      "parameters": _obj({"expr": _S, "node": {**_S, "description": "节点 id，默认 全部"}, "scheme": _S}, ["expr"])},
     {"name": "ask_question",
-     "description": "记录需要财务确认的问题（不会中断工作）。一般问题按 suggested 的理解继续计算；"
-                    "blocking=true 表示材料要求确认前不得计算或发放的口径（如未收款政策、跨期抵扣），"
-                    "结果会标为待确认，相关条款不要自行补出算法。",
+     "description": "向财务提问：材料之间有冲突、缺少必要的信息（参数、口径、数据）、或能有两种理解时使用。"
+                    "不要自行假设或补出算法；提问后继续做不受影响的部分，问完后调用 finish 结束本轮，"
+                    "财务答复后下一轮接着做。options 列出可选的理解，suggested 是你的建议（只供财务参考，不会被采用）。"
+                    "related 写受影响的方案或规则（如 ANNUAL.offsets）。blocking=false 只用于不影响任何金额的提示。",
      "parameters": _obj({"text": _S, "options": {"type": "array", "items": _S}, "suggested": _I, "related": _S,
                          "blocking": {"type": "boolean"}}, ["text", "options"])},
     {"name": "finish", "description": "完成。要求每个方案在最近一次修改之后都已成功试算。",
@@ -155,6 +157,7 @@ class Workspace:
     notes: dict[str, str] = field(default_factory=dict)
     done: bool = False
     budget: str = ""
+    round: int = 1                                          # 第几轮（同一案卷和财务来回的次数）
 
     @property
     def data_files(self) -> list[Path]:
@@ -529,17 +532,30 @@ class Workspace:
         return f"{expr} = {ev.traces['probe'].rendered} = {fmt(v)}"
 
     # ---- 问题与完成 ----
-    def ask_question(self, text: str, options: list[str], suggested: int | None = 0, related: str = "",
-                     blocking: bool = False) -> str:
-        q = Question(id=f"q{len(self.questions) + 1}", text=text, options=options, suggested=suggested, related=related,
-                     blocking=blocking)
+    def ask_question(self, text: str, options: list[str] | None = None, suggested: int | None = None, related: str = "",
+                     blocking: bool = True) -> str:
+        same = next((q for q in self.questions if q.text.strip() == text.strip()), None)
+        if same is not None:
+            if same.answer:
+                return f"这个问题（{same.id}）财务已答复：{same.answer}。请按答复处理"
+            return f"这个问题已经问过（{same.id}），还在等财务答复"
+        q = Question(id=f"q{len(self.questions) + 1}", text=text, options=options or [], suggested=suggested,
+                     related=related, blocking=blocking, round=self.round)
         self.questions.append(q)
         if blocking:
-            return (f"已记录阻断问题 {q.id}：财务确认前结果只是草稿、不得发放。不要自行选择口径，"
-                    "相关条款先不写进规则，其余部分照常完成并试算")
-        return f"已记录问题 {q.id}，请按「{options[suggested] if suggested is not None and 0 <= suggested < len(options) else '最可能的理解'}」继续"
+            return (f"已记录问题 {q.id}，等财务答复。不要自行选择口径或补出算法；"
+                    "继续做不受影响的部分，全部问完后调用 finish 结束本轮")
+        return f"已记录提示 {q.id}（不影响金额，不必等答复）"
+
+    @property
+    def pending(self) -> list[Question]:
+        """还在等财务答复的问题。"""
+        return [q for q in self.questions if q.blocking and not q.answer]
 
     def finish(self, summary: str, ignored: list[dict] | None = None) -> str:
+        if self.pending:     # 有问题等答复：结束本轮，不出正式结果
+            self.summary, self.ignored, self.done = summary, ignored or [], True
+            return f"本轮结束，等待财务答复 {len(self.pending)} 个问题：{'、'.join(q.id for q in self.pending)}"
         if not self.schemes:
             raise ToolError("还没有写入规则")
         pending = [s for s in self.schemes if s in self.untested or s not in self.results]
@@ -569,7 +585,9 @@ class Workspace:
         else:
             lines.append("- 尚未写入规则")
         if self.questions:
-            lines.append("- 已记录问题：" + "；".join(q.text for q in self.questions))
+            lines.append("- 问题：")
+            lines += [f"  · {q.id} {q.text} → " + (f"财务答复：{q.answer}" if q.answer else "等待答复" if q.blocking else "提示")
+                      for q in self.questions]
         if self.transcripts:
             lines.append(f"- 已查看图片：{', '.join(self.transcripts)}")
         for s in self.schemes:
@@ -648,7 +666,13 @@ class AgentResult:
     quote_total: int = 0
     recheck: str = ""
     rulesets: dict[str, RuleSet] = field(default_factory=dict)          # 方案 -> 规则
-    pending: list[dict] = field(default_factory=list)                   # 尚未答复的阻断问题
+    pending: list[dict] = field(default_factory=list)                   # 尚未答复的问题
+    draft_results: dict[str, dict[str, Result]] = field(default_factory=dict)   # 有问题未答复时的试算结果（不输出）
+    round: int = 1
+    changes: dict | None = None                                         # 本轮相对上一轮的文件变化
+    diff_rows: list[list] = field(default_factory=list)                 # 与上一轮逐个对象的金额对比
+    rule_changes: list[str] = field(default_factory=list)
+    compared: bool = False                                              # 上一轮有结果，做了金额对比
     results: dict[str, dict[str, Result]] = field(default_factory=dict)  # 方案 -> 修订 -> 结果
 
     @property
@@ -666,8 +690,10 @@ class AgentResult:
 
     @property
     def status(self) -> str:
-        """OK：可交财务复核；NEEDS_CONFIRMATION：有阻断问题未答复，结果只是草稿、不得发放；FAILED：未完成。"""
-        return "FAILED" if not self.ok else "NEEDS_CONFIRMATION" if self.pending else "OK"
+        """OK：已算出，可交财务复核；NEEDS_CONFIRMATION：有问题等财务答复，本轮不出结果；FAILED：未完成。"""
+        if self.ws.done and self.pending:
+            return "NEEDS_CONFIRMATION"
+        return "OK" if self.ok else "FAILED"
 
 
 def _size(ms: list[dict]) -> int:
@@ -723,8 +749,11 @@ def _answers_text(answers: list[dict] | None) -> str:
 def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = None, *,
               answers: list[dict] | None = None, max_steps: int = 80, max_history_chars: int = 24000,
               max_files: int = MAX_FILES, max_tokens: int | None = 1_000_000, exclude: list[str | Path] = (),
-              on_step: Callable[[int, Step], None] | None = None) -> AgentResult:
-    """max_steps 和 max_tokens 都是安全上限：模型调用 finish 就结束，正常不会用满。"""
+              on_step: Callable[[int, Step], None] | None = None, resume: bool = True) -> AgentResult:
+    """max_steps 和 max_tokens 都是安全上限：模型调用 finish 就结束，正常不会用满。
+
+    out_dir 是案卷目录：里面已有上一轮的 case.json 时（resume=True），从上一轮的工作区接着做，
+    财务答复默认读取案卷里的 questions.yaml。"""
     try:
         files = collect_files(paths, exclude=([out_dir] if out_dir else []) + list(exclude), max_files=max_files)
     except (TooManyFiles, FileNotFoundError) as e:
@@ -732,9 +761,28 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     if not files:
         raise ToolError("没有找到可处理的文件（支持 .docx .pptx .xlsx .xlsm .png .jpg .txt .md .json .csv）")
     ws = Workspace(llm, build_inventory(files))
+    out = Path(out_dir) if out_dir is not None else None
+    case = cs.load_case(out) if out is not None and resume else None
+    prints = cs.fingerprint(files)
+    rnd = cs.new_round(case, prints)
+    ws.round = rnd["n"]
+    if answers is None and case and (out / "questions.yaml").exists():
+        answers = yaml.safe_load((out / "questions.yaml").read_text(encoding="utf-8")) or []
+    last = case["rounds"][-1] if case and case.get("rounds") else None
+    changes = None
+    if case:
+        cs.restore(ws, case["workspace"])
+        changes = cs.file_changes(last["files"] if last else {}, prints)
+    else:   # 首轮就带了答复（如上一次单轮运行的 questions.yaml）：作为已答复的问题放进工作区
+        ws.questions = [Question(id=a.get("id") or f"q{i + 1}", text=a["text"], options=a.get("options") or [])
+                        for i, a in enumerate(answers or []) if a.get("text") and a.get("answer") not in (None, "")]
+    fresh = cs.apply_answers(ws.questions, answers)
     handlers = {t["name"]: getattr(ws, t["name"]) for t in TOOLS}
-    task = ("请完成本批次的奖金计算。文件清单：\n" + ws.list_files() + _answers_text(answers)
-            + "\n\n完成后调用 finish。")
+    if case:
+        task = _resume_task(ws, last, changes, fresh)
+    else:
+        task = ("请完成本批次的奖金计算。文件清单：\n" + ws.list_files() + _answers_text(answers)
+                + "\n\n完成后调用 finish。")
     mode = llm.tool_mode
     sys = system_prompt()
     history: list[dict] = []
@@ -842,19 +890,64 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
 
     tested = {s: ws.results[s] for s in ws.schemes if s in ws.results and s not in ws.untested}
     rss = {s: ws._ruleset(s) for s in tested}
-    first = next(iter(rss), None)
-    ar = AgentResult(ws, steps, rss.get(first), tested[first]["R0"] if first else None, error, rulesets=rss, results=tested)
+    draft = {}
+    if ws.pending:          # 还有问题等答复：不出正式结果，试算结果只作草稿留在内存
+        draft, tested = tested, {}
+    first = next(iter(tested), None)
+    ar = AgentResult(ws, steps, rss.get(first), tested[first]["R0"] if first else None, error,
+                     rulesets={s: rss[s] for s in tested}, results=tested)
+    ar.draft_results, ar.round, ar.changes = draft, rnd["n"], changes
+    ar.pending = [q.model_dump() for q in ws.pending]
+    if last and last.get("digest") is not None and tested:
+        ar.diff_rows, ar.compared = cs.diff_results(last["digest"], tested), True
+    if last and last.get("drafts") is not None:
+        ar.rule_changes = cs.diff_rules(last["drafts"], ws.drafts)
     for rs in rss.values():
         h, t, _ = check_quotes(rs, ws.inv.docs)
         ar.quote_hits, ar.quote_total = ar.quote_hits + h, ar.quote_total + t
-    if out_dir is not None:
-        ar.outputs = write_agent_outputs(ar, Path(out_dir), answers)
+    if out is not None:
+        ar.outputs = write_agent_outputs(ar, out, answers)
+        rnd.update(status=ar.status, error=error, pending=[q.id for q in ws.pending], summary=ws.summary,
+                   answered=[q.id for q in fresh], changes=changes, drafts=json.loads(json.dumps(ws.drafts)),
+                   digest=cs.digest(tested) if tested else (last or {}).get("digest"))
+        case = case or {"created": rnd["at"], "rounds": []}
+        case["rounds"].append(rnd)
+        case["workspace"] = cs.snapshot(ws)
+        ar.outputs["case"] = cs.save_case(out, case)
+        cs.archive(out, rnd["n"], ar.outputs)
     return ar
 
 
+def _resume_task(ws: Workspace, last: dict | None, changes: dict | None, fresh: list[Question]) -> str:
+    n = ws.round
+    lines = [f"这是同一笔奖金的第 {n} 轮处理（上一轮状态：{(last or {}).get('status', '未知')}）。上一轮的数据表、列映射、规则、"
+             "笔记和问题都已恢复到工作区（见工作区状态），没有变化的材料不必重读。", "", "本轮变化："]
+    if fresh:
+        lines.append("- 财务新答复（必须照做）：")
+        lines += [f"  · {q.id} {q.text} → {q.answer}" for q in fresh]
+    for k, v in (changes or {}).items():
+        if v:
+            lines.append(f"- {k}文件：{'、'.join(v)}")
+    if not fresh and not any((changes or {}).values()):
+        lines.append("- 没有新答复，也没有文件变化")
+    if ws.pending:
+        lines.append("- 仍在等待答复：" + "；".join(f"{q.id} {q.text}" for q in ws.pending))
+    lines += ["", "请：",
+              "1. 按新答复修改规则（答复只影响它相关的部分，其余保持不变）；",
+              "2. 阅读新增、修改的文件，与已有规则、笔记逐项对照：同一参数取值不同、口径前后矛盾、新增内容不明确时，"
+              "用 ask_question 提问，写明冲突双方的出处，不要自行取舍；补充说明明确覆盖旧规定的，按新规定改；",
+              "3. 删除的文件如果被数据表用到，改映射或提问；",
+              "4. 试算全部方案，确认结果合理后 finish。还有问题等答复时，做完不受影响的部分就 finish 结束本轮。",
+              "", "当前文件清单：", ws.list_files()]
+    return "\n".join(lines)
+
+
 # ---------------- 输出 ----------------
-def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None) -> dict[str, Path]:
+def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None = None) -> dict[str, Path]:
     out.mkdir(parents=True, exist_ok=True)
+    for old in [*out.glob("result*.xlsx"), *out.glob("rules*.yaml"), *out.glob("adjust_*.yaml"),
+                out / "待确认问题.xlsx", out / "expected_check.txt"]:
+        old.unlink(missing_ok=True)       # 上一轮的输出已存档在 history/，不能留在顶层被误用
     ws, paths = ar.ws, {}
     if ws.mapping:
         paths["mapping"] = out / "mapping.yaml"
@@ -872,21 +965,27 @@ def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None) 
             paths[f"adjust:{name}:{rev['name']}"] = out / f"adjust_{_safe(name)}_{_safe(rev['name'])}.yaml"
             paths[f"adjust:{name}:{rev['name']}"].write_text(yaml.safe_dump(list(done), allow_unicode=True, sort_keys=False),
                                                              encoding="utf-8")
-    prev = {a.get("text"): a.get("answer") for a in answers or []}
-    qrows = [{"id": q.id, "text": q.text, "options": q.options, "suggested": q.suggested, "related": q.related,
-              "blocking": q.blocking, "answer": prev.get(q.text)} for q in ws.questions]
-    asked = {r["text"] for r in qrows}
-    qrows += [dict(a) for a in answers or [] if a.get("text") not in asked]
-    ar.pending = [r for r in qrows if r.get("blocking") and r.get("answer") in (None, "")]
+    qrows = [{"id": q.id, "round": q.round, "text": q.text, "options": q.options, "suggested": q.suggested,
+              "related": q.related, "blocking": q.blocking, "answer": q.answer} for q in ws.questions]
     paths["questions"] = out / "questions.yaml"
     paths["questions"].write_text(
-        "# 财务答复：在 answer 里填选项序号（从 0 开始）或直接写文字，然后用 --answers 这个文件重跑\n"
+        "# 财务答复：在 answer 里填选项序号（从 0 开始）或直接写文字；有补充材料放进材料文件夹，\n"
+        "# 然后用同一个输出目录再运行一次，智能体会从这一轮接着做（不用 --answers）\n"
         + yaml.safe_dump(qrows, allow_unicode=True, sort_keys=False), encoding="utf-8")
     paths["log"] = out / "agent_log.json"
     paths["log"].write_text(json.dumps({"summary": ws.summary, "error": ar.error, "transcripts": ws.transcripts,
                                         "steps": [vars(s) for s in ar.steps]}, ensure_ascii=False, indent=2),
                             encoding="utf-8")
     if not ar.results:
+        if ar.pending or ws.questions:     # 本轮不出结果：把问题、规划和工作记录给财务看
+            import openpyxl
+            from bonus_core.report.excel import _sheet
+            wb = openpyxl.Workbook()
+            wb.remove(wb.active)
+            for title, headers, data, widths in _sheets(ar, qrows):
+                _sheet(wb, title, headers, data, widths=widths)
+            paths["pending"] = out / "待确认问题.xlsx"
+            wb.save(paths["pending"])
         return paths
     ar.recheck = "；".join(_recheck(ar, paths, name, rev) for name, revs in ar.results.items() for rev in revs)
     if ar.single:
@@ -964,11 +1063,11 @@ def _recheck(ar: AgentResult, paths: dict[str, Path], name: str, rev: str) -> st
 
 def _sheets(ar: AgentResult, qrows: list[dict]):
     ws = ar.ws
-    status = (f"未完成：{ar.error}" if not ar.ok else
-              "待财务确认（NEEDS_CONFIRMATION）：有阻断问题未答复，以下结果只是草稿，不得发放。问题："
-              + "；".join(r["text"] for r in ar.pending) if ar.pending else
-              "智能体草稿：规则和数据映射由大模型生成，尚未经财务确认。请先处理「待确认问题」，确认后重算。")
-    plan = [["状态", status],
+    status = ("待财务答复（NEEDS_CONFIRMATION）：本轮不出结果。请在 questions.yaml 填写答复（或补充材料）后，"
+              "用同一个输出目录再运行一次。问题：" + "；".join(f"{r['id']} {r['text']}" for r in ar.pending)
+              if ar.status == "NEEDS_CONFIRMATION" else f"未完成：{ar.error}" if not ar.ok else
+              "智能体草稿：规则和数据映射由大模型生成，尚未经财务确认。请核对后再发放。")
+    plan = [["状态", status], ["轮次", f"第 {ar.round} 轮"],
             ["方案概述", ws.summary],
             ["计算方案", "、".join(f"{n}（{'、'.join(r)}）" for n, r in ar.results.items()) or "无"],
             ["规则来源", "、".join(d.name for d in ws.inv.docs)]]
@@ -981,12 +1080,21 @@ def _sheets(ar: AgentResult, qrows: list[dict]):
     plan += [["已忽略", f"{i.get('ref')}：{i.get('reason', '')}"] for i in ws.ignored]
     plan.append(["原文引用命中", f"{ar.quote_hits}/{ar.quote_total}"])
     plan.append(["复算核对", ar.recheck])
-    q = [[r["id"], "是" if r.get("blocking") else "", r["text"], " / ".join(r.get("options") or []),
+    if ar.changes is not None:
+        plan.append(["本轮文件变化", "；".join(f"{k}：{'、'.join(v)}" for k, v in ar.changes.items() if v) or "无"])
+    if ar.round > 1:
+        plan.append(["规则改动（与上一轮比）", "；".join(ar.rule_changes) or "无"])
+    q = [[r["id"], r.get("round", 1), r["text"], " / ".join(r.get("options") or []),
           (r["options"][r["suggested"]] if isinstance(r.get("suggested"), int)
            and 0 <= r["suggested"] < len(r.get("options") or []) else ""), "" if r.get("answer") is None else str(r["answer"])]
          for r in qrows]
     log = [[i, s.tool, json.dumps(s.args, ensure_ascii=False)[:300], ("" if s.ok else "失败：") + s.result[:500]]
            for i, s in enumerate(ar.steps, start=1)]
-    return [("待确认问题", ["编号", "阻断", "问题", "选项", "本次计算采用", "财务答复"], q, {"问题": 60, "选项": 40, "本次计算采用": 20}),
+    out = [("待确认问题", ["编号", "提出轮次", "问题", "选项", "智能体建议（未采用）", "财务答复"], q,
+            {"问题": 60, "选项": 40, "智能体建议（未采用）": 20})]
+    if ar.compared:
+        out.append(("与上一轮对比", ["方案", "修订", "对象", "名称", "上一轮应得", "本轮应得", "差额", "上一轮实发", "本轮实发"],
+                    ar.diff_rows or [["（所有对象金额与上一轮相同）"]], {"对象": 16, "名称": 14}))
+    return out + [
             ("智能体规划", ["项目", "内容"], plan, {"项目": 22, "内容": 100}),
             ("智能体工作记录", ["步骤", "工具", "参数", "结果"], log, {"参数": 60, "结果": 90})]

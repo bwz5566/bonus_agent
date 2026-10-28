@@ -169,15 +169,49 @@ def test_agent_changing_quarter_retests_annual(tmp_path):
         ws.trial_run("ANNUAL")
 
 
-def test_agent_blocking_question_marks_needs_confirmation(tmp_path):
+def test_agent_blocking_question_then_next_round(tmp_path):
+    """第 1 轮缺跨期抵扣口径：提问后结束本轮，不出结果；财务答复并补上规则后，第 2 轮接着做并与第 1 轮的草稿对比。"""
     from bonus_agent.agent import run_agent
     from bonus_agent.llm import FakeLLM
-    ar = run_agent(FakeLLM(_script(blocking=True)), [run_case.XLSX], tmp_path)
-    assert ar.ok and ar.status == "NEEDS_CONFIRMATION"
-    wb = openpyxl.load_workbook(tmp_path / "result.xlsx")
+    out = tmp_path / "案卷"
+    ar = run_agent(FakeLLM(_script(blocking=True)), [run_case.XLSX], out)
+    assert ar.status == "NEEDS_CONFIRMATION" and not ar.results and set(ar.draft_results) == {"QUARTER", "PROCESS", "ANNUAL"}
+    assert not list(out.glob("result*.xlsx"))
+    wb = openpyxl.load_workbook(out / "待确认问题.xlsx")
     plan = {r[0]: r[1] for r in wb["智能体规划"].iter_rows(min_row=2, values_only=True)}
-    assert plan["状态"].startswith("待财务确认（NEEDS_CONFIRMATION）")
-    q = yaml.safe_load((tmp_path / "questions.yaml").read_text(encoding="utf-8").split("\n", 1)[1])
-    q[0]["answer"] = "扣本年度预付和季度 R2 实发"
-    ar2 = run_agent(FakeLLM(_script(blocking=True)), [run_case.XLSX], tmp_path / "again", answers=q)
-    assert ar2.status == "OK"
+    assert plan["状态"].startswith("待财务答复（NEEDS_CONFIRMATION）") and "q1" in plan["状态"]
+    case = json.loads((out / "case.json").read_text(encoding="utf-8"))
+    assert case["rounds"][0]["status"] == "NEEDS_CONFIRMATION" and case["rounds"][0]["pending"] == ["q1"]
+
+    q = yaml.safe_load((out / "questions.yaml").read_text(encoding="utf-8"))
+    q[0]["answer"] = "扣本年度预付和季度 R2 实发，过程奖不扣"
+    (out / "questions.yaml").write_text(yaml.safe_dump(q, allow_unicode=True), encoding="utf-8")
+    offsets = yaml.safe_load((CASE / "rules" / "rules_ANNUAL.yaml").read_text(encoding="utf-8"))["offsets"]
+    llm = FakeLLM([{"tool": "ask_question", "args": {"text": q[0]["text"], "options": ["待财务确认"]}},
+                   {"tool": "set_rules", "args": {"scheme": "ANNUAL", "offsets": offsets}},
+                   {"tool": "trial_run"}, {"tool": "finish", "args": {"summary": "三个方案"}}])
+    ar2 = run_agent(llm, [run_case.XLSX], out)
+    assert ar2.status == "OK" and ar2.round == 2, ar2.error
+    assert "财务已答复" in ar2.steps[0].result               # 重复提问直接拿到答复
+    task = llm.calls[0][1]["content"]
+    assert "第 2 轮" in task and "扣本年度预付" in task
+    ref = json.loads((CASE / "reference.json").read_text(encoding="utf-8"))
+    assert run_case.diff_reference(ar2.results, ref) == []
+    assert ar2.rule_changes == ["「ANNUAL」：已发抵扣修改"]
+    assert (out / "result.xlsx").exists() and (out / "history" / "第1轮" / "待确认问题.xlsx").exists()
+    assert not (out / "待确认问题.xlsx").exists()
+    # 第 3 轮：修改数据文件（E001 的贡献评分），与第 2 轮逐个对象对比
+    wb = openpyxl.load_workbook(run_case.XLSX)
+    ws = wb["绩效评分"]
+    ws.cell(2, 3).value = 60
+    data = tmp_path / "补充材料" / run_case.XLSX.name
+    data.parent.mkdir()
+    wb.save(data)
+    llm = FakeLLM([{"tool": "trial_run"}, {"tool": "finish", "args": {"summary": "三个方案"}}])
+    ar3 = run_agent(llm, [data], out)
+    assert ar3.status == "OK" and ar3.changes["修改"] == [run_case.XLSX.name]
+    assert "修改文件：03_业务输入.xlsx" in llm.calls[0][1]["content"]
+    changed = {(r[0], r[1], r[2]) for r in ar3.diff_rows}
+    assert ("QUARTER", "R0", "个人:E001") in changed and not any(r[2].startswith("部门") for r in ar3.diff_rows)
+    wb = openpyxl.load_workbook(out / "result.xlsx")
+    assert "与上一轮对比" in wb.sheetnames

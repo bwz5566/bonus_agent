@@ -5,6 +5,12 @@ reference_rules: rules.yaml
 data: [年度数据.xlsx]
 mapping: mapping.yaml
 
+# 评测时扮演财务回答智能体的问题（问题里含关键字就用对应答复），回答后智能体在下一轮接着算
+finance_answers:
+  全额: 全额累进：净利润达到某一档后，全部净利润按该档比例计提
+  超额: 全额累进：净利润达到某一档后，全部净利润按该档比例计提
+  累进: 全额累进：净利润达到某一档后，全部净利润按该档比例计提
+
 checks:
   - {name: 净利润阶梯档位, type: tier, steps: [[0, 0.05], [30000000, 0.08]]}
   - {name: 绩效系数（图片）, type: lookup, mapping: {A: 1.5, B: 1.2, C: 1.0, D: 0.5}}
