@@ -166,3 +166,83 @@ def archive(out: Path, n: int, paths: dict[str, Path]) -> Path:
 def new_round(case: dict | None, files: dict[str, str]) -> dict:
     rounds = (case or {}).get("rounds", [])
     return {"n": len(rounds) + 1, "at": datetime.now().isoformat(timespec="seconds"), "files": files}
+
+
+def sha256(p: Path) -> str:
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+class ConfirmError(ValueError):
+    pass
+
+
+def confirm(out: Path, by: str, note: str = "", data: list[Path] | None = None) -> Path:
+    """财务确认最新一轮：核对输出文件没被改过、按这些文件复算与该轮结果逐分一致，然后冻结成 template/。
+
+    只能确认最新的一轮，且该轮已出结果（状态 OK）。返回模板目录。
+    """
+    import yaml
+
+    from bonus_core.dsl.models import RuleSet
+    from bonus_core.template import MANIFEST, Template, order_schemes
+    out = Path(out)
+    case = load_case(out)
+    if not case or not case.get("rounds"):
+        raise ConfirmError(f"{out} 不是案卷（没有 {CASE_FILE}），先用 bonus-agent auto --out {out} 计算")
+    if not by.strip():
+        raise ConfirmError("要写明确认人")
+    rnd = case["rounds"][-1]
+    if rnd.get("status") != "OK":
+        raise ConfirmError(f"第 {rnd['n']} 轮状态是 {rnd.get('status')}，没有正式结果，不能确认"
+                           + ("（还有问题等财务答复）" if rnd.get("pending") else ""))
+    outs = rnd.get("outputs") or {}
+    changed = [name for name, h in outs.values() if not (out / name).exists() or sha256(out / name) != h]
+    if changed:
+        raise ConfirmError(f"这些文件在第 {rnd['n']} 轮输出之后被改过或删除：{'、'.join(changed)}。"
+                           "改规则请走一轮智能体处理，不要直接改文件")
+    # 方案、规则文件和修订
+    rules = {k: v[0] for k, v in outs.items() if k == "rules" or k.startswith("rules:")}
+    names = {("默认" if k == "rules" else k.split(":", 1)[1]): f for k, f in rules.items()}
+    rss = {n: RuleSet.load(out / f) for n, f in names.items()}
+    revs = {n: [{"name": k.split(":")[2], "adjust": v[0]} for k, v in outs.items()
+                if k.startswith(f"adjust:{n}:")] for n in names}
+    tpl = out / "template"
+    if tpl.exists():
+        shutil.rmtree(tpl)
+    tpl.mkdir(parents=True)
+    files = [v[0] for v in outs.values()]
+    for f in files:
+        shutil.copy2(out / f, tpl / f)
+    inputs = [Path(p) for p in (data or rnd.get("inputs") or [])]
+    missing = [str(p) for p in inputs if not p.exists()]
+    if missing or not inputs:
+        shutil.rmtree(tpl)
+        raise ConfirmError("找不到确认时要复算用的数据文件：" + ("、".join(missing) or "无") + "，请在命令后面给出数据文件")
+    at = datetime.now().isoformat(timespec="seconds")
+    manifest = {
+        "confirmed": {"by": by, "at": at, "round": rnd["n"], "note": note, "summary": rnd.get("summary", "")},
+        "mapping": outs["mapping"][0],
+        "schemes": [{"name": n, "rules": names[n], "revisions": revs[n]} for n in order_schemes(rss)],
+        "files": {f: sha256(tpl / f) for f in files},
+        "data": {p.name: sha256(p) for p in inputs},
+    }
+    (tpl / MANIFEST).write_text(yaml.safe_dump(manifest, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    # 复算：按模板算出的每个对象金额必须与该轮结果一致
+    try:
+        results, _ = Template.load(tpl).run(inputs)
+    except Exception as e:
+        shutil.rmtree(tpl)
+        raise ConfirmError(f"按模板复算失败：{e}") from None
+    want = rnd.get("digest") or {}
+    got = digest(results)
+    diff = [f"{s} {r} {nid}" for s in want for r in want[s] for nid, v in want[s][r].items()
+            if got.get(s, {}).get(r, {}).get(nid, [None, None])[1] != v[1]]
+    if diff or set(got) != set(want):
+        shutil.rmtree(tpl)
+        raise ConfirmError(f"按模板复算与第 {rnd['n']} 轮结果不一致：{diff[:10]}（数据文件是否换过？）")
+    rec = {**manifest["confirmed"], "template": str(tpl)}
+    case.setdefault("confirmations", []).append(rec)
+    case["confirmed"] = rec
+    rnd["confirmed"] = rec
+    save_case(out, case)
+    return tpl

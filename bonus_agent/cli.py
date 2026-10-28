@@ -9,6 +9,9 @@
                                            --out 是案卷目录：有问题时本轮停下等答复；在 questions.yaml 填答复、
                                            补充材料后用同一个目录再运行，从上一轮接着做（--new 从头开始）
                                            （--pipeline 改用固定流程：规划 → 抽取 → 计算）
+  confirm --out 案卷目录 --by 确认人 [--note 说明] [数据文件...]
+                                           财务确认最新一轮结果：复算核对后把规则、映射和调整冻结为 案卷目录/template/，
+                                           以后每期用 bonus run-template 计算，不再调用大模型
 """
 from __future__ import annotations
 
@@ -45,6 +48,11 @@ def main(argv=None) -> int:
     p.add_argument("--model")
     p.add_argument("--no-llm", action="store_true")
     p.add_argument("data", nargs="+")
+    p = sub.add_parser("confirm")
+    p.add_argument("--out", required=True, help="案卷目录")
+    p.add_argument("--by", required=True, help="确认人")
+    p.add_argument("--note", default="", help="确认说明")
+    p.add_argument("data", nargs="*", help="复算用的数据文件（默认用该轮的输入文件）")
     p = sub.add_parser("auto")
     p.add_argument("--model")
     p.add_argument("--answers", help="财务答复文件（默认读案卷目录里的 questions.yaml）")
@@ -120,6 +128,16 @@ def main(argv=None) -> int:
         llm = None if a.no_llm else LLM.from_config(a.model, cfg)
         m = suggest(rs, [s for f in a.data for s in detect(f)], llm)
         print(yaml.safe_dump({k: v.model_dump(exclude_none=True) for k, v in m.items()}, allow_unicode=True, sort_keys=False))
+        return 0
+    if a.cmd == "confirm":
+        from bonus_agent.case import ConfirmError, confirm
+        try:
+            tpl = confirm(Path(a.out), a.by, a.note, [Path(x) for x in a.data] or None)
+        except ConfirmError as e:
+            print(f"不能确认：{e}")
+            return 1
+        print(f"已确认并冻结为模板：{tpl}（按模板复算，与该轮结果逐分一致）")
+        print(f"以后每期：bonus run-template --template {tpl} --out 结果目录 数据文件...")
         return 0
     if a.cmd == "auto" and not a.pipeline:
         return _agent(a, cfg)

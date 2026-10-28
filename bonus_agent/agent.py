@@ -762,15 +762,16 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         raise ToolError("没有找到可处理的文件（支持 .docx .pptx .xlsx .xlsm .png .jpg .txt .md .json .csv）")
     ws = Workspace(llm, build_inventory(files))
     out = Path(out_dir) if out_dir is not None else None
-    case = cs.load_case(out) if out is not None and resume else None
+    case = cs.load_case(out) if out is not None else None      # --new 也保留历次记录，只是不接着上一轮的工作区
+    resumed = bool(case and resume and case.get("workspace"))
     prints = cs.fingerprint(files)
     rnd = cs.new_round(case, prints)
     ws.round = rnd["n"]
-    if answers is None and case and (out / "questions.yaml").exists():
+    if answers is None and resumed and (out / "questions.yaml").exists():
         answers = yaml.safe_load((out / "questions.yaml").read_text(encoding="utf-8")) or []
     last = case["rounds"][-1] if case and case.get("rounds") else None
     changes = None
-    if case:
+    if resumed:
         cs.restore(ws, case["workspace"])
         changes = cs.file_changes(last["files"] if last else {}, prints)
     else:   # 首轮就带了答复（如上一次单轮运行的 questions.yaml）：作为已答复的问题放进工作区
@@ -778,7 +779,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                         for i, a in enumerate(answers or []) if a.get("text") and a.get("answer") not in (None, "")]
     fresh = cs.apply_answers(ws.questions, answers)
     handlers = {t["name"]: getattr(ws, t["name"]) for t in TOOLS}
-    if case:
+    if resumed:
         task = _resume_task(ws, last, changes, fresh)
     else:
         task = ("请完成本批次的奖金计算。文件清单：\n" + ws.list_files() + _answers_text(answers)
@@ -907,6 +908,9 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         ar.quote_hits, ar.quote_total = ar.quote_hits + h, ar.quote_total + t
     if out is not None:
         ar.outputs = write_agent_outputs(ar, out, answers)
+        rnd["inputs"] = [str(f) for f in ws.data_files]
+        rnd["outputs"] = {k: [p.name, cs.sha256(p)] for k, p in ar.outputs.items()
+                          if k == "mapping" or k == "rules" or k.startswith(("rules:", "adjust:"))}
         rnd.update(status=ar.status, error=error, pending=[q.id for q in ws.pending], summary=ws.summary,
                    answered=[q.id for q in fresh], changes=changes, drafts=json.loads(json.dumps(ws.drafts)),
                    digest=cs.digest(tested) if tested else (last or {}).get("digest"))

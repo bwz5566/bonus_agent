@@ -215,3 +215,43 @@ def test_agent_blocking_question_then_next_round(tmp_path):
     assert ("QUARTER", "R0", "个人:E001") in changed and not any(r[2].startswith("部门") for r in ar3.diff_rows)
     wb = openpyxl.load_workbook(out / "result.xlsx")
     assert "与上一轮对比" in wb.sheetnames
+
+
+def test_confirm_freezes_template_and_runs_without_llm(tmp_path):
+    """财务确认后冻结为模板：复算一致才冻结；模板按顺序算三个方案和修订；模板被改过拒绝计算。"""
+    from bonus_agent.agent import run_agent
+    from bonus_agent.case import ConfirmError, confirm
+    from bonus_agent.llm import FakeLLM
+    from bonus_core.cli import main as bonus_main
+    from bonus_core.template import Template, TemplateError
+    out = tmp_path / "案卷"
+    pending = run_agent(FakeLLM(_script(blocking=True)), [run_case.XLSX], out)
+    assert pending.status == "NEEDS_CONFIRMATION"
+    with pytest.raises(ConfirmError, match="等财务答复"):
+        confirm(out, "财务甲")
+    ar = run_agent(FakeLLM(_script()), [run_case.XLSX], out, resume=False)
+    assert ar.status == "OK"
+    rules = out / "rules_ANNUAL.yaml"
+    text = rules.read_text(encoding="utf-8")
+    rules.write_text(text + "\n# 手改\n", encoding="utf-8")
+    with pytest.raises(ConfirmError, match="rules_ANNUAL.yaml"):
+        confirm(out, "财务甲")
+    rules.write_text(text, encoding="utf-8")
+    tpl = confirm(out, "财务甲", "Q3 验收")
+    m = yaml.safe_load((tpl / "manifest.yaml").read_text(encoding="utf-8"))
+    order = [s["name"] for s in m["schemes"]]
+    assert order.index("QUARTER") < order.index("ANNUAL") and m["confirmed"]["by"] == "财务甲"   # 被引用的先算
+    assert [r["name"] for r in next(s for s in m["schemes"] if s["name"] == "QUARTER")["revisions"]] == ["R1", "R2"]
+    case = json.loads((out / "case.json").read_text(encoding="utf-8"))
+    assert case["confirmed"]["round"] == 2 and case["rounds"][-1]["confirmed"]
+    # 按模板计算（不调用大模型），与参考实现一致
+    results, _ = Template.load(tpl).run([run_case.XLSX])
+    ref = json.loads((CASE / "reference.json").read_text(encoding="utf-8"))
+    assert run_case.diff_reference(results, ref) == []
+    assert bonus_main(["run-template", "--template", str(tpl), "--out", str(tmp_path / "下期"), str(run_case.XLSX)]) == 0
+    wb = openpyxl.load_workbook(tmp_path / "下期" / "result_QUARTER_R2.xlsx")
+    assert dict(wb["确认信息"].iter_rows(min_row=2, values_only=True))["确认人"] == "财务甲"
+    (tpl / "rules_QUARTER.yaml").write_text("# 改过\n" + (tpl / "rules_QUARTER.yaml").read_text(encoding="utf-8"),
+                                            encoding="utf-8")
+    with pytest.raises(TemplateError, match="被修改过"):
+        Template.load(tpl)
