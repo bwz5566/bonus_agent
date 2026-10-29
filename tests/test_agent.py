@@ -87,6 +87,7 @@ def test_secrets_file_and_model_groups(tmp_path, monkeypatch):
 
 
 ANNUAL = ROOT / "evals" / "cases" / "annual_2026"
+GRADE_IMG = "| 绩效等级 | 绩效系数 |\n| A | 1.5 |\n| B | 1.2 |\n| C | 1.0 |\n| D | 0.5 |"   # 年终奖方案里绩效系数表图片的转写
 
 
 def test_annual_reference_golden():
@@ -183,7 +184,9 @@ def test_agent_native_end_to_end(tmp_path):
     script.insert(j + 2, {"tool": "evaluate", "args": {"expr": "sum(net_profit)"}})
     script.insert(j + 3, {"tool": "explain", "args": {"id": "个人:E2001"}})
     steps = []
-    ar = run_agent(FakeLLM(script), [ANNUAL], tmp_path, on_step=lambda n, s: steps.append(s))
+    llm = FakeLLM(script)
+    llm.images = GRADE_IMG
+    ar = run_agent(llm, [ANNUAL], tmp_path, on_step=lambda n, s: steps.append(s))
     # 第 1 轮：对全额 / 超额提了问题，等财务答复，不出结果
     assert ar.status == "NEEDS_CONFIRMATION" and not ar.results and ar.draft_results, ar.error
     assert not (tmp_path / "result.xlsx").exists() and (tmp_path / "待确认问题.xlsx").exists()
@@ -213,7 +216,7 @@ def test_agent_json_mode_and_state_in_every_turn():
     case, script = _agent_case()
     texts = [json.dumps({"thought": "", "tool": s["tool"], "args": s.get("args", {})}, ensure_ascii=False) for s in script]
     llm = FakeLLM(["这不是 JSON"] + texts)
-    llm.tool_mode, llm.images = "json", "（图片转写）"
+    llm.tool_mode, llm.images = "json", GRADE_IMG
     q = next(s["args"] for s in script if s["tool"] == "ask_question")      # 财务已答复过同一个问题
     ar = run_agent(llm, [ANNUAL], answers=[{"text": q["text"], "options": q["options"], "answer": 0}])
     assert ar.ok, ar.error

@@ -22,7 +22,7 @@ from pydantic import ValidationError
 
 from bonus_agent.auto import (DATA_SUFFIXES, MAX_FILES, Inventory, PlanDataset, TooManyFiles, build_inventory,
                               check_dataset, collect_files, filter_sheet)
-from bonus_agent import case as cs, clauses as cl, failure, fixes
+from bonus_agent import case as cs, clauses as cl, failure, fixes, lint
 from bonus_agent import facts as fx
 from bonus_agent.extract_rules import Extraction, Question, check_quotes, prompt
 from bonus_agent.llm import LLM, LLMError, image_part, parse_json
@@ -267,6 +267,7 @@ class Workspace:
     _sheet_corpus: dict[str, str] = field(default_factory=dict)
     progress: tuple[int, int] = (0, 0)                      # 已用步数、上限
     pinned: set[str] = field(default_factory=set)           # 全文已附在材料包里的文件 / 工作表
+    lint: dict = field(default_factory=dict)                # 方案 -> 程序检查结果（lint.Report），finish 前要处理其中的 gates
     said: str = ""                                          # 财务在对话里发过的文字：和材料一样可以引用（file 写「财务对话」）
 
     @property
@@ -924,7 +925,40 @@ class Workspace:
         warns = [str(i) for i in list(issues) + list(base.issues) if i.severity == "warning"]
         if warns:
             lines.append("数据提示：\n" + "\n".join(f"- {w}" for w in warns[:8]))
+        rep = self.lint[name] = lint.check(rs, data, self._rule_text(), base.traces, sourced=self._sources_readable())
+        if rep.warns:
+            lines.append("程序检查提示：\n" + "\n".join(f"- {w}" for w in rep.warns[:8]))
+        gates = self._open_gates(rep)
+        if gates:
+            lines.append(f"程序检查发现 {len(gates)} 处要处理（finish 前必须改好、问财务，或写进 finish 的 ignored 说明原因）：\n"
+                         + "\n".join(f"- {g}" for g in gates[:10]))
         return "\n".join(lines)
+
+    def _rule_text(self) -> str:
+        """规则材料的原文（规则文档、没定义成数据表的工作表、财务的话和答复），程序检查用来找常数和取值的出处。"""
+        used = {(m.file, m.sheet) for m in self.mapping.values()}
+        parts = [l for f in self.inv.files if f.suffix.lower() not in DATA_SUFFIXES for l in self._lines(f.name)]
+        for ref, body in self.inv.sheet_text.items():
+            file, sheet = ref.split("/", 1)
+            if (file, sheet) not in used and not any(Path(str(a)).name == file and b == sheet for a, b in used):
+                parts.append(body)
+        parts.append(self.said)
+        parts += [f"{q.text} {q.answer or ''}" for q in self.questions]
+        return "\n".join(parts)
+
+    def _sources_readable(self) -> str:
+        """常数出处能不能核对：没有规则材料，或有图片还没转写时返回原因（常数只提示、不拦）。"""
+        if not any(f.suffix.lower() not in DATA_SUFFIXES for f in self.inv.files) and not self.said:
+            return "没有规则文档"
+        n = sum(1 for d in self.inv.docs for k, b in enumerate([b for b in d.blocks if b.kind == "image"], start=1)
+                if f"{d.name}#{k}" not in self.transcripts)
+        return f"材料里有 {n} 张图片还没转写" if n else ""
+
+    def _open_gates(self, rep) -> list[str]:
+        """还没处理的程序检查项：已写进 ignored，或已有问题提到这个取值 / 常数的，算处理过。"""
+        skipped = {str(i.get("ref", "")) for i in self.ignored}
+        asked = " ".join(f"{q.text} {q.answer or ''}" for q in self.questions)
+        return [g for g, k in zip(rep.gates, rep.keys) if k not in skipped and k.split(" ", 1)[1] not in asked]
 
     def _period_mismatch(self, name: str) -> str:
         """奖金池和分配权重用的统计期间（日期、period == "Q3" 这类取值）对不上时给出提示，常见于把按季度算的权重放在共用部分、
@@ -1044,6 +1078,11 @@ class Workspace:
         if miss:
             raise ToolError(f"台账里这些参数的数值在规则里没有出现：{'、'.join(miss)}。请核对规则是否漏了或写错；"
                             "确实不参与计算的写进 ignored（ref 写参数名，说明原因）")
+        gates = [f"方案「{s}」：{g}" for s in self.schemes if s in self.lint for g in self._open_gates(self.lint[s])]
+        if gates:
+            raise ToolError("程序检查还有没处理的（逐条改规则；需要财务确认的用 ask_question；确实无关的写进 ignored，"
+                            "ref 写“常数 x”或“取值 x”并说明原因）：\n" + "\n".join(f"- {g}" for g in gates[:12])
+                            + (f"\n……共 {len(gates)} 处" if len(gates) > 12 else ""))
         if review:                           # 规则在核对之后又改过的条款，结束前再并排核对一次
             texts = self._element_texts()
             stale = [c for c in self.clauses if cl.refs(c.where) and not c.where.startswith((cl.BUILTIN, cl.NOT_APPLY, cl.ASKED))
