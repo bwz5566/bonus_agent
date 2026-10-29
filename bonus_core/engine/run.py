@@ -326,8 +326,8 @@ class Engine:
                 raise EngineError([Issue.block("rollup_key_missing", f"{n.id} 的 {key}={k} 在「{ent}」表里找不到", n.id)])
             groups.setdefault(str(k), []).append(n)
         out = {}
-        for k in sorted(groups):
-            e, ms = index[k], groups[k]
+        for k in sorted(index):                          # 没有最末层记录的实体也列出（只有预发时记超发）
+            e, ms = index[k], groups.get(k, [])
             ps = [payouts[m.id] for m in ms]
             offset = Decimal(0)
             for o in self.rs.offsets:

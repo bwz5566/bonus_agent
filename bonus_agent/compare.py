@@ -24,7 +24,8 @@ METRICS = {
     "应得": ("应得", "应发", "奖金", "bonus", "amount", "final", "金额"),
     "本次可发": ("本次可发", "本次实发", "实发", "paid"),
     "暂缓": ("暂缓", "挂起", "held"),
-    "已发抵扣": ("已发抵扣", "抵扣", "offset"),
+    "已发抵扣": ("已发抵扣", "预发", "已发金额", "offset"),
+    "实际抵扣": ("实际抵扣", "本次抵扣", "抵扣", "deducted"),
     "超发待核对": ("超发", "overpaid"),
 }
 PRIORITY = (("期望", "标准", "答案", "expected", "golden"), ("应得", "应发"))   # 列名优先级，靠前的优先
@@ -72,7 +73,8 @@ def _figures(res: Result) -> dict[str, dict[str, Decimal]]:
         return out
     for r in res.rollups.values():          # 按关联实体汇总后再抵扣：发放类指标以实体为准
         out["应得"].setdefault(r.key, Decimal(r.final))
-    for m, attr in (("本次可发", "paid"), ("暂缓", "held"), ("已发抵扣", "offset"), ("超发待核对", "overpaid")):
+    for m, attr in (("本次可发", "paid"), ("暂缓", "held"), ("已发抵扣", "offset"), ("实际抵扣", "deducted"),
+                    ("超发待核对", "overpaid")):
         acc: dict[str, Decimal] = {}
         if res.rollups and attr != "held":
             out[m] = {r.key: Decimal(getattr(r, attr)) for r in res.rollups.values()}
@@ -157,10 +159,13 @@ def _best_in(st, scheme, rev, metric, ours, schemes, revs, column=None) -> _Shee
     heads = [str(h or "").lower() for h in st.headers]
     others = [kw for m, kws in METRICS.items() if m != metric for kw in kws if m != "应得"]
 
+    def best(h):         # 列名同时含几个指标的关键字时（如“已发抵扣”含“抵扣”），取匹配最长的那个
+        return max((len(kw), m) for m, kws in METRICS.items() if m != "应得" for kw in kws if kw in h)[1]
+
     def named(j):
         h = heads[j]
         return any(kw in h for kw in METRICS[metric]) and not any(x in h for x in EXCLUDE) and \
-            (metric != "应得" or not any(kw in h for kw in others))
+            (not any(kw in h for kw in others) if metric == "应得" else best(h) == metric)
 
     if column is not None:
         cand = [j for j in range(len(cols)) if j != id_col and str(st.headers[j]).strip() == column.strip()]
