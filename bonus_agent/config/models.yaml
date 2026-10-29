@@ -17,7 +17,7 @@ providers:
     base_url: http://127.0.0.1:8000/v1
     api_key_env: VLLM_API_KEY
 
-default: qwen3.6-35b-a3b
+default: deepseek-flash
 
 # 智能体相关的可选项（写在每个模型下）：
 #   tool_mode: native | json      native 为原生工具调用（默认）；服务不支持时会自动改用 json

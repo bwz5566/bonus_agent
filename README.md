@@ -56,7 +56,7 @@ bonus-agent auto --out 输出目录 本批次文件夹
 | ask_question | 有冲突、缺信息或理解不明确时向财务提问，不自行假设；有未答复的问题时本轮不出结果 |
 | finish | 完成（要求最近一次修改后已成功试算） |
 
-工作区状态（笔记、数据表、规则摘要、问题、试算结论）每轮都会附给模型。对话历史超过上限（默认 24000 字）才整理一次：较早的工具结果只留摘要，仍太长就丢掉最早的几轮；两次整理之间只追加不改动，请求前缀不变，私有化 vLLM 的前缀缓存和百炼显式缓存（`cache: explicit`）都能命中。
+工作区状态（笔记、数据表、规则摘要、问题、试算结论）每轮都会附给模型。对话历史超过上限（默认 40000 字）才整理一次：较早的工具结果只留摘要，仍太长就丢掉最早的几轮；两次整理之间只追加不改动，请求前缀不变，私有化 vLLM 的前缀缓存和百炼显式缓存（`cache: explicit`）都能命中。
 金额始终由计算引擎按模型写的规则算出，每一分钱可追溯；模型只负责“读懂并建模”，不做任何计算。写出结果后，程序会从写出的规则和映射文件重新读入、重新计算，逐个对象核对金额（结果里的「复算核对」）。
 
 命令行会实时打印每一步，失败的步骤打印完整原因。输出目录里有：`result.xlsx`（结果 +「待确认问题」「智能体规划」「智能体工作记录」）、`rules.yaml`、`mapping.yaml`、`questions.yaml`、`agent_log.json`。
@@ -95,7 +95,7 @@ bonus run-template --template 案卷目录/template --out 结果目录 本期数
 `run-template` 运行前核对模板文件指纹，被改过就拒绝计算；按顺序算各方案和修订（被引用的方案先算），结果里有「确认信息」。
 规则要改时，在案卷上再走一轮智能体处理并重新确认。
 
-其他：`--max-steps`（默认 80）和 `--max-tokens`（默认 100 万）是安全上限，模型调用 finish 就结束，正常用不满；重复调用会被拦截，连续重复 6 次直接停止；`--pipeline` 改用固定流程（规划 → 抽取 → 计算），给工具调用能力弱的模型用；模型不支持原生工具调用时会自动改用 JSON 动作协议。
+其他：`--max-steps`（默认 80）和 `--max-tokens`（默认 200 万）是安全上限，模型调用 finish 就结束，正常用不满；重复调用会被拦截，同一问题重复或连续失败 3 次直接停止；`--pipeline` 改用固定流程（规划 → 抽取 → 计算），给工具调用能力弱的模型用；模型不支持原生工具调用时会自动改用 JSON 动作协议。
 
 支持的方案结构：奖金池 + 多层按权重分配；奖金包按部门（或其他层级）分别计算再往下分；“每人按公式直接算”的方案（总包 = 各人金额之和）；公司级数据表（如各月利润）；某些人不参与（权重为 0）；按比例暂缓发放；一批多个方案（季度、过程、年度）和人工调整修订（R1、R2）。
 
@@ -153,11 +153,11 @@ bonus-eval --modes agent,auto --repeats 3             # 对比智能体和固定
 
 | 分组 | 模型 | 说明 |
 | --- | --- | --- |
-| candidates（默认） | qwen3.6-35b-a3b / qwen3.6-27b / qwen3.5-35b-a3b / qwen3.5-27b | 百炼在售、权重开源，可私有化部署 |
+| candidates | qwen3.6-35b-a3b / qwen3.6-27b / qwen3.5-35b-a3b / qwen3.5-27b | 百炼在售、权重开源，可私有化部署 |
 | open | 以上 + qwen3.5-122b-a10b | 开源模型全集 |
 | reference | qwen3-vl-plus / qwen3.6-flash | 商业版，不能私有化，只看效果上限 |
 | legacy | qwen3-vl-32b / 30b-a3b / 8b | 已在百炼下线，仅作记录 |
-| deepseek | deepseek-flash / deepseek-v4-pro | DeepSeek 官方 API；flash 能看图，v4-pro 只有文本（图片交给 flash 转写） |
+| deepseek（默认 deepseek-flash） | deepseek-flash / deepseek-v4-pro | DeepSeek 官方 API；flash 能看图，v4-pro 只有文本（图片交给 flash 转写） |
 
 **换用其他模型**：任何 OpenAI 兼容接口（百炼、DeepSeek、vLLM、其他云厂商）都可以用。在 `models.yaml` 的 `providers` 里加服务商地址和 Key 的环境变量名，
 在 `models` 里加模型，运行时用 `--model 模型名`，或把 `default` 改掉。例：`DEEPSEEK_API_KEY=sk-... bonus-agent auto --model deepseek-flash --out 案卷目录 材料文件夹`。
