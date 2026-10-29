@@ -707,10 +707,35 @@ class Workspace:
                          + (f"，已发抵扣 {off:,.2f}，超发待核对 {over:,.2f}" if off or over else ""))
         if refs:
             lines.append("引用：" + "、".join(refs))
+        mismatch = self._period_mismatch(name)
+        if mismatch:
+            lines.append("请核对：" + mismatch)
         warns = [str(i) for i in list(issues) + list(base.issues) if i.severity == "warning"]
         if warns:
             lines.append("数据提示：\n" + "\n".join(f"- {w}" for w in warns[:8]))
         return "\n".join(lines)
+
+    def _period_mismatch(self, name: str) -> str:
+        """奖金池和分配权重用的统计期间（日期、period == "Q3" 这类取值）对不上时给出提示，常见于把按季度算的权重放在共用部分、
+        年度方案也跟着用了。只提示，不阻断。"""
+        full = self._merged(name)
+        variables = full.get("variables") or {}
+
+        def periods(expr: str, depth: int = 0) -> set[str]:
+            out = set(re.findall(r'"(\d{4}-\d{2}-\d{2})"', expr)) | set(re.findall(r'==\s*"([^"]{1,4})"', expr))
+            if depth < 4:
+                for n in set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expr)) & set(variables):
+                    out |= periods(str((variables[n] or {}).get("expr", "")), depth + 1)
+            return out
+        own = [full.get("pool") or {}] + list(full.get("payout") or []) + list(full.get("offsets") or [])
+        pool = periods(" ".join(str(v) for p in own if isinstance(p, dict) for k, v in p.items()
+                                if k in ("expr", "pay_ratio", "hold_ratio")))
+        weight = periods(" ".join(str(lv.get("weight") or "") for lv in full.get("allocation") or []))
+        if pool and weight and not pool & weight:
+            src = "（allocation 来自共用部分）" if "allocation" not in self.drafts.get(name, {}) else ""
+            return (f"方案「{name}」的奖金池和发放用的期间是 {sorted(pool)}，分配权重用的是 {sorted(weight)}{src}。"
+                    "如果权重应按本方案的期间计算，把 allocation 写到这个方案里")
+        return ""
 
     @property
     def result(self) -> Result | None:

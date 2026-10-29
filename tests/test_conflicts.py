@@ -214,3 +214,15 @@ def test_stops_after_three_identical_failures(tmp_path):
     bad = {"tool": "record_facts", "args": {"facts": [fact("5%", "方案.docx", "原文没有这句 5%")]}}
     ar = run_agent(FakeLLM([bad] * 20), [m])
     assert "卡住" in ar.error and len(ar.steps) == 3 and "record_facts" in ar.error
+
+
+def test_tiers_under_one_name_are_not_a_conflict(tmp_path):
+    ws = Workspace(FakeLLM([]), build_inventory(sorted(_materials(tmp_path / "m").iterdir())))
+    out = ws.record_facts([F5, {**F6, "file": "方案.docx", "quote": F5["quote"], "value": "5%"},
+                           {**F5, "quote": "季度奖按部门销售额的 5% 计提奖金池", "value": "5%"}])
+    assert not ws.questions
+    tier = [fact("5%", "方案.docx", "季度奖按部门销售额的 5% 计提奖金池"), fact("6%", "补充说明.docx", "季度奖计提比例为 6%。")]
+    ws2 = Workspace(FakeLLM([]), build_inventory(sorted(_materials(tmp_path / "n").iterdir())))
+    ws2.record_facts(tier)
+    assert len(ws2.pending) == 1                           # 两个文件各给一个不同的值：仍是冲突
+    assert "撤回问题 q1" in ws2.remove_facts(tier[0]["name"]) and not ws2.pending

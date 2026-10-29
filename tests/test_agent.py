@@ -303,3 +303,15 @@ def test_text_only_model_and_vision_model():
     assert not text_only.calls and "当前模型不能看图" in ws.briefing()
     with pytest.raises(ToolError, match="ask_question"):
         ws.view_image("毛利率系数图.png")
+
+
+def test_period_mismatch_between_pool_and_shared_weights():
+    from bonus_agent.agent import Workspace
+    ws = Workspace(FakeLLM([]), None)
+    ws.drafts = {"共用": {"allocation": [{"level": "个人", "key": "employee_id",
+                                         "weight": 'sum(score, where: period == "Q3")'}]},
+                 "ANNUAL": {"pool": {"expr": 'sum(sales, where: between(d, "2026-01-01", "2026-12-31"))'}},
+                 "QUARTER": {"pool": {"expr": 'q_sales'},
+                             "variables": {"q_sales": {"expr": 'sum(sales, where: period == "Q3")'}}}}
+    assert "allocation 来自共用部分" in ws._period_mismatch("ANNUAL")
+    assert ws._period_mismatch("QUARTER") == ""          # 经变量引用也能看出同一期间
