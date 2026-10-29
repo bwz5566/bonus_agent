@@ -298,3 +298,17 @@ def test_manual_stop_keeps_steps(tmp_path):
                    [_materials(tmp_path / "m")], tmp_path / "out", should_stop=lambda: bool(calls.append(1)) or len(calls) > 1)
     assert ar.error.startswith("已手动停止") and len(ar.steps) == 1
     assert "手动停止" in explain(ar.error)["title"] and (tmp_path / "out" / "agent_log.json").exists()
+
+
+def test_blocking_issues_come_with_fixes(tmp_path):
+    """阻断问题附上改法；改法表里的每一类都是程序真的会报的问题。"""
+    import re as _re
+    from pathlib import Path as _P
+    from bonus_agent.fixes import FIXES
+    src = "".join(p.read_text(encoding="utf-8") for p in _P("bonus_core").rglob("*.py"))
+    codes = set(_re.findall(r'(?:block|_block|warn)\("([a-z_]+)"', src)) | {"check_failed", "eval_error"}
+    assert set(FIXES) <= codes, set(FIXES) - codes
+    ws = Workspace(FakeLLM([]), build_inventory(sorted(_materials(tmp_path / "m").iterdir())))
+    ws.define_dataset(**DATASET["args"])
+    out = ws.set_rules(pool={"expr": "sum(sales) * 5%"}, allocation=[{"level": "个人", "key": "eid", "weight": "salse"}])
+    assert "name_unknown" in out and "改法：" in out and "不是 Excel 列名" in out

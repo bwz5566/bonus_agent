@@ -22,7 +22,7 @@ from pydantic import ValidationError
 
 from bonus_agent.auto import (DATA_SUFFIXES, MAX_FILES, Inventory, PlanDataset, TooManyFiles, build_inventory,
                               check_dataset, collect_files, filter_sheet)
-from bonus_agent import case as cs, clauses as cl, failure
+from bonus_agent import case as cs, clauses as cl, failure, fixes
 from bonus_agent import facts as fx
 from bonus_agent.extract_rules import Extraction, Question, check_quotes, prompt
 from bonus_agent.llm import LLM, LLMError, image_part, parse_json
@@ -725,7 +725,8 @@ class Workspace:
             head = f"「{t}」" + ("（尚未设定 pool）" if "pool" not in full else "")
             self.last_blocking |= {(t, i.code, i.where) for i in issues if i.severity == "blocking"}
             if blocking:
-                out.append(head + "静态校验发现问题，需要修正：\n" + "\n".join(f"- {e}" for e in blocking))
+                out.append(head + "静态校验发现问题，需要修正：\n" + "\n".join(f"- {e}" for e in blocking)
+                           + fixes.hints([i for i in issues if i.severity == "blocking"]))
             else:
                 out.append(head + "静态校验通过。" + ("\n提示：\n" + "\n".join(f"- {w}" for w in warns) if warns else ""))
         tiers = [_tier_text(n, t) for n, t in (parts.get("tables") or {}).items() if isinstance(t, dict) and t.get("kind") == "tier"]
@@ -845,7 +846,7 @@ class Workspace:
                                     created_at=f"{len(done) + i:06d}") for i, a in enumerate(rev["adjust"])]
                 res[rev["name"]] = eng.compute(list(done))
         except EngineError as e:
-            raise ToolError(f"方案「{name}」试算失败：\n" + "\n".join(f"- {i}" for i in e.issues[:8])) from None
+            raise ToolError(f"方案「{name}」试算失败：\n" + "\n".join(f"- {i}" for i in e.issues[:8]) + fixes.hints(e.issues)) from None
         except (EvalError, AdjustConflict, ValueError) as e:
             raise ToolError(f"方案「{name}」试算失败：{e}") from None
         self.results[name] = res
