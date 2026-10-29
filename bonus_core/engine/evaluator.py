@@ -68,6 +68,13 @@ def fmt(v) -> str:
     return str(v)
 
 
+def lookup_key(v) -> str:
+    """查找表的键按文本比较：数字不带千分位、不带多余的 0（1000 → "1000"，1.50 → "1.5"），和 Excel 里 x&"" 的结果一致。"""
+    if isinstance(v, Decimal) and not isinstance(v, bool):
+        return str(v.quantize(Decimal(1))) if v == v.to_integral_value() else format(v.normalize(), "f")
+    return v if isinstance(v, str) else fmt(v)
+
+
 _ARITH = {"+": operator.add, "-": operator.sub, "*": operator.mul, "/": operator.truediv}
 _CMP = {"==": operator.eq, "!=": operator.ne, ">=": operator.ge, "<=": operator.le, ">": operator.gt, "<": operator.lt}
 
@@ -303,7 +310,7 @@ class Evaluator:
             t, k = self.ev(c.args[0], ctx), self.ev(c.args[1], ctx)
             if not isinstance(t.v, LookupTable):
                 raise EvalError(f"lookup 的第一个参数必须是查找表，得到 {t.text}", ctx.where)
-            key = k.v if isinstance(k.v, str) else fmt(k.v)
+            key = lookup_key(k.v)
             if key in t.v.mapping:
                 r = t.v.mapping[key]
             elif t.v.default is not None:

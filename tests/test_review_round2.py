@@ -206,3 +206,22 @@ def test_rebind_files_only_when_unique(tmp_path):
     other = book("11月备份.xlsx", "人员", "销售")
     assert rebind_files(m, [nov, other, tgt])["人员"].file == "10月.xlsx"       # 两个都像，不换
     assert rebind_files(m, [book("无关.xlsx", "人员"), tgt])["人员"].file == "10月.xlsx"   # 缺工作表，不换
+
+
+def test_numeric_lookup_key_has_no_thousands_separator(tmp_path):
+    """#5 数字查找键：1000 要查到键 "1000"（不是 "1,000"），1.50 查到 "1.5"；没有默认值也不能报错，Excel 复核一致。"""
+    import shutil
+    from bonus_core.report.excel import write_excel
+    rs = rules(datasets={"人员": ds("eid", eid="id", level="number")},
+               tables={"lv_coef": {"kind": "lookup", "mapping": {"1000": 3, "1.5": 2, "20000": 5}}},
+               variables={"b": {"scope": "个人", "expr": "lookup(lv_coef, level)"}},
+               pool={"expr": "b", "scope": "个人"}, allocation=[{"level": "个人", "key": "eid"}])
+    data = {"人员": table("人员", {"eid": "E1", "level": Decimal(1000)}, {"eid": "E2", "level": Decimal("1.50")},
+                        {"eid": "E3", "level": Decimal("20000.00")})}
+    res = compute(rs, data)
+    assert {k: v.final for k, v in res.nodes.items() if k.startswith("个人")} == \
+        {"个人:E1": "3.00", "个人:E2": "2.00", "个人:E3": "5.00"}
+    if not shutil.which("soffice"):
+        pytest.skip("需要 LibreOffice 重算公式")
+    ws = _recalc(write_excel(rs, res, tmp_path / "r.xlsx"), tmp_path / "calc")["个人过程复核"]
+    assert [r[-1] for r in ws.iter_rows(min_row=3, values_only=True) if r[0] in ("E1", "E2", "E3")] == ["一致"] * 3
