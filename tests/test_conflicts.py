@@ -239,3 +239,13 @@ def test_define_remove_oscillation_stops(tmp_path):
     assert "反复建了又删" in ar.error and len(ar.steps) == 6, ar.error
     assert "删了 2 次" in ar.steps[3].result
     assert "「人员」" in explain(ar.error)["title"]
+
+
+def test_date_spellings_are_not_conflicts():
+    """同一个日期的不同写法（Word 里的“2026 年 7 月 1 日”、Excel 里的日期时间、没写年份的“9 月 30 日”）不算冲突。"""
+    mk = lambda v, f: fx.Fact(name="季度奖统计期间-结束", value=v, file=f, quote=v)    # noqa: E731
+    fs = [mk("2026 年 9 月 30 日", "a.docx"), mk("2026-09-30 00:00:00", "b.xlsx"), mk("9 月 30 日", "c.pptx")]
+    assert fx.detect(fs, {}, [], 1) == []
+    fs.append(mk("2026-10-31", "d.xlsx"))
+    q = fx.detect(fs, {}, [], 1)
+    assert len(q) == 1 and len(q[0].options) == 3      # 两个不同日期 + 其他

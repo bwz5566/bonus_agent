@@ -63,6 +63,13 @@ def replay(snapshot: dict, files: list[Path], cases: list[dict], sheets: dict[st
 
     if not any(s != "共用" and d.get("pool") for s, d in (snapshot.get("drafts") or {}).items()):
         raise ValueError("这个案卷还没有写好的方案（智能体没跑完或失败了），没法做坏数据回归")
+    base = Workspace(FakeLLM([]), build_inventory(files))      # 先在原始数据上算一遍：本身就算不出来，后面的“拦住”都不作数
+    cs.restore(base, copy.deepcopy(snapshot))
+    try:
+        for s in base.schemes:
+            base._trial(s)
+    except ToolError as e:
+        raise ValueError("这个案卷的规则在原始数据上就算不出结果，没法做坏数据回归：" + " ".join(str(e).split())[:200]) from None
     out = []
     for c in cases:
         p = c.get("patch") or {}

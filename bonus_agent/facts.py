@@ -58,12 +58,26 @@ def number(value: str) -> Decimal | None:
         return None
 
 
+_DATE = re.compile(r"^(?:(\d{4})\s*(?:年|-|/|\.)\s*)?(\d{1,2})\s*(?:月|-|/|\.)\s*(\d{1,2})\s*日?(?:\s+0{1,2}:0{2}(?::0{2})?)?$")
+
+
+def date_key(value: str) -> str | None:
+    """日期的各种写法（2026 年 7 月 1 日、2026-07-01 00:00:00、2026/7/1、9 月 30 日）统一成 date:2026-07-01；没写年份的年份记为 *。"""
+    m = _DATE.match(unicodedata.normalize("NFKC", str(value)).strip())
+    if not m:
+        return None
+    y, mo, d = m.group(1) or "*", int(m.group(2)), int(m.group(3))
+    if not (1 <= mo <= 12 and 1 <= d <= 31) or (y == "*" and "月" not in value):
+        return None
+    return f"date:{y}-{mo:02d}-{d:02d}"
+
+
 def same_value(f: Fact) -> str:
     """用来判断两条记录是否一致的取值。"""
     n = number(f.value)
     if n is not None:
         return format(n.normalize(), "f")
-    return norm(f.meaning or f.value)
+    return date_key(f.value) or norm(f.meaning or f.value)
 
 
 def label(f: Fact) -> str:
@@ -129,6 +143,10 @@ def detect(facts: list[Fact], conflicts: dict[str, Conflict], questions: list[Qu
         by: dict[str, list[Fact]] = {}
         for f in fs:
             by.setdefault(same_value(f), []).append(f)
+        for k in [k for k in by if k.startswith("date:*-")]:       # 没写年份的日期，和唯一一个同月同日的日期算同一个
+            full = [x for x in by if x.startswith("date:") and not x.startswith("date:*") and x.endswith(k[-5:])]
+            if len(full) == 1:
+                by[full[0]] += by.pop(k)
         if len(by) < 2 or len({number(g[0].value) is None for g in by.values()}) > 1:
             continue      # 一处是数、一处是文字（如 0.1 和 “MIN(工龄,5)÷5”）：是两个参数用了同一个名字，不算冲突（record_facts 会提示改名）
         files = {f.file for f in fs}
