@@ -164,7 +164,7 @@ def _label(rs: RuleSet, name: str) -> str:
 def _review_sheets(wb, rs: RuleSet, res: Result) -> None:
     """每个层级一张「过程复核」表：每个对象一行；灰色列是引擎取数（对明细的汇总、字段值），绿色列是 Excel 公式，
     最后用公式复算应得（或权重），和引擎结果比对。参数表另起一张，公式引用它。"""
-    from openpyxl.formatting.rule import CellIsRule
+    from openpyxl.formatting.rule import CellIsRule, FormulaRule
 
     from bonus_core.dsl import excel_formula as xf
     plans = xf.plan(rs)
@@ -213,19 +213,29 @@ def _review_sheets(wb, rs: RuleSet, res: Result) -> None:
                 engine = float(_d(n.final if target == "pool" else n.weight))
                 a, b = letter["@复算"], letter["@引擎"]
                 tol = "0.005" if target == "pool" else f"0.000001*MAX(1,ABS({b}{r}))"
-                check = "人工调整" if n.id in adjusted and target == "pool" else f'=IF(ABS({a}{r}-{b}{r})<{tol},"一致","不一致")'
+                check = "人工调整" if n.id in adjusted and target == "pool" else \
+                    f'=IF(ISERROR({a}{r}),"公式出错",IF(ABS({a}{r}-{b}{r})<{tol},"一致","不一致"))'
                 row += [re_, engine, check]
             ws.append(row)
         last = 2 + len(ns)
+        lo, hi = 3 + len(p["inputs"]), len(cols) - (1 if target else 0)    # 公式所在的列（不含核对列）
+        first, end = get_column_letter(lo), get_column_letter(max(lo, hi))
+        if hi >= lo:
+            ws.conditional_formatting.add(f"{first}3:{end}{last}", FormulaRule(formula=[f"ISERROR({first}3)"], fill=RED))
         if target:
             k = letter["@核对"]
-            ws.conditional_formatting.add(f"{k}3:{k}{last}", CellIsRule(operator="equal", formula=['"不一致"'], fill=RED))
+            for bad in ('"不一致"', '"公式出错"'):
+                ws.conditional_formatting.add(f"{k}3:{k}{last}", CellIsRule(operator="equal", formula=[bad], fill=RED))
             for name in ("@复算", "@引擎"):
                 col = cols.index(name) + 1
                 for (cell,) in ws.iter_rows(min_row=3, max_row=last, min_col=col, max_col=col):
                     cell.number_format = MONEY if target == "pool" else "0.000000"
-            ws.append([])
-            ws.append(["不一致的个数", f'=COUNTIF({k}3:{k}{last},"不一致")'])
+        ws.append([])
+        if target:
+            ws.append(["复核未通过的个数", f'=COUNTIF({k}3:{k}{last},"不一致")+COUNTIF({k}3:{k}{last},"公式出错")'
+                                         f'+SUMPRODUCT(--ISERROR({k}3:{k}{last}))'])
+        if hi >= lo:
+            ws.append(["公式出错的单元格", f"=SUMPRODUCT(--ISERROR({first}3:{end}{last}))"])
         ws.freeze_panes = "C3"
     if params.rows:
         ps = wb.create_sheet("参数表")

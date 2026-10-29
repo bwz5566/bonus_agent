@@ -108,10 +108,12 @@ def build_tree(rs: RuleSet, data: Datasets) -> tuple[Node, dict[str, list[Node]]
         return tbl[key]
 
     # 1. 实体表：建立节点并带上属性
+    listed: set[str] = set()      # 有实体表的层级：上级编号必须在实体表里，不能由下级推导
     for lv in levels:
         ent = rs.entity_dataset(lv.key)
         if ent is None:
             continue
+        listed.add(lv.level)
         name, _ = ent
         if name not in data:
             issues.append(Issue.block("dataset_missing", f"缺少数据表「{name}」", where=name))
@@ -139,6 +141,11 @@ def build_tree(rs: RuleSet, data: Datasets) -> tuple[Node, dict[str, list[Node]]
             if pk is None:
                 issues.append(Issue.block(
                     "parent_missing", f"{n.id} 缺少上级字段 {lv.parent_key}，无法归入「{up.level}」",
+                    where=str(n.attr_src)))
+                continue
+            if up.level in listed and str(pk) not in nodes[up.level]:
+                issues.append(Issue.block(
+                    "parent_unknown", f"{n.id} 的上级 {lv.parent_key}={pk} 在「{up.level}」的实体表里不存在",
                     where=str(n.attr_src)))
                 continue
             p = get(up.level, str(pk))

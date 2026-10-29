@@ -93,6 +93,13 @@ class Evaluator:
         self.detail_fields = self.layout.row_only
         self.index: dict[str, dict[str, Node]] = root.index or {}
         self._row_node = {id(n.row): n for tbl in self.index.values() for n in tbl.values()}
+        # 每一行所属的对象（层级对象、关联实体）：对行聚合时，行里再嵌套的聚合按这一行自己的对象算，
+        # 不能沿用外层对象（否则项目层对参与记录求和时，每条记录都会读到整个项目的工时）
+        self._home: dict[int, Node] = {}
+        for n in [*root.walk(), *(m for tbl in self.index.values() for m in tbl.values())]:
+            for rows in n.own_rows.values():
+                for r in rows:
+                    self._home.setdefault(id(r), n)
 
     # ---------------- 对外接口 ----------------
     def evaluate(self, expr: str, node: Node, trace_id: str, rule_item: str) -> Decimal:
@@ -372,8 +379,11 @@ class Evaluator:
         rows = ctx.node.rows(ds)
         aux = ds in self.layout.aux
 
-        def rctx(r):   # 关联实体的行在它自己的节点上求值，才能用到该实体的变量
-            return Ctx(self._row_node[id(r)], r, ctx.where) if aux else Ctx(ctx.node, r, ctx.where)
+        def rctx(r):   # 关联实体的行在它自己的节点上求值，才能用到该实体的变量；其他行在它所属的下级对象上求值
+            if aux:
+                return Ctx(self._row_node[id(r)], r, ctx.where)
+            home = self._home.get(id(r))
+            return Ctx(home if home is not None and ctx.node in home.chain() else ctx.node, r, ctx.where)
         if "where" in kw:
             cond = kw["where"]
             rows = [r for r in rows if self._bool(self.ev(cond, rctx(r)), ctx)]

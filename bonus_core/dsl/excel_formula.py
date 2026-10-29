@@ -67,7 +67,7 @@ class Params:
             refs = []
             for k, v in items:
                 r = len(self.rows) + 1
-                key = float(k) if not isinstance(k, str) or re.fullmatch(r"-?\d+(\.\d+)?", k) else k
+                key = str(k) if isinstance(t, LookupTable) else float(k)     # 查找表的键保留文本（如 001），阶梯下限是数
                 self.rows.append(["", key, float(v)])
                 refs.append((f"'{self.sheet}'!$B${r}", f"'{self.sheet}'!$C${r}"))
             if isinstance(t, LookupTable) and t.default is not None:
@@ -105,8 +105,10 @@ class Formula:
                 return f"({self.tr(l)}{op}{self.tr(r)})"
             case Cmp(op=op, left=l, right=r):
                 return f"({self.tr(l)}{_CMP[op]}{self.tr(r)})"
-            case BoolOp(op=op, left=l, right=r):
-                return f"{op.upper()}({self.tr(l)},{self.tr(r)})"
+            case BoolOp(op=op, left=l, right=r):      # 用 IF 保留短路：左边已能定结果时不算右边（AND()/OR() 会两边都算）
+                if op == "and":
+                    return f"IF({self.tr(l)},IF({self.tr(r)},TRUE,FALSE),FALSE)"
+                return f"IF({self.tr(l)},TRUE,IF({self.tr(r)},TRUE,FALSE))"
             case Call():
                 return self._call(n)
         raise NotExcel(str(n))
@@ -129,8 +131,8 @@ class Formula:
         if c.fn == "lookup":
             out = refs[-1][1] if t.default is not None else "NA()"
             keys = list(t.mapping)
-            for k, (kc, vc) in reversed(list(zip(keys, refs))):
-                out = f"IF({x}={kc},{vc},{out})"
+            for k, (kc, vc) in reversed(list(zip(keys, refs))):     # 和引擎一样按文本比较键（数字 1 与键 "1" 相同）
+                out = f"IF(({x}&\"\")={kc},{vc},{out})"
             return out
         steps = list(zip(t.steps, refs))
         op = ">=" if t.lower_inclusive else ">"

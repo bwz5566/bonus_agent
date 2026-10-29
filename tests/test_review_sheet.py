@@ -51,5 +51,5 @@ def test_tier_lookup_formulas_match_engine(tmp_path):
         wb = _recalc(f, tmp_path / "calc")
         for ws in [w for w in wb.worksheets if w.title.endswith("过程复核")]:
             heads = [c.value for c in ws[2]]
-            rows = [r for r in ws.iter_rows(min_row=3, values_only=True) if r[0] and r[0] != "不一致的个数"]
+            rows = [r for r in ws.iter_rows(min_row=3, values_only=True) if r[0] and r[0] not in ("复核未通过的个数", "公式出错的单元格")]
             assert rows and all(r[heads.index("核对")] in ("一致", "人工调整") for r in rows), (f.name, ws.title)

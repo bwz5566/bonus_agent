@@ -25,24 +25,51 @@ class NegResult:
     detail: str
 
 
-def patch_workbook(src: Path, dst: Path, patch: dict, sheets: dict[str, str] | None = None) -> None:
+def patch_workbook(src: Path, dst: Path, patch: dict, sheets: dict[str, str] | None = None,
+                   header_rows: list[int] | None = None, columns: dict[str, str] | None = None) -> None:
+    """在复制的工作簿上改一处。行号按表头位置换算（表头不一定在第 1 行）：header_rows 是案卷里保存的表头行，
+    没有时按程序识别的表头；index 是第几条数据行（从 0 开始，不含表头、空行和合计行）。
+    field 可以写 Excel 列名，也可以写标准字段名（columns：标准字段 -> 列名）。"""
+    from bonus_core.data.table_detect import detect_sheet, table_at
+
+    sheet = (sheets or {}).get(patch["table"], patch["table"])
+    st = table_at(src, sheet, header_rows) if header_rows else detect_sheet(openpyxl.load_workbook(src, data_only=True)[sheet], src.name)
+    if st is None or not st.rows:
+        raise ValueError(f"工作表「{sheet}」里没有识别出数据行")
+    if not 0 <= patch["index"] < len(st.rows):
+        raise ValueError(f"「{sheet}」只有 {len(st.rows)} 条数据行，没有第 {patch['index']} 条")
+    r = st.rows[patch["index"]][0]
     wb = openpyxl.load_workbook(src)
-    ws = wb[(sheets or {}).get(patch["table"], patch["table"])]
-    head = [c.value for c in ws[1]]
-    r = patch["index"] + 2
-    if patch["op"] == "append_copy":
-        ws.append([c.value for c in ws[r]])
+    ws = wb[sheet]
+    if patch["op"] == "append_copy":         # 复制一条数据行，插在最后一条数据行后面（合计行之前）
+        last = st.rows[-1][0]
+        vals = [c.value for c in ws[r]]
+        ws.insert_rows(last + 1)
+        for i, v in enumerate(vals, start=1):
+            ws.cell(last + 1, i).value = v
     elif patch["op"] == "set":
+        name = patch["field"]
+        col = name if name in st.headers else (columns or {}).get(name)
+        if col not in st.headers:
+            raise ValueError(f"「{sheet}」的表头（第 {st.header_row} 行）里没有列「{name}」：{[h for h in st.headers if h]}")
         v = patch["value"]
         if isinstance(v, str):
             try:
                 v = float(v)
             except ValueError:
                 pass
-        ws.cell(r, head.index(patch["field"]) + 1).value = v
+        ws.cell(r, st.headers.index(col) + 1).value = v
     else:
         raise ValueError(f"不支持的 op：{patch['op']}")
     wb.save(dst)
+
+
+def _layout(snapshot: dict, sheet: str) -> tuple[list[int] | None, dict[str, str] | None]:
+    """案卷里这张工作表保存的表头行和列对照（标准字段 -> 列名）。"""
+    for m in (snapshot.get("mapping") or {}).values():
+        if isinstance(m, dict) and m.get("sheet") == sheet:
+            return m.get("header_rows"), m.get("columns")
+    return None, None
 
 
 def _target(files: list[Path], patch: dict, sheets: dict[str, str] | None) -> Path:
@@ -81,7 +108,7 @@ def replay(snapshot: dict, files: list[Path], cases: list[dict], sheets: dict[st
             for f in files:
                 dst = Path(tmp) / f.name
                 if f == src:
-                    patch_workbook(f, dst, p, sheets)
+                    patch_workbook(f, dst, p, sheets, *_layout(snapshot, (sheets or {}).get(p["table"], p["table"])))
                 else:
                     shutil.copy(f, dst)
                 copies.append(dst)
