@@ -137,15 +137,20 @@ class Evaluator:
         for n in node.chain():
             if n.level == scope:
                 return n
-        if row is not None:
-            for ref in self._refs(row):
-                for n in ref.chain():
-                    if n.level == scope:
-                        return n
+        for ref in self._refs(row) if row is not None else self._node_refs(node):
+            for n in ref.chain():
+                if n.level == scope:
+                    return n
         if scope in self.layout.aux:
             raise EvalError(f"变量 {name} 属于关联实体「{scope}」，这里取不到对应的{scope}（当前行没有它的编号 "
                             f"{self.rs.datasets[scope].key}）", node.id)
         raise EvalError(f"变量 {name} 属于「{scope}」层级，不能在「{node.level}」层直接引用（需要聚合）", node.id)
+
+    def _node_refs(self, node: Node):
+        """层级对象经自己行上的编号字段引用到的关联实体（如参与记录 → 人员）。"""
+        for n in node.chain():
+            if n.attrs and not n.aux:
+                yield from self._refs(Row(n.attrs, n.attr_src))
 
     def _refs(self, row: Row):
         """当前行经编号字段引用到的关联实体，近的在前（如回款 → 销售单 → 项目）。"""
@@ -250,6 +255,13 @@ class Evaluator:
                 if v is None:
                     raise EvalError(f"{node.id} 的字段 {n} 为空", str(node.attr_src))
                 return Val(v, fmt(v))
+        if ctx.row is None:
+            for ref in self._node_refs(ctx.node):
+                if n in ref.attrs:
+                    v = ref.attrs[n]
+                    if v is None:
+                        raise EvalError(f"{ref.id} 的字段 {n} 为空", str(ref.attr_src))
+                    return Val(v, f"{n}[{ref.key}]", rows=(ref.row,))
         if n in self.rs.tables:
             return Val(self.rs.tables[n], n)
         if n in self.detail_fields:

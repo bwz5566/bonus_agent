@@ -277,6 +277,11 @@ class _ScopeCheck:
             return
         if ent is not None and lay.visible(n, ent):
             return
+        if agg is None and ent is None:          # 层级对象自己行上的编号引用到的关联实体（如参与记录的 emp_id → 人员）
+            for lv in rs.allocation[:ctx + 1] if ctx >= 0 else []:
+                ed = rs.entity_dataset(lv.key)
+                if ed and lay.visible(n, ed[0]):
+                    return
         sc = lay.aux_var_scope(n)
         owners = lay.row_only.get(n, set())
         if sc is not None or (owners and owners <= set(lay.aux)):    # 关联实体的字段或变量
@@ -291,7 +296,9 @@ class _ScopeCheck:
             si = -1 if vs == "global" else lay.index.get(vs, -1)
             if si > ctx:
                 self._block("scope_var", f"变量 {n} 属于「{vs}」层级，不能在「{lab(ctx)}」层引用。"
-                                         f"上层需要下层的数时，请在上层直接对数据表聚合（如 sum(...)），不要引用下层变量")
+                                         f"上层需要下层的数时，请在上层直接对数据表聚合（如 sum(...)），不要引用下层变量"
+                                         + (f"；如果奖金池是每个「{vs}」各自计提的，把 pool 的 scope 写成「{vs}」"
+                                            if ctx < 0 and vs in lay.index else ""))
             elif vs == "global" and ctx >= 0:
                 self._global_total(n, ctx)
             return
