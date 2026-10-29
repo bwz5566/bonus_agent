@@ -140,3 +140,18 @@ def test_excel_review_counts_formula_errors(tmp_path):
     assert e1[-1] == "公式出错"
     summary = {r[0]: r[1] for r in calc.iter_rows(values_only=True) if r[0] in ("复核未通过的个数", "公式出错的单元格")}
     assert summary["复核未通过的个数"] == 1 and summary["公式出错的单元格"] >= 2
+
+
+def test_money_cannot_stay_in_empty_middle_level():
+    """部门分到了钱、下面却没有员工：拦下，不能让这笔钱留在部门层没人领。"""
+    rs = rules(datasets={"部门": ds("dept_id", dept_id="id", w="number"), "员工": ds("emp_id", emp_id="id", dept_id="id")},
+               pool={"expr": "100"},
+               allocation=[{"level": "部门", "key": "dept_id", "weight": "w"},
+                           {"level": "员工", "key": "emp_id", "parent_key": "dept_id", "weight": "1"}])
+    data = {"部门": table("部门", {"dept_id": "D1", "w": Decimal(1)}, {"dept_id": "D2", "w": Decimal(1)}),
+            "员工": table("员工", {"emp_id": "E1", "dept_id": "D1"})}
+    with pytest.raises(EngineError) as ei:
+        compute(rs, data)
+    assert ei.value.issues[0].code == "branch_empty" and "部门:D2" in str(ei.value.issues[0])
+    data["部门"] = table("部门", {"dept_id": "D1", "w": Decimal(1)}, {"dept_id": "D2", "w": Decimal(0)})   # 权重为 0：分不到钱，不拦
+    assert compute(rs, data).nodes["员工:E1"].final == "100.00"

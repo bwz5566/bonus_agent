@@ -234,7 +234,19 @@ class Engine:
                 raise PermissionError(f"{a.actor} 无权调整 {a.node_id}（只能调整自己管辖节点的下级）")
             n.lock = a.amount.quantize(CENT)  # 同一节点多次调整，以最后一次为准
         allocate(self.root, round_pool(self.pool_exact), self.pool_exact)
+        self._check_stranded()
         return active
+
+    def _check_stranded(self) -> None:
+        """不在最末层、下面又没有对象的节点分到了钱：这笔钱发不到任何人，必须拦下（不能悄悄留在中间层）。"""
+        leaf = self.rs.allocation[-1].level if self.rs.allocation else None
+        stuck = [n for n in self.root.walk() if n.level != leaf and not n.children and n.final != 0]
+        if stuck:
+            nxt = {lv.level: self.rs.allocation[i + 1].level for i, lv in enumerate(self.rs.allocation[:-1])}
+            nxt[ROOT_LEVEL] = self.rs.allocation[0].level if self.rs.allocation else ""
+            raise EngineError([Issue.block(
+                "branch_empty", f"{n.id}（{n.label}）分到 {n.final} 元，但下面没有任何「{nxt.get(n.level, '')}」，这笔钱发不到人。"
+                f"请核对数据是否漏了下级，或规则是否应把这类对象排除（如权重为 0）", n.id) for n in stuck[:8]])
 
     def compute(self, adjustments: list[Adjustment] = (), actor_scopes=None) -> Result:
         adjustments = list(adjustments)
