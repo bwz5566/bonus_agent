@@ -134,4 +134,6 @@ def test_safe_name_and_passwords(tmp_path):
         u.add("a", "short", ["editor"])
     with pytest.raises(ValueError):
         u.add("a", PW, ["root"])
+    with pytest.raises(ValueError, match="display"):
+        u.add("李经理账号", PW, ["approver"])
     assert oct(Path(tmp_path / "users.yaml").stat().st_mode)[-3:] == "600"

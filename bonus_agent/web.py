@@ -79,8 +79,8 @@ class Users:
         bad = [r for r in roles if r not in ROLES]
         if bad:
             raise ValueError(f"没有角色 {bad}，可选：{list(ROLES)}")
-        if not re.fullmatch(r"[\w.\-@]{1,64}", name):
-            raise ValueError("用户名只能用字母、数字、下划线、点、减号、@")
+        if not re.fullmatch(r"[A-Za-z0-9_.\-@]{1,64}", name):    # 浏览器登录只支持英文用户名，中文姓名写在 display
+            raise ValueError("用户名只能用英文字母、数字、下划线、点、减号、@（中文姓名请用 --display）")
         if len(password) < 8:
             raise ValueError("口令至少 8 位")
         users = self.load()
