@@ -1,5 +1,6 @@
 """程序检查：不靠模型记住提示词，按规则结构和真实数据找出常见的写错，必要时强制提问。
 
+- 照抄：查找表的键和值和某张数据表的两列完全一样（如把品类费率表抄成常数），下一期数据变了规则不跟着变，要改成直接读字段；
 - 出处：规则里的每个常数（系数、比例、阈值、单价）都要在材料、财务的话或答复里找得到；
 - 取值：规则里和字段比较的文字（如 review == "通过"）要在数据或材料里出现，防止写错取值导致整批被筛掉；
 - 未提及的取值：数据里出现了材料和规则都没提到的取值（如工单状态“挂起”），规则会把它悄悄当成不满足条件，要问财务；
@@ -139,9 +140,17 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
     rep = Report()
     norm = unicodedata.normalize("NFKC", text)
     nums = material_numbers(text)
+    # 0. 查找表照抄了数据表：换期后数据变了，规则还按旧数算，而且不报错
+    copied = _copied(rs, data)
+    for name, (ds, key, fld) in copied.items():
+        rep.gates.append(f"查找表 {name} 照抄了数据表「{ds}」的 {fld}（按 {key} 对应）。下一期数据变了，规则还会按旧数算；"
+                         f"删掉这张查找表，直接引用字段 {fld}（行上有 {key} 的表都能按编号读到）")
+        rep.keys.append(f"查找表 {name}")
     # 1. 常数要有出处
     miss: dict[str, set[str]] = {}
     for n, where in constants(rs):
+        if where.removeprefix("tables.") in copied:
+            continue
         if n in FREE or abs(n) in FREE or _key(abs(n)) in nums:
             continue
         miss.setdefault(_key(n), set()).add(where)
@@ -185,6 +194,33 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
     if traces:
         rep.warns += _all_zero(rs, traces)
     return rep
+
+
+def _copied(rs: RuleSet, data: Datasets) -> dict[str, tuple[str, str, str]]:
+    """查找表 -> (数据表, 键字段, 值字段)：查找表的每个键在数据表里都有，对应的值也完全一样。"""
+    out = {}
+    for name, t in rs.tables.items():
+        if not isinstance(t, LookupTable) or len(t.mapping) < 2:
+            continue
+        for ds, tbl in data.items():
+            rows = [r.values for r in tbl.rows]
+            fields = list(rs.datasets[ds].fields) if ds in rs.datasets else []
+            hit = None
+            for key in fields:
+                index = {str(r.get(key)): r for r in rows if r.get(key) is not None}
+                if not all(k in index for k in t.mapping):
+                    continue
+                for fld in fields:
+                    if fld != key and all(isinstance(index[k].get(fld), Decimal) and index[k][fld] == v
+                                          for k, v in t.mapping.items()):
+                        hit = (ds, key, fld)
+                        break
+                if hit:
+                    break
+            if hit:
+                out[name] = hit
+                break
+    return out
 
 
 def _reachable(rs: RuleSet) -> set[str]:

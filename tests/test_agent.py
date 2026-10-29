@@ -318,3 +318,17 @@ def test_period_mismatch_between_pool_and_shared_weights():
                              "variables": {"q_sales": {"expr": 'sum(sales, where: period == "Q3")'}}}}
     assert "allocation 来自共用部分" in ws._period_mismatch("ANNUAL")
     assert ws._period_mismatch("QUARTER") == ""          # 经变量引用也能看出同一期间
+
+
+def test_agent_stops_only_on_same_failure_reason():
+    """同一工具因为不同原因先后失败，是在往前改，不算卡住；同一个原因连续 3 次才停下。"""
+    from bonus_agent.agent import run_agent
+    cols = {"a": {"column": "b", "type": "id"}}
+    calls = [{"tool": "define_dataset", "args": {"name": "x", "file": "无.xlsx", "sheet": "a", "fields": cols}},
+             {"tool": "define_dataset", "args": {"name": "x", "file": "年度数据.xlsx", "sheet": "不存在", "fields": cols}},
+             {"tool": "define_dataset", "args": {"name": "x"}},
+             {"tool": "list_files"}]
+    ar = run_agent(FakeLLM(calls), [ANNUAL], max_steps=4)
+    assert len(ar.steps) == 4 and "卡住" not in ar.error
+    ar = run_agent(FakeLLM([{"tool": "finish", "args": {"summary": "x"}}] * 4), [ANNUAL], max_steps=6)
+    assert "卡住" in ar.error and len(ar.steps) == 3

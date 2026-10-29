@@ -250,8 +250,18 @@ def draft_numbers(drafts: dict) -> set[str]:
     return out
 
 
-def unused(facts: list[Fact], drafts: dict, conflicts: dict[str, Conflict], questions: list[Question]) -> list[str]:
-    """登记了数值、规则里却没有用到的参数（冲突的按财务选定的取值查）。"""
+def data_numbers(rs, data) -> set[tuple[str, str]]:
+    """规则读取的数据字段里出现的数，(文件名, 数)：参数表（费率、系数）在数据文件里、规则直接读表时，从这个文件登记的参数也算用上了。"""
+    from bonus_core.data.mapping import used_fields
+    used = used_fields(rs)
+    return {(r.src.file if r.src else "", format(v.normalize(), "f")) for t in data.values() for r in t.rows
+            for k, v in r.values.items() if k in used and isinstance(v, Decimal) and not isinstance(v, bool)}
+
+
+def unused(facts: list[Fact], drafts: dict, conflicts: dict[str, Conflict], questions: list[Question],
+           read: set[tuple[str, str]] = frozenset()) -> list[str]:
+    """登记了数值、规则里却没有用到的参数（冲突的按财务选定的取值查）。read：规则读取的数据里出现的 (文件名, 数)，
+    只对从同一个数据文件登记的参数生效；规则文档里的参数仍要在规则里出现。"""
     nums = draft_numbers(drafts)
     out = []
     for name in dict.fromkeys(f.name.strip() for f in facts):
@@ -266,6 +276,7 @@ def unused(facts: list[Fact], drafts: dict, conflicts: dict[str, Conflict], ques
             continue
         n = number(fs[0].value)
         raw = _NUM.match(unicodedata.normalize("NFKC", fs[0].value).replace(",", "").replace(" ", "")).group(1)
-        if format(n.normalize(), "f") not in nums and format(Decimal(raw).normalize(), "f") not in nums:
+        keys = {format(n.normalize(), "f"), format(Decimal(raw).normalize(), "f")}
+        if not keys & nums and not any((f.file, k) in read for f in fs for k in keys):
             out.append(f"{name}（{fs[0].value}）")
     return out

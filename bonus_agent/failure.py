@@ -32,6 +32,10 @@ def _explain(err: str) -> dict:
     m = re.search(r"：(\w+) 连续 (\d+) 次失败，最后一次：(.*)", err, re.S)
     if m:
         tool, n, last = TOOL_NAMES.get(m.group(1), m.group(1)), m.group(2), m.group(3)
+        if "结束前自查" in last or "条款清单还有没落实" in last:     # 程序自己的核对没走完，不是要财务回答的问题
+            return {"title": f"智能体在结束前的自查（规则逐条对照材料）连续 {n} 次没走完，已自动停下。"
+                             "这是程序内部的核对，不需要你回答。",
+                    "advice": f"{RETRY}；重试后还停在这里，请把这条消息发给开发。", "where": ""}
         why, ask = _why(last)
         return {"title": f"智能体在「{tool}」这一步连续失败 {n} 次，已自动停下" + (f"，{why}" if why else "") + "。",
                 "advice": f"{SEND}（直接重试多半还会卡在同一处）。",

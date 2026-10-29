@@ -283,6 +283,7 @@ class Workspace:
     _sheet_corpus: dict[str, str] = field(default_factory=dict)
     progress: tuple[int, int] = (0, 0)                      # 已用步数、上限
     pinned: set[str] = field(default_factory=set)           # 全文已附在材料包里的文件 / 工作表
+    read_nums: dict = field(default_factory=dict)           # 方案 -> 规则读取的数据字段里出现的数（直接读表的参数算用上了）
     lint: dict = field(default_factory=dict)                # 方案 -> 程序检查结果（lint.Report），finish 前要处理其中的 gates
     said: str = ""                                          # 财务在对话里发过的文字：和材料一样可以引用（file 写「财务对话」）
 
@@ -890,6 +891,7 @@ class Workspace:
         except (EvalError, AdjustConflict, ValueError) as e:
             raise ToolError(f"方案「{name}」试算失败：{e}") from None
         self.results[name] = res
+        self.read_nums[name] = fx.data_numbers(rs, data)
         self.untested.discard(name)
         self.untested |= {s for s in self.schemes if s != name and name in {d for d, _ in self._deps(s)}}  # 引用本方案的要重算
         base = res["R0"]
@@ -974,8 +976,9 @@ class Workspace:
         return f"材料里有 {n} 张图片还没转写" if n else ""
 
     def _open_gates(self, rep) -> list[str]:
-        """还没处理的程序检查项：已写进 ignored，或已有问题提到这个取值 / 常数的，算处理过。"""
-        skipped = {str(i.get("ref", "")) for i in self.ignored}
+        """还没处理的程序检查项：已写进 ignored，或已有问题提到这个取值 / 常数的，算处理过。
+        照抄数据表的查找表不能自己写进 ignored 了事（会让下一期悄悄算错），只能改规则或问财务。"""
+        skipped = {str(i.get("ref", "")) for i in self.ignored if not str(i.get("ref", "")).startswith("查找表 ")}
         asked = " ".join(f"{q.text} {q.answer or ''}" for q in self.questions)
         return [g for g, k in zip(rep.gates, rep.keys) if k not in skipped and k.split(" ", 1)[1] not in asked]
 
@@ -1093,7 +1096,8 @@ class Workspace:
         if gaps:
             raise ToolError("条款清单还有没落实的（逐条处理后再 finish；用 cover_clauses 标注）：\n"
                             + "\n".join(f"- {g}" for g in gaps[:15]) + (f"\n……共 {len(gaps)} 条" if len(gaps) > 15 else ""))
-        miss = [n for n in fx.unused(self.facts, self.drafts, self.conflicts, self.questions) if n.split("（")[0] not in skipped]
+        miss = [n for n in fx.unused(self.facts, self.drafts, self.conflicts, self.questions,
+                                set().union(*(self.read_nums.get(s, set()) for s in self.schemes))) if n.split("（")[0] not in skipped]
         if miss:
             raise ToolError(f"台账里这些参数的数值在规则里没有出现：{'、'.join(miss)}。请核对规则是否漏了或写错；"
                             "确实不参与计算的写进 ignored（ref 写参数名，说明原因）")
@@ -1515,6 +1519,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     repeats = 0
     last_write: tuple[str, str] | None = None
     fails: dict[str, int] = {}         # 工具 -> 连续失败次数
+    fail_why: dict[str, str | None] = {}   # 工具 -> 上次失败的原因（报错第一行的开头）
     stuck = ""
     undo: dict[tuple[str, str], int] = {}
     same_block, prev_block = 0, set()
@@ -1620,7 +1625,10 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                     stuck = f"反复提交相同的 {c['name']}，结果：{result[:300]}"
                 last_write = (sig, result)
                 seen.clear()   # 工作区变了，重新读取是合理的
-            fails[c["name"]] = 0 if ok else fails.get(c["name"], 0) + 1
+            # 同一工具因为同一个原因连续失败才算卡住；原因变了说明在往前改（如 finish 先后被不同的检查拦下）
+            why = re.sub(r"\d+", "", result.removeprefix("错误：").split("\n", 1)[0])[:15]
+            fails[c["name"]] = 0 if ok else (fails.get(c["name"], 0) + 1 if fail_why.get(c["name"]) == why else 1)
+            fail_why[c["name"]] = None if ok else why
             if ok and c["name"] in ("remove_dataset", "remove_facts"):     # 建了又删、删了又建：没有进展的来回改
                 what = str((args or {}).get("name", ""))
                 undo[(c["name"], what)] = undo.get((c["name"], what), 0) + 1

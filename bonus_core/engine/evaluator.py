@@ -161,9 +161,9 @@ class Evaluator:
         raise EvalError(f"变量 {name} 属于「{scope}」层级，不能在「{node.level}」层直接引用（需要聚合）", node.id)
 
     def _node_refs(self, node: Node):
-        """层级对象经自己行上的编号字段引用到的关联实体（如参与记录 → 人员）。"""
+        """对象经自己（及上级）行上的编号字段引用到的关联实体（如参与记录 → 人员、订单 → 品类费率）。"""
         for n in node.chain():
-            if n.attrs and not n.aux:
+            if n.attrs:
                 yield from self._refs(Row(n.attrs, n.attr_src))
 
     def _refs(self, row: Row):
