@@ -173,3 +173,30 @@ def test_login_logout_and_lockout(env):
     sid = c.cookies.get("bonus_session")
     app.state.sessions[sid] = ("carol", 0)
     assert c.get("/", follow_redirects=False).status_code == 303
+
+
+def test_chat_window(env):
+    app, store, scripts, c, m = env
+    cid = store.create("对话", "张会计")
+    for p in m.iterdir():
+        (store.dir(cid) / "materials" / p.name).write_bytes(p.read_bytes())
+    scripts.append([{"tool": "record_facts", "args": {"facts": [F5, F6]}}, DATASET,
+                    {"tool": "finish", "args": {"summary": "季度奖"}}])
+    post(c, store, f"/cases/{cid}/run")
+    wait(app, cid)
+    # 对话里答复问题并修改：生成第 2 轮
+    scripts.append([{"tool": "answer_question", "args": {"id": "q1", "answer": "按 6%"}}, rules("6%"),
+                    {"tool": "reply", "args": {"text": "已按 6% 重新计算"}}])
+    assert post(c, store, f"/cases/{cid}/chat", {"text": "按 6%"}).status_code == 303
+    assert "已出结果" in wait(app, cid).message
+    # 只是提问：直接回复，不生成新的一轮
+    scripts.append([{"tool": "reply", "args": {"text": "奖金池是销售额合计的 6%"}}])
+    post(c, store, f"/cases/{cid}/chat", {"text": "奖金池怎么来的？"})
+    assert wait(app, cid).message == "已回复"
+    chat = store.chat(cid)
+    assert [x["role"] for x in chat] == ["user", "agent", "user", "agent"]
+    assert "已按修改生成第 2 轮" in chat[1]["text"] and chat[3]["text"] == "奖金池是销售额合计的 6%"
+    page = c.get(f"/cases/{cid}").text
+    assert "奖金池怎么来的？" in page and "发送" in page and "第 2 轮" in page
+    assert post(c, store, f"/cases/{cid}/chat", {"text": "x"}, user="carol").status_code == 403
+    assert any(a["action"] == "对话" for a in store.audit_log(cid))

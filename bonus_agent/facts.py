@@ -176,7 +176,11 @@ def chosen(name: str, conflicts: dict[str, Conflict], questions: list[Question],
     if q is None or not q.answer:
         return True, None
     i = next((i for i, o in enumerate(q.options) if o == q.answer), None)
-    return True, (c.values[i] if i is not None and i < len(c.values) else None)
+    if i is not None:
+        return True, (c.values[i] if i < len(c.values) else None)
+    # 答复是一段话（如对话里说“以补充说明为准，6%”）：里面恰好提到一个冲突取值时，就是选定的值
+    hit = {v for v in draft_numbers({"a": q.answer}) if v in c.values}
+    return True, (hit.pop() if len(hit) == 1 else None)
 
 
 def draft_numbers(drafts: dict) -> set[str]:

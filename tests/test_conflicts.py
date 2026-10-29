@@ -1,4 +1,5 @@
 """冲突自动检测：同一参数在不同材料里取值不一致时，由程序判定并提问，不交给模型取舍。"""
+import json
 from decimal import Decimal
 
 import docx
@@ -164,3 +165,39 @@ def test_quote_miss_suggests_original_and_hints_next_step(tmp_path):
     assert "define_dataset" in ws.next_hint() and "补充说明.docx" in ws.next_hint()
     ws.progress = (30, 80)
     assert "下一步（程序判断）" in ws.state()
+
+
+def test_chat_answers_and_changes(tmp_path):
+    m, out = _materials(tmp_path / "m"), tmp_path / "案卷"
+    r1 = [{"tool": "record_facts", "args": {"facts": [F5, F6]}}, DATASET, {"tool": "finish", "args": {"summary": "季度奖"}}]
+    assert run_agent(FakeLLM(r1), [m], out).status == "NEEDS_CONFIRMATION"
+    # 对话里财务明确答复了问题：记下原话、按答复改规则，程序自动试算并检查，生成第 2 轮
+    llm = FakeLLM([{"tool": "answer_question", "args": {"id": "q1", "answer": "以补充说明为准，6%"}}, rules("6%"),
+                   {"tool": "reply", "args": {"text": "已按 6% 计提"}}])
+    ar = run_agent(llm, [m], out, message="计提比例以补充说明为准，6%", by="张会计")
+    assert "财务的消息：计提比例以补充说明为准，6%" in llm.calls[0][1]["content"]
+    assert ar.status == "OK" and ar.round == 2 and ar.reply == "已按 6% 计提" and ar.result.pool == "24000.00"
+    q = yaml.safe_load((out / "questions.yaml").read_text(encoding="utf-8"))[0]
+    assert q["answer"] == "以补充说明为准，6%" and q["answered_by"] == "张会计（对话）"
+    case = json.loads((out / "case.json").read_text(encoding="utf-8"))
+    assert case["rounds"][-1]["message"] == {"by": "张会计", "text": "计提比例以补充说明为准，6%"}
+    # 只是提问：可以查算式，不生成新的一轮
+    llm = FakeLLM([{"tool": "explain", "args": {"id": "个人:E1"}}, {"tool": "reply", "args": {"text": "E1 按销售额占比分得 6000"}}])
+    ar = run_agent(llm, [m], out, message="E1 怎么算的？", by="张会计", chat=[{"role": "user", "text": "之前的话"}])
+    assert ar.reply.startswith("E1") and ar.steps[0].ok and "最终金额 6,000" in ar.steps[0].result
+    assert len(json.loads((out / "case.json").read_text(encoding="utf-8"))["rounds"]) == 2
+    assert "之前的话" in llm.calls[0][1]["content"]
+    # 改了规则但试算 / 检查不通过：reply 被拦下，模型修正后才结束
+    llm = FakeLLM([rules("4%"), {"tool": "reply", "args": {"text": "改好了"}},
+                   rules("6%"), {"tool": "reply", "args": {"text": "改回 6%"}}])
+    ar = run_agent(llm, [m], out, message="试试 4%", by="张会计")
+    bad = next(s for s in ar.steps if s.tool == "reply" and not s.ok)
+    assert "财务选定 0.06" in bad.result and ar.reply == "改回 6%" and ar.round == 3
+    # 不是对话时不能用 reply / answer_question
+    ws = Workspace(FakeLLM([]), build_inventory(sorted(m.iterdir())))
+    for call in (lambda: ws.reply("x"), lambda: ws.answer_question("q1", "x")):
+        try:
+            call()
+            raise AssertionError("非对话也能用")
+        except Exception as e:
+            assert "对话" in str(e)

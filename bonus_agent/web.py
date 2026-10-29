@@ -147,6 +147,14 @@ class Store:
         p = self.dir(cid) / "audit.jsonl"
         return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines() if x] if p.exists() else []
 
+    def chat(self, cid: str) -> list[dict]:
+        p = self.dir(cid) / "chat.jsonl"
+        return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines() if x] if p.exists() else []
+
+    def chat_add(self, cid: str, role: str, user: str, text: str) -> None:
+        with (self.root / "cases" / cid / "chat.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"at": now(), "role": role, "user": user, "text": text}, ensure_ascii=False) + "\n")
+
     def csrf(self, user: str) -> str:
         return hmac.new(self.secret, f"csrf:{user}".encode(), hashlib.sha256).hexdigest()[:32]
 
@@ -196,24 +204,29 @@ class Runner:
         j = self.jobs.get(cid)
         return j is not None and j.status == "running"
 
-    def start(self, cid: str, user: str, new: bool = False) -> Job:
+    def start(self, cid: str, user: str, new: bool = False, message: str | None = None) -> Job:
         with self.lock:
             if self.running(cid):
                 raise RuntimeError("这个案卷正在运行，请等本轮结束")
             job = self.jobs[cid] = Job(cid, user)
-        self.store.audit(cid, user, "运行下一轮", new=new)
-        job.thread = threading.Thread(target=self._run, args=(job, new), daemon=True)
+        if message:
+            self.store.chat_add(cid, "user", user, message)
+            self.store.audit(cid, user, "对话", text=message[:200])
+        else:
+            self.store.audit(cid, user, "运行下一轮", new=new)
+        job.thread = threading.Thread(target=self._run, args=(job, new, message), daemon=True)
         job.thread.start()
         return job
 
-    def _run(self, job: Job, new: bool) -> None:
+    def _run(self, job: Job, new: bool, message: str | None = None) -> None:
         from bonus_agent.agent import run_agent
         d = self.store.dir(job.cid)
         try:
             with self.slots:
                 llm = self.llm_factory()
                 ar = run_agent(llm, [d / "materials"], d / "out", resume=not new, max_steps=self.max_steps,
-                               max_tokens=self.max_tokens,
+                               max_tokens=self.max_tokens, message=message, by=job.by,
+                               chat=self.store.chat(job.cid)[:-1] if message else None,
                                on_step=lambda n, s: job.steps.append(f"[{n:02d}] {s.tool} {'✓' if s.ok else '✗'} "
                                                                       f"{(s.result.splitlines() or [''])[0][:160]}"))
                 expected = sorted((d / "expected").glob("*.xlsx"))
@@ -224,9 +237,18 @@ class Runner:
             job.status, job.result = "done", ar.status
             job.message = {"OK": "已出结果，请核对", "NEEDS_CONFIRMATION": f"有 {len(ar.pending)} 个问题等答复，本轮不出结果"
                            }.get(ar.status, f"未完成：{ar.error}")
-            self.store.audit(job.cid, job.by, "本轮结束", round=ar.round, status=ar.status, error=ar.error)
+            if message:
+                made = bool(ar.outputs)          # 对话里改了东西才会生成新的一轮
+                note = (f"\n\n（已按修改生成第 {ar.round} 轮：{job.message}）" if made else "")
+                self.store.chat_add(job.cid, "agent", "智能体", (ar.reply or f"（没有回复：{ar.error or '未完成'}）") + note)
+                if not made:
+                    job.result, job.message = "", "已回复"
+            if ar.outputs or not message:
+                self.store.audit(job.cid, job.by, "本轮结束", round=ar.round, status=ar.status, error=ar.error)
         except Exception as e:  # 失败要如实显示，不能当作完成
             job.status, job.message = "failed", f"运行失败：{e}"
+            if message:
+                self.store.chat_add(job.cid, "agent", "智能体", f"（运行失败：{e}）")
             self.store.audit(job.cid, job.by, "本轮失败", error=str(e))
 
 
@@ -276,7 +298,10 @@ button{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:6px 1
 button.link{background:none;color:var(--bad);padding:0}header button.link{color:var(--acc)}input[type=text],input[type=password],textarea{width:100%;padding:6px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);font:inherit}
 .q{border-top:1px solid var(--line);padding:10px 0}.q:first-of-type{border-top:0}.opt{display:block;margin:2px 0}
 pre{white-space:pre-wrap;background:var(--bg);padding:8px;border-radius:6px;max-height:320px;overflow:auto;margin:0}
-.wrap{overflow-x:auto}
+.wrap{overflow-x:auto}.chat{max-height:480px;overflow-y:auto;margin-bottom:10px}
+.msg{margin:8px 0;display:flex;flex-direction:column}.msg.user{align-items:flex-end}
+.bubble{white-space:pre-wrap;padding:8px 12px;border-radius:10px;max-width:85%;background:var(--bg);border:1px solid var(--line)}
+.msg.user .bubble{background:var(--acc);color:#fff;border-color:var(--acc)}
 """
 STATUS = {"OK": ("已出结果，待财务核对", "ok"), "NEEDS_CONFIRMATION": ("等财务答复，本轮不出结果", "warn"),
           "FAILED": ("未完成", "bad")}
@@ -482,6 +507,15 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             info += form(f"/cases/{cid}/run", "<p><button>运行下一轮</button> <label class='mut'><input type='checkbox' "
                                               "name='new' value='1'> 从头开始（不接着上一轮）</label></p>", csrf)
         parts.append(f"<section><h2>状态</h2>{info}</section>")
+        msgs = "".join(f"<div class='msg {m['role']}'><div class='mut'>{e(m['user'])} · {e(m['at'][5:16].replace('T', ' '))}</div>"
+                       f"<div class='bubble'>{e(m['text'])}</div></div>" for m in store.chat(cid)[-40:])
+        if busy and job and job.steps:
+            msgs += "<div class='msg agent'><div class='bubble mut'>正在处理……</div></div>"
+        box = form(f"/cases/{cid}/chat", "<textarea name='text' rows='3' placeholder='直接问结果（如：E001 的季度奖怎么算的？），"
+                                         "或者让智能体修改（如：华东区域系数改为 1.05）' required></textarea>"
+                                         "<p><button>发送</button> <span class='mut'>改了规则会自动重新试算，生成新的一轮；"
+                                         "只是提问不会生成新的一轮</span></p>", csrf) if editor and not busy else ""
+        parts.append(f"<section><h2>对话</h2><div class='chat'>{msgs or '<p class=mut>还没有对话</p>'}</div>{box}</section>")
         # 问题
         qs = load_questions(out)
         if qs:
@@ -627,6 +661,20 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             return back(cid, "还没有材料，请先上传")
         try:
             runner.start(cid, u["display"], new=f.get("new") == "1")
+        except RuntimeError as err:
+            raise HTTPException(409, str(err)) from None
+        return back(cid)
+
+    @app.post("/cases/{cid}/chat")
+    async def chat(cid: str, request: Request, u: dict = Depends(user)):
+        need(u, "editor")
+        case_dir(cid)
+        f = await posted(request, u)
+        text = str(f.get("text", "")).strip()[:4000]
+        if not text:
+            return back(cid)
+        try:
+            runner.start(cid, u["display"], message=text)
         except RuntimeError as err:
             raise HTTPException(409, str(err)) from None
         return back(cid)

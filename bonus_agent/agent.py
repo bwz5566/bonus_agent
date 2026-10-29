@@ -45,6 +45,7 @@ SHARED = "共用"                # 多个方案共用的部分（权重、校验
 KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保留全文
 BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
 READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate"}
+WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", "ask_question", "answer_question"}
 RULE_SUFFIXES = {".docx", ".pptx", ".png", ".jpg", ".jpeg", ".txt", ".md"}   # 规则文档：要登记参数
 
 
@@ -136,6 +137,13 @@ TOOLS: list[dict] = [
                     "related 写受影响的方案或规则（如 ANNUAL.offsets）。blocking=false 只用于不影响任何金额的提示。",
      "parameters": _obj({"text": _S, "options": {"type": "array", "items": _S}, "suggested": _I, "related": _S,
                          "blocking": {"type": "boolean"}}, ["text", "options"])},
+    {"name": "reply",
+     "description": "对话时用：回复财务这条消息并结束本次对话。改过规则、数据表或台账时，程序会先自动试算全部方案并做完成前检查，"
+                    "不通过会把原因返回给你修正。回复里的金额要来自 evaluate / explain / 试算结果，不要自己算。",
+     "parameters": _obj({"text": _S, "ignored": {"type": "array", "items": _obj({"ref": _S, "reason": _S})}}, ["text"])},
+    {"name": "answer_question",
+     "description": "对话时用：财务在消息里明确答复了某个待确认问题时，把他的原话记为该问题的答复。他没说清楚的不要替他选，用 reply 反问。",
+     "parameters": _obj({"id": _S, "answer": {**_S, "description": "财务的原话或他选的选项"}}, ["id", "answer"])},
     {"name": "finish", "description": "完成。要求每个方案在最近一次修改之后都已成功试算。",
      "parameters": _obj({"summary": {**_S, "description": "两三句话说明：什么奖金、奖金池怎么来、怎么分、发放条件"},
                          "ignored": {"type": "array", "items": _obj({"ref": _S, "reason": _S})}}, ["summary"])},
@@ -170,6 +178,9 @@ class Workspace:
     ignored: list[dict] = field(default_factory=list)
     notes: dict[str, str] = field(default_factory=dict)
     done: bool = False
+    chat_by: str = ""                                       # 对话模式：发消息的财务；空表示普通的一轮处理
+    changed: bool = False                                   # 对话里改过规则、数据表、台账或问题
+    reply_text: str = ""
     budget: str = ""
     round: int = 1                                          # 第几轮（同一案卷和财务来回的次数）
     facts: list[fx.Fact] = field(default_factory=list)      # 参数台账：从材料里登记的参数和口径
@@ -644,6 +655,29 @@ class Workspace:
         self.summary, self.ignored, self.done = summary, ignored, True
         return "已完成"
 
+    def reply(self, text: str, ignored: list[dict] | None = None) -> str:
+        if not self.chat_by:
+            raise ToolError("现在不是对话，请用 finish 结束")
+        if self.changed and self.schemes:
+            if any(s in self.untested or s not in self.results for s in self.schemes):
+                out = self.trial_run()
+                if any(s in self.untested or s not in self.results for s in self.schemes):
+                    raise ToolError("修改后试算没有通过，请修正后再回复：\n" + out[:2000])
+            self.finish(self.summary or "对话中修改", ignored)
+        self.reply_text, self.done = text.strip(), True
+        return "已回复"
+
+    def answer_question(self, id: str, answer: str) -> str:
+        if not self.chat_by:
+            raise ToolError("只有对话中财务明确答复时才能用")
+        q = next((q for q in self.questions if q.id == id), None)
+        if q is None or q.withdrawn:
+            raise ToolError(f"没有待答复的问题 {id}")
+        from datetime import datetime
+        q.answer, q.answered_by = answer.strip(), f"{self.chat_by}（对话）"
+        q.answered_at = datetime.now().isoformat(timespec="seconds")
+        return f"已记录 {id} 的答复：{q.answer}。请按答复修改规则"
+
     def next_hint(self) -> str:
         """程序根据工作区判断的下一步（模型原地打转或步数用得多时提示）。"""
         docs = [f.name for f in self.inv.files if f.suffix.lower() in RULE_SUFFIXES]
@@ -781,6 +815,7 @@ class AgentResult:
     rule_changes: list[str] = field(default_factory=list)
     compared: bool = False                                              # 上一轮有结果，做了金额对比
     results: dict[str, dict[str, Result]] = field(default_factory=dict)  # 方案 -> 修订 -> 结果
+    reply: str = ""                                                      # 对话时给财务的回复
 
     @property
     def single(self) -> bool:
@@ -856,7 +891,8 @@ def _answers_text(answers: list[dict] | None) -> str:
 def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = None, *,
               answers: list[dict] | None = None, max_steps: int = 80, max_history_chars: int = 24000,
               max_files: int = MAX_FILES, max_tokens: int | None = 1_000_000, exclude: list[str | Path] = (),
-              on_step: Callable[[int, Step], None] | None = None, resume: bool = True) -> AgentResult:
+              on_step: Callable[[int, Step], None] | None = None, resume: bool = True,
+              message: str | None = None, by: str = "", chat: list[dict] | None = None) -> AgentResult:
     """max_steps 和 max_tokens 都是安全上限：模型调用 finish 就结束，正常不会用满。
 
     out_dir 是案卷目录：里面已有上一轮的 case.json 时（resume=True），从上一轮的工作区接着做，
@@ -889,7 +925,15 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                         for i, a in enumerate(answers or []) if a.get("text") and a.get("answer") not in (None, "")]
     fresh = cs.apply_answers(ws.questions, answers)
     handlers = {t["name"]: getattr(ws, t["name"]) for t in TOOLS}
-    if resumed:
+    if message:             # 对话：财务的一条消息。先按现有规则试算一遍，便于回答和查算式
+        ws.chat_by = by or "财务"
+        for s in ws._order(ws.schemes):
+            try:
+                ws._trial(s)
+            except Exception:
+                pass
+        task = _chat_task(ws, message, chat, fresh, (changes if resumed else None))
+    elif resumed:
         task = _resume_task(ws, last, changes, fresh, withdrawn)
     else:
         task = ("请完成本批次的奖金计算。文件清单：\n" + ws.list_files() + _answers_text(answers)
@@ -982,6 +1026,8 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             if len(result) > MAX_RESULT_CHARS:
                 result = result[:MAX_RESULT_CHARS] + "……（已截断）"
             step = Step(c["name"], args if isinstance(args, dict) else {}, result, ok)
+            if ok and c["name"] in WRITE_TOOLS:
+                ws.changed = True
             if c["name"] in READ_ONLY and ok:
                 seen[sig] = len(steps) + 1
             elif c["name"] not in READ_ONLY:
@@ -1001,6 +1047,11 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     else:
         error = f"达到最大步数 {max_steps} 仍未完成"
 
+    if message and not ws.changed and not fresh and not any((changes or {}).values()):
+        # 对话里只是问答、没有改动：不算新的一轮，不改案卷和输出
+        ar = AgentResult(ws, steps, None, None, error, round=(last or {}).get("n", 0))
+        ar.reply = ws.reply_text or (f"（没有完成：{error}）" if error else "")
+        return ar
     tested = {s: ws.results[s] for s in ws.schemes if s in ws.results and s not in ws.untested}
     rss = {s: ws._ruleset(s) for s in tested}
     draft = {}
@@ -1010,6 +1061,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     ar = AgentResult(ws, steps, rss.get(first), tested[first]["R0"] if first else None, error,
                      rulesets={s: rss[s] for s in tested}, results=tested)
     ar.draft_results, ar.round, ar.changes = draft, rnd["n"], changes
+    ar.reply = ws.reply_text
     ar.pending = [q.model_dump() for q in ws.pending]
     if last and last.get("digest") is not None and tested:
         ar.diff_rows, ar.compared = cs.diff_results(last["digest"], tested), True
@@ -1023,6 +1075,8 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         rnd["inputs"] = [str(f) for f in ws.data_files]
         rnd["outputs"] = {k: [p.name, cs.sha256(p)] for k, p in ar.outputs.items()
                           if k == "mapping" or k == "rules" or k.startswith(("rules:", "adjust:"))}
+        if message:
+            rnd["message"] = {"by": ws.chat_by, "text": message}
         rnd.update(status=ar.status, error=error, pending=[q.id for q in ws.pending], summary=ws.summary,
                    answered=[q.id for q in fresh], changes=changes, drafts=json.loads(json.dumps(ws.drafts)),
                    digest=cs.digest(tested) if tested else (last or {}).get("digest"))
@@ -1032,6 +1086,29 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         ar.outputs["case"] = cs.save_case(out, case)
         cs.archive(out, rnd["n"], ar.outputs)
     return ar
+
+
+def _chat_task(ws: Workspace, message: str, chat: list[dict] | None, fresh: list[Question],
+               changes: dict | None) -> str:
+    lines = ["财务在对话中给你发了一条消息。工作区（数据表、规则、笔记、台账、问题）是上一轮的状态，已按现有规则试算过，"
+             "可以直接用 explain / evaluate 查算式和数字。"]
+    if chat:
+        lines.append("\n之前的对话：")
+        lines += [f"- {'财务' if m.get('role') == 'user' else '你'}：{m.get('text', '')[:500]}" for m in chat[-10:]]
+    if fresh:
+        lines.append("\n财务在问题表里的新答复（必须照做）：" + "；".join(f"{q.id} → {q.answer}" for q in fresh))
+    if changes and any(changes.values()):
+        lines.append("\n文件变化：" + "；".join(f"{k} {'、'.join(v)}" for k, v in changes.items() if v)
+                     + "（新增、修改的规则文档要读并 record_facts 登记）")
+    lines += ["", f"财务的消息：{message}", "",
+              "请：",
+              "1. 是提问：查清楚后用 reply 回答，金额和算式来自 explain / evaluate，不要自己算；",
+              "2. 是要求修改：照做（set_rules、define_dataset 等），他的话本身就是依据；要求不明确、和材料冲突、"
+              "或缺信息时不要猜，用 reply 反问；",
+              "3. 他明确答复了某个待确认问题：用 answer_question 记下原话，再按答复改规则；",
+              "4. 最后调用 reply 结束。改过东西时程序会自动试算并检查，不通过会告诉你原因。",
+              "", "当前文件清单：", ws.list_files()]
+    return "\n".join(lines)
 
 
 def _resume_task(ws: Workspace, last: dict | None, changes: dict | None, fresh: list[Question],

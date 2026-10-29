@@ -200,6 +200,9 @@ bonus-agent user add --data /srv/bonus 李经理账号 --roles approver --displa
 bonus-agent serve --data /srv/bonus --host 127.0.0.1 --port 8080 [--model local]
 ```
 
+- 对话：案卷页的“对话”框可以直接问结果（智能体用 explain / evaluate 查算式，不自己算），也可以让它修改（改系数、改口径、答复问题）。
+  改了规则、数据表或台账时，程序自动试算全部方案并做完成前检查，通过才生成新的一轮；只是提问不生成新的一轮。要求不明确或与材料冲突时智能体反问，不猜。
+  对话里答复的问题记为“某某（对话）”，对话内容记入 `chat.jsonl` 和操作记录。
 - 角色：`editor`（经办）传材料、答复问题、运行、按模板计算；`approver`（审批）确认结果；其他登录用户只读。
 - 答复记录答复人和时间（写进 questions.yaml）；新建、上传（含 sha256）、删除、答复、运行、确认、按模板计算、下载都记入案卷的 `audit.jsonl`，页面上可查。
 - 每个案卷同时只跑一轮，运行中不能改材料和答复；全局最多同时跑 `--max-parallel` 轮。
