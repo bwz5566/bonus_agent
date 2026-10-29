@@ -240,7 +240,7 @@ class Runner:
                 llm = self.llm_factory()
                 ar = run_agent(llm, [d / "materials"], d / "out", resume=not new, max_steps=self.max_steps,
                                max_tokens=self.max_tokens, message=message, by=job.by,
-                               chat=self.store.chat(job.cid)[:-1] if message else None,
+                               chat=self.store.chat(job.cid)[:-1] if message else self.store.chat(job.cid),
                                on_step=lambda n, s: self._step(job, d / "out", n, s), should_stop=lambda: job.cancel,
                                instruction=instruction)
                 expected = sorted((d / "expected").glob("*.xlsx"))
@@ -725,7 +725,7 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         need(u, "editor")
         case_dir(cid)
         f = await posted(request, u)
-        text = str(f.get("text", "")).strip()[:4000]
+        text = str(f.get("text", "")).strip()[:20000]
         files = [x for x in f.getlist("files") if getattr(x, "filename", "")]
         if not text and not files:
             return back(cid)

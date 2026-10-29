@@ -49,7 +49,8 @@ READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain
 WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", "remove_facts", "ask_question",
                "record_clauses", "cover_clauses",
                "answer_question"}
-RULE_SUFFIXES = {".docx", ".pptx", ".png", ".jpg", ".jpeg", ".txt", ".md"}   # 规则文档：要登记参数
+RULE_SUFFIXES = {".docx", ".pptx", ".pdf", ".png", ".jpg", ".jpeg", ".txt", ".md"}   # 规则文档：要登记参数
+CHAT_SOURCE = "财务对话"       # 财务在对话里贴的规则原文、口径说明：和材料一样可以引用核对
 PIN_DOC_CHARS = 12000          # 不超过这么长的文档全文附在任务里（材料包），不必用工具读
 PIN_TOTAL_CHARS = 40000        # 材料包里文档全文的总长上限
 PIN_SHEET_ROWS = 30            # 不超过这么多行的工作表整表附上，更长的只附表头和前几行
@@ -92,7 +93,8 @@ TOOLS: list[dict] = [
                     "quote 逐字复制包含该取值的原文（不超过 200 字），程序会核对 quote 在文件里、value 在 quote 里。",
      "parameters": _obj({"facts": {"type": "array", "items": _obj({
          "name": {**_S, "description": "参数名，写清适用范围，如 季度奖-部门净利润提成比例"},
-         "value": {**_S, "description": "原文写法，一条只写一个值（阶梯、系数表每一档分开登记）"}, "file": _S, "quote": _S,
+         "value": {**_S, "description": "原文写法，一条只写一个值（阶梯、系数表每一档分开登记）"},
+         "file": {**_S, "description": "出处文件名；财务在对话里发的内容写「财务对话」"}, "quote": _S,
          "meaning": {**_S, "description": "可选：文字口径的规范说法，如 含税"},
          "override": {"type": "boolean", "description": "原文明确写了修改旧规定（修改为 / 以本通知为准）时为 true，"
                                                          "quote 要包含这句话"}}, ["name", "value", "file", "quote"])}},
@@ -103,7 +105,8 @@ TOOLS: list[dict] = [
                     "清单每一步都附给你，不会被裁剪；写完规则后用 cover_clauses 标注每条落在哪里，finish 前程序会检查。",
      "parameters": _obj({"clauses": {"type": "array", "items": _obj({
          "point": {**_S, "description": "要点：用自己的话写这条要求什么（不超过 100 字）"},
-         "file": _S, "quote": {**_S, "description": "逐字复制原文关键句（不超过 200 字）"}}, ["point", "file", "quote"])}},
+         "file": {**_S, "description": "出处文件名；财务在对话里发的内容写「财务对话」"},
+         "quote": {**_S, "description": "逐字复制原文关键句（不超过 200 字）"}}, ["point", "file", "quote"])}},
          ["clauses"])},
     {"name": "cover_clauses",
      "description": "标注条款清单里每条落在规则的哪里：{\"C1\": \"variables.net_receipt\", \"C2\": \"checks.grade_known、pool\"}。"
@@ -264,6 +267,7 @@ class Workspace:
     _sheet_corpus: dict[str, str] = field(default_factory=dict)
     progress: tuple[int, int] = (0, 0)                      # 已用步数、上限
     pinned: set[str] = field(default_factory=set)           # 全文已附在材料包里的文件 / 工作表
+    said: str = ""                                          # 财务在对话里发过的文字：和材料一样可以引用（file 写「财务对话」）
 
     @property
     def data_files(self) -> list[Path]:
@@ -294,6 +298,9 @@ class Workspace:
                 d = next(d for d in self.inv.docs if d.name == f.name)
                 imgs = sum(1 for b in d.blocks if b.kind == "image")
                 lines.append(f"- {f.name}（{f.suffix[1:]}，约 {len(d.full_text())} 字" + (f"，{imgs} 张图片" if imgs else "") + "）")
+        if self.said:
+            lines.append(f"- {CHAT_SOURCE}（财务在对话里发的文字，约 {len(self.said)} 字；里面的规则和参数与材料同样有效，"
+                         f"record_facts / record_clauses 引用时 file 写「{CHAT_SOURCE}」）")
         return "\n".join(lines)
 
     def read_document(self, file: str, offset: int = 0, limit: int = MAX_RESULT_CHARS - 200) -> str:
@@ -405,6 +412,8 @@ class Workspace:
                 else:
                     parts.append(f"## 工作表 {ref}（数据表，只附前 5 行；define_dataset 会读取全部行）\n"
                                  + self.read_sheet(f.name, sheet, 1, 6))
+        if self.said:
+            parts.append(f"## {CHAT_SOURCE}（财务在对话里发的文字，全文；引用时 file 写「{CHAT_SOURCE}」）\n{self.said}")
         return "\n\n".join(parts)
 
     def note(self, topic: str, text: str) -> str:
@@ -417,6 +426,8 @@ class Workspace:
     # ---- 参数台账 ----
     def _lines(self, name: str) -> list[str]:
         """文件的原文，按行：文档文字、图片转写、Excel 每行单元格。"""
+        if name == CHAT_SOURCE:
+            return self.said.splitlines()
         f = self._file(name)
         if f.suffix.lower() in DATA_SUFFIXES:
             if f.name not in self._sheet_corpus:
@@ -432,7 +443,10 @@ class Workspace:
 
     def _corpus(self) -> dict[str, str]:
         """每个文件规范化后的全文，用来核对引用。"""
-        return {f.name: fx.norm("".join(self._lines(f.name))) for f in self.inv.files}
+        out = {f.name: fx.norm("".join(self._lines(f.name))) for f in self.inv.files}
+        if self.said:
+            out[CHAT_SOURCE] = fx.norm("".join(self._lines(CHAT_SOURCE)))
+        return out
 
     def record_facts(self, facts: list[dict]) -> str:
         corpus, lines, added, dup = self._corpus(), [], 0, 0
@@ -1380,7 +1394,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     except (TooManyFiles, FileNotFoundError) as e:
         raise ToolError(str(e)) from None
     if not files:
-        raise ToolError("没有找到可处理的文件（支持 .docx .pptx .xlsx .xlsm .png .jpg .txt .md .json .csv）")
+        raise ToolError("没有找到可处理的文件（支持 .docx .pptx .pdf .xlsx .xlsm .png .jpg .txt .md .json .csv）")
     ws = Workspace(llm, build_inventory(files))
     out = Path(out_dir) if out_dir is not None else None
     case = cs.load_case(out) if out is not None else None      # --new 也保留历次记录，只是不接着上一轮的工作区
@@ -1403,6 +1417,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         ws.questions = [Question(id=a.get("id") or f"q{i + 1}", text=a["text"], options=a.get("options") or [])
                         for i, a in enumerate(answers or []) if a.get("text") and a.get("answer") not in (None, "")]
     fresh = cs.apply_answers(ws.questions, answers)
+    ws.said = _said(chat, message, instruction)
     handlers = {t["name"]: getattr(ws, t["name"]) for t in TOOLS}
     ws.transcribe_all()
     pack = ("\n\n【材料包】以下是本批次材料的内容（程序读取，图片已转写），每轮都附在这里、不会被裁剪。"
@@ -1619,6 +1634,17 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         ar.outputs["case"] = cs.save_case(out, case)
         cs.archive(out, rnd["n"], ar.outputs)
     return ar
+
+
+def _said(chat: list[dict] | None, message: str | None, instruction: str | None) -> str:
+    """财务在对话里发过的全部文字（去重，按时间），作为可引用的来源「财务对话」。"""
+    out: list[str] = []
+    for t in [m.get("text", "") for m in chat or [] if m.get("role") == "user"
+                                       and not str(m.get("text", "")).startswith("上传了期望结果")] + [message or "", instruction or ""]:
+        t = str(t).strip()
+        if t and t not in out:
+            out.append(t)
+    return "\n\n".join(out)
 
 
 def _chat_task(ws: Workspace, message: str, chat: list[dict] | None, fresh: list[Question],

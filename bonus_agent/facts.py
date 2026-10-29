@@ -89,7 +89,7 @@ def check_fact(f: Fact, corpus: dict[str, str]) -> str | None:
     if not f.name.strip() or not f.value.strip():
         return "name 和 value 不能为空"
     if f.file not in corpus:
-        return f"没有文件「{f.file}」"
+        return f"没有文件「{f.file}」，file 只能是：{'、'.join(corpus)}"
     q = norm(f.quote)
     if not q:
         return "quote 不能为空，要逐字复制包含取值的原文"

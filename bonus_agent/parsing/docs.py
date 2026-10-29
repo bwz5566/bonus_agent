@@ -1,4 +1,4 @@
-"""把规则文档（Word / PPT / Excel / 图片）解析为有序的内容块。
+"""把规则文档（Word / PPT / PDF / Excel / 图片）解析为有序的内容块。
 
 - 文字和表格由程序直接读取，不经过大模型；
 - PPT 里的原生图表直接读出数据序列，比看图更准；
@@ -124,6 +124,54 @@ def parse_xlsx(path: Path, max_rows: int = 200) -> ParsedDoc:
     return out
 
 
+SCAN_CHARS = 30          # PDF 一页读出的文字少于这么多，当作扫描件，整页转成图片交给多模态模型转写
+FIGURE_SHARE = 0.15      # 页面里图片占页面面积超过这个比例（截图、图表），整页另附一张图片
+
+
+def parse_pdf(path: Path, dpi: int = 150) -> ParsedDoc:
+    """文字型 PDF 由程序直接读出文字和表格；扫描件、含截图或图表的页面整页转成图片，交给多模态模型转写。"""
+    import pdfplumber
+
+    out = ParsedDoc(path.name)
+    render = []
+    with pdfplumber.open(str(path)) as pdf:
+        for i, page in enumerate(pdf.pages, start=1):
+            tables = page.find_tables()
+            boxes = [t.bbox for t in tables]
+
+            def outside(obj, boxes=boxes):
+                x = (obj.get("x0", 0) + obj.get("x1", 0)) / 2
+                y = (obj.get("top", 0) + obj.get("bottom", 0)) / 2
+                return not any(b[0] <= x <= b[2] and b[1] <= y <= b[3] for b in boxes)
+            text = (page.filter(outside).extract_text() or "").strip() if boxes else (page.extract_text() or "").strip()
+            if text:
+                out.blocks.append(Block(path.name, i, "text", text))
+            for t in tables:
+                md = md_table(t.extract())
+                if md:
+                    out.blocks.append(Block(path.name, i, "table", md))
+            area = float(page.width * page.height) or 1.0
+            pics = sum(abs((im["x1"] - im["x0"]) * (im["bottom"] - im["top"])) for im in page.images)
+            if len(text) + sum(len(b.text) for b in out.blocks if b.page == i and b.kind == "table") < SCAN_CHARS \
+                    or pics / area > FIGURE_SHARE:
+                render.append(i)
+    if render:
+        import io
+
+        import pypdfium2 as pdfium
+        doc = pdfium.PdfDocument(str(path))
+        try:
+            for i in render:
+                img = doc[i - 1].render(scale=dpi / 72).to_pil()
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                out.blocks.append(Block(path.name, i, "image", image=buf.getvalue(), mime="image/png"))
+        finally:
+            doc.close()
+    out.blocks.sort(key=lambda b: (b.page or 0, b.kind == "image"))
+    return out
+
+
 def parse_image(path: Path) -> ParsedDoc:
     mime = mimetypes.guess_type(path.name)[0] or "image/png"
     return ParsedDoc(path.name, [Block(path.name, None, "image", image=path.read_bytes(), mime=mime)])
@@ -143,7 +191,7 @@ def parse_text(path: Path) -> ParsedDoc:
     return ParsedDoc(path.name, [Block(path.name, None, "text", text)])
 
 
-PARSERS = {".docx": parse_docx, ".pptx": parse_pptx, ".xlsx": parse_xlsx, ".xlsm": parse_xlsx,
+PARSERS = {".docx": parse_docx, ".pptx": parse_pptx, ".pdf": parse_pdf, ".xlsx": parse_xlsx, ".xlsm": parse_xlsx,
            ".png": parse_image, ".jpg": parse_image, ".jpeg": parse_image,
            ".txt": parse_text, ".md": parse_text, ".json": parse_text, ".csv": parse_text}
 

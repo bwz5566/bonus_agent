@@ -192,7 +192,7 @@ bonus-eval --modes agent,auto --repeats 3             # 对比智能体和固定
 ```bash
 bonus-agent models
 bonus-agent extract --model qwen3-vl-32b --datasets examples/sales_q3/rules.yaml \
-    --out draft.yaml 激励方案.docx 系数表.pptx
+    --out draft.yaml 激励方案.docx 系数表.pptx 补充通知.pdf
 # draft.yaml 是规则草稿，draft.questions.json 是问题卡和校验结果，交财务逐条确认
 bonus-agent map --model qwen3-vl-32b --rules draft.yaml 数据.xlsx
 ```

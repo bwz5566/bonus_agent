@@ -29,7 +29,7 @@ class Clause(BaseModel):
 
 def check_quote(file: str, quote: str, corpus: dict[str, str]) -> str | None:
     if file not in corpus:
-        return f"没有文件「{file}」"
+        return f"没有文件「{file}」，file 只能是：{'、'.join(corpus)}"
     q = norm(quote)
     if not q:
         return "quote 不能为空，要逐字复制原文"

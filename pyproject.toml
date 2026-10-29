@@ -15,9 +15,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-agent = ["openai>=1.40", "python-docx>=1.1", "python-pptx>=0.6", "Pillow>=10"]
+agent = ["openai>=1.40", "python-docx>=1.1", "python-pptx>=0.6", "Pillow>=10", "pdfplumber>=0.11", "pypdfium2>=4"]
 web = ["fastapi>=0.110", "uvicorn>=0.29", "python-multipart>=0.0.9"]
-dev = ["pytest>=8", "hypothesis>=6", "httpx>=0.27"]
+dev = ["pytest>=8", "hypothesis>=6", "httpx>=0.27", "reportlab>=4"]
 
 [project.scripts]
 bonus = "bonus_core.cli:main"

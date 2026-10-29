@@ -247,3 +247,21 @@ def test_steps_written_while_running(env):
     wait(app, cid)
     log = (store.dir(cid) / "out" / "running_steps.txt").read_text(encoding="utf-8")
     assert log.count("trial_run") == 3 and "结果：" in log
+
+
+def test_chat_text_is_citable_source(tmp_path):
+    """财务在对话里贴的规则原文可以作为出处登记参数（file 写「财务对话」），没上传成文件也不会卡住。"""
+    from bonus_agent.agent import CHAT_SOURCE, Workspace, _said
+    from bonus_agent.auto import build_inventory
+    from bonus_agent.llm import FakeLLM
+
+    doc = tmp_path / "01_制度.md"
+    doc.write_text("客服奖金按月发放。", encoding="utf-8")
+    ws = Workspace(FakeLLM([]), build_inventory([doc]))
+    ws.said = _said([{"role": "user", "text": "上传了期望结果：x.xlsx（只用于核对，不交给智能体）"},
+                     {"role": "agent", "text": "好的"}], "在线客服300.00 800.00\n上限作用于用工折算后的最终金额", None)
+    assert "期望结果" not in ws.said and "好的" not in ws.said
+    out = ws.record_facts([{"name": "在线客服保障标准", "value": "300.00", "file": CHAT_SOURCE, "quote": "在线客服300.00"},
+                           {"name": "在线客服上限", "value": "800.00", "file": "03_说明.pdf", "quote": "800.00"}])
+    assert "已登记 1 条" in out and f"file 只能是：01_制度.md、{CHAT_SOURCE}" in out
+    assert CHAT_SOURCE in ws.list_files() and "上限作用于用工折算后的最终金额" in ws.briefing()
