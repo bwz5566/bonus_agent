@@ -1,3 +1,4 @@
+import shutil
 """财务验收样例（evals/cases/syn_acceptance）：季度 R0/R1/R2、过程奖、年度奖（按回款比例发放、扣减预付和季度 R2）。
 
 - 手写的标准规则经引擎计算，与独立参考实现（reference.py）逐分一致；
@@ -233,6 +234,11 @@ def test_confirm_freezes_template_and_runs_without_llm(tmp_path):
     # 按模板计算（不调用大模型），与参考实现一致
     results, _ = Template.load(tpl).run([run_case.XLSX])
     ref = json.loads((CASE / "reference.json").read_text(encoding="utf-8"))
+    assert run_case.diff_reference(results, ref) == []
+    nxt = tmp_path / "下期输入" / "业务输入_下期.xlsx"            # 下一期文件名变了，按工作表对上新文件
+    nxt.parent.mkdir()
+    shutil.copy(run_case.XLSX, nxt)
+    results, _ = Template.load(tpl).run([nxt])
     assert run_case.diff_reference(results, ref) == []
     assert bonus_main(["run-template", "--template", str(tpl), "--out", str(tmp_path / "下期"), str(run_case.XLSX)]) == 0
     wb = openpyxl.load_workbook(tmp_path / "下期" / "result_QUARTER_R2.xlsx")

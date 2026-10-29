@@ -17,7 +17,7 @@ from pathlib import Path
 
 import yaml
 
-from bonus_core.data.mapping import apply_mapping, load_mapping
+from bonus_core.data.mapping import apply_mapping, load_mapping, rebind_files
 from bonus_core.dsl.models import RuleSet
 from bonus_core.engine.issues import EngineError, Issue
 from bonus_core.engine.run import Adjustment, Engine, Result
@@ -87,7 +87,7 @@ class Template:
 
     def run(self, data_files: list[str | Path]) -> tuple[dict[str, dict[str, Result]], list[Issue]]:
         """按顺序计算每个方案的基准结果和各修订，被引用的方案结果传给引用它的方案。"""
-        mapping = load_mapping(self.dir / self.manifest["mapping"])
+        mapping = rebind_files(load_mapping(self.dir / self.manifest["mapping"]), data_files)
         out: dict[str, dict[str, Result]] = {}
         refs: dict[str, Result] = {}
         warnings: list[Issue] = []

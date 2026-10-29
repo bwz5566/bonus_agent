@@ -182,3 +182,27 @@ def test_negcheck_keeps_formula_values(tmp_path):
     src, out = tmp_path / "d.xlsx", tmp_path / "out.xlsx"
     patch_workbook(src, out, {"op": "set", "table": "明细", "index": 0, "field": "数量", "value": 10})
     assert [v for _, v in table_at(out, "明细", [1]).rows] == [["A", 2, 10, 6], ["B", 5, 4, 20]]
+
+
+def test_rebind_files_only_when_unique(tmp_path):
+    """#4 模板复用：旧文件名不在本批时，换成唯一包含同样工作表的新文件；对不上或拿不准时不换。"""
+    import openpyxl
+    from bonus_core.data.mapping import DatasetMapping, rebind_files
+
+    def book(name, *sheets):
+        wb = openpyxl.Workbook()
+        wb.active.title = sheets[0]
+        for s in sheets[1:]:
+            wb.create_sheet(s)
+        wb.save(tmp_path / name)
+        return tmp_path / name
+    m = {"人员": DatasetMapping(file="10月.xlsx", sheet="人员", columns={"employee_id": "工号"}),
+         "销售": DatasetMapping(file="10月.xlsx", sheet="销售", columns={"project_id": "项目编号"}),
+         "目标": DatasetMapping(file="目标.xlsx", sheet="目标", columns={"group_id": "小组"})}
+    nov, tgt = book("11月.xlsx", "人员", "销售"), book("目标.xlsx", "目标")
+    out = rebind_files(m, [nov, tgt])
+    assert [out[k].file for k in ("人员", "销售", "目标")] == ["11月.xlsx", "11月.xlsx", "目标.xlsx"]
+    assert m["人员"].file == "10月.xlsx"                                       # 原映射不变
+    other = book("11月备份.xlsx", "人员", "销售")
+    assert rebind_files(m, [nov, other, tgt])["人员"].file == "10月.xlsx"       # 两个都像，不换
+    assert rebind_files(m, [book("无关.xlsx", "人员"), tgt])["人员"].file == "10月.xlsx"   # 缺工作表，不换

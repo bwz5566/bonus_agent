@@ -118,6 +118,38 @@ def used_fields(rs: RuleSet) -> set[str]:
     return used & set(rs.field_owner())
 
 
+def rebind_files(mapping: Mapping, files: list[str | Path]) -> Mapping:
+    """模板按期复用时，下一期的文件名通常会变（如 2026-10 → 2026-11）。映射里记的文件名不在本批时，
+    找出包含它对应全部工作表的那个新文件，换成新文件名；只在能唯一对上时才换，否则原样返回，照常报“文件不在本批”。"""
+    import openpyxl
+
+    paths = {Path(f).name: Path(f) for f in files}
+    stale = sorted({m.file for m in mapping.values() if m.file is not None and m.file not in paths})
+    if not stale:
+        return mapping
+    fresh = [n for n in paths if n not in {m.file for m in mapping.values()}]
+    sheets: dict[str, set[str]] = {}
+    for n in fresh:
+        try:
+            wb = openpyxl.load_workbook(paths[n], read_only=True)
+            sheets[n] = set(wb.sheetnames)
+            wb.close()
+        except Exception:
+            continue
+    to: dict[str, str] = {}
+    for old in stale:
+        want = {m.sheet for m in mapping.values() if m.file == old and m.sheet}
+        if want:
+            hits = [n for n in sheets if want <= sheets[n]]
+        else:          # 没记工作表时，只有一个旧文件、一个新文件才能对上
+            hits = list(sheets) if len(stale) == 1 else []
+        if len(hits) == 1:
+            to[old] = hits[0]
+    if len(set(to.values())) != len(to):        # 两个旧文件对到同一个新文件，拿不准，不换
+        return mapping
+    return {k: m.model_copy(update={"file": to[m.file]}) if m.file in to else m for k, m in mapping.items()}
+
+
 def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping) -> tuple[Datasets, list[Issue]]:
     sheets = [s for f in files for s in detect(f)]
     data: Datasets = {}
