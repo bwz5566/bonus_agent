@@ -1,13 +1,14 @@
 """把规则表达式翻译成 Excel 公式，供结果文件里的「过程复核」表用：财务在 Excel 里用公式自己重算一遍，和引擎结果逐个核对。
 
-只翻译逐个对象可以直接算的部分（四则运算、比较、if / min / max / round / abs / clamp / ratio、查找表、阶梯表）。
-对明细的汇总（sum / count …）、日期、同级占比等不翻译，作为“取数”列直接写引擎算出的值。
+只翻译逐个对象可以直接算的部分（四则运算、比较（日期、是/否字段和文字比较时按字段类型换成 DATE / TRUE / FALSE）、if / min / max / round / abs / clamp / ratio、查找表、阶梯表）。
+对明细的汇总（sum / count …）、日期函数、同级占比、类型不确定的文字比较等不翻译，作为“取数”列直接写引擎算出的值。
 """
 from __future__ import annotations
 
 import re
 from decimal import Decimal
 
+from bonus_core.data.table import ConvertError, to_bool, to_date
 from bonus_core.dsl.models import LookupTable, RuleSet, TierTable
 from bonus_core.dsl.parser import BinOp, BoolOp, Call, Cmp, Const, ExprError, Name, Neg, Not, Num, Str, parse, walk
 
@@ -25,6 +26,11 @@ def translatable(src: str, rs: RuleSet) -> bool:
     except ExprError:
         return False
     for n in walk(ast):
+        if isinstance(n, Cmp):
+            try:
+                _cmp_sides(n, rs)
+            except NotExcel:
+                return False
         if isinstance(n, Call):
             if n.fn not in FUNCS or n.kwargs and not (n.fn == "ratio" and set(n.kw()) == {"zero"}):
                 return False
@@ -33,6 +39,37 @@ def translatable(src: str, rs: RuleSet) -> bool:
             if n.fn in ("tier", "tier_rate", "lookup") and not (isinstance(n.args[0], Name) and n.args[0].id in rs.tables):
                 return False
     return True
+
+
+def _field_type(n, rs: RuleSet) -> str | None:
+    if not isinstance(n, Name):
+        return None
+    types = {d.fields[n.id].type for d in rs.datasets.values() if n.id in d.fields}
+    return types.pop() if len(types) == 1 else None
+
+
+def _cmp_sides(c: Cmp, rs: RuleSet) -> tuple[str | None, str | None]:
+    """比较里带引号的文字按对方字段的类型换成 Excel 的值，和引擎一致（日期字段 >= "2026-01-01"、是/否字段 == "是"）。
+    返回 (左边, 右边) 的替换文本，None 表示照常翻译；对方类型不确定（变量、算式）时无法照搬，抛 NotExcel。"""
+    out: list[str | None] = [None, None]
+    for i, (a, b) in enumerate(((c.left, c.right), (c.right, c.left))):
+        if not isinstance(a, Str) or isinstance(b, Str):
+            continue
+        t = _field_type(b, rs)
+        if t in ("text", "enum", "id"):
+            continue
+        try:
+            if t == "date":
+                d = to_date(a.value)
+                out[i] = f"DATE({d.year},{d.month},{d.day})"
+                continue
+            if t == "bool":
+                out[i] = "TRUE" if to_bool(a.value) else "FALSE"
+                continue
+        except ConvertError:
+            pass
+        raise NotExcel(f"{a.value!r} 和 {b} 比较")
+    return out[0], out[1]
 
 
 def names(src: str, rs: RuleSet) -> list[str]:
@@ -104,7 +141,8 @@ class Formula:
             case BinOp(op=op, left=l, right=r):
                 return f"({self.tr(l)}{op}{self.tr(r)})"
             case Cmp(op=op, left=l, right=r):
-                return f"({self.tr(l)}{_CMP[op]}{self.tr(r)})"
+                a, b = _cmp_sides(n, self.rs)
+                return f"({a or self.tr(l)}{_CMP[op]}{b or self.tr(r)})"
             case BoolOp(op=op, left=l, right=r):      # 用 IF 保留短路：左边已能定结果时不算右边（AND()/OR() 会两边都算）
                 if op == "and":
                     return f"IF({self.tr(l)},IF({self.tr(r)},TRUE,FALSE),FALSE)"

@@ -225,3 +225,30 @@ def test_numeric_lookup_key_has_no_thousands_separator(tmp_path):
         pytest.skip("需要 LibreOffice 重算公式")
     ws = _recalc(write_excel(rs, res, tmp_path / "r.xlsx"), tmp_path / "calc")["个人过程复核"]
     assert [r[-1] for r in ws.iter_rows(min_row=3, values_only=True) if r[0] in ("E1", "E2", "E3")] == ["一致"] * 3
+
+
+def test_excel_review_date_and_yes_no_literals(tmp_path):
+    """#6 复核表：日期字段和 "2026-01-01"、是/否字段和 "是" 比较，Excel 里要按日期、TRUE/FALSE 比，结果一致；
+    和变量比较文字时类型不确定，不翻译成公式（改为取引擎值）。"""
+    import shutil
+    from datetime import date
+
+    from bonus_core.dsl.excel_formula import plan
+    from bonus_core.report.excel import write_excel
+    rs = rules(datasets={"人员": ds("eid", eid="id", join_date="date", approved="bool", grade="text")},
+               variables={"base": {"scope": "个人", "expr": 'if(join_date >= "2026-01-01" and approved == "是", 100, 50)'},
+                          "ok": {"scope": "个人", "expr": 'grade == "A"'},
+                          "extra": {"scope": "个人", "expr": 'if(ok == "是", 10, 0)'}},
+               pool={"expr": "base + extra", "scope": "个人"}, allocation=[{"level": "个人", "key": "eid"}])
+    data = {"人员": table("人员", {"eid": "E1", "join_date": date(2026, 3, 1), "approved": True, "grade": "A"},
+                        {"eid": "E2", "join_date": date(2025, 12, 31), "approved": True, "grade": "B"},
+                        {"eid": "E3", "join_date": date(2026, 1, 1), "approved": False, "grade": "A"})}
+    res = compute(rs, data)
+    assert {k: v.final for k, v in res.nodes.items() if k.startswith("个人")} == \
+        {"个人:E1": "110.00", "个人:E2": "50.00", "个人:E3": "60.00"}
+    p = plan(rs)["个人"]
+    assert "base" in p["computed"] and "ok" in p["computed"] and "extra" not in p["computed"]
+    if not shutil.which("soffice"):
+        pytest.skip("需要 LibreOffice 重算公式")
+    ws = _recalc(write_excel(rs, res, tmp_path / "r.xlsx"), tmp_path / "calc")["个人过程复核"]
+    assert [r[-1] for r in ws.iter_rows(min_row=3, values_only=True) if r[0] in ("E1", "E2", "E3")] == ["一致"] * 3
