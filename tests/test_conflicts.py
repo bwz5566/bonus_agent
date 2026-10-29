@@ -128,6 +128,10 @@ def test_finish_requires_facts_and_uses_them(tmp_path):
         assert f"{NAME}（5%）" in str(e)
     ws.set_rules(**rules("5%")["args"])
     ws.trial_run()
+    with pytest.raises(ToolError) as ei:               # 核对过的规则又改了：并排列出原文和现在的规则，自查一次
+        ws.finish("x")
+    assert "结束前自查" in str(ei.value) and "原文（方案.docx）：季度奖按部门销售额的 5% 计提奖金池" in str(ei.value)
+    assert "奖金池[global] = sum(sales) * 5%" in str(ei.value)
     assert ws.finish("x") == "已完成"          # 上一次 finish 写的忽略项仍然有效
 
 

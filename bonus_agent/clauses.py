@@ -24,6 +24,7 @@ class Clause(BaseModel):
     quote: str                 # 原文摘录
     where: str = ""            # 落在哪里：variables.x、checks.y、datasets.z……，或 引擎自带：… / 不适用：原因 / 已提问 q1
     round: int = 1
+    checked: str = ""          # 最近一次并排给模型核对时，对应规则的内容；规则改过后要重新核对
 
 
 def check_quote(file: str, quote: str, corpus: dict[str, str]) -> str | None:

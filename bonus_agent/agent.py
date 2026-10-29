@@ -516,7 +516,41 @@ class Workspace:
         if not ok:
             raise ToolError("没有标注任何条款：\n" + "\n".join(bad))
         return (f"已标注 {len(ok)} 条。" + ("\n未标注成功：\n" + "\n".join(bad) if bad else "")
-                + (f"\n还没落实的条款：{'、'.join(left[:30])}" if left else "\n条款清单已全部落实"))
+                + (f"\n还没落实的条款：{'、'.join(left[:30])}" if left else "\n条款清单已全部落实")
+                + "\n\n" + self._side_by_side([byid[i] for i in ok]))
+
+    def _element_texts(self) -> dict[str, list[str]]:
+        """规则元素位置 -> 各方案里的内容（各方案相同的只列一次）。"""
+        out: dict[str, list[str]] = {}
+        many = len(self.drafts) > 1
+        for sch, d in self.drafts.items():
+            for ref, line in _rules_lines(d):
+                text = (f"「{sch}」" if many else "") + line.strip().split("  ", 1)[-1]
+                if text not in out.setdefault(ref, []):
+                    out[ref].append(text)
+        for n, d in self.datasets.items():
+            units = {f: fd.unit for f, fd in d.fields.items() if fd.unit}
+            m = self.mapping.get(n)
+            out[f"datasets.{n}"] = [f"数据表 {n} ← {m.file}/{m.sheet}" + (f" 筛选 {m.filter}" if m and m.filter else "")
+                                    + (f"，金额单位 {units}（程序已换算成元）" if units else "")] if m else [f"数据表 {n}"]
+        return out
+
+    def _clause_sig(self, c, texts: dict[str, list[str]]) -> str:
+        return "\n".join(t for r in cl.refs(c.where) for t in texts.get(r, []))
+
+    def _side_by_side(self, clauses: list, limit: int = 9000) -> str:
+        """条款原文和它落到的规则并排列出，让模型逐条核对；列出过的记下当时的规则内容。"""
+        texts, lines = self._element_texts(), []
+        for c in clauses:
+            sig = self._clause_sig(c, texts)
+            body = "\n".join(f"      {t[:300]}" for t in sig.splitlines()) or f"      {c.where}"
+            lines.append(f"- {c.id} 原文（{c.file}）：{c.quote[:160]}\n    要点：{c.point}\n    规则：\n{body}")
+            c.checked = sig
+        text = "\n".join(lines)
+        if len(text) > limit:
+            text = text[:limit] + "……"
+        return ("逐条核对：规则有没有完整体现原文？条件、范围（筛选、期间、截止日）、边界（含不含）、单位、取整、"
+                "作用的层级是否一致？发现出入就改规则，再重新标注。\n" + text)
 
     def _clause_gaps(self, skipped: set[str]) -> list[str]:
         """结束前检查：每份规则文档都有条款；每条条款都落到了现有的规则元素上（规则改过后会重新核对）。"""
@@ -960,7 +994,7 @@ class Workspace:
         """还在等财务答复的问题。"""
         return [q for q in self.questions if q.blocking and not q.answer and not q.withdrawn]
 
-    def finish(self, summary: str, ignored: list[dict] | None = None) -> str:
+    def finish(self, summary: str, ignored: list[dict] | None = None, review: bool = True) -> str:
         # 上一轮登记过的忽略项继续有效，本轮同名的覆盖
         ignored = list({str(i.get("ref", "")): i for i in [*self.ignored, *(ignored or [])] if isinstance(i, dict)}.values())
         self.ignored = ignored                 # finish 被拦下时也保留，修正后再 finish 不必重写
@@ -986,6 +1020,13 @@ class Workspace:
         if miss:
             raise ToolError(f"台账里这些参数的数值在规则里没有出现：{'、'.join(miss)}。请核对规则是否漏了或写错；"
                             "确实不参与计算的写进 ignored（ref 写参数名，说明原因）")
+        if review:                           # 规则在核对之后又改过的条款，结束前再并排核对一次
+            texts = self._element_texts()
+            stale = [c for c in self.clauses if cl.refs(c.where) and not c.where.startswith((cl.BUILTIN, cl.NOT_APPLY, cl.ASKED))
+                     and self._clause_sig(c, texts) != c.checked]
+            if stale:
+                raise ToolError(f"结束前自查：这 {len(stale)} 条条款对应的规则在核对之后改过（或还没核对过），请逐条对照后再 finish"
+                                "（没有问题就直接再调用 finish）：\n" + self._side_by_side(stale))
         self.summary, self.ignored, self.done = summary, ignored, True
         return "已完成"
 
@@ -997,7 +1038,7 @@ class Workspace:
                 out = self.trial_run()
                 if any(s in self.untested or s not in self.results for s in self.schemes):
                     raise ToolError("修改后试算没有通过，请修正后再回复：\n" + out[:2000])
-            self.finish(self.summary or "对话中修改", ignored)
+            self.finish(self.summary or "对话中修改", ignored, review=False)     # 财务直接要求的修改，不再整体自查
         self.reply_text, self.done = text.strip(), True
         return "已回复"
 
@@ -1154,29 +1195,45 @@ def _revisions(revs) -> list[dict]:
 
 
 def _rules_lines(draft: dict) -> list[tuple[str, str]]:
-    """规则摘要的每一行：(名字, 行)。"""
+    """规则摘要的每一行：(规则元素位置, 行)。位置就是 cover_clauses 里写的那个（如 variables.x、payout.y）。"""
     out = []
     for n, t in (draft.get("tables") or {}).items():
-        if t.get("kind") == "lookup" or "mapping" in t:
-            out.append((f"表 {n}", f"  表 {n}：查找表 {json.dumps(t.get('mapping'), ensure_ascii=False)}"))
+        if not isinstance(t, dict):
+            continue
+        if t.get("kind") == "tier":
+            text = _tier_text(n, t) or f"{n}：阶梯 {json.dumps(t.get('steps'), ensure_ascii=False)}"
         else:
-            out.append((f"表 {n}", f"  表 {n}：{t.get('mode', '')} 阶梯 {json.dumps(t.get('steps'), ensure_ascii=False)}"))
+            text = f"{n}：查找表 {json.dumps(t.get('mapping'), ensure_ascii=False)}" + (
+                f"，查不到时取 {t.get('default')}" if t.get("default") is not None else "，查不到时报错")
+        out.append((f"tables.{n}", text))
     for n, v in (draft.get("variables") or {}).items():
-        out.append((n, f"  变量 {n}[{v.get('scope', 'global')}] = {v.get('expr')}"))
-    if "pool" in draft:
-        p = draft["pool"] or {}
-        out.append(("pool", f"  pool[{p.get('scope', 'global')}] = {p.get('expr')}"))
+        out.append((f"variables.{n}", f"{n}[{(v or {}).get('scope', 'global')}] = {(v or {}).get('expr')}"))
+    if draft.get("pool"):
+        p = draft["pool"]
+        out.append(("pool", f"奖金池[{p.get('scope', 'global')}] = {p.get('expr')}"))
     for lv in draft.get("allocation") or []:
-        out.append((f"分配 {lv.get('level')}", f"  分配 {lv.get('level')}（key={lv.get('key')}, parent_key={lv.get('parent_key')}）"
-                                              f"权重 = {lv.get('weight')}"))
+        if isinstance(lv, dict):
+            out.append((f"allocation.{lv.get('level')}", f"分配层 {lv.get('level')}（key={lv.get('key')}, parent_key={lv.get('parent_key')}）"
+                                                         f"权重 = {lv.get('weight') or '（奖金包所在层，不需要）'}"))
     for p in draft.get("payout") or []:
-        out.append((f"发放 {p.get('id')}", f"  发放 {p.get('id')}[{p.get('scope')}] 暂缓比例 = {p.get('hold_ratio')}"))
+        if isinstance(p, dict):
+            what = f"可发比例 = {p['pay_ratio']}" if p.get("pay_ratio") else f"暂缓比例 = {p.get('hold_ratio')}"
+            out.append((f"payout.{p.get('id')}", f"发放 {p.get('id')}[{p.get('scope')}] {what}"))
+    for o in draft.get("offsets") or []:
+        if isinstance(o, dict):
+            out.append((f"offsets.{o.get('id')}", f"抵扣 {o.get('id')}[{o.get('scope')}] 已发金额 = {o.get('expr')}"))
     for c in draft.get("checks") or []:
-        out.append((f"校验 {c.get('id')}", f"  校验 {c.get('id')}[{c.get('scope', 'global')}]：{c.get('expr')}"))
+        if isinstance(c, dict):
+            out.append((f"checks.{c.get('id')}", f"校验 {c.get('id')}[{c.get('scope', 'global')}]：{c.get('expr')}"))
+    for x in draft.get("patches") or []:
+        if isinstance(x, dict):
+            body = {k: v for k, v in x.items() if k not in ("source", "desc", "sources") and v}
+            out.append((f"patches.{x.get('source')}", f"数据修订 {x.get('source')}：{json.dumps(body, ensure_ascii=False)}"))
     for r in draft.get("revisions") or []:
-        out.append((f"修订 {r.get('name')}", f"  修订 {r.get('name')}："
-                    + "，".join(f"{a.get('node')}={a.get('amount')}" for a in r.get("adjust") or [])))
-    return out
+        if isinstance(r, dict):
+            out.append((f"revisions.{r.get('name')}", f"修订 {r.get('name')}："
+                        + "，".join(f"{a.get('node')}={a.get('amount')}" for a in r.get("adjust") or [] if isinstance(a, dict))))
+    return [(k, f"  {k}  {t}") for k, t in out]
 
 
 def _rules_briefs(drafts: dict, limit: int = 6000) -> dict[str, str]:
