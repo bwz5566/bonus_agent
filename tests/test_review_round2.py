@@ -252,3 +252,24 @@ def test_excel_review_date_and_yes_no_literals(tmp_path):
         pytest.skip("需要 LibreOffice 重算公式")
     ws = _recalc(write_excel(rs, res, tmp_path / "r.xlsx"), tmp_path / "calc")["个人过程复核"]
     assert [r[-1] for r in ws.iter_rows(min_row=3, values_only=True) if r[0] in ("E1", "E2", "E3")] == ["一致"] * 3
+
+
+def test_release_applies_data_patches_first():
+    """#7 补发：和首次计算一样先应用规则里的数据修订。回款更正表把 J1 的回款改成全额，补发时要按更正后的回款全部释放。"""
+    from bonus_core.engine.ledger import ledger_entries, release
+    rs = rules(datasets={"项目": ds("project_id", project_id="id", amount="money", collected="money"),
+                         "回款更正": ds(None, project_id="id", new_collected="money")},
+               pool={"expr": "amount", "scope": "项目"}, allocation=[{"level": "项目", "key": "project_id"}],
+               variables={"ratio": {"scope": "项目", "expr": "collected / amount"}},
+               payout=[{"id": "未回款挂起", "scope": "项目", "hold_ratio": "1 - min(ratio, 1)"}],
+               patches=[{"kind": "correct", "source": "回款更正", "target": "项目", "key": "project_id",
+                         "set": {"collected": "new_collected"}}])
+    first = {"项目": table("项目", {"project_id": "J1", "amount": Decimal(100), "collected": Decimal(50)}),
+             "回款更正": table("回款更正")}
+    entries = ledger_entries(compute(rs, first))
+    assert [(e["node_id"], e["held"]) for e in entries] == [("项目:J1", "50.00")]
+    later = {"项目": first["项目"],                                     # 原表没改，回款更正表里更正为全额
+             "回款更正": table("回款更正", {"project_id": "J1", "new_collected": Decimal(100)})}
+    assert compute(rs, later).payouts["项目:J1"].holds.get("未回款挂起", "0.00") in ("0", "0.00")
+    out = release(rs, entries, later)
+    assert out[0]["release_now"] == "50.00" and out[0]["still_held"] == "0.00"

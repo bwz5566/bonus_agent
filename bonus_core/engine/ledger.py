@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from decimal import ROUND_HALF_UP, Decimal
 
+from bonus_core.data.patches import apply_patches
 from bonus_core.data.table import Datasets
 from bonus_core.dsl.models import RuleSet
 from bonus_core.engine.allocation import CENT
@@ -25,7 +26,9 @@ def release(rs_then: RuleSet, entries: list[dict], updated: Datasets) -> list[di
 
     应发金额沿用当时的结果，不随新数据变化；只有挂起部分会被释放。
     """
+    updated, patched = apply_patches(rs_then, updated)      # 和首次计算一样，先应用规则里的数据修订
     root, by_level, issues = build_tree(rs_then, updated)
+    issues = patched + issues
     blocking = [i for i in issues if i.severity == "blocking"]
     if blocking:
         raise EngineError(blocking)
