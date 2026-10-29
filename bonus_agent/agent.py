@@ -557,14 +557,17 @@ class Workspace:
         for k in ("pool", "allocation", "payout", "offsets", "checks", "revisions"):
             if parts.get(k) is not None:
                 draft[k] = parts[k]
+        for lv in draft.get("allocation") or []:       # 最上层不需要权重，模型常写成 null
+            if isinstance(lv, dict) and lv.get("weight") is None:
+                lv["weight"] = ""
         try:
             _revisions(draft.get("revisions"))
-            targets = self.schemes if name == SHARED else [name]
+            targets = (self.schemes or [SHARED]) if name == SHARED else [name]   # 还没有方案时也先校验共用部分的格式
             rss = {t: self._ruleset(t, {**self.drafts, name: draft}) for t in targets}
         except (ValidationError, ValueError) as e:
             raise ToolError(f"规则格式不对，未保存：{str(e)[:2500]}") from None
         self.drafts[name] = draft
-        self.untested |= set(targets)
+        self.untested |= set(targets) - {SHARED}
         out = [f"已保存{'共用部分' if name == SHARED else f'方案「{name}」'}。"]
         for t, rs in rss.items():
             full = self._merged(t)
@@ -578,8 +581,8 @@ class Workspace:
                 out.append(head + "静态校验发现问题，需要修正：\n" + "\n".join(f"- {e}" for e in blocking))
             else:
                 out.append(head + "静态校验通过。" + ("\n提示：\n" + "\n".join(f"- {w}" for w in warns) if warns else ""))
-        if not rss:
-            out.append("还没有具体方案；用 set_rules(scheme=方案名, pool=...) 写入各方案后再校验。")
+        if not self.schemes:
+            out.append("还没有具体方案；用 set_rules(scheme=方案名, pool=...) 写入各方案后再完整校验。")
         return "\n".join(out)
 
     def _merged(self, scheme: str, drafts: dict | None = None) -> dict:
