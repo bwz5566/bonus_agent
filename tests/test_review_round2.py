@@ -273,3 +273,27 @@ def test_release_applies_data_patches_first():
     assert compute(rs, later).payouts["项目:J1"].holds.get("未回款挂起", "0.00") in ("0", "0.00")
     out = release(rs, entries, later)
     assert out[0]["release_now"] == "50.00" and out[0]["still_held"] == "0.00"
+
+
+def test_trial_summary_with_empty_level(tmp_path):
+    """#9 某层一个对象都没有时，试算摘要不能因为取不到“最少的”而中断，要说明这一层是空的。"""
+    import openpyxl
+
+    from bonus_agent.agent import Workspace
+    from bonus_agent.auto import build_inventory
+    from bonus_agent.llm import FakeLLM
+    d = tmp_path / "m"
+    d.mkdir()
+    (d / "01_制度.md").write_text("每人奖金 = 工单数 × 10", encoding="utf-8")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "员工"
+    ws.append(["工号", "工单数"])                     # 本期没有员工数据
+    wb.save(d / "02_数据.xlsx")
+    w = Workspace(FakeLLM([]), build_inventory(sorted(d.iterdir())))
+    w.define_dataset("员工", "02_数据.xlsx", "员工", {"emp_id": {"column": "工号", "type": "id"},
+                                                    "n": {"column": "工单数", "type": "number"}},
+                     header_rows=[1], key="emp_id")
+    w.set_rules(scheme="月度", pool={"expr": "n * 10", "scope": "个人"}, allocation=[{"level": "个人", "key": "emp_id"}])
+    out = w.trial_run()
+    assert "「个人」0 个" in out

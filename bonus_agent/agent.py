@@ -896,6 +896,9 @@ class Workspace:
         lines = [f"方案「{name}」试算成功。奖金池 {fmt(Decimal(base.pool))} 元（精确值 {base.pool_exact}）"]
         for lv in base.levels:
             ns = sorted((n for n in base.nodes.values() if n.level == lv), key=lambda n: -float(n.final))
+            if not ns:
+                lines.append(f"「{lv}」0 个：这一层没有任何对象，没有人能分到钱。核对这一层的数据表、映射和筛选条件")
+                continue
             total = sum(float(n.final) for n in ns)
             zero = sum(1 for n in ns if float(n.final) == 0)
             top = "，".join(f"{n.id}（{n.label}）{fmt(Decimal(n.final))}" for n in ns[:8])
