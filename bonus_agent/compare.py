@@ -70,8 +70,15 @@ def _figures(res: Result) -> dict[str, dict[str, Decimal]]:
     out = {"应得": {n.key: Decimal(n.final) for n in res.nodes.values() if n.key}}
     if not res.payouts:
         return out
+    for r in res.rollups.values():          # 按关联实体汇总后再抵扣：发放类指标以实体为准
+        out["应得"].setdefault(r.key, Decimal(r.final))
     for m, attr in (("本次可发", "paid"), ("暂缓", "held"), ("已发抵扣", "offset"), ("超发待核对", "overpaid")):
         acc: dict[str, Decimal] = {}
+        if res.rollups and attr != "held":
+            out[m] = {r.key: Decimal(getattr(r, attr)) for r in res.rollups.values()}
+            continue
+        for r in res.rollups.values():
+            acc[r.key] = Decimal(r.held)
         for nid, p in res.payouts.items():
             v = Decimal(getattr(p, attr) or 0)
             n = res.nodes.get(nid)

@@ -97,6 +97,7 @@ def digest(results: dict[str, dict[str, Result]]) -> dict:
             out.setdefault(s, {})[rev] = {
                 nid: [n.label, n.final, r.payouts[nid].paid if nid in r.payouts else None]
                 for nid, n in r.nodes.items() if n.key}
+            out[s][rev].update({nid: [x.label, x.final, x.paid] for nid, x in r.rollups.items()})
     return out
 
 

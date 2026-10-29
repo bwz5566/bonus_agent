@@ -596,6 +596,7 @@ class Workspace:
         self.drafts[name] = draft
         self.untested |= set(targets) - {SHARED}
         out = [f"已保存{'共用部分' if name == SHARED else f'方案「{name}」'}。"]
+        self.last_blocking = set()
         for t, rs in rss.items():
             full = self._merged(t)
             issues = self._validate(t, rs)
@@ -604,6 +605,7 @@ class Workspace:
             blocking = [str(i) for i in issues if i.severity == "blocking"]
             warns = [str(i) for i in issues if i.severity == "warning"]
             head = f"「{t}」" + ("（尚未设定 pool）" if "pool" not in full else "")
+            self.last_blocking |= {(t, i.code, i.where) for i in issues if i.severity == "blocking"}
             if blocking:
                 out.append(head + "静态校验发现问题，需要修正：\n" + "\n".join(f"- {e}" for e in blocking))
             else:
@@ -752,11 +754,18 @@ class Workspace:
                                     for k in changed[:6]))
         held = sum(float(p.held) for p in base.payouts.values())
         if base.payouts:
-            paid = sum(Decimal(p.paid) for p in base.payouts.values())
-            off = sum(Decimal(p.offset or 0) for p in base.payouts.values())
-            over = sum(Decimal(p.overpaid or 0) for p in base.payouts.values())
+            rows = base.payout_rows()
+            paid = sum(Decimal(p.paid) for p in rows)
+            off = sum(Decimal(p.offset or 0) for p in rows)
+            over = sum(Decimal(p.overpaid or 0) for p in rows)
             lines.append(f"发放：本次实发合计 {paid:,.2f}，暂缓合计 {held:,.2f}"
                          + (f"，已发抵扣 {off:,.2f}，超发待核对 {over:,.2f}" if off or over else ""))
+            if base.rollups:
+                rs_ = sorted(base.rollups.values(), key=lambda r: r.key)
+                lines.append(f"按「{rs_[0].entity}」汇总后抵扣：{len(rs_)} 个；"
+                             + "，".join(f"{r.key}（{r.label}）可发上限 {fmt(Decimal(r.cap))} 抵扣 {fmt(Decimal(r.deducted))} "
+                                        f"实发 {fmt(Decimal(r.paid))}" + (f" 超发 {fmt(Decimal(r.overpaid))}" if Decimal(r.overpaid) else "")
+                                        for r in rs_[:8]) + ("……" if len(rs_) > 8 else ""))
             if held == 0 and any(p.get("pay_ratio") or p.get("hold_ratio") for p in self._merged(name).get("payout") or []):
                 lines.append("请核对：写了按比例发放，但所有对象都全额可发、暂缓为 0。比例的分子分母是否写反"
                              "（如应为 回款 ÷ 销售），筛选条件是否对")
@@ -1248,6 +1257,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     fails: dict[str, int] = {}         # 工具 -> 连续失败次数
     stuck = ""
     undo: dict[tuple[str, str], int] = {}
+    same_block, prev_block = 0, set()
     for turn in range(max_steps):
         used = llm.usage.prompt_tokens + llm.usage.completion_tokens
         if max_tokens and used >= max_tokens:
@@ -1354,6 +1364,17 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 elif undo[(c["name"], what)] == MAX_STUCK - 1:
                     result += (f"\n注意：「{what}」已经删了 {MAX_STUCK - 1} 次。先想清楚它该怎么定义再动手，"
                                f"再删一次程序会停下；拿不准就用 ask_question 问财务")
+                    step.result = result
+            if ok and c["name"] == "set_rules":      # 保存了但阻断问题一直没改掉：同样算没有进展
+                now = getattr(ws, "last_blocking", set())
+                same_block = same_block + 1 if now and now & prev_block else (1 if now else 0)
+                prev_block = now if same_block <= 1 else now & prev_block
+                if same_block >= MAX_STUCK:
+                    repeats = MAX_STUCK
+                    stuck = f"set_rules 连续 {same_block} 次保存后仍有同样的阻断问题，最后一次：{result[:300]}"
+                elif same_block == MAX_STUCK - 1:
+                    result += ("\n注意：同样的阻断问题已经连续两次没改掉。再出现一次程序会停下；"
+                               "如果是规则写法表达不了材料的要求，用 ask_question 问财务或说明卡在哪里")
                     step.result = result
             if fails[c["name"]] >= MAX_STUCK:
                 stuck = f"{c['name']} 连续 {fails[c['name']]} 次失败，最后一次：{result[:300]}"

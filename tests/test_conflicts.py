@@ -249,3 +249,19 @@ def test_date_spellings_are_not_conflicts():
     fs.append(mk("2026-10-31", "d.xlsx"))
     q = fx.detect(fs, {}, [], 1)
     assert len(q) == 1 and len(q[0].options) == 3      # 两个不同日期 + 其他
+
+
+def test_saving_rules_with_same_blocking_issue_stops(tmp_path):
+    """set_rules 每次都“保存成功”，但同一个阻断问题一直没改掉：第 3 次停下（内容不同，不算原样重复）。"""
+    from bonus_agent.agent import run_agent
+    from bonus_agent.failure import explain
+    from bonus_agent.llm import FakeLLM
+
+    def bad(i):
+        return {"tool": "set_rules", "args": {"pool": {"expr": f"sum(sales) * 0.0{i}"},
+                                              "allocation": [{"level": "个人", "key": "eid", "weight": "no_such_var"}]}}
+    ar = run_agent(FakeLLM([DATASET, bad(1), bad(2), bad(3), bad(4), {"tool": "finish", "args": {"summary": "x"}}]),
+                   [_materials(tmp_path / "m")], tmp_path / "out")
+    assert "同样的阻断问题" in ar.error and len(ar.steps) == 4, ar.error
+    assert "连续两次没改掉" in ar.steps[2].result
+    assert "同一个问题一直没改掉" in explain(ar.error)["title"]

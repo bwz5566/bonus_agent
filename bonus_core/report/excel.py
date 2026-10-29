@@ -49,7 +49,7 @@ def write_excel(rs: RuleSet, res: Result, path: str | Path, ledger: list[dict] |
 
     # 汇总
     total_held = sum((_d(p.held) for p in res.payouts.values()), Decimal(0))
-    total_paid = sum((_d(p.paid) for p in res.payouts.values()), Decimal(0)) if res.payouts else _d(res.pool)
+    total_paid = sum((_d(p.paid) for p in res.payout_rows()), Decimal(0)) if res.payouts else _d(res.pool)
     rows = [
         ["规则", f"{res.rule_set}（{res.rule_version}）"],
         ["奖金池（精确值）", float(_d(res.pool_exact))],
@@ -96,6 +96,12 @@ def write_excel(rs: RuleSet, res: Result, path: str | Path, ledger: list[dict] |
                         + [float(_d(p.holds[c])) for c in conds])
     _sheet(wb, f"{leaf}发放", ["节点", "名称", "上级", "应得", "暂缓", "可发上限", "已发抵扣", "本次实发", "超发待核对"]
            + [f"挂起：{c}" for c in conds], pay_rows, money_cols=range(4, 10 + len(conds)))
+    if res.rollups:
+        ent = next(iter(res.rollups.values())).entity
+        _sheet(wb, f"按{ent}汇总发放", ["节点", "名称", "包含", "应得", "暂缓", "可发上限", "已发抵扣", "实际抵扣", "本次实发", "超发待核对"],
+               [[r.node_id, r.label, "、".join(r.members), float(_d(r.final)), float(_d(r.held)), float(_d(r.cap)),
+                 float(_d(r.offset)), float(_d(r.deducted)), float(_d(r.paid)), float(_d(r.overpaid))]
+                for r in res.rollups.values()], money_cols=range(4, 11), widths={"包含": 40})
 
     # 调整记录
     adj_rows = [[a.created_at, a.node_id, nodes[a.node_id].label if a.node_id in nodes else "", float(a.amount),

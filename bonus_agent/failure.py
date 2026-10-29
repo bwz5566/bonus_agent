@@ -25,6 +25,12 @@ def explain(error: str) -> dict:
                 "advice": (f"{why}{RETRY}；如果重试还卡在同一处，{TELL}（例如“没有回款的销售单按 0 处理”），"
                            "或把下面的详细信息发给开发。"),
                 "detail": err}
+    m = re.search(r"set_rules 连续 (\d+) 次保存后仍有同样的阻断问题，最后一次：(.*)", err, re.S)
+    if m:
+        return {"title": f"智能体连续 {m.group(1)} 次写计算规则，同一个问题一直没改掉，已自动停下。",
+                "advice": (f"多半是材料要求的算法和它选的写法对不上（例如一人参与多个项目时硬加「个人」层）。"
+                           f"{TELL}（例如说明分配到哪一层、按什么汇总），然后点「重试」；还不行就把下面的详细信息发给开发。"),
+                "detail": err}
     m = re.search(r"「([^」]+)」反复建了又删", err)
     if m:
         return {"title": f"智能体对「{m.group(1)}」反复建了又删，没有进展，已自动停下。",

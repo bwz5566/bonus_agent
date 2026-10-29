@@ -213,3 +213,49 @@ def test_engine_error_hints():
     bad.variables["contrib"].expr = 'sum(contribution_score, where: period)'     # 文字字段当条件
     with pytest.raises(EngineError, match='period == "Q3"'):
         compute(bad, data)
+
+
+def test_offset_rolled_up_to_person_across_projects():
+    """一人参与多个项目：按参与记录分配，再按工号汇总可发上限，在人员上抵扣预发。"""
+    from bonus_core.data.table import from_records
+    rs = RuleSet.model_validate(yaml.safe_load('''
+name: 交付结算
+version: v1
+datasets:
+  项目: {key: project_id, fields: {project_id: {type: id}, budget: {type: money}, visit_ok: {type: bool}}}
+  参与: {key: part_id, fields: {part_id: {type: id}, project_id: {type: id}, emp_id: {type: id}, share: {type: ratio}}}
+  人员: {key: emp_id, fields: {emp_id: {type: id}, emp_name: {type: text}}}
+  预发: {link: emp_id, fields: {emp_id: {type: id}, amount: {type: money}}}
+pool: {scope: global, expr: "10000"}
+allocation:
+  - {level: 项目, key: project_id, weight: budget}
+  - {level: 参与记录, key: part_id, parent_key: project_id, weight: share}
+payout:
+  - {id: 回访, scope: 参与记录, pay_ratio: 'if(visit_ok, 1, 0.8)'}
+offsets:
+  - {id: 预发, scope: 人员, expr: 'sum(amount, of: "预发")'}
+'''))
+    assert not [i for i in validate(rs) if i.severity == "blocking"], validate(rs)
+    data = from_records(rs, {
+        "项目": [{"project_id": "J1", "budget": 3, "visit_ok": True}, {"project_id": "J2", "budget": 1, "visit_ok": False}],
+        "参与": [{"part_id": "A1", "project_id": "J1", "emp_id": "U1", "share": 0.5},
+                 {"part_id": "A2", "project_id": "J1", "emp_id": "U2", "share": 0.5},
+                 {"part_id": "A3", "project_id": "J2", "emp_id": "U1", "share": 1}],
+        "人员": [{"emp_id": "U1", "emp_name": "甲"}, {"emp_id": "U2", "emp_name": "乙"}],
+        "预发": [{"emp_id": "U1", "amount": 1000}, {"emp_id": "U2", "amount": 4000}],
+    })
+    res = compute(rs, data)
+    u1, u2 = res.rollups["人员:U1"], res.rollups["人员:U2"]
+    # U1：J1 一半 3750 全发 + J2 2500 发 80% = 2000 → 上限 5750，扣 1000
+    assert (u1.final, u1.held, u1.cap, u1.deducted, u1.paid, u1.overpaid) == ("6250.00", "500.00", "5750.00", "1000.00", "4750.00", "0")
+    # U2：上限 3750，预发 4000 → 实发 0，超发 250
+    assert (u2.cap, u2.deducted, u2.paid, u2.overpaid) == ("3750.00", "3750.00", "0.00", "250.00")
+    assert sorted(u1.members) == ["参与记录:A1", "参与记录:A3"]
+    from bonus_agent.compare import _figures
+    f = _figures(res)
+    assert f["本次可发"] == {"U1": Decimal("4750.00"), "U2": Decimal("0.00")} and f["应得"]["U1"] == Decimal("6250.00")
+    # 最末层直接写个人层、但个人表没有 project_id：提示改用参与记录 + 按人汇总
+    bad = rs.model_copy(deep=True)
+    bad.allocation[1].key, bad.allocation[1].level = "emp_id", "个人"
+    msgs = [i.message for i in validate(bad) if i.code == "parent_key_missing"]
+    assert msgs and "offsets 的 scope" in msgs[0]

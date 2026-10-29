@@ -50,7 +50,10 @@ def validate(rs: RuleSet) -> list[Issue]:
             if not lv.parent_key:
                 issues.append(Issue.block("level_no_parent", f"层级「{lv.level}」需要 parent_key 指向上一层", f"allocation.{lv.level}"))
             elif ent and lv.parent_key not in ent[1].fields:
-                issues.append(Issue.block("parent_key_missing", f"实体表「{ent[0]}」没有字段 {lv.parent_key}", f"allocation.{lv.level}"))
+                issues.append(Issue.block("parent_key_missing", f"实体表「{ent[0]}」没有字段 {lv.parent_key}"
+                                          + ("。如果一个对象对应上一层的多条记录（如一人参与多个项目），不要把它放在下一层："
+                                             "最末层用那张记录表，需要按人汇总抵扣时把 offsets 的 scope 写成人员表"
+                                             if i == len(rs.allocation) - 1 else ""), f"allocation.{lv.level}"))
             elif lv.parent_key != rs.allocation[i - 1].key:
                 issues.append(Issue.warn("parent_key_name", f"parent_key {lv.parent_key} 与上一层主键 {rs.allocation[i - 1].key} 名字不同，请确认", f"allocation.{lv.level}"))
     if rs.allocation and rs.entity_dataset(rs.leaf.key) is None:
@@ -110,9 +113,20 @@ def validate(rs: RuleSet) -> list[Issue]:
             issues.append(Issue.block("payout_scope", f"发放条件 {p.id} 目前只支持最末层「{rs.leaf.level}」", f"payout.{p.id}"))
         if bool(p.hold_ratio.strip()) == bool(p.pay_ratio.strip()):
             issues.append(Issue.block("payout_ratio", f"发放条件 {p.id} 要在 hold_ratio（挂起比例）和 pay_ratio（可发比例）中写且只写一个", f"payout.{p.id}"))
+    leaf_ds = rs.entity_dataset(rs.leaf.key) if rs.allocation else None
+    rolled = set()
     for o in rs.offsets:
-        if rs.allocation and o.scope != rs.leaf.level:
-            issues.append(Issue.block("payout_scope", f"抵扣 {o.id} 目前只支持最末层「{rs.leaf.level}」", f"offsets.{o.id}"))
+        if not rs.allocation or o.scope == rs.leaf.level:
+            continue
+        ent = rs.datasets.get(o.scope)
+        if o.scope in lay.aux and ent is not None and leaf_ds is not None and ent.key in leaf_ds[1].fields:
+            rolled.add(o.scope)       # 最末层按该实体编号汇总后再抵扣
+            continue
+        issues.append(Issue.block("payout_scope", f"抵扣 {o.id} 的 scope 要写最末层「{rs.leaf.level}」，或者最末层数据表"
+                                  f"（{leaf_ds[0] if leaf_ds else '?'}）里有编号字段的关联实体表（按该实体汇总后再抵扣，如一人参与多个项目）",
+                                  f"offsets.{o.id}"))
+    if len(rolled) > 1:
+        issues.append(Issue.block("payout_scope", f"抵扣只能汇总到一个关联实体，现在有 {sorted(rolled)}", "offsets"))
 
     # ---- 表达式 ----
     deps: dict[str, set[str]] = {}

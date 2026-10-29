@@ -61,6 +61,24 @@ class PayoutResult:
     cap: str = ""               # 可发上限 = 应得 − 暂缓
     offset: str = "0"           # 已发抵扣
     overpaid: str = "0"         # 超发待核对 = MAX(已发抵扣 − 可发上限, 0)，只登记不追回
+    deducted: str = "0"         # 实际抵扣 = MIN(可发上限, 已发抵扣)
+
+
+@dataclass
+class RollupResult:
+    """抵扣的 scope 是关联实体（如 人员）时：最末层按该实体编号汇总后再抵扣（一个人参与多个项目）。"""
+    node_id: str
+    entity: str                 # 关联实体表名
+    key: str
+    label: str
+    members: list[str]          # 汇总进来的最末层节点
+    final: str
+    held: str
+    cap: str
+    offset: str
+    deducted: str
+    paid: str
+    overpaid: str
 
 
 @dataclass
@@ -78,6 +96,11 @@ class Result:
     adjustments: list[Adjustment]
     issues: list[Issue] = field(default_factory=list)
     data_hash: str = ""         # 只含规则和数据；input_hash 另含人工调整和引用的其他方案结果
+    rollups: dict[str, RollupResult] = field(default_factory=dict)
+
+    def payout_rows(self) -> list:
+        """发放的最终口径：有按实体汇总的抵扣时用汇总行，否则用最末层。"""
+        return list(self.rollups.values()) if self.rollups else list(self.payouts.values())
 
     def node(self, node_id: str) -> NodeResult:
         return self.nodes[node_id]
@@ -212,6 +235,7 @@ class Engine:
         adjustments = list(adjustments)
         active = self._apply(adjustments, actor_scopes)
         payouts = self._payouts()
+        rollups = self._rollups(payouts)
         nodes = {
             n.id: NodeResult(
                 id=n.id, level=n.level, key=n.key, label=n.label,
@@ -224,7 +248,7 @@ class Engine:
             rule_set=self.rs.name, rule_version=self.rs.version, engine_version=ENGINE_VERSION,
             input_hash=run_hash(self.hash, active, self.refs), data_hash=self.hash, pool_exact=str(self.pool_exact), pool=str(self.root.final),
             levels=[lv.level for lv in self.rs.allocation], nodes=nodes, payouts=payouts,
-            traces=dict(self.ev.traces), adjustments=adjustments, issues=list(self.issues),
+            traces=dict(self.ev.traces), adjustments=adjustments, issues=list(self.issues), rollups=rollups,
         )
 
     def preview(self, existing: list[Adjustment], new: Adjustment, actor_scopes=None) -> dict:
@@ -268,6 +292,8 @@ class Engine:
                 holds[cond.id], ratios[cond.id] = str(h), str(r)
             offset = Decimal(0)
             for o in self.rs.offsets:
+                if o.scope != leaf:
+                    continue
                 try:
                     v = self.ev.evaluate(o.expr, n, f"{n.id}/已发抵扣/{o.id}", f"offsets.{o.id}")
                 except EvalError as e:
@@ -278,7 +304,48 @@ class Engine:
             held = n.final - remaining
             paid, over = max(remaining - offset, Decimal(0)), max(offset - remaining, Decimal(0))
             out[n.id] = PayoutResult(n.id, str(n.final), str(held), str(paid), holds, ratios,
-                                     cap=str(remaining), offset=str(offset), overpaid=str(over))
+                                     cap=str(remaining), offset=str(offset), overpaid=str(over),
+                                     deducted=str(min(remaining, offset)))
+        return out
+
+    def _rollups(self, payouts: dict[str, PayoutResult]) -> dict[str, RollupResult]:
+        """抵扣写在关联实体上：最末层的应得、暂缓、可发按实体编号（最末层行上的字段）汇总，再在实体上算抵扣。"""
+        leaf = self.rs.leaf.level
+        scopes = list(dict.fromkeys(o.scope for o in self.rs.offsets if o.scope != leaf))
+        if not scopes:
+            return {}
+        ent = scopes[0]                                  # 校验器保证只有一个
+        key = self.rs.datasets[ent].key
+        index = (self.root.index or {}).get(ent, {})
+        groups: dict[str, list[Node]] = {}
+        for n in self.by_level[leaf]:
+            k = n.attrs.get(key)
+            if k in (None, ""):
+                raise EngineError([Issue.block("rollup_key_missing", f"{n.id} 没有「{key}」，无法汇总到「{ent}」", n.id)])
+            if str(k) not in index:
+                raise EngineError([Issue.block("rollup_key_missing", f"{n.id} 的 {key}={k} 在「{ent}」表里找不到", n.id)])
+            groups.setdefault(str(k), []).append(n)
+        out = {}
+        for k in sorted(groups):
+            e, ms = index[k], groups[k]
+            ps = [payouts[m.id] for m in ms]
+            offset = Decimal(0)
+            for o in self.rs.offsets:
+                if o.scope != ent:
+                    continue
+                try:
+                    v = self.ev.evaluate(o.expr, e, f"{e.id}/已发抵扣/{o.id}", f"offsets.{o.id}")
+                except EvalError as err:
+                    raise EngineError([Issue.block("eval_error", str(err), err.where)]) from None
+                if v < 0:
+                    raise EngineError([Issue.block("offset_negative", f"{o.id} 的已发金额为负：{v}", e.id)])
+                offset += v.quantize(CENT, ROUND_HALF_UP)
+            final = sum((Decimal(p.final) for p in ps), Decimal(0))
+            held = sum((Decimal(p.held) for p in ps), Decimal(0))
+            cap = sum((Decimal(p.paid) for p in ps), Decimal(0))     # 最末层自己的抵扣（如有）已先扣
+            ded = min(cap, offset)
+            out[e.id] = RollupResult(e.id, ent, str(k), e.label, [m.id for m in ms], str(final), str(held), str(cap),
+                                     str(offset), str(ded), str(cap - ded), str(max(offset - cap, Decimal(0))))
         return out
 
 

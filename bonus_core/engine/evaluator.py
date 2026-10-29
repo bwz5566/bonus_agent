@@ -342,9 +342,9 @@ class Evaluator:
             ref = self.refs.get(key)
             if ref is None:
                 raise EvalError(f"scheme_paid 需要方案 {key} 的结果，请先计算该方案", ctx.where)
-            p = ref.payouts.get(ctx.node.id)
+            p = ref.payouts.get(ctx.node.id) or getattr(ref, "rollups", {}).get(ctx.node.id)
             if p is None:
-                raise EvalError(f"方案 {key} 的结果里没有 {ctx.node.id} 的发放记录（只能在最末层使用）", ctx.where)
+                raise EvalError(f"方案 {key} 的结果里没有 {ctx.node.id} 的发放记录（只能在最末层或抵扣汇总到的实体上使用）", ctx.where)
             r = Decimal(p.paid)
             return Val(r, f"{key} 实发 {fmt(r)}", frozenset({f"{key}:{ctx.node.id}"}))
         if fn in ("year", "month", "quarter"):
