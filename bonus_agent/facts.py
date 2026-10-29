@@ -130,8 +130,9 @@ def detect(facts: list[Fact], conflicts: dict[str, Conflict], questions: list[Qu
             continue      # 一处是数、一处是文字（如 0.1 和 “MIN(工龄,5)÷5”）：是两个参数用了同一个名字，不算冲突（record_facts 会提示改名）
         files = {f.file for f in fs}
         sets = {fl: frozenset(same_value(f) for f in fs if f.file == fl) for fl in files}
-        if len(files) == 1 or (len(set(sets.values())) == 1 and not any(f.override for f in fs)):
-            continue      # 只在一个文件里出现多个取值，或各文件给出的整组取值相同（如阶梯几档）：多半是把几档登记成了一个名字，不算冲突（record_facts 会提示）
+        if len(files) == 1 or (_nested(sets) and not any(f.override for f in fs)):
+            continue      # 只在一个文件里出现多个取值，或各文件给出的取值互相包含（如阶梯几档，有的文件只登记了一档）：
+            #               多半是把几档登记成了一个名字，不算冲突（record_facts 会提示分开登记）
         over, at = _override(fs)
         if len(over) == 1 and len(by) == 2 and not any(
                 not f.override and same_value(f) not in over and f.round > at for f in fs):
@@ -152,6 +153,12 @@ def detect(facts: list[Fact], conflicts: dict[str, Conflict], questions: list[Qu
     return new
 
 
+def _nested(sets: dict) -> bool:
+    """各文件登记的取值集合都包含在最大的那个里（如一个文件登记了阶梯三档，另一个只登记了第一档）。"""
+    big = max(sets.values(), key=len)
+    return all(v <= big for v in sets.values())
+
+
 def multi_valued(facts: list[Fact]) -> list[str]:
     """同一个参数名下有几个取值、但不构成冲突的（一个文件里几个值，或各文件整组取值相同）。"""
     groups: dict[str, list[Fact]] = {}
@@ -162,7 +169,7 @@ def multi_valued(facts: list[Fact]) -> list[str]:
         if len({same_value(f) for f in fs}) < 2 or len({number(f.value) is None for f in fs}) > 1:
             continue
         sets = {fl: frozenset(same_value(f) for f in fs if f.file == fl) for fl in {f.file for f in fs}}
-        if len(sets) == 1 or len(set(sets.values())) == 1:
+        if len(sets) == 1 or _nested(sets):
             out.append(n)
     return out
 
