@@ -15,7 +15,8 @@ from bonus_core.data.table import Datasets
 from bonus_core.dsl.models import RuleSet
 from bonus_core.dsl.validator import _weighted, validate
 from bonus_core.engine.allocation import CENT, AdjustConflict, allocate, max_allowed, round_pool
-from bonus_core.engine.evaluator import EvalError, Evaluator, Trace
+from bonus_core.dsl import excel_formula as xf
+from bonus_core.engine.evaluator import Ctx, EvalError, Evaluator, Trace
 from bonus_core.engine.issues import EngineError, Issue
 from bonus_core.engine.tree import ROOT_LEVEL, Node, build_tree
 
@@ -98,6 +99,7 @@ class Result:
     issues: list[Issue] = field(default_factory=list)
     data_hash: str = ""         # 只含规则和数据；input_hash 另含人工调整和引用的其他方案结果
     rollups: dict[str, RollupResult] = field(default_factory=dict)
+    inputs: dict[str, dict[str, object]] = field(default_factory=dict)   # 过程复核表的取数：节点 -> {字段或变量: 引擎值}
 
     def payout_rows(self) -> list:
         """发放的最终口径：有按实体汇总的抵扣时用汇总行，否则用最末层。"""
@@ -252,7 +254,21 @@ class Engine:
             input_hash=run_hash(self.hash, active, self.refs), data_hash=self.hash, pool_exact=str(self.pool_exact), pool=str(self.root.final),
             levels=[lv.level for lv in self.rs.allocation], nodes=nodes, payouts=payouts,
             traces=dict(self.ev.traces), adjustments=adjustments, issues=list(self.issues), rollups=rollups,
+            inputs=self._sheet_inputs(),
         )
+
+    def _sheet_inputs(self) -> dict[str, dict[str, object]]:
+        """「过程复核」表里直接取数的列：每个对象的字段值和不能用公式复算的变量值。取不到的留空。"""
+        out: dict[str, dict[str, object]] = {}
+        for lv, p in xf.plan(self.rs).items():
+            for n in self.by_level.get(lv, []):
+                row = out.setdefault(n.id, {})
+                for name in p["inputs"]:
+                    try:
+                        row[name] = self.ev._name(name, Ctx(n, where=f"{n.id}/{name}")).v
+                    except (EvalError, ArithmeticError):
+                        row[name] = None
+        return out
 
     def preview(self, existing: list[Adjustment], new: Adjustment, actor_scopes=None) -> dict:
         """试算一次调整：返回每个节点的变化；冲突时附带 max_allowed。"""
