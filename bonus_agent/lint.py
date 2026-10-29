@@ -1,6 +1,7 @@
 """程序检查：不靠模型记住提示词，按规则结构和真实数据找出常见的写错，必要时强制提问。
 
 - 照抄：查找表的键和值和某张数据表的两列完全一样（如把品类费率表抄成常数），下一期数据变了规则不跟着变，要改成直接读字段；
+- 抵扣：pool 里用 max(应得 − 预发 / 已发, 0) 直接扣了已发金额，发放表会把实发当成应得、已发抵扣和超发显示为 0，要改用 offsets；
 - 出处：规则里的每个常数（系数、比例、阈值、单价）都要在材料、财务的话或答复里找得到；
 - 取值：规则里和字段比较的文字（如 review == "通过"）要在数据或材料里出现，防止写错取值导致整批被筛掉；
 - 未提及的取值：数据里出现了材料和规则都没提到的取值（如工单状态“挂起”），规则会把它悄悄当成不满足条件，要问财务；
@@ -17,7 +18,7 @@ from decimal import Decimal, InvalidOperation
 
 from bonus_core.data.table import Datasets
 from bonus_core.dsl.models import LookupTable, RuleSet, TierTable
-from bonus_core.dsl.parser import Call, Cmp, ExprError, Name, Num, Str, parse, walk
+from bonus_core.dsl.parser import BinOp, Call, Cmp, ExprError, Name, Num, Str, parse, walk
 
 # 不需要出处的常数：0、1、百分数换算、单位换算（月、天、小时、分钟、周）
 FREE = {Decimal(x) for x in ("0", "1", "-1", "12", "24", "60", "7", "365", "366", "0.01")} | {Decimal(10) ** i for i in range(1, 9)}
@@ -146,6 +147,13 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
         rep.gates.append(f"查找表 {name} 照抄了数据表「{ds}」的 {fld}（按 {key} 对应）。下一期数据变了，规则还会按旧数算；"
                          f"删掉这张查找表，直接引用字段 {fld}（行上有 {key} 的表都能按编号读到）")
         rep.keys.append(f"查找表 {name}")
+    # 0'. 已发金额扣在 pool 里：应得、已发抵扣、超发登记三列都会错（实发碰巧对）
+    paid = _paid_in_pool(rs)
+    if paid:
+        rep.gates.append(f"奖金池用 max(… − …, 0) 直接扣减了已发 / 预发金额（{'、'.join(paid)}）。这样「发放」表会把实发当成应得，"
+                         "已发抵扣、超发待核对都显示为 0。改法：pool 写扣减前的应得；已发金额写进 offsets（scope 最末层或人员表，"
+                         "expr 写已发合计），引擎算本次实发 = MAX(应得 − 已发, 0)，超发待核对 = MAX(已发 − 应得, 0)")
+        rep.keys.append("抵扣 pool")
     # 1. 常数要有出处
     miss: dict[str, set[str]] = {}
     for n, where in constants(rs):
@@ -194,6 +202,42 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
     if traces:
         rep.warns += _all_zero(rs, traces)
     return rep
+
+
+_PAID = re.compile(r"预发|预付|预支|已发|已付|已支付|已领|prepa|paid|advance", re.I)
+
+
+def _paid_in_pool(rs: RuleSet) -> list[str]:
+    """奖金池（顺着变量展开）里 max(a − b, 0) 的 b 取自预发 / 已发类数据的字段名。"""
+    paid_fields = {f for n, d in rs.datasets.items() for f, fd in d.fields.items()
+                   if _PAID.search(n) or _PAID.search(f) or _PAID.search(fd.desc or "")}
+
+    def names_of(node, seen=()) -> set[str]:
+        out = set()
+        for x in walk(node):
+            if isinstance(x, Name):
+                if x.id in rs.variables and x.id not in seen:
+                    try:
+                        out |= names_of(parse(rs.variables[x.id].expr), seen + (x.id,))
+                    except ExprError:
+                        pass
+                out.add(x.id)
+        return out
+
+    def scan(src: str, seen=()) -> list[str]:
+        try:
+            ast = parse(src)
+        except ExprError:
+            return []
+        hits = []
+        for c in walk(ast):
+            if isinstance(c, Call) and c.fn == "max" and len(c.args) == 2 and isinstance(c.args[1], Num) \
+                    and c.args[1].value == 0 and isinstance(c.args[0], BinOp) and c.args[0].op == "-":
+                hits += sorted(names_of(c.args[0].right) & paid_fields)
+            if isinstance(c, Name) and c.id in rs.variables and c.id not in seen:
+                hits += scan(rs.variables[c.id].expr, seen + (c.id,))
+        return hits
+    return list(dict.fromkeys(scan(rs.pool.expr)))
 
 
 def _copied(rs: RuleSet, data: Datasets) -> dict[str, tuple[str, str, str]]:

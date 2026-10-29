@@ -15,7 +15,7 @@ def test_targets_are_chosen_by_program_and_finish_waits(tmp_path):
     rules(w, "amount * rate")
     gaps = w._verify_gaps()
     assert [g.split("（")[0] for g in gaps] == ["方案「月度」个人:002", "方案「月度」个人:001"]
-    assert "金额最高，引擎算出 52 元" in gaps[0] and "金额最低的非零" in gaps[1]
+    assert "应得金额最高，引擎算出 52 元" in gaps[0] and "应得金额最低的非零" in gaps[1]
     assert "待独立验算（程序指定，全部通过才能 finish）：方案「月度」个人:002" in w.state()
     with pytest.raises(ToolError, match="独立验算还没全部通过"):
         w.finish("x", ignored=[{"ref": "01_规则.md", "reason": "测试"}], review=False)

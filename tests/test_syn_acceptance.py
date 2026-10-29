@@ -62,7 +62,7 @@ def test_engine_matches_reference(results):
 def test_annual_offsets_quarter_r2(results):
     a, q = results["ANNUAL"]["R0"].payouts["个人:E001"], results["QUARTER"]["R2"].payouts["个人:E001"]
     assert Decimal(a.offset) == Decimal("300000") + Decimal(q.paid)
-    assert a.paid == "0" and Decimal(a.overpaid) == Decimal(a.offset) - Decimal(a.cap)
+    assert a.paid == "0.00" and Decimal(a.overpaid) == Decimal(a.offset) - Decimal(a.cap)
     assert "QUARTER/R2:个人:E001" in results["ANNUAL"]["R0"].traces["个人:E001/已发抵扣/prior"].inputs
 
 

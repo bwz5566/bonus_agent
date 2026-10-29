@@ -332,7 +332,7 @@ class Engine:
                     raise EngineError([Issue.block("offset_negative", f"{o.id} 的已发金额为负：{v}", n.id)])
                 offset += v.quantize(CENT, ROUND_HALF_UP)
             held = n.final - remaining
-            paid, over = max(remaining - offset, Decimal(0)), max(offset - remaining, Decimal(0))
+            paid, over = max(remaining - offset, Decimal(0)).quantize(CENT), max(offset - remaining, Decimal(0)).quantize(CENT)
             out[n.id] = PayoutResult(n.id, str(n.final), str(held), str(paid), holds, ratios,
                                      cap=str(remaining), offset=str(offset), overpaid=str(over),
                                      deducted=str(min(remaining, offset)))
@@ -375,7 +375,7 @@ class Engine:
             cap = sum((Decimal(p.paid) for p in ps), Decimal(0))     # 最末层自己的抵扣（如有）已先扣
             ded = min(cap, offset)
             out[e.id] = RollupResult(e.id, ent, str(k), e.label, [m.id for m in ms], str(final), str(held), str(cap),
-                                     str(offset), str(ded), str(cap - ded), str(max(offset - cap, Decimal(0))))
+                                     str(offset), str(ded), str(cap - ded), str(max(offset - cap, Decimal(0)).quantize(CENT)))
         return out
 
 

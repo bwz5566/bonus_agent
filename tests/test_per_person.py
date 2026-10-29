@@ -74,6 +74,6 @@ def test_per_person_end_to_end_with_independent_verification(tmp_path):
     ar = run_agent(FakeLLM(steps), [make(tmp_path / "m")], tmp_path / "out")
     assert ar.status == "OK", (ar.error, [(s.tool, s.result[:300]) for s in ar.steps if not s.ok])
     first = next(s for s in ar.steps if s.tool == "finish")
-    assert not first.ok and "个人:E1（金额最高" in first.result and "个人:E2（金额为 0" in first.result
+    assert not first.ok and "个人:E1（应得金额最高" in first.result and "个人:E2（应得金额为 0" in first.result
     assert [s.ok for s in ar.steps if s.tool == "verify"] == [True, True, True]
     assert ar.ws.verified["月度|个人:E3"]["basis"] == basis

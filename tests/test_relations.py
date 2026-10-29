@@ -249,7 +249,7 @@ offsets:
     res = compute(rs, data)
     u1, u2 = res.rollups["人员:U1"], res.rollups["人员:U2"]
     # U1：J1 一半 3750 全发 + J2 2500 发 80% = 2000 → 上限 5750，扣 1000
-    assert (u1.final, u1.held, u1.cap, u1.deducted, u1.paid, u1.overpaid) == ("6250.00", "500.00", "5750.00", "1000.00", "4750.00", "0")
+    assert (u1.final, u1.held, u1.cap, u1.deducted, u1.paid, u1.overpaid) == ("6250.00", "500.00", "5750.00", "1000.00", "4750.00", "0.00")
     # U2：上限 3750，预发 4000 → 实发 0，超发 250
     assert (u2.cap, u2.deducted, u2.paid, u2.overpaid) == ("3750.00", "3750.00", "0.00", "250.00")
     assert sorted(u1.members) == ["参与记录:A1", "参与记录:A3"] and res.nodes["参与记录:A4"].final == "0.00"

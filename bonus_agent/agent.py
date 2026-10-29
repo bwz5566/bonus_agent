@@ -189,12 +189,17 @@ TOOLS: list[dict] = [
                     "对不上时先想清楚是规则错了还是验算式写错了，改对的那一边；拿不准就 ask_question。",
      "parameters": _obj({"node": {**_S, "description": "要验算的对象，如 个人:E1001"}, "expr": _S,
                          "basis": {**_S, "description": "依据的材料原文（条款号或原句）"},
-                         "at": {**_S, "description": "在哪个节点上计算，默认是 node 自己"}, "scheme": _S},
+                         "at": {**_S, "description": "在哪个节点上计算，默认是 node 自己"}, "scheme": _S,
+                         "amount": {**_S, "enum": ["应得", "实发"], "description": "验算应得（默认）还是本次实发（扣暂缓、已发之后）"}},
                         ["node", "expr", "basis"])},
     {"name": "finish", "description": "完成。要求每个方案在最近一次修改之后都已成功试算，程序指定的对象都已独立验算通过。",
      "parameters": _obj({"summary": {**_S, "description": "两三句话说明：什么奖金、奖金池怎么来、怎么分、发放条件"},
                          "ignored": {"type": "array", "items": _obj({"ref": _S, "reason": _S})}}, ["summary"])},
 ]
+
+
+def _verify_key(scheme: str, node: str, amount: str) -> str:
+    return f"{scheme}|{node}" + ("" if amount == "应得" else f"|{amount}")
 
 
 def _split_thought(arguments: str) -> tuple[str, str]:
@@ -1103,22 +1108,37 @@ class Workspace:
         return v, ev.traces["probe"].rendered
 
     # ---- 独立验算 ----
-    def verify(self, node: str, expr: str, basis: str, at: str | None = None, scheme: str | None = None) -> str:
+    def verify(self, node: str, expr: str, basis: str, at: str | None = None, scheme: str | None = None,
+               amount: str = "应得") -> str:
         name = self._scheme(scheme)
         if name in self.untested or name not in self.results:
             raise ToolError(f"方案「{name}」最近修改后还没有试算，先 trial_run")
-        if node not in self.results[name]["R0"].nodes:
-            raise ToolError(f"方案「{name}」没有对象「{node}」，要验算的对象见工作区状态的“待独立验算”")
+        if amount not in ("应得", "实发"):
+            raise ToolError("amount 写 应得 或 实发")
+        if node not in self._amounts(name, amount):
+            raise ToolError(f"方案「{name}」没有对象「{node}」的{amount}金额，要验算的对象见工作区状态的“待独立验算”")
         if not basis.strip():
             raise ToolError("basis 写依据的材料原文（条款号或原句）")
-        rec = {"expr": expr, "at": at or node, "basis": basis.strip()}
+        rec = {"expr": expr, "at": at or node, "basis": basis.strip(), "amount": amount}
         bad = self._verify_mismatch(name, node, rec)
         if bad:
             raise ToolError(bad)
-        self.verified[f"{name}|{node}"] = rec
+        self.verified[_verify_key(name, node, amount)] = rec
         left = self._verify_gaps()
-        return (f"验算通过：{node} {self._verify_note}。"
+        return (f"验算通过：{node} 的{amount} {self._verify_note}。"
                 + (f"还要验算：{'；'.join(left[:6])}" if left else "程序指定的对象都已验算通过"))
+
+    def _amounts(self, name: str, kind: str) -> dict[str, tuple[Decimal, bool]]:
+        """对象 -> (引擎金额, 是否带按份额分配的舍入尾差)。应得取各层对象金额；实发取发放口径（有按人汇总的抵扣时取汇总行）。"""
+        res = self.results[name]["R0"]
+
+        def tail(nid):
+            n = res.nodes.get(nid)
+            return n is not None and Decimal(n.exact).quantize(Decimal("0.01"), ROUND_HALF_UP) != Decimal(n.final)
+        if kind == "应得":
+            return {k: (Decimal(n.final), tail(k)) for k, n in res.nodes.items()}
+        return {r.node_id: (Decimal(r.paid), any(tail(m) for m in getattr(r, "members", [r.node_id])))
+                for r in res.payout_rows()}
 
     def _verify_mismatch(self, name: str, node: str, rec: dict) -> str:
         """按当前规则和数据重新比对一条验算记录；一致返回空串，并把比对说明放在 _verify_note。"""
@@ -1131,27 +1151,33 @@ class Workspace:
         if own:
             return (f"验算式引用了规则变量 {'、'.join(own)}。独立验算不能借用规则的中间结果，"
                     "按材料原文直接从字段、参数表重新写（需要汇总就用 sum / count，按编号筛选用 where）")
+        kind = rec.get("amount", "应得")
+        got = self._amounts(name, kind).get(node)
+        if got is None:
+            return f"{node} 现在没有{kind}金额（对象变了），按新的结果重新验算"
         try:
             v, rendered = self._probe(name, rec["expr"], rec["at"])
         except ToolError as e:
             return f"验算式算不出来：{e}"
         if isinstance(v, bool) or not isinstance(v, Decimal):
             return f"验算式算出的不是金额：{fmt(v)}"
-        n = self.results[name]["R0"].nodes[node]
-        final, exact = Decimal(n.final), Decimal(n.exact)
+        final, has_tail = got
         mine = v.quantize(Decimal("0.01"), ROUND_HALF_UP)
         if mine == final:
             self._verify_note = f"引擎 {fmt(final)} 元，独立验算 {fmt(mine)} 元，一致"
             return ""
-        if abs(mine - final) <= Decimal("0.01") and abs(v - exact) <= VERIFY_TOL:     # 按份额分配，舍入后的尾差分到了别人身上
-            self._verify_note = f"引擎 {fmt(final)} 元，独立验算 {fmt(v)} 元；差 {fmt(final - mine)} 元是按份额分配的尾差（未舍入份额 {exact}）"
-            return ""
-        return (f"{node} 对不上：引擎算出 {fmt(final)} 元（未舍入 {exact}），独立验算 {rec['expr']} = {rendered} = {fmt(v)}。"
+        if has_tail and abs(mine - final) <= Decimal("0.01"):     # 按份额分配，舍入后的尾差分到了别人身上
+            exact = self.results[name]["R0"].nodes[node].exact if node in self.results[name]["R0"].nodes else ""
+            if kind == "实发" or abs(v - Decimal(exact)) <= VERIFY_TOL:
+                self._verify_note = f"引擎 {fmt(final)} 元，独立验算 {fmt(v)} 元；差 {fmt(final - mine)} 元是按份额分配的舍入尾差"
+                return ""
+        return (f"{node} 的{kind}对不上：引擎算出 {fmt(final)} 元，独立验算 {rec['expr']} = {rendered} = {fmt(v)}。"
                 f"先想清楚哪一边不符合材料（{rec['basis'][:100]}）：用 explain 查看 {node} 的计算链逐项对照，规则错了就改规则后重新试算，"
                 "验算式错了就改验算式；拿不准就 ask_question")
 
-    def _verify_targets(self, name: str) -> list[tuple[str, str]]:
-        """程序指定要独立验算的对象：每层金额最高的；最末层再加金额最低的非零对象和一个为 0 的对象。不由模型挑。"""
+    def _verify_targets(self, name: str) -> list[tuple[str, str, str]]:
+        """程序指定要独立验算的 (对象, 应得 / 实发, 原因)，不由模型挑：每层应得最高的；最末层再加最低的非零对象和一个为 0 的对象。
+        有暂缓或已发抵扣时，再验算实发：实发最高的、有超发登记的、有暂缓的。"""
         base = self.results[name]["R0"]
         out = []
         for i, lv in enumerate(base.levels):
@@ -1166,7 +1192,18 @@ class Workspace:
                 zero = [n for n in ns if Decimal(n.final) == 0]
                 if zero and zero[0] is not ns[-1]:
                     picks.append((zero[0], "金额为 0"))
-            out += [(n.id, f"{why}，引擎算出 {fmt(Decimal(n.final))} 元") for n, why in picks]
+            out += [(n.id, "应得", f"应得{why}，引擎算出 {fmt(Decimal(n.final))} 元") for n, why in picks]
+        rs = self._ruleset(name)
+        if rs.offsets or rs.payout:
+            rows = sorted(base.payout_rows(), key=lambda r: (Decimal(r.paid), r.node_id))
+            picks = [(rows[-1], "实发最高")] if rows else []
+            picks += [(r, "有超发登记") for r in rows if Decimal(r.overpaid) > 0][:1]
+            picks += [(r, "有暂缓") for r in rows if Decimal(r.held) > 0][:1]
+            seen = set()
+            for r, why in picks:
+                if r.node_id not in seen:
+                    seen.add(r.node_id)
+                    out.append((r.node_id, "实发", f"{why}，引擎算出实发 {fmt(Decimal(r.paid))} 元"))
         return out
 
     def _verify_gaps(self) -> list[str]:
@@ -1184,10 +1221,10 @@ class Workspace:
         for name in self.schemes:
             if name in self.untested or name not in self.results:
                 continue
-            for node, why in self._verify_targets(name):
-                rec = self.verified.get(f"{name}|{node}")
+            for node, kind, why in self._verify_targets(name):
+                rec = self.verified.get(_verify_key(name, node, kind))
                 if rec is None:
-                    out.append(f"方案「{name}」{node}（{why}）")
+                    out.append(f"方案「{name}」{node}（{why}" + ("，verify 写 amount=实发" if kind == "实发" else "") + "）")
                     continue
                 bad = self._verify_mismatch(name, node, rec)
                 if bad:

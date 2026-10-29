@@ -53,3 +53,37 @@ def test_tier_lookup_formulas_match_engine(tmp_path):
             heads = [c.value for c in ws[2]]
             rows = [r for r in ws.iter_rows(min_row=3, values_only=True) if r[0] and r[0] not in ("复核未通过的个数", "公式出错的单元格")]
             assert rows and all(r[heads.index("核对")] in ("一致", "人工调整") for r in rows), (f.name, ws.title)
+
+
+def _same_as_libreoffice(path: Path, outdir: Path) -> int:
+    """文件里写好的公式计算值（不重算直接读）和 LibreOffice 重算的结果逐个单元格一致；返回比对的公式个数。"""
+    formulas = openpyxl.load_workbook(path)
+    cached = openpyxl.load_workbook(path, data_only=True)
+    calc = _recalc(path, outdir)
+    n = 0
+    for ws in formulas.worksheets:
+        for row in ws.iter_rows():
+            for c in row:
+                if isinstance(c.value, str) and c.value.startswith("="):
+                    mine, lo = cached[ws.title][c.coordinate].value, calc[ws.title][c.coordinate].value
+                    assert mine is not None, (path.name, ws.title, c.coordinate, c.value)
+                    if isinstance(lo, (int, float)) and not isinstance(lo, bool):
+                        assert abs(float(mine) - lo) < 1e-9, (ws.title, c.coordinate, c.value, mine, lo)
+                    else:
+                        assert mine == lo, (ws.title, c.coordinate, c.value, mine, lo)
+                    n += 1
+    return n
+
+
+@pytest.mark.skipif(not shutil.which("soffice"), reason="需要 LibreOffice 对照")
+def test_cached_formula_values_match_excel_recalculation(tmp_path):
+    """公式单元格写了计算值：上传到不重算的系统、用 openpyxl / pandas 读也有值，而且和真正重算的结果一致。"""
+    t = _mod("test_delivery_h2")
+    case = t.mk.make(tmp_path / "case")
+    ar = run_agent(FakeLLM(t.script()), [case / "materials"], tmp_path / "out")
+    assert ar.status == "OK", ar.error
+    files = sorted((tmp_path / "out").glob("result_*.xlsx"))
+    r2 = _mod("test_review_round2")
+    files.append(r2._review_book(tmp_path))
+    total = sum(_same_as_libreoffice(f, tmp_path / f"calc{i}") for i, f in enumerate(files))
+    assert total > 50

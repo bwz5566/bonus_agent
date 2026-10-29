@@ -11,6 +11,7 @@ from openpyxl.utils import get_column_letter
 
 from bonus_core.dsl.models import RuleSet
 from bonus_core.engine.run import Result
+from bonus_core.report import xlcalc
 
 MONEY = "#,##0.00"
 HEAD_FILL = PatternFill("solid", fgColor="DDEBF7")
@@ -134,7 +135,9 @@ def write_excel(rs: RuleSet, res: Result, path: str | Path, ledger: list[dict] |
         ["数据哈希（规则+数据）", res.data_hash],
     ], widths={"项目": 14, "值": 70})
 
+    wb.calculation.fullCalcOnLoad = True       # Excel 打开时整本重算
     wb.save(path)
+    xlcalc.fill_cached(path)                   # 公式单元格写入计算值：不重算的程序读到的也不是空白
     _self_check(path, res)
     return path
 
