@@ -1213,7 +1213,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
               answers: list[dict] | None = None, max_steps: int = 80, max_history_chars: int = 40000,
               max_files: int = MAX_FILES, max_tokens: int | None = 2_000_000, exclude: list[str | Path] = (),
               on_step: Callable[[int, Step], None] | None = None, resume: bool = True,
-              should_stop: Callable[[], bool] | None = None,
+              should_stop: Callable[[], bool] | None = None, instruction: str | None = None,
               message: str | None = None, by: str = "", chat: list[dict] | None = None) -> AgentResult:
     """max_steps 和 max_tokens 都是安全上限：模型调用 finish 就结束，正常不会用满。
 
@@ -1263,6 +1263,8 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     else:
         task = ("请完成本批次的奖金计算。文件清单：\n" + ws.list_files() + _answers_text(answers)
                 + "\n\n完成后调用 finish。")
+    if instruction and not message:      # 上传材料时附带的说明
+        task += f"\n\n财务随材料附的说明（必须照做；不明确或与材料冲突时用 ask_question 提问）：{instruction}"
     task += pack
     mode = llm.tool_mode
     sys = system_prompt()

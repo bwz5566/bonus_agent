@@ -194,8 +194,9 @@ def test_chat_window(env):
     post(c, store, f"/cases/{cid}/chat", {"text": "奖金池怎么来的？"})
     assert wait(app, cid).message == "已回复"
     chat = store.chat(cid)
-    assert [x["role"] for x in chat] == ["user", "agent", "user", "agent"]
-    assert "已按修改生成第 2 轮" in chat[1]["text"] and chat[3]["text"] == "奖金池是销售额合计的 6%"
+    assert [x["role"] for x in chat] == ["agent", "user", "agent", "user", "agent"]
+    assert "第 1 轮暂停" in chat[0]["text"]          # 每轮结束都在对话里交代
+    assert "已按修改生成第 2 轮" in chat[2]["text"] and chat[4]["text"] == "奖金池是销售额合计的 6%"
     page = c.get(f"/cases/{cid}").text
     assert "奖金池怎么来的？" in page and "发送" in page and "第 2 轮" in page
     assert post(c, store, f"/cases/{cid}/chat", {"text": "x"}, user="carol").status_code == 403
@@ -207,7 +208,8 @@ def test_failure_explained_with_retry(env):
     from bonus_agent.failure import explain
     x = explain("智能体卡住了，已停止以免继续消耗 tokens：trial_run 连续 3 次失败，最后一次：错误：方案「Q」试算失败："
                 "- [阻断] eval_error: min 没有可计算的明细行（回款明细）")
-    assert "「试算」" in x["title"] and "没有对应的明细行" in x["advice"] and "重试" in x["advice"]
+    assert "「试算」" in x["title"] and "没有对应的明细行" in x["title"] and "重试" in x["advice"]
+    assert "按 0 处理" in x["ask"] and "min 没有可计算的明细行" in x["where"]
     assert "欠费" in explain("Error code: 400 - Arrearage")["title"]
     cid = store.create("失败", "张会计")
     (store.dir(cid) / "materials" / "数据.xlsx").write_bytes((m / "数据.xlsx").read_bytes())
@@ -216,6 +218,24 @@ def test_failure_explained_with_retry(env):
     wait(app, cid)
     page = c.get(f"/cases/{cid}").text
     assert "已自动停下" in page and ">重试<" in page and "详细信息" in page
+    said = store.chat(cid)[-1]["text"]                 # 对话里先说原因，再说需要什么帮助、想了解什么
+    assert said.index("原因：") < said.index("需要你帮忙：") < said.index("想了解：")
+
+
+def test_upload_in_chat(env):
+    app, store, scripts, c, m = env
+    cid = store.create("附件", "张会计")
+    files = [("files", (p.name, p.read_bytes())) for p in m.iterdir()]
+    scripts.append([{"tool": "finish", "args": {"summary": "x"}}])
+    assert post(c, store, f"/cases/{cid}/chat", {"text": "这是第一批材料"}, files=files).status_code == 303
+    wait(app, cid)
+    chat = store.chat(cid)
+    assert chat[0]["text"].startswith("上传了材料：") and "这是第一批材料" in chat[0]["text"]
+    assert sorted(p.name for p in (store.dir(cid) / "materials").iterdir()) == sorted(p.name for p in m.iterdir())
+    post(c, store, f"/cases/{cid}/chat", {"expected": "1"}, files=[("files", ("期望.xlsx", (m / "数据.xlsx").read_bytes()))])
+    assert "期望结果" in store.chat(cid)[-1]["text"] and (store.dir(cid) / "expected" / "期望.xlsx").exists()
+    page = c.get(f"/cases/{cid}").text
+    assert "<h2>材料</h2>" not in page and "已有材料" in page
 
 
 def test_steps_written_while_running(env):

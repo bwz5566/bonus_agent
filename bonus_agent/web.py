@@ -206,7 +206,9 @@ class Runner:
         j = self.jobs.get(cid)
         return j is not None and j.status == "running"
 
-    def start(self, cid: str, user: str, new: bool = False, message: str | None = None) -> Job:
+    def start(self, cid: str, user: str, new: bool = False, message: str | None = None,
+              instruction: str | None = None) -> Job:
+        """message：对话（提问或修改）；instruction：随上传材料附的说明，按正常一轮处理。"""
         with self.lock:
             if self.running(cid):
                 raise RuntimeError("这个案卷正在运行，请等本轮结束")
@@ -216,7 +218,7 @@ class Runner:
             self.store.audit(cid, user, "对话", text=message[:200])
         else:
             self.store.audit(cid, user, "运行下一轮", new=new)
-        job.thread = threading.Thread(target=self._run, args=(job, new, message), daemon=True)
+        job.thread = threading.Thread(target=self._run, args=(job, new, message, instruction), daemon=True)
         job.thread.start()
         return job
 
@@ -230,7 +232,7 @@ class Runner:
         except OSError:
             pass
 
-    def _run(self, job: Job, new: bool, message: str | None = None) -> None:
+    def _run(self, job: Job, new: bool, message: str | None = None, instruction: str | None = None) -> None:
         from bonus_agent.agent import run_agent
         d = self.store.dir(job.cid)
         try:
@@ -239,7 +241,8 @@ class Runner:
                 ar = run_agent(llm, [d / "materials"], d / "out", resume=not new, max_steps=self.max_steps,
                                max_tokens=self.max_tokens, message=message, by=job.by,
                                chat=self.store.chat(job.cid)[:-1] if message else None,
-                               on_step=lambda n, s: self._step(job, d / "out", n, s), should_stop=lambda: job.cancel)
+                               on_step=lambda n, s: self._step(job, d / "out", n, s), should_stop=lambda: job.cancel,
+                               instruction=instruction)
                 expected = sorted((d / "expected").glob("*.xlsx"))
                 if expected and ar.results:
                     from bonus_agent.compare import compare_expected, report
@@ -258,13 +261,25 @@ class Runner:
                 self.store.chat_add(job.cid, "agent", "智能体", (ar.reply or (f"（没有完成）{to_text(ar.error)}" if ar.error else f"（已处理：{ar.ws.summary or job.message}）")) + note)
                 if not made:
                     job.result, job.message = "", "已回复"
+            else:                                # 每轮的结果都在对话里交代：没完成先说原因，再说需要什么帮助
+                self.store.chat_add(job.cid, "agent", "智能体", round_text(ar))
             if ar.outputs or not message:
                 self.store.audit(job.cid, job.by, "本轮结束", round=ar.round, status=ar.status, error=ar.error)
         except Exception as e:  # 失败要如实显示，不能当作完成
             job.status, job.message = "failed", f"运行失败：{e}"
-            if message:
-                self.store.chat_add(job.cid, "agent", "智能体", f"（运行失败：{e}）")
+            self.store.chat_add(job.cid, "agent", "智能体", f"第 {job.started[11:16]} 开始的这一轮运行出错，没有完成。\n{to_text(str(e))}")
             self.store.audit(job.cid, job.by, "本轮失败", error=str(e))
+
+
+def round_text(ar) -> str:
+    if ar.error:
+        return f"第 {ar.round} 轮没有完成。\n{to_text(ar.error)}"
+    if ar.status == "NEEDS_CONFIRMATION":
+        qs = [q for q in ar.pending][:8]
+        return (f"第 {ar.round} 轮暂停：有 {len(ar.pending)} 个问题需要你确认，确认前不出结果。\n"
+                + "\n".join(f"- {getattr(q, 'id', '')} {getattr(q, 'text', q)}" for q in qs)
+                + "\n请在下方「问题」里选择或填写答复，保存后点「运行下一轮」。")
+    return f"第 {ar.round} 轮已出结果，请核对。" + (f"\n{ar.ws.summary}" if getattr(ar.ws, "summary", "") else "")
 
 
 # ---------------- 问题答复 ----------------
@@ -538,10 +553,19 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         if busy and job and job.steps:
             msgs += "<div class='msg agent'><div class='bubble mut'>正在处理……</div></div>"
         box = form(f"/cases/{cid}/chat", "<textarea name='text' rows='3' placeholder='直接问结果（如：E001 的季度奖怎么算的？），"
-                                         "或者让智能体修改（如：华东区域系数改为 1.05）' required></textarea>"
-                                         "<p><button>发送</button> <span class='mut'>改了规则会自动重新试算，生成新的一轮；"
-                                         "只是提问不会生成新的一轮</span></p>", csrf) if editor and not busy else ""
-        parts.append(f"<section><h2>对话</h2><div class='chat'>{msgs or '<p class=mut>还没有对话</p>'}</div>{box}</section>")
+                                         "让智能体修改（如：华东区域系数改为 1.05），或者附上材料并说明'></textarea>"
+                                         "<p><input type='file' name='files' multiple> <label class='mut'><input type='checkbox' "
+                                         "name='expected' value='1'> 附件是期望结果（只用于核对，不交给智能体）</label></p>"
+                                         "<p><button>发送</button> <span class='mut'>附上材料（规则文档、Excel、补充文件，同名覆盖）会按新材料处理一轮；"
+                                         "只发文字时，改了规则会重新试算，只是提问不会生成新的一轮</span></p>", csrf, upload=True) \
+            if editor and not busy else ""
+        mats = files_table(d / "materials", f"/cases/{cid}/dl/materials", csrf, f"/cases/{cid}/materials/delete" if editor and not busy else None)
+        exps = files_table(d / "expected", f"/cases/{cid}/dl/expected", csrf, f"/cases/{cid}/expected/delete" if editor and not busy else None)
+        n_mat = sum(1 for p in (d / "materials").rglob("*") if p.is_file())
+        files = (f"<details><summary class='mut'>已有材料 {n_mat} 个（查看、下载、删除）</summary>{mats}</details>"
+                 f"<details><summary class='mut'>期望结果（只用于核对）</summary>{exps}</details>")
+        parts.append(f"<section><h2>对话</h2><div class='chat'>{msgs or '<p class=mut>还没有对话。先附上材料发送，智能体就开始处理</p>'}</div>"
+                     f"{box}{files}</section>")
         # 问题
         qs = load_questions(out)
         if qs:
@@ -569,15 +593,6 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
                 body = form(f"/cases/{cid}/answers", body + "<p><button>保存答复</button> "
                                                            "<span class='mut'>保存后点“运行下一轮”</span></p>", csrf)
             parts.append(f"<section><h2>问题</h2>{body}</section>")
-        # 材料
-        up = form(f"/cases/{cid}/materials", "<p><input type='file' name='files' multiple> <button>上传</button></p>",
-                  csrf, upload=True) if editor and not busy else ""
-        parts.append(f"<section><h2>材料</h2>{files_table(d / 'materials', f'/cases/{cid}/dl/materials', csrf, f'/cases/{cid}/materials/delete' if editor and not busy else None)}{up}"
-                     "<p class='mut'>规则文档（Word、PPT、图片）和 Excel 数据都放这里。补充材料、修改后的数据直接上传（同名覆盖），下一轮会识别出新增、修改、删除的文件。</p></section>")
-        exp = form(f"/cases/{cid}/expected", "<p><input type='file' name='files'> <button>上传期望结果</button></p>",
-                   csrf, upload=True) if editor and not busy else ""
-        parts.append(f"<section><h2>期望结果（可选）</h2>{files_table(d / 'expected', f'/cases/{cid}/dl/expected', csrf, f'/cases/{cid}/expected/delete' if editor and not busy else None)}{exp}"
-                     "<p class='mut'>只在算完后逐个对象核对（写入 expected_check.txt），不会交给智能体。</p></section>")
         # 结果
         top = [p for p in sorted(out.glob("*")) if p.is_file() and p.name != cs.CASE_FILE]
         res = "".join(f"<li><a href='/cases/{cid}/dl/out/{e(p.name)}'>{e(p.name)}</a></li>" for p in top)
@@ -608,10 +623,13 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         return page(m["name"], "".join(parts), u, refresh=busy)
 
     async def _upload(request: Request, u: dict, cid: str, area: str, single: bool = False) -> list[str]:
-        d = case_dir(cid)
+        case_dir(cid)
         idle(cid)
         f = await posted(request, u)
-        files = [x for x in f.getlist("files") if getattr(x, "filename", "")]
+        return await _save(cid, u, [x for x in f.getlist("files") if getattr(x, "filename", "")], area, single)
+
+    async def _save(cid: str, u: dict, files: list, area: str, single: bool = False) -> list[str]:
+        d = case_dir(cid)
         if not files:
             raise HTTPException(400, "没有选择文件")
         if single:
@@ -708,10 +726,22 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         case_dir(cid)
         f = await posted(request, u)
         text = str(f.get("text", "")).strip()[:4000]
-        if not text:
+        files = [x for x in f.getlist("files") if getattr(x, "filename", "")]
+        if not text and not files:
             return back(cid)
+        idle(cid)
         try:
-            runner.start(cid, u["display"], message=text)
+            if files and f.get("expected") == "1":       # 期望结果：只登记，不交给智能体
+                names = await _save(cid, u, files, "expected", single=True)
+                store.chat_add(cid, "user", u["display"], f"上传了期望结果：{'、'.join(names)}（只用于核对，不交给智能体）")
+                if text:
+                    runner.start(cid, u["display"], message=text)
+            elif files:                                  # 材料：附言作为说明，按新材料处理一轮
+                names = await _save(cid, u, files, "materials")
+                store.chat_add(cid, "user", u["display"], f"上传了材料：{'、'.join(names)}" + (f"\n{text}" if text else ""))
+                runner.start(cid, u["display"], instruction=text or None)
+            else:
+                runner.start(cid, u["display"], message=text)
         except RuntimeError as err:
             raise HTTPException(409, str(err)) from None
         return back(cid)
