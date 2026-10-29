@@ -132,7 +132,7 @@ def test_agent_orders_schemes_by_reference(tmp_path):
     ar = run_agent(FakeLLM(_script()), [run_case.XLSX], tmp_path)
     assert ar.ok and ar.status == "OK", (ar.error, [s.result for s in ar.steps if not s.ok])
     first = next(s for s in ar.steps if s.tool == "trial_run")
-    assert first.ok and "引用：QUARTER/R2" in first.result and "已发抵扣" in first.result
+    assert first.ok and "引用：QUARTER/R2" in first.result and "实际抵扣" in first.result
     ref = json.loads((CASE / "reference.json").read_text(encoding="utf-8"))
     assert run_case.diff_reference(ar.results, ref) == []
     assert ar.recheck.count("一致") == 5 and "不一致" not in ar.recheck and "失败" not in ar.recheck, ar.recheck
