@@ -196,6 +196,19 @@ class _ScopeCheck:
             self.seen.add(msg)
             self.issues.append(Issue.block(code, msg, self.where))
 
+    def _global_total(self, n: str, ctx: int):
+        """全局变量在某层引用时是全公司一个数；它聚合的数据表在这一层每个对象都有自己的行，多半是漏写了 scope。"""
+        lab = self.lay.level_label
+        own = sorted(ds for ds in _global_aggs(self.rs.variables[n].expr, self.lay)
+                     if ds not in self.lay.aux and self.lay.table_level.get(ds, -1) >= ctx)
+        if own:
+            msg = (f"变量 {n} 没写 scope（全局，算的是全公司所有行的合计），却在「{lab(ctx)}」层引用；"
+                   f"它聚合的「{'、'.join(own)}」在「{lab(ctx)}」层每个对象都有自己的行。"
+                   f"如果要每个对象自己的值，给 {n} 写 scope: {lab(ctx)}；确实要全公司合计才保留")
+            if msg not in self.seen:
+                self.seen.add(msg)
+                self.issues.append(Issue.warn("global_in_level", msg, self.where))
+
     def _visit(self, node, ctx: int, ent: str | None, agg: str | None):
         lab = self.lay.level_label
         match node:
@@ -265,6 +278,8 @@ class _ScopeCheck:
             if si > ctx:
                 self._block("scope_var", f"变量 {n} 属于「{vs}」层级，不能在「{lab(ctx)}」层引用。"
                                          f"上层需要下层的数时，请在上层直接对数据表聚合（如 sum(...)），不要引用下层变量")
+            elif vs == "global" and ctx >= 0:
+                self._global_total(n, ctx)
             return
         if n in rs.tables:
             return
@@ -281,6 +296,15 @@ class _ScopeCheck:
         elif n in lay.entity_level:
             self._block("scope_field", f"字段 {n} 属于「{lab(lay.entity_level[n])}」层的实体表，不能在「{lab(ctx)}」层直接使用，"
                                        f"需要时用聚合，如 sum({n})")
+
+
+def _global_aggs(src: str, lay: Layout) -> set[str]:
+    try:
+        ast = parse(src)
+    except ExprError:
+        return set()
+    return {ds for node in walk(ast) if isinstance(node, Call) and is_aggregate(node)
+            for ds in [lay.agg_dataset(node)[0]] if ds is not None}
 
 
 def _items(rs: RuleSet):

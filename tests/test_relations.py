@@ -194,3 +194,22 @@ def test_compare_with_expected_workbook(tmp_path):
     assert p.matched == p.total - 1 and p.diffs[0][0] == "E003"
     text = "\n".join(report(ms.values()))
     assert "E003 期望" in text and "14/14" in text
+
+
+def test_global_variable_used_per_person_is_flagged():
+    rs = load("quarter")
+    assert "global_in_level" not in {i.code for i in validate(rs)}
+    bad = rs.model_copy(deep=True)
+    bad.variables["contrib"].scope = "global"                  # 漏写 scope：变成全公司评分合计
+    bad.variables["contrib"].expr = 'sum(contribution_score, of: "绩效评分", where: period == "Q3" and approved)'
+    w = [i for i in validate(bad) if i.code == "global_in_level"]
+    assert w and w[0].severity == "warning" and "scope: 个人" in w[0].message
+
+
+def test_engine_error_hints():
+    rs = load("quarter")
+    data, _ = apply_mapping(rs, [XLSX], load_mapping(CASE / "mapping.yaml"))
+    bad = rs.model_copy(deep=True)
+    bad.variables["contrib"].expr = 'sum(contribution_score, where: period)'     # 文字字段当条件
+    with pytest.raises(EngineError, match='period == "Q3"'):
+        compute(bad, data)

@@ -178,7 +178,8 @@ def _fix_arguments(text: str) -> str:
                 err, pos = e.msg, e.pos
     near = f"，出错位置附近：…{raw[max(0, pos - 60):pos + 40]}…" if pos is not None else ""
     return json.dumps({"_invalid_json": f"参数不是合法 JSON（{err}{near}），未执行。请重新调用：字符串用双引号，"
-                                        "表达式里的双引号要转义成 \\\"，不要有注释和多余的逗号"}, ensure_ascii=False)
+                                        "表达式里的双引号要转义成 \\\"，不要有注释和多余的逗号；参数很长时分几次调用"
+                                        "（如 set_rules 先写 variables，再写 allocation、pool），每次少写一些"}, ensure_ascii=False)
 
 
 def _coerce_args(tool: str, args: dict) -> dict:
@@ -586,7 +587,12 @@ class Workspace:
             targets = (self.schemes or [SHARED]) if name == SHARED else [name]   # 还没有方案时也先校验共用部分的格式
             rss = {t: self._ruleset(t, {**self.drafts, name: draft}) for t in targets}
         except (ValidationError, ValueError) as e:
-            raise ToolError(f"规则格式不对，未保存：{str(e)[:2500]}") from None
+            hint = ""
+            for k in ("variables", "tables"):
+                v = draft.get(k)
+                if isinstance(v, dict) and ("expr" in v or "kind" in v):
+                    hint += f"\n{k} 要写成 {{名字: {{...}}}}，每一项以名字为键，如 {{\"emp_sales\": {{\"expr\": \"...\", \"scope\": \"个人\"}}}}"
+            raise ToolError(f"规则格式不对，未保存：{str(e)[:2500]}{hint}") from None
         self.drafts[name] = draft
         self.untested |= set(targets) - {SHARED}
         out = [f"已保存{'共用部分' if name == SHARED else f'方案「{name}」'}。"]

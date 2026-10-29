@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import operator
 from dataclasses import asdict, dataclass, field
 from datetime import date
@@ -222,7 +223,9 @@ class Evaluator:
 
     def _bool(self, val: Val, ctx: Ctx) -> bool:
         if not isinstance(val.v, bool):
-            raise EvalError(f"需要条件（是/否），得到 {val.text}", ctx.where)
+            hint = (f"；{val.text} 的值是文字 {val.v!r}，要写成比较，如 {val.text} == {json.dumps(val.v, ensure_ascii=False)}"
+                    if isinstance(val.v, str) else "")
+            raise EvalError(f"需要条件（是/否），得到 {val.text}{hint}", ctx.where)
         return val.v
 
     # ---- 名字解析 ----
@@ -378,7 +381,9 @@ class Evaluator:
                 if c.fn == "sum":
                     r = sum(nums, Decimal(0))
                 elif not nums:
-                    raise EvalError(f"{c.fn} 没有可计算的明细行（{ds}）", ctx.where)
+                    raise EvalError(f"{c.fn} 没有可计算的明细行（{ds}）：这个对象在「{ds}」里没有行，{c.fn} 求不出值。"
+                                    f"没有行时应当怎样，按材料写明，如 count(of: \"{ds}\") == 0 or {c.fn}(...) >= 0，"
+                                    f"或 if(count(of: \"{ds}\") > 0, {c.fn}(...), 0)；合计用 sum（没有行时为 0）", ctx.where)
                 elif c.fn == "avg":
                     r = sum(nums, Decimal(0)) / len(nums)
                 else:

@@ -244,7 +244,7 @@ class Runner:
             if message:
                 made = bool(ar.outputs)          # 对话里改了东西才会生成新的一轮
                 note = (f"\n\n（已按修改生成第 {ar.round} 轮：{job.message}）" if made else "")
-                self.store.chat_add(job.cid, "agent", "智能体", (ar.reply or f"（没有回复：{ar.error or '未完成'}）") + note)
+                self.store.chat_add(job.cid, "agent", "智能体", (ar.reply or (f"（没有回复：{ar.error}）" if ar.error else f"（已处理：{ar.ws.summary or job.message}）")) + note)
                 if not made:
                     job.result, job.message = "", "已回复"
             if ar.outputs or not message:
