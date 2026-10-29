@@ -23,17 +23,27 @@ def env(tmp_path):
     store.users.add("bob", PW, ["approver"], "李经理")
     store.users.add("carol", PW, [])
     c = TestClient(app)
+    c.sids = {}
     return app, store, scripts, c, _materials(tmp_path / "m")
 
 
+def login(c, name, pw=PW):
+    c.cookies.clear()
+    return c.post("/login", data={"username": name, "password": pw}, follow_redirects=False)
+
+
 def as_(c, name):
-    c.auth = (name, PW)
+    """切换到某个用户（每个用户只登录一次，之后换回它的会话号）。"""
+    if name not in c.sids:
+        assert login(c, name).status_code == 303
+        c.sids[name] = c.cookies.get("bonus_session")
+    c.cookies.set("bonus_session", c.sids[name])
     return c
 
 
 def post(c, store, url, data=None, files=None, user="alice"):
     as_(c, user)
-    return c.post(url, data={"csrf": store.csrf(user), **(data or {})}, files=files, follow_redirects=False)
+    return c.post(url, data={"csrf": store.csrf(c.sids[user]), **(data or {})}, files=files, follow_redirects=False)
 
 
 def wait(app, cid):
@@ -43,9 +53,10 @@ def wait(app, cid):
 
 def test_web_rounds_confirm_and_template(env):
     app, store, scripts, c, m = env
-    assert c.get("/").status_code == 401
-    c.auth = ("alice", "wrong-password")
-    assert c.get("/").status_code == 401
+    r = c.get("/cases/x", follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/login?next=/cases/x"     # 没登录先去登录页
+    r = login(c, "alice", "wrong-password")
+    assert "msg=" in r.headers["location"] and not c.cookies.get("bonus_session")
     assert as_(c, "carol").get("/").status_code == 200                       # 只读用户能看
     assert post(c, store, "/cases", {"name": "Q3"}, user="carol").status_code == 403
     as_(c, "alice")
@@ -134,6 +145,31 @@ def test_safe_name_and_passwords(tmp_path):
         u.add("a", "short", ["editor"])
     with pytest.raises(ValueError):
         u.add("a", PW, ["root"])
-    with pytest.raises(ValueError, match="display"):
-        u.add("李经理账号", PW, ["approver"])
+    u.add("李经理", PW, ["approver"])                       # 中文用户名也可以
+    assert u.check("李经理", PW)["roles"] == ["approver"]
     assert oct(Path(tmp_path / "users.yaml").stat().st_mode)[-3:] == "600"
+
+
+def test_login_logout_and_lockout(env):
+    app, store, scripts, c, m = env
+    r = login(c, "alice")
+    assert r.status_code == 303 and "httponly" in r.headers["set-cookie"].lower()
+    assert "张会计" in c.get("/").text and "退出" in c.get("/").text
+    sid = c.cookies.get("bonus_session")
+    assert c.post("/logout", data={"csrf": "x"}, follow_redirects=False).status_code == 403   # 退出也要防伪码
+    r = c.post("/logout", data={"csrf": store.csrf(sid)}, follow_redirects=False)
+    assert r.status_code == 303 and sid not in app.state.sessions
+    c.cookies.set("bonus_session", sid)                       # 旧会话号作废
+    assert c.get("/", follow_redirects=False).status_code == 303
+    # 外部跳转地址不接受
+    r = c.post("/login", data={"username": "alice", "password": PW, "next": "//evil.example"}, follow_redirects=False)
+    assert r.headers["location"] == "/"
+    # 连续输错 5 次：正确口令也暂停登录
+    for _ in range(5):
+        login(c, "bob", "wrong-password")
+    assert "msg=" in login(c, "bob").headers["location"] and not c.cookies.get("bonus_session")
+    # 会话过期
+    login(c, "carol")
+    sid = c.cookies.get("bonus_session")
+    app.state.sessions[sid] = ("carol", 0)
+    assert c.get("/", follow_redirects=False).status_code == 303

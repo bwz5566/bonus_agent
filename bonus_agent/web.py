@@ -24,10 +24,12 @@ import re
 import secrets
 import shutil
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
+from urllib.parse import quote
 
 import yaml
 
@@ -35,6 +37,9 @@ from bonus_agent import case as cs
 from bonus_agent.parsing.docs import PARSERS
 
 ROLES = {"editor": "传材料、答复问题、运行、按模板计算", "approver": "确认结果"}
+COOKIE = "bonus_session"
+SESSION_SECONDS = 8 * 3600       # 登录 8 小时后要重新登录
+MAX_FAILURES, LOCK_SECONDS = 5, 300   # 同一用户名 5 分钟内输错 5 次，暂停登录
 ROLE_NAMES = {"editor": "经办", "approver": "审批"}
 DETAIL_NAMES = {"name": "名称", "file": "文件", "new": "从头开始", "round": "轮次", "status": "状态", "error": "错误",
                 "question": "问题", "answer": "答复", "note": "说明", "reason": "原因", "run": "批次", "pools": "奖金池",
@@ -79,8 +84,8 @@ class Users:
         bad = [r for r in roles if r not in ROLES]
         if bad:
             raise ValueError(f"没有角色 {bad}，可选：{list(ROLES)}")
-        if not re.fullmatch(r"[A-Za-z0-9_.\-@]{1,64}", name):    # 浏览器登录只支持英文用户名，中文姓名写在 display
-            raise ValueError("用户名只能用英文字母、数字、下划线、点、减号、@（中文姓名请用 --display）")
+        if not re.fullmatch(r"[\w.\-@]{1,64}", name):
+            raise ValueError("用户名只能用字母（含中文）、数字、下划线、点、减号、@")
         if len(password) < 8:
             raise ValueError("口令至少 8 位")
         users = self.load()
@@ -268,7 +273,7 @@ h1{font-size:20px;margin:4px 0 12px}h2{font-size:16px;margin:0 0 10px}a{color:va
 table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top}
 th{color:var(--mut);font-weight:500}td:not(:last-child),th{white-space:nowrap}.mut{color:var(--mut)}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
 button{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:6px 14px;cursor:pointer;font:inherit}
-button.link{background:none;color:var(--bad);padding:0}input[type=text],textarea{width:100%;padding:6px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);font:inherit}
+button.link{background:none;color:var(--bad);padding:0}header button.link{color:var(--acc)}input[type=text],input[type=password],textarea{width:100%;padding:6px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);font:inherit}
 .q{border-top:1px solid var(--line);padding:10px 0}.q:first-of-type{border-top:0}.opt{display:block;margin:2px 0}
 pre{white-space:pre-wrap;background:var(--bg);padding:8px;border-radius:6px;max-height:320px;overflow:auto;margin:0}
 .wrap{overflow-x:auto}
@@ -288,17 +293,21 @@ def detail(a: dict) -> str:
     return "；".join(f"{DETAIL_NAMES.get(k, k)}：{v(x)}" for k, x in items)[:240]
 
 
-def page(title: str, body: str, user: dict, refresh: bool = False) -> str:
+def page(title: str, body: str, user: dict | None, refresh: bool = False) -> str:
+    who = "" if user is None else (
+        f"<span class='mut'>{e(user['display'])}（{e('、'.join(ROLE_NAMES.get(r, r) for r in user['roles']) or '只读')}）"
+        f" {form('/logout', '<button class=link>退出</button>', user['csrf'], inline=True)}</span>")
     return ("<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
             + ("<meta http-equiv='refresh' content='3'>" if refresh else "")
             + f"<title>{e(title)}</title><style>{CSS}</style></head><body>"
-            f"<header><a href='/'>奖金计算</a><span class='mut'>{e(user['display'])}（{e('、'.join(ROLE_NAMES.get(r, r) for r in user['roles']) or '只读')}）</span></header>"
+            f"<header><a href='/'>奖金计算</a>{who}</header>"
             f"<main>{body}</main></body></html>")
 
 
-def form(action: str, inner: str, csrf: str, upload: bool = False) -> str:
+def form(action: str, inner: str, csrf: str, upload: bool = False, inline: bool = False) -> str:
     enc = " enctype='multipart/form-data'" if upload else ""
+    enc += " style='display:inline'" if inline else ""
     return f"<form method='post' action='{e(action)}'{enc}><input type='hidden' name='csrf' value='{csrf}'>{inner}</form>"
 
 
@@ -329,13 +338,14 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
                max_steps: int = 80, max_tokens: int = 1_000_000):
     from fastapi import Depends, FastAPI, HTTPException, Request
     from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
-    from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
     store = Store(Path(root))
     runner = Runner(store, llm_factory, max_parallel, max_steps, max_tokens)
     app = FastAPI(title="奖金计算", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store, app.state.runner = store, runner
-    basic = HTTPBasic(realm="bonus-agent")
+    sessions: dict[str, tuple[str, float]] = {}            # 会话号 -> (用户名, 到期时间)；服务重启后要重新登录
+    failures: dict[str, list[float]] = {}                   # 用户名 -> 最近登录失败的时间
+    app.state.sessions = sessions
 
     @app.middleware("http")
     async def headers(request, call_next):
@@ -345,19 +355,66 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
                              "Content-Security-Policy": "default-src 'self'; style-src 'unsafe-inline'; form-action 'self'"})
         return resp
 
-    def user(c: HTTPBasicCredentials = Depends(basic)) -> dict:
-        u = store.users.check(c.username, c.password)
-        if u is None:       # 原因只打在服务端控制台，不告诉浏览器
-            known = c.username in store.users.load()
-            print(f"登录失败：{'口令不对' if known else '没有这个用户'}（用户名「{c.username}」，数据目录 {store.root.resolve()}）",
+    def user(request: Request) -> dict:
+        """登录状态放在服务端会话里，浏览器只拿到随机会话号（HttpOnly Cookie）；角色每次从 users.yaml 读，改了立即生效。"""
+        sid = request.cookies.get(COOKIE, "")
+        name, exp = sessions.get(sid, ("", 0.0))
+        info = store.users.load().get(name) if exp > time.time() else None
+        if info is None:
+            sessions.pop(sid, None)
+            nxt = request.url.path if request.method == "GET" else "/"
+            raise HTTPException(303, "请先登录", headers={"Location": f"/login?next={quote(nxt)}"})
+        return {"name": name, "display": info.get("display") or name, "roles": list(info.get("roles") or []),
+                "sid": sid, "csrf": store.csrf(sid)}
+
+    @app.get("/login", response_class=HTMLResponse)
+    def login_page(request: Request):
+        nxt = request.query_params.get("next", "/")
+        msg = request.query_params.get("msg", "")
+        body = ("<section style='max-width:360px;margin:40px auto'><h1>登录</h1>"
+                + (f"<p class='bad'>{e(msg)}</p>" if msg else "")
+                + f"<form method='post' action='/login'><input type='hidden' name='next' value='{e(nxt)}'>"
+                "<p><input type='text' name='username' placeholder='用户名' autocomplete='username' required></p>"
+                "<p><input type='password' name='password' placeholder='口令' autocomplete='current-password' required></p>"
+                "<p><button>登录</button></p></form></section>")
+        return page("登录", body, None)
+
+    @app.post("/login")
+    async def login(request: Request):
+        f = await request.form()
+        name, pw = str(f.get("username", "")).strip(), str(f.get("password", ""))
+        nxt = str(f.get("next") or "/")
+        nxt = nxt if nxt.startswith("/") and not nxt.startswith("//") else "/"
+        recent = [t for t in failures.get(name, []) if t > time.time() - LOCK_SECONDS]
+        if len(recent) >= MAX_FAILURES:
+            return RedirectResponse(f"/login?next={quote(nxt)}&msg={quote('失败次数太多，请 5 分钟后再试')}", status_code=303)
+        u = store.users.check(name, pw)
+        if u is None:       # 具体原因只打在服务端控制台，不告诉浏览器
+            failures[name] = recent + [time.time()]
+            known = name in store.users.load()
+            print(f"登录失败：{'口令不对' if known else '没有这个用户'}（用户名「{name}」，数据目录 {store.root.resolve()}）",
                   flush=True)
-            raise HTTPException(401, "用户名或口令不对", headers={"WWW-Authenticate": 'Basic realm="bonus-agent"'})
-        return u
+            return RedirectResponse(f"/login?next={quote(nxt)}&msg={quote('用户名或口令不对')}", status_code=303)
+        failures.pop(name, None)
+        sid = secrets.token_urlsafe(32)
+        sessions[sid] = (name, time.time() + SESSION_SECONDS)
+        resp = RedirectResponse(nxt, status_code=303)
+        resp.set_cookie(COOKIE, sid, max_age=SESSION_SECONDS, httponly=True, samesite="strict",
+                        secure=request.url.scheme == "https")
+        return resp
+
+    @app.post("/logout")
+    async def logout(request: Request, u: dict = Depends(user)):
+        await posted(request, u)
+        sessions.pop(u["sid"], None)
+        resp = RedirectResponse("/login?msg=" + quote("已退出"), status_code=303)
+        resp.delete_cookie(COOKIE)
+        return resp
 
     async def posted(request: Request, u: dict) -> dict:
         """读表单并核对防伪码（防止别的网页借浏览器里的登录状态提交）。"""
         f = await request.form()
-        if not hmac.compare_digest(str(f.get("csrf", "")), store.csrf(u["name"])):
+        if not hmac.compare_digest(str(f.get("csrf", "")), u["csrf"]):
             raise HTTPException(403, "表单已失效，请刷新页面后重试")
         return f
 
@@ -383,7 +440,7 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         rows = "".join(f"<tr><td><a href='/cases/{cid}'>{e(m['name'])}</a></td><td>{status_text(c)}</td>"
                        f"<td class='mut'>{e(m['created_by'])} · {e(m['created'][:16])}</td></tr>" for cid, m, c in store.cases())
         new = form("/cases", "<input type='text' name='name' placeholder='如 2026 年 Q3 季度奖' required> "
-                             "<p><button>新建案卷</button></p>", store.csrf(u["name"])) if "editor" in u["roles"] else ""
+                             "<p><button>新建案卷</button></p>", u["csrf"]) if "editor" in u["roles"] else ""
         body = (f"<h1>案卷</h1><section><div class='wrap'><table><tr><th>名称</th><th>状态</th><th>创建</th></tr>{rows}</table></div>"
                 + ("" if rows else "<p class='mut'>还没有案卷</p>") + "</section>"
                 + (f"<section><h2>新建</h2>{new}</section>" if new else ""))
@@ -402,7 +459,7 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
     def view(cid: str, request: Request, u: dict = Depends(user)):
         d = case_dir(cid)
         m, case, out = store.meta(cid), cs.load_case(d / "out"), d / "out"
-        csrf, job = store.csrf(u["name"]), runner.jobs.get(cid)
+        csrf, job = u["csrf"], runner.jobs.get(cid)
         editor, approver, busy = "editor" in u["roles"], "approver" in u["roles"], runner.running(cid)
         msg = request.query_params.get("msg", "")
         parts = [f"<h1>{e(m['name'])}</h1>"]
