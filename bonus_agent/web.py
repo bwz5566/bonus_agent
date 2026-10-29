@@ -676,9 +676,7 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             raise HTTPException(400, "没有选择文件")
         if single:
             files = files[:1]
-            for old in (d / area).glob("*"):
-                old.unlink()
-        saved = []
+        got = []          # 先把每个文件都读完、校验过，再动磁盘：有一个被拒，原有文件和其他新文件都不变
         for x in files:
             try:
                 name = safe_name(x.filename)
@@ -687,6 +685,12 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             data = await x.read(MAX_UPLOAD + 1)
             if len(data) > MAX_UPLOAD:
                 raise HTTPException(413, f"{name} 超过 {MAX_UPLOAD // 1024 // 1024} MB")
+            got.append((name, data))
+        if single:
+            for old in (d / area).glob("*"):
+                old.unlink()
+        saved = []
+        for name, data in got:
             (d / area / name).write_bytes(data)
             saved.append(name)
             store.audit(cid, u["display"], "上传" + ("期望结果" if area == "expected" else "材料"), file=name,

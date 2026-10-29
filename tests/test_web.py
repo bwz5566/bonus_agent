@@ -282,3 +282,17 @@ def test_list_where_object_expected_is_tolerated(tmp_path):
     assert _coerce_args("cover_clauses", {"items": [{"id": "C1", "where": "pool"}]}) == {"items": {"C1": "pool"}}
     v = _coerce_args("set_rules", {"variables": [{"name": "n", "expr": "1", "scope": "个人"}]})["variables"]
     assert v == {"n": {"expr": "1", "scope": "个人"}}
+
+
+def test_rejected_upload_keeps_existing_files(env, monkeypatch):
+    """#8 新文件被拒（太大）时：原来的期望结果还在；一批材料里有一个被拒，整批都不写入。"""
+    import bonus_agent.web as web
+    app, store, scripts, c, m = env
+    cid = store.create("上传", "张会计")
+    post(c, store, f"/cases/{cid}/expected", files=[("files", ("期望.xlsx", b"old"))])
+    monkeypatch.setattr(web, "MAX_UPLOAD", 10)
+    r = post(c, store, f"/cases/{cid}/expected", files=[("files", ("新期望.xlsx", b"x" * 20))])
+    assert r.status_code == 413
+    assert [p.name for p in (store.dir(cid) / "expected").iterdir()] == ["期望.xlsx"]
+    r = post(c, store, f"/cases/{cid}/materials", files=[("files", ("a.xlsx", b"ok")), ("files", ("b.xlsx", b"x" * 20))])
+    assert r.status_code == 413 and not list((store.dir(cid) / "materials").glob("*.xlsx"))
