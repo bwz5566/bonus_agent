@@ -1,0 +1,18 @@
+# 一次性安装全部依赖：pip install -r requirements.txt
+# 与 pyproject.toml 保持一致（基础 + agent + web）；最后一行把本项目以可编辑方式装上，命令行 bonus / bonus-agent 可用
+pydantic>=2.6
+lark>=1.1
+openpyxl>=3.1
+PyYAML>=6
+# 智能体：调用模型、读 Word / PPT / 图片 / PDF
+openai>=1.40
+python-docx>=1.1
+python-pptx>=0.6
+Pillow>=10
+pdfplumber>=0.11
+pypdfium2>=4
+# 网页对话
+fastapi>=0.110
+uvicorn>=0.29
+python-multipart>=0.0.9
+-e .

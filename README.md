@@ -30,8 +30,9 @@ tests/                 单元测试、属性测试、端到端测试
 ## 安装
 
 ```bash
-pip install -e ".[agent,dev]"
-python -m pytest          # 38 个测试，应全部通过
+pip install -r requirements.txt        # 一次装齐：计算引擎、智能体（含 PDF）、网页服务
+pip install -r requirements-dev.txt    # 开发和跑测试时再装这个（包含上一行）
+python -m pytest                       # 全部测试应通过
 ```
 
 ## 零、全自动模式（推荐先试这个）
@@ -208,7 +209,7 @@ bonus-agent map --model qwen3-vl-32b --rules draft.yaml 数据.xlsx
 财务不用编辑 yaml、不用命令行：在网页上建案卷、传材料、看问题、填答复，点“运行下一轮”；审批人确认结果后，每期上传本期数据按模板计算。
 
 ```bash
-pip install -e ".[agent,web]"
+pip install -r requirements.txt
 bonus-agent user add --data /srv/bonus 张会计账号 --roles editor --display 张会计       # 口令在终端输入，只存 PBKDF2 哈希
 bonus-agent user add --data /srv/bonus 李经理账号 --roles approver --display 李经理
 bonus-agent serve --data /srv/bonus --host 127.0.0.1 --port 8080 [--model local]

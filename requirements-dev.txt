@@ -1,0 +1,6 @@
+# 开发和跑测试另外需要：pip install -r requirements-dev.txt
+-r requirements.txt
+pytest>=8
+hypothesis>=6
+httpx>=0.27
+reportlab>=4
