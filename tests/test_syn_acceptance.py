@@ -82,23 +82,9 @@ def test_compare_finds_all_sheets(results, tmp_path):
 
 
 def _patched(case, tmp_path) -> Path:
-    p = case["patch"]
-    wb = openpyxl.load_workbook(run_case.XLSX)
-    ws = wb[SHEET[p["table"]]]
-    head = [c.value for c in ws[1]]
-    r = p["index"] + 2
-    if p["op"] == "append_copy":
-        ws.append([c.value for c in ws[r]])
-    else:
-        v = p["value"]
-        if isinstance(v, str):
-            try:
-                v = float(v)
-            except ValueError:
-                pass
-        ws.cell(r, head.index(p["field"]) + 1).value = v
+    from bonus_agent.negcheck import patch_workbook
     out = tmp_path / run_case.XLSX.name      # 文件名要和映射里指定的一致
-    wb.save(out)
+    patch_workbook(run_case.XLSX, out, case["patch"], SHEET)
     return out
 
 
@@ -255,3 +241,28 @@ def test_confirm_freezes_template_and_runs_without_llm(tmp_path):
                                             encoding="utf-8")
     with pytest.raises(TemplateError, match="被修改过"):
         Template.load(tpl)
+
+
+def test_negcheck_replays_agent_rules_on_bad_data(tmp_path):
+    """坏数据回归：用智能体案卷里的规则（不调用大模型）在改坏的数据上重算，8 种数据问题都要拦住。"""
+    from bonus_agent import case as cs
+    from bonus_agent.agent import run_agent
+    from bonus_agent.llm import FakeLLM
+    from bonus_agent.negcheck import replay, report
+    ar = run_agent(FakeLLM(_script()), [run_case.XLSX], tmp_path)
+    res = replay(cs.snapshot(ar.ws), [run_case.XLSX], NEG, SHEET)
+    assert len(res) == 8 and all(r.blocked for r in res), report(res)
+
+
+def test_trial_spot_check_and_missing_scope_guard(tmp_path):
+    """试算结果附带每层一个对象的权重代入值；按人引用却漏写 scope 的变量，试算前必须先改。"""
+    from bonus_agent.agent import ToolError, run_agent
+    from bonus_agent.llm import FakeLLM
+    ar = run_agent(FakeLLM(_script()), [run_case.XLSX], tmp_path)
+    out = ar.ws._trial("QUARTER")
+    assert "抽查「个人」" in out and "0.2 * " in out
+    ar.ws.drafts["共用"]["variables"]["n_proj"].pop("scope")     # 漏写 scope：变成全公司项目数
+    with pytest.raises(ToolError, match="n_proj 没写 scope"):
+        ar.ws._trial("QUARTER")
+    ar.ws.drafts["共用"]["variables"]["n_proj"]["scope"] = "global"   # 明确写全局：放行
+    ar.ws._trial("QUARTER")

@@ -33,7 +33,7 @@ from bonus_core.dsl.models import DatasetDef, RuleSet
 from bonus_core.dsl.validator import validate
 from bonus_core.engine.allocation import AdjustConflict
 from bonus_core.engine.evaluator import EvalError, Evaluator, fmt
-from bonus_core.engine.issues import EngineError
+from bonus_core.engine.issues import EngineError, Issue
 from bonus_core.engine.run import Adjustment, Engine, Result, compute
 from bonus_core.engine.tree import ROOT_LEVEL, build_tree
 from bonus_core.report.excel import write_excel
@@ -598,7 +598,7 @@ class Workspace:
         out = [f"已保存{'共用部分' if name == SHARED else f'方案「{name}」'}。"]
         for t, rs in rss.items():
             full = self._merged(t)
-            issues = validate(rs)
+            issues = self._validate(t, rs)
             if "pool" not in full:
                 issues = [i for i in issues if i.where != "pool"]
             blocking = [str(i) for i in issues if i.severity == "blocking"]
@@ -695,8 +695,22 @@ class Workspace:
             refs[f"{s}/{rev}"] = self.results[s][rev]
         return refs
 
+    def _validate(self, scheme: str, rs: RuleSet) -> list[Issue]:
+        """静态校验；全局变量在某层按对象引用、又没明确写 scope 的，必须先处理（写明 scope），不能只当提示。"""
+        variables = self._merged(scheme).get("variables") or {}
+        out = []
+        for i in validate(rs):
+            m = re.match(r"变量 (\S+) 没写 scope", i.message) if i.code == "global_in_level" else None
+            if m and "scope" not in (variables.get(m.group(1)) or {}):
+                i = Issue.block(i.code, i.message + "。必须明确写 scope（要全公司合计就写 scope: global）", i.where)
+            out.append(i)
+        return out
+
     def _trial(self, name: str, _path: tuple = ()) -> str:
         rs = self._ruleset(name)
+        guard = [str(i) for i in self._validate(name, rs) if i.code == "global_in_level" and i.severity == "blocking"]
+        if guard:
+            raise ToolError(f"方案「{name}」试算前需要修正：\n" + "\n".join(f"- {g}" for g in guard))
         data, issues = self._data(rs)
         refs = self._refs(name, _path)
         try:
@@ -723,6 +737,14 @@ class Workspace:
             top = "，".join(f"{n.id}（{n.label}）{fmt(Decimal(n.final))}" for n in ns[:8])
             lines.append(f"「{lv}」{len(ns)} 个，合计 {total:,.2f}，为 0 的 {zero} 个；最多的：{top}"
                          + ("……" if len(ns) > 8 else "") + f"；最少的：{ns[-1].id} {fmt(Decimal(ns[-1].final))}")
+        for lv in base.levels:                          # 抽查：每层取一个中间对象，列出权重代入后的数值
+            ns = sorted((n for n in base.nodes.values() if n.level == lv), key=lambda n: float(n.final))
+            nid = ns[len(ns) // 2].id if ns else ""
+            tr = base.traces.get(f"{nid}/权重")
+            while tr is not None and tr.expr.isidentifier() and f"{nid}/{tr.expr}" in base.traces:   # 权重直接写成变量名时展开
+                tr = base.traces[f"{nid}/{tr.expr}"]
+            if tr is not None and tr.rendered != tr.expr:
+                lines.append(f"抽查「{lv}」{tr.id}：{tr.rendered[:400]} = {tr.value}")
         for rev, r in list(res.items())[1:]:
             changed = [k for k, n in r.nodes.items() if n.final != base.nodes[k].final]
             lines.append(f"修订 {rev}：{len(changed)} 个对象金额变化，奖金池 {fmt(Decimal(r.pool))}；"

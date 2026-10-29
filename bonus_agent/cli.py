@@ -12,6 +12,9 @@
   confirm --out 案卷目录 --by 确认人 [--note 说明] [数据文件...]
                                            财务确认最新一轮结果：复算核对后把规则、映射和调整冻结为 案卷目录/template/，
                                            以后每期用 bonus run-template 计算，不再调用大模型
+  negcheck --out 案卷目录 --cases negative_cases.json [--sheet 表名=工作表 ...] 材料...
+                                           坏数据回归：用该案卷的规则（不调用大模型）在逐个改坏的数据上重算，
+                                           列出每种坏数据有没有被拦住
   serve --data 数据目录 [--host 127.0.0.1] [--port 8080] [--model M]
                                            内网网页服务：看问题、填答复、传材料、运行下一轮、确认、按模板计算
   user add --data 数据目录 用户名 --roles editor,approver [--display 姓名]
@@ -58,6 +61,11 @@ def main(argv=None) -> int:
     p.add_argument("--by", required=True, help="确认人")
     p.add_argument("--note", default="", help="确认说明")
     p.add_argument("data", nargs="*", help="复算用的数据文件（默认用该轮的输入文件）")
+    p = sub.add_parser("negcheck")
+    p.add_argument("--out", required=True, help="案卷目录（读其中 case.json 的规则）")
+    p.add_argument("--cases", required=True, help="坏数据用例 JSON")
+    p.add_argument("--sheet", action="append", default=[], help="数据表名=工作表名，可写多次")
+    p.add_argument("files", nargs="+", help="原始材料文件或文件夹")
     p = sub.add_parser("serve")
     p.add_argument("--data", required=True, help="数据目录：用户、案卷、材料和结果都在这里")
     p.add_argument("--host", default="127.0.0.1", help="默认只监听本机；内网访问请放在 HTTPS 反向代理后面")
@@ -103,6 +111,18 @@ def main(argv=None) -> int:
             return 1
         print(f"已保存用户 {a.name}（{a.roles}）")
         return 0
+    if a.cmd == "negcheck":
+        from bonus_agent import case as cs
+        from bonus_agent.auto import collect_files
+        from bonus_agent.negcheck import replay, report
+        case = cs.load_case(Path(a.out))
+        if not case or not case.get("workspace"):
+            print(f"{a.out} 里没有案卷记录（case.json）")
+            return 1
+        sheets = dict(s.split("=", 1) for s in a.sheet)
+        res = replay(case["workspace"], collect_files(a.files), json.loads(Path(a.cases).read_text(encoding="utf-8")), sheets)
+        print("\n".join(report(res)))
+        return 0 if all(r.blocked for r in res) else 3
     if a.cmd == "serve":
         from bonus_agent.web import serve
         serve(a.data, a.host, a.port, a.model, max_parallel=a.max_parallel)
