@@ -837,9 +837,11 @@ class Workspace:
             rows = base.payout_rows()
             paid = sum(Decimal(p.paid) for p in rows)
             off = sum(Decimal(p.offset or 0) for p in rows)
+            ded = sum(Decimal(getattr(p, "deducted", 0) or 0) for p in rows)
             over = sum(Decimal(p.overpaid or 0) for p in rows)
             lines.append(f"发放：本次实发合计 {paid:,.2f}，暂缓合计 {held:,.2f}"
-                         + (f"，已发抵扣 {off:,.2f}，超发待核对 {over:,.2f}" if off or over else ""))
+                         + (f"，已发（预发）合计 {off:,.2f}，其中实际抵扣 {ded:,.2f}、超发待核对 {over:,.2f}"
+                            f"（勾稽：应得 = 本次实发 + 暂缓 + 实际抵扣）" if off or over else ""))
             if base.rollups:
                 rs_ = sorted(base.rollups.values(), key=lambda r: r.key)
                 lines.append(f"按「{rs_[0].entity}」汇总后抵扣：{len(rs_)} 个；"
