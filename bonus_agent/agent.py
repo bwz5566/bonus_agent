@@ -154,6 +154,26 @@ TOOLS: list[dict] = [
 ]
 
 
+def _fix_arguments(text: str) -> str:
+    """模型输出的参数不是合法 JSON 时尽量修复（后面多了内容就取第一个对象）；修不好就换成说明错误的合法 JSON。
+    历史里的参数必须是合法 JSON，否则服务端会拒绝之后的所有请求。"""
+    try:
+        json.loads(text or "{}")
+        return text or "{}"
+    except ValueError:
+        pass
+    try:
+        obj, _ = json.JSONDecoder().raw_decode((text or "").strip())
+        if isinstance(obj, dict):
+            return json.dumps(obj, ensure_ascii=False)
+    except ValueError as e:
+        err = str(e)
+    else:
+        err = "参数不是 JSON 对象"
+    return json.dumps({"_invalid_json": f"参数不是合法 JSON（{err}），未执行。请重新调用，参数写成一个合法的 JSON 对象"},
+                      ensure_ascii=False)
+
+
 def _coerce_args(tool: str, args: dict) -> dict:
     """数组、对象类参数被模型写成了 JSON 字符串（思考模式下常见）时，解析回来。"""
     props = next((t["parameters"]["properties"] for t in TOOLS if t["name"] == tool), {})
@@ -1129,7 +1149,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                     continue
                 error = str(e)
                 break
-            calls = reply["tool_calls"]
+            calls = [{**c, "arguments": _fix_arguments(c["arguments"])} for c in reply["tool_calls"]]
             history.append({"role": "assistant", "content": reply["content"],
                             **({"tool_calls": [{"id": c["id"], "type": "function",
                                                 "function": {"name": c["name"], "arguments": c["arguments"]}}
@@ -1163,6 +1183,8 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 fn = handlers.get(c["name"])
                 if not isinstance(args, dict):
                     raise ToolError("参数必须是 JSON 对象")
+                if "_invalid_json" in args:
+                    raise ToolError(args["_invalid_json"])
                 args = _coerce_args(c["name"], args)
                 if fn is None:
                     raise ToolError(f"没有工具 {c['name']}，可用：{list(handlers)}")
