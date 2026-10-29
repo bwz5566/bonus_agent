@@ -7,7 +7,9 @@ import openpyxl
 import yaml
 
 from bonus_agent import facts as fx
-from bonus_agent.agent import Workspace, run_agent
+import pytest
+
+from bonus_agent.agent import ToolError, Workspace, run_agent
 from bonus_agent.auto import build_inventory
 from bonus_agent.llm import FakeLLM
 
@@ -72,7 +74,8 @@ def test_conflict_asked_by_program(tmp_path):
     q = ws.pending[0]
     assert q.related == f"参数:{NAME}" and q.blocking and q.options[:2] == ["5%（方案.docx）", "6%（补充说明.docx）"]
     assert "补充说明.docx“季度奖计提比例为 6%。”" in q.text
-    ws.record_facts([F5, F6, {**F5, "value": "5 %"}])           # 再登记同样的取值：不重复提问
+    with pytest.raises(ToolError, match="之前已登记过"):         # 再登记同样的取值：不重复提问，作为失败返回
+        ws.record_facts([F5, F6, {**F5, "value": "5 %"}])
     assert len(ws.questions) == 1 and len(ws.facts) == 2
     # 有冲突未答复：可以结束本轮（不出结果）
     assert "等待财务答复" in ws.finish("x")
@@ -158,10 +161,13 @@ def test_conflict_rounds(tmp_path):
 
 def test_quote_miss_suggests_original_and_hints_next_step(tmp_path):
     ws = Workspace(FakeLLM([]), build_inventory(sorted(_materials(tmp_path / "m").iterdir())))
-    out = ws.record_facts([fact("5%", "方案.docx", "季度奖按销售额 5% 计提")])
+    with pytest.raises(ToolError) as ei:
+        ws.record_facts([fact("5%", "方案.docx", "季度奖按销售额 5% 计提")])
+    out = str(ei.value)
     assert "最接近的一句：季度奖按部门销售额的 5% 计提奖金池" in out
     ws.record_facts([F5])
-    assert "之前已登记过" in ws.record_facts([F5])
+    with pytest.raises(ToolError, match="之前已登记过"):
+        ws.record_facts([F5])
     assert "define_dataset" in ws.next_hint() and "补充说明.docx" in ws.next_hint()
     ws.progress = (30, 80)
     assert "下一步（程序判断）" in ws.state()
@@ -201,3 +207,10 @@ def test_chat_answers_and_changes(tmp_path):
             raise AssertionError("非对话也能用")
         except Exception as e:
             assert "对话" in str(e)
+
+
+def test_stops_after_three_identical_failures(tmp_path):
+    m = _materials(tmp_path / "m")
+    bad = {"tool": "record_facts", "args": {"facts": [fact("5%", "方案.docx", "原文没有这句 5%")]}}
+    ar = run_agent(FakeLLM([bad] * 20), [m])
+    assert "卡住" in ar.error and len(ar.steps) == 3 and "record_facts" in ar.error

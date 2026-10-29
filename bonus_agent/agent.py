@@ -42,6 +42,7 @@ MAX_RESULT_CHARS = 6000
 DEFAULT_SCHEME = "默认"        # 只有一个方案时的方案名
 SCHEME_REF = re.compile(r"""scheme_paid\(\s*["']([^"']+)["']\s*(?:,\s*["']([^"']+)["']\s*)?\)""")   # 规则里引用别的方案
 SHARED = "共用"                # 多个方案共用的部分（权重、校验、共用变量），合并进每个方案
+MAX_STUCK = 3                  # 同一调用原样重复、或同一工具连续失败达到这个次数就停下，把卡住的原因报给财务
 KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保留全文
 BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
 READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate"}
@@ -324,6 +325,9 @@ class Workspace:
                 continue
             self.facts.append(f)
             added += 1
+        if not added:       # 一条也没登记上：作为失败返回，避免模型以为成功、反复提交同样的内容
+            raise ToolError("没有登记任何新参数。" + (f"{dup} 条之前已登记过，不要重复登记。" if dup else "") + "\n".join(lines)
+                            + f"\n下一步（程序判断）：{self.next_hint()}")
         new = fx.detect(self.facts, self.conflicts, self.questions, self.round)
         out = [f"已登记 {added} 条（台账共 {len(self.facts)} 条）。" + (f"另有 {dup} 条之前已登记过，已跳过。" if dup else "")] + lines
         if new:
@@ -946,6 +950,9 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     nudges = 0
     seen: dict[str, int] = {}          # 只读工具的调用 -> 第几步，用来发现原地打转
     repeats = 0
+    last_write: tuple[str, str] | None = None
+    fails: dict[str, int] = {}         # 工具 -> 连续失败次数
+    stuck = ""
     for turn in range(max_steps):
         used = llm.usage.prompt_tokens + llm.usage.completion_tokens
         if max_tokens and used >= max_tokens:
@@ -1000,6 +1007,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             sig = f"{c['name']}:{c['arguments']}"
             if c["name"] in READ_ONLY and sig in seen:
                 repeats += 1
+                stuck = f"反复调用 {c['name']}（参数相同，内容没有变化）"
                 result = (f"这次调用与第 {seen[sig]} 步完全相同，内容没有变化，已跳过。不要重复调用；"
                           f"需要更多内容请换参数（如 start_row、offset），否则根据已有信息进行下一步。"
                           f"程序判断的下一步：{ws.next_hint()}")
@@ -1031,7 +1039,14 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             if c["name"] in READ_ONLY and ok:
                 seen[sig] = len(steps) + 1
             elif c["name"] not in READ_ONLY:
+                if (sig, result) == last_write:      # 写入类工具原样重复、结果也一样：同样算原地打转
+                    repeats += 1
+                    stuck = f"反复提交相同的 {c['name']}，结果：{result[:300]}"
+                last_write = (sig, result)
                 seen.clear()   # 工作区变了，重新读取是合理的
+            fails[c["name"]] = 0 if ok else fails.get(c["name"], 0) + 1
+            if fails[c["name"]] >= MAX_STUCK:
+                stuck = f"{c['name']} 连续 {fails[c['name']]} 次失败，最后一次：{result[:300]}"
             steps.append(step)
             if on_step:
                 on_step(len(steps), step)
@@ -1041,8 +1056,9 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 history.append({"role": "tool", "tool_call_id": c["id"], "content": result})
         if ws.done:
             break
-        if repeats >= 6:
-            error = "智能体反复重复相同的调用，已停止"
+        if repeats >= MAX_STUCK or any(n >= MAX_STUCK for n in fails.values()):
+            error = (f"智能体卡住了，已停止以免继续消耗 tokens：{stuck}。"
+                     f"已用 {len(steps)} 步。请把这条信息反馈给开发，或在对话里告诉智能体怎么处理")
             break
     else:
         error = f"达到最大步数 {max_steps} 仍未完成"

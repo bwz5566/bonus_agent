@@ -250,7 +250,7 @@ def test_agent_stops_looping_and_paginates():
     same = {"tool": "read_sheet", "args": {"file": "年度数据.xlsx", "sheet": "员工花名册", "rows": 5}}
     llm = FakeLLM([{"tool": "note", "args": {"topic": "总包", "text": "净利润 8%"}}] + [same] * 10)
     ar = run_agent(llm, [ANNUAL], max_steps=30)
-    assert not ar.ok and "重复" in ar.error and len(ar.steps) < 12
+    assert not ar.ok and "卡住" in ar.error and "反复调用 read_sheet" in ar.error and len(ar.steps) == 5
     first = ar.steps[1].result
     assert "start_row=6" in first and "共 28 行" in first
     assert "已跳过" in ar.steps[2].result
