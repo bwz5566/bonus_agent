@@ -155,3 +155,30 @@ def test_money_cannot_stay_in_empty_middle_level():
     assert ei.value.issues[0].code == "branch_empty" and "部门:D2" in str(ei.value.issues[0])
     data["部门"] = table("部门", {"dept_id": "D1", "w": Decimal(1)}, {"dept_id": "D2", "w": Decimal(0)})   # 权重为 0：分不到钱，不拦
     assert compute(rs, data).nodes["员工:E1"].final == "100.00"
+
+
+def test_negcheck_keeps_formula_values(tmp_path):
+    """业务表里有公式列（如 金额 = 单价 × 数量）：改坏一处后，其他公式单元格的值不能变成空。"""
+    import shutil
+    import subprocess
+
+    import openpyxl
+
+    from bonus_agent.negcheck import patch_workbook
+    from bonus_core.data.table_detect import table_at
+    if not shutil.which("soffice"):
+        pytest.skip("需要 LibreOffice 生成带计算值的公式")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "明细"
+    ws.append(["编号", "单价", "数量", "金额"])
+    ws.append(["A", 2, 3, "=B2*C2"])
+    ws.append(["B", 5, 4, "=B3*C3"])
+    raw = tmp_path / "raw" / "d.xlsx"
+    raw.parent.mkdir()
+    wb.save(raw)
+    subprocess.run(["soffice", "--headless", "--calc", "--convert-to", "xlsx", "--outdir", str(tmp_path), str(raw)],
+                   check=True, capture_output=True, timeout=120)       # 像 Excel 保存一样带上计算值
+    src, out = tmp_path / "d.xlsx", tmp_path / "out.xlsx"
+    patch_workbook(src, out, {"op": "set", "table": "明细", "index": 0, "field": "数量", "value": 10})
+    assert [v for _, v in table_at(out, "明细", [1]).rows] == [["A", 2, 10, 6], ["B", 5, 4, 20]]

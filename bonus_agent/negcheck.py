@@ -39,7 +39,8 @@ def patch_workbook(src: Path, dst: Path, patch: dict, sheets: dict[str, str] | N
     if not 0 <= patch["index"] < len(st.rows):
         raise ValueError(f"「{sheet}」只有 {len(st.rows)} 条数据行，没有第 {patch['index']} 条")
     r = st.rows[patch["index"]][0]
-    wb = openpyxl.load_workbook(src)
+    # 按值读入再保存：公式单元格换成它的计算值。直接带公式保存会丢掉计算值，程序读回来是空，用例会因为别的原因被拦下
+    wb = openpyxl.load_workbook(src, data_only=True)
     ws = wb[sheet]
     if patch["op"] == "append_copy":         # 复制一条数据行，插在最后一条数据行后面（合计行之前）
         last = st.rows[-1][0]
