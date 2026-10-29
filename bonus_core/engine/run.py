@@ -244,8 +244,7 @@ class Engine:
         if stuck:
             nxt = {lv.level: self.rs.allocation[i + 1].level for i, lv in enumerate(self.rs.allocation[:-1])}
             nxt[ROOT_LEVEL] = self.rs.allocation[0].level if self.rs.allocation else ""
-            raise EngineError([Issue.block(
-                "branch_empty", f"{n.id}（{n.label}）分到 {n.final} 元，但下面没有任何「{nxt.get(n.level, '')}」，这笔钱发不到人。"
+            raise EngineError([Issue.block("branch_empty", f"{n.id}（{n.label}）分到 {n.final} 元，但下面没有任何「{nxt.get(n.level, '')}」，这笔钱发不到人。"
                 f"请核对数据是否漏了下级，或规则是否应把这类对象排除（如权重为 0）", n.id) for n in stuck[:8]])
 
     def compute(self, adjustments: list[Adjustment] = (), actor_scopes=None) -> Result:
