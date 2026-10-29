@@ -1,5 +1,6 @@
 """每人按公式直接算金额（没有奖金池）：先写共用变量、后写分配层级时不误报；pool 按最末层计算，金额与公式逐分一致。"""
 import openpyxl
+import pytest
 
 from bonus_agent.agent import run_agent
 from bonus_agent.clauses import check_where, refs
@@ -59,3 +60,20 @@ def test_per_person_amounts(tmp_path):
 def test_where_ignores_notes_in_brackets():
     assert refs("tables.error_deduction（允许值外报错）、pool(仅求和)") == ["tables.error_deduction", "pool"]
     assert check_where("pool（仅求和、无 payout/offsets）", {"pool"}, set()) is None
+
+
+@pytest.mark.verify
+def test_per_person_end_to_end_with_independent_verification(tmp_path):
+    """完整流程：finish 先被拦下要求验算；按材料原文从字段独立重算 E1（最高）、E3（最低非零）、E2（为 0）后才出结果。"""
+    v = 'round(max(base + count(of: "工单", where: review == "有效") * 12.5 - ded, 0), 2)'
+    basis = "每人奖金 = 保障奖 + 有效工单数 × 12.5 − 差错扣款，扣减后低于 0 的按 0 计"
+    steps = script()
+    fin = steps.pop()
+    steps += [fin] + [{"tool": "verify", "args": {"thought": f"按原文独立重算 {n}", "node": n, "expr": v, "basis": basis}}
+                      for n in ("个人:E1", "个人:E3", "个人:E2")] + [fin]
+    ar = run_agent(FakeLLM(steps), [make(tmp_path / "m")], tmp_path / "out")
+    assert ar.status == "OK", (ar.error, [(s.tool, s.result[:300]) for s in ar.steps if not s.ok])
+    first = next(s for s in ar.steps if s.tool == "finish")
+    assert not first.ok and "个人:E1（金额最高" in first.result and "个人:E2（金额为 0" in first.result
+    assert [s.ok for s in ar.steps if s.tool == "verify"] == [True, True, True]
+    assert ar.ws.verified["月度|个人:E3"]["basis"] == basis

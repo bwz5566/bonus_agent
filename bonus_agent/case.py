@@ -50,6 +50,7 @@ def snapshot(ws) -> dict:
         "facts": [f.model_dump() for f in ws.facts],
         "clauses": [c.model_dump() for c in ws.clauses],
         "conflicts": {k: c.model_dump() for k, c in ws.conflicts.items()},
+        "verified": ws.verified,
     }
 
 
@@ -65,6 +66,7 @@ def restore(ws, snap: dict) -> None:
     ws.facts = [Fact.model_validate(f) for f in snap.get("facts", [])]
     ws.clauses = [Clause.model_validate(c) for c in snap.get("clauses", [])]
     ws.conflicts = {k: Conflict.model_validate(c) for k, c in snap.get("conflicts", {}).items()}
+    ws.verified = snap.get("verified", {})     # 验算式留着，按本轮的规则和数据重新比对
     ws.untested = set(ws.schemes)            # 数据或答复可能变了，每个方案都要重新试算
 
 

@@ -11,7 +11,7 @@ TOOL_NAMES = {
     "remove_facts": "撤回参数登记", "define_dataset": "定义数据表", "remove_dataset": "删除数据表",
     "set_rules": "写计算规则", "trial_run": "试算", "explain": "查看计算过程", "evaluate": "验算公式",
     "ask_question": "提问", "answer_question": "记录答复", "note": "记笔记", "finish": "结束本轮", "reply": "回复",
-    "record_clauses": "摘录条款", "cover_clauses": "标注条款位置",
+    "record_clauses": "摘录条款", "cover_clauses": "标注条款位置", "verify": "独立验算",
 }
 
 RETRY = "直接点「重试」，会从停下的地方接着做"
@@ -94,6 +94,9 @@ def _why(last: str) -> tuple[str, str]:
         return "原因是把文字字段当成了是/否条件", "这个字段有哪些取值？哪个取值算“是”？"
     if "主键" in last and "重复" in last:
         return "原因是数据表的编号有重复", "重复的编号是录入错误，还是一个编号本来就对应多行（如一人参与多个项目）？"
+    if "独立验算还没全部通过" in last or "对不上：引擎算出" in last:
+        return ("原因是引擎算出的金额和按材料原文独立验算的结果对不上，或还没验算完",
+                "下面这个对象的金额按材料应该怎么算？")
     if "程序检查还有没处理的" in last:
         return ("原因是规则里有数在材料里找不到出处，或写的取值和数据对不上",
                 "下面列出的数或取值应该是多少、怎么处理？（例如“挂起的工单不计入”）")

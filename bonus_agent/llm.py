@@ -284,6 +284,6 @@ class FakeLLM(LLM):
         if isinstance(out, str):
             return {"content": out, "tool_calls": []}
         items = out if isinstance(out, list) else [out]
-        return {"content": "", "tool_calls": [
+        return {"content": items[0].get("thought", ""), "tool_calls": [     # 顶层 thought 当作模型写在正文里的思考
             {"id": f"call_{self.usage.calls}_{i}", "name": it["tool"],
              "arguments": json.dumps(it.get("args", {}), ensure_ascii=False)} for i, it in enumerate(items)]}

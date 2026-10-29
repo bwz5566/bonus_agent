@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import re
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -27,9 +27,12 @@ from bonus_agent import facts as fx
 from bonus_agent.extract_rules import Extraction, Question, check_quotes, prompt
 from bonus_agent.llm import LLM, LLMError, image_part, parse_json
 from bonus_core.data.mapping import DatasetMapping, apply_mapping
+from bonus_core.data.patches import apply_patches
 from bonus_core.data.table_detect import table_at
 from bonus_core.dsl.functions import describe as describe_functions
 from bonus_core.dsl.models import DatasetDef, RuleSet
+from bonus_core.dsl.parser import ExprError, parse
+from bonus_core.dsl.parser import names as parse_names
 from bonus_core.dsl.validator import validate
 from bonus_core.engine.allocation import AdjustConflict
 from bonus_core.engine.evaluator import EvalError, Evaluator, fmt
@@ -46,6 +49,7 @@ MAX_STUCK = 3                  # 同一调用原样重复、或同一工具连�
 KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保留全文
 BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
 READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate"}
+VERIFY_TOL = Decimal("0.005")   # 按份额分配时，独立算式和引擎未舍入的份额之差不超过半分，才算尾差
 WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", "remove_facts", "ask_question",
                "record_clauses", "cover_clauses",
                "answer_question"}
@@ -178,10 +182,31 @@ TOOLS: list[dict] = [
     {"name": "answer_question",
      "description": "对话时用：财务在消息里明确答复了某个待确认问题时，把他的原话记为该问题的答复。他没说清楚的不要替他选，用 reply 反问。",
      "parameters": _obj({"id": _S, "answer": {**_S, "description": "财务的原话或他选的选项"}}, ["id", "answer"])},
-    {"name": "finish", "description": "完成。要求每个方案在最近一次修改之后都已成功试算。",
+    {"name": "verify",
+     "description": "独立验算一个对象的金额：不看规则，按材料原文从原始字段另写一遍算式，由引擎在节点 at 上算出，和试算结果对到分。"
+                    "要验算哪些对象由程序指定（见工作区状态的“待独立验算”），全部通过才能 finish。算式里不能引用规则变量（只能用字段、"
+                    "参数表和函数）；at 默认是该对象自己（对自己的明细求和），按份额分配的对象在 全部 上用 where 按编号筛选计算。"
+                    "对不上时先想清楚是规则错了还是验算式写错了，改对的那一边；拿不准就 ask_question。",
+     "parameters": _obj({"node": {**_S, "description": "要验算的对象，如 个人:E1001"}, "expr": _S,
+                         "basis": {**_S, "description": "依据的材料原文（条款号或原句）"},
+                         "at": {**_S, "description": "在哪个节点上计算，默认是 node 自己"}, "scheme": _S},
+                        ["node", "expr", "basis"])},
+    {"name": "finish", "description": "完成。要求每个方案在最近一次修改之后都已成功试算，程序指定的对象都已独立验算通过。",
      "parameters": _obj({"summary": {**_S, "description": "两三句话说明：什么奖金、奖金池怎么来、怎么分、发放条件"},
                          "ignored": {"type": "array", "items": _obj({"ref": _S, "reason": _S})}}, ["summary"])},
 ]
+
+
+def _split_thought(arguments: str) -> tuple[str, str]:
+    """(思考, 去掉思考后的参数)：重复调用按去掉思考后的参数判断。"""
+    try:
+        a = json.loads(arguments or "{}")
+    except json.JSONDecodeError:
+        return "", arguments
+    if not isinstance(a, dict):
+        return "", arguments
+    t = a.pop("thought", "")
+    return (t.strip() if isinstance(t, str) else ""), json.dumps(a, ensure_ascii=False, sort_keys=True)
 
 
 def _fix_arguments(text: str) -> str:
@@ -244,6 +269,13 @@ def _list_to_obj(items: list[dict]):
     return items
 
 
+THOUGHT = {"type": "string", "description": "思考（必填）：上一步观察到了什么、为什么做这一步、预期看到什么；上一步出错时先说明原因"}
+for _t in TOOLS:          # 思考-行动-观察：每次行动都带上思考，记进运行步骤
+    _p = _t["parameters"]
+    _p["properties"] = {"thought": THOUGHT, **_p.get("properties", {})}
+    _p["required"] = ["thought", *_p.get("required", [])]
+
+
 def openai_tools() -> list[dict]:
     return [{"type": "function", "function": t} for t in TOOLS]
 
@@ -255,6 +287,7 @@ class Step:
     args: dict
     result: str
     ok: bool
+    thought: str = ""
 
 
 @dataclass
@@ -283,6 +316,10 @@ class Workspace:
     _sheet_corpus: dict[str, str] = field(default_factory=dict)
     progress: tuple[int, int] = (0, 0)                      # 已用步数、上限
     pinned: set[str] = field(default_factory=set)           # 全文已附在材料包里的文件 / 工作表
+    _verify_note: str = ""
+    _probe_cache: dict = field(default_factory=dict)
+    _gap_cache: tuple | None = None
+    verified: dict = field(default_factory=dict)            # "方案|对象" -> 独立验算记录 {expr, at, basis}，结束前按最新规则重新比对
     read_nums: dict = field(default_factory=dict)           # 方案 -> 规则读取的数据字段里出现的数（直接读表的参数算用上了）
     lint: dict = field(default_factory=dict)                # 方案 -> 程序检查结果（lint.Report），finish 前要处理其中的 gates
     said: str = ""                                          # 财务在对话里发过的文字：和材料一样可以引用（file 写「财务对话」）
@@ -1036,22 +1073,126 @@ class Workspace:
         name = self._scheme(scheme) if self.schemes else self._scheme(None, for_write=True)
         if not self._merged(name).get("allocation"):
             raise ToolError("需要先用 set_rules 设定 allocation（pool 可以先写 0）")
-        rs = self._ruleset(name)
-        data, _ = self._data(rs)
+        v, rendered = self._probe(name, expr, node)
+        return f"{expr} = {rendered} = {fmt(v)}"
+
+    def _probe(self, name: str, expr: str, node: str):
+        """在方案的数据上（已应用数据修订、带上引用的其他方案结果）对某个节点计算表达式，和正式计算用同样的数据。"""
+        key = id(self.results.get(name))           # 试算结果没变时规则和数据也没变，不必重读文件
+        hit = self._probe_cache.get(name)
+        if hit and hit[0] == key and name in self.results and name not in self.untested:
+            rs, data, patched = hit[1:]
+        else:
+            rs = self._ruleset(name)
+            data, _ = self._data(rs)
+            data, patched = apply_patches(rs, data)
+            self._probe_cache[name] = (key, rs, data, patched)
         root, by_level, issues = build_tree(rs, data)
-        blocking = [i for i in issues if i.severity == "blocking"]
+        blocking = [i for i in patched + issues if i.severity == "blocking"]
         if blocking:
             raise ToolError("建树失败：" + "；".join(str(i) for i in blocking[:5]))
         nodes = {n.id: n for n in root.walk()}
         nodes.update({n.id: n for tbl in (root.index or {}).values() for n in tbl.values()})
         if node not in nodes:
             raise ToolError(f"没有节点「{node}」，例：{list(nodes)[:5]}")
-        ev = Evaluator(rs, root, by_level)
+        ev = Evaluator(rs, root, by_level, self._refs(name))
         try:
             v = ev.evaluate(expr, nodes[node], "probe", "probe")
         except (EvalError, ValueError) as e:
             raise ToolError(f"计算失败：{e}") from None
-        return f"{expr} = {ev.traces['probe'].rendered} = {fmt(v)}"
+        return v, ev.traces["probe"].rendered
+
+    # ---- 独立验算 ----
+    def verify(self, node: str, expr: str, basis: str, at: str | None = None, scheme: str | None = None) -> str:
+        name = self._scheme(scheme)
+        if name in self.untested or name not in self.results:
+            raise ToolError(f"方案「{name}」最近修改后还没有试算，先 trial_run")
+        if node not in self.results[name]["R0"].nodes:
+            raise ToolError(f"方案「{name}」没有对象「{node}」，要验算的对象见工作区状态的“待独立验算”")
+        if not basis.strip():
+            raise ToolError("basis 写依据的材料原文（条款号或原句）")
+        rec = {"expr": expr, "at": at or node, "basis": basis.strip()}
+        bad = self._verify_mismatch(name, node, rec)
+        if bad:
+            raise ToolError(bad)
+        self.verified[f"{name}|{node}"] = rec
+        left = self._verify_gaps()
+        return (f"验算通过：{node} {self._verify_note}。"
+                + (f"还要验算：{'；'.join(left[:6])}" if left else "程序指定的对象都已验算通过"))
+
+    def _verify_mismatch(self, name: str, node: str, rec: dict) -> str:
+        """按当前规则和数据重新比对一条验算记录；一致返回空串，并把比对说明放在 _verify_note。"""
+        try:
+            names = set(parse_names(parse(rec["expr"])))
+        except ExprError as e:
+            return f"验算式写错了：{e}"
+        rs = self._ruleset(name)
+        own = sorted(names & set(rs.variables))
+        if own:
+            return (f"验算式引用了规则变量 {'、'.join(own)}。独立验算不能借用规则的中间结果，"
+                    "按材料原文直接从字段、参数表重新写（需要汇总就用 sum / count，按编号筛选用 where）")
+        try:
+            v, rendered = self._probe(name, rec["expr"], rec["at"])
+        except ToolError as e:
+            return f"验算式算不出来：{e}"
+        if isinstance(v, bool) or not isinstance(v, Decimal):
+            return f"验算式算出的不是金额：{fmt(v)}"
+        n = self.results[name]["R0"].nodes[node]
+        final, exact = Decimal(n.final), Decimal(n.exact)
+        mine = v.quantize(Decimal("0.01"), ROUND_HALF_UP)
+        if mine == final:
+            self._verify_note = f"引擎 {fmt(final)} 元，独立验算 {fmt(mine)} 元，一致"
+            return ""
+        if abs(mine - final) <= Decimal("0.01") and abs(v - exact) <= VERIFY_TOL:     # 按份额分配，舍入后的尾差分到了别人身上
+            self._verify_note = f"引擎 {fmt(final)} 元，独立验算 {fmt(v)} 元；差 {fmt(final - mine)} 元是按份额分配的尾差（未舍入份额 {exact}）"
+            return ""
+        return (f"{node} 对不上：引擎算出 {fmt(final)} 元（未舍入 {exact}），独立验算 {rec['expr']} = {rendered} = {fmt(v)}。"
+                f"先想清楚哪一边不符合材料（{rec['basis'][:100]}）：用 explain 查看 {node} 的计算链逐项对照，规则错了就改规则后重新试算，"
+                "验算式错了就改验算式；拿不准就 ask_question")
+
+    def _verify_targets(self, name: str) -> list[tuple[str, str]]:
+        """程序指定要独立验算的对象：每层金额最高的；最末层再加金额最低的非零对象和一个为 0 的对象。不由模型挑。"""
+        base = self.results[name]["R0"]
+        out = []
+        for i, lv in enumerate(base.levels):
+            ns = sorted((n for n in base.nodes.values() if n.level == lv), key=lambda n: (Decimal(n.final), n.id))
+            if not ns:
+                continue
+            picks = [(ns[-1], "金额最高")]
+            if i == len(base.levels) - 1:
+                nz = [n for n in ns if Decimal(n.final) != 0]
+                if nz and nz[0] is not ns[-1]:
+                    picks.append((nz[0], "金额最低的非零"))
+                zero = [n for n in ns if Decimal(n.final) == 0]
+                if zero and zero[0] is not ns[-1]:
+                    picks.append((zero[0], "金额为 0"))
+            out += [(n.id, f"{why}，引擎算出 {fmt(Decimal(n.final))} 元") for n, why in picks]
+        return out
+
+    def _verify_gaps(self) -> list[str]:
+        """还没通过独立验算的对象（含规则或数据改过之后重新比对不一致的）。"""
+        key = (tuple((s, id(self.results.get(s)), s in self.untested) for s in self.schemes),
+               json.dumps(self.verified, ensure_ascii=False, sort_keys=True))
+        if self._gap_cache and self._gap_cache[0] == key:
+            return list(self._gap_cache[1])
+        out = self._verify_gaps_now()
+        self._gap_cache = (key, out)
+        return list(out)
+
+    def _verify_gaps_now(self) -> list[str]:
+        out = []
+        for name in self.schemes:
+            if name in self.untested or name not in self.results:
+                continue
+            for node, why in self._verify_targets(name):
+                rec = self.verified.get(f"{name}|{node}")
+                if rec is None:
+                    out.append(f"方案「{name}」{node}（{why}）")
+                    continue
+                bad = self._verify_mismatch(name, node, rec)
+                if bad:
+                    out.append(f"方案「{name}」{node} 之前验算通过，按现在的规则重新比对不一致：{bad[:300]}")
+        return out
 
     # ---- 问题与完成 ----
     def ask_question(self, text: str, options: list[str] | None = None, suggested: int | None = None, related: str = "",
@@ -1106,6 +1247,11 @@ class Workspace:
             raise ToolError("程序检查还有没处理的（逐条改规则；需要财务确认的用 ask_question；确实无关的写进 ignored，"
                             "ref 写“常数 x”或“取值 x”并说明原因）：\n" + "\n".join(f"- {g}" for g in gates[:12])
                             + (f"\n……共 {len(gates)} 处" if len(gates) > 12 else ""))
+        left = self._verify_gaps()
+        if left:
+            raise ToolError("独立验算还没全部通过（金额错一分都不能出结果）。对下面每个对象用 verify：按材料原文从原始字段另写算式，"
+                            "不引用规则变量，引擎结果要和它对到分：\n" + "\n".join(f"- {g}" for g in left[:12])
+                            + (f"\n……共 {len(left)} 个" if len(left) > 12 else ""))
         if review:                           # 规则在核对之后又改过的条款，结束前再并排核对一次
             texts = self._element_texts()
             stale = [c for c in self.clauses if cl.refs(c.where) and not c.where.startswith((cl.BUILTIN, cl.NOT_APPLY, cl.ASKED))
@@ -1165,6 +1311,8 @@ class Workspace:
             step = f"用 record_facts 登记这些文档的参数：{'、'.join(bare)}"
         elif self._clause_gaps({str(i.get("ref", "")) for i in self.ignored}):
             step = "用 record_clauses / cover_clauses 把条款清单逐条落实"
+        elif self._verify_gaps():
+            step = "用 verify 独立验算：" + "；".join(self._verify_gaps()[:3])
         else:
             step = "核对后调用 finish"
         return step + (f"；还没登记参数的规则文档：{'、'.join(bare)}" if bare and "record_facts" not in step else "")
@@ -1215,6 +1363,9 @@ class Workspace:
             r = self.results.get(s, {})
             lines.append(f"- 试算「{s}」：" + ("最近修改后尚未试算" if s in self.untested or not r else
                                              f"已试算，奖金池 {fmt(Decimal(r['R0'].pool))}" + (f"，修订 {list(r)[1:]}" if len(r) > 1 else "")))
+        if self.schemes and all(s not in self.untested and s in self.results for s in self.schemes):
+            left = self._verify_gaps()
+            lines.append("- 待独立验算（程序指定，全部通过才能 finish）：" + ("；".join(left[:12]) if left else "全部通过"))
         return "\n".join(lines)
 
 
@@ -1451,8 +1602,8 @@ def _answers_text(answers: list[dict] | None) -> str:
 
 
 def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = None, *,
-              answers: list[dict] | None = None, max_steps: int = 80, max_history_chars: int = 40000,
-              max_files: int = MAX_FILES, max_tokens: int | None = 2_000_000, exclude: list[str | Path] = (),
+              answers: list[dict] | None = None, max_steps: int = 150, max_history_chars: int = 40000,
+              max_files: int = MAX_FILES, max_tokens: int | None = 4_000_000, exclude: list[str | Path] = (),
               on_step: Callable[[int, Step], None] | None = None, resume: bool = True,
               should_stop: Callable[[], bool] | None = None, instruction: str | None = None,
               message: str | None = None, by: str = "", chat: list[dict] | None = None) -> AgentResult:
@@ -1549,7 +1700,10 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             history.append({"role": "assistant", "content": text})
             try:
                 act = parse_json(text)
-                calls = [{"id": "", "name": act["tool"], "arguments": json.dumps(act.get("args") or {}, ensure_ascii=False)}]
+                a = act.get("args") or {}
+                if isinstance(a, dict) and act.get("thought") and not a.get("thought"):
+                    a = {"thought": act["thought"], **a}
+                calls = [{"id": "", "name": act["tool"], "arguments": json.dumps(a, ensure_ascii=False)}]
             except (LLMError, KeyError, TypeError, ValueError):
                 history.append({"role": "user", "content": '格式不对：请只输出 {"thought": ..., "tool": ..., "args": {...}}'})
                 continue
@@ -1576,16 +1730,19 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 history.append({"role": "user", "content": "请调用工具继续工作；全部完成后调用 finish。"})
                 continue
         turn_start, skipped = len(history) - 1, 0     # 本轮 assistant 消息的位置；被拦下的重复调用数
+        said = "" if mode == "json" else (reply.get("content") or "").strip()     # 原生工具调用时模型写在正文里的思考
         for c in calls:
             args = {}
-            sig = f"{c['name']}:{c['arguments']}"
+            thought, bare = _split_thought(c["arguments"])
+            thought = thought or said
+            sig = f"{c['name']}:{bare}"          # 思考不同、参数相同，仍是同一个调用
             if c["name"] in READ_ONLY and sig in seen:
                 repeats += 1
                 stuck = f"反复调用 {c['name']}（参数相同，内容没有变化）"
                 result = (f"这次调用与第 {seen[sig]} 步完全相同，内容没有变化，已跳过。不要重复调用；"
                           f"需要更多内容请换参数（如 start_row、offset），否则根据已有信息进行下一步。"
                           f"程序判断的下一步：{ws.next_hint()}")
-                steps.append(Step(c["name"], {}, result, False))
+                steps.append(Step(c["name"], {}, result, False, thought))
                 if on_step:
                     on_step(len(steps), steps[-1])
                 history.append({"role": "user", "content": f"【{c['name']} 的结果】\n{result}"} if mode == "json"
@@ -1599,6 +1756,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                     raise ToolError("参数必须是 JSON 对象")
                 if "_invalid_json" in args:
                     raise ToolError(args["_invalid_json"])
+                args.pop("thought", None)
                 args = _coerce_args(c["name"], args)
                 if fn is None:
                     raise ToolError(f"没有工具 {c['name']}，可用：{list(handlers)}")
@@ -1614,7 +1772,9 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                               "要求对象 {...} 的地方不要写成列表 [...]，反之亦然"), False
             if len(result) > MAX_RESULT_CHARS:
                 result = result[:MAX_RESULT_CHARS] + "……（已截断）"
-            step = Step(c["name"], args if isinstance(args, dict) else {}, result, ok)
+            if not thought:
+                result += "\n（提醒：每次调用都先在 thought 里写思考：上一步观察到了什么、为什么做这一步、预期看到什么。）"
+            step = Step(c["name"], args if isinstance(args, dict) else {}, result, ok, thought)
             if ok and c["name"] in WRITE_TOOLS:
                 ws.changed = True
             if c["name"] in READ_ONLY and ok:
