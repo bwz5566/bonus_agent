@@ -216,7 +216,8 @@ def confirm(out: Path, by: str, note: str = "", data: list[Path] | None = None) 
     rss = {n: RuleSet.load(out / f) for n, f in names.items()}
     revs = {n: [{"name": k.split(":")[2], "adjust": v[0]} for k, v in outs.items()
                 if k.startswith(f"adjust:{n}:")] for n in names}
-    tpl = out / "template"
+    final = out / "template"
+    tpl = out / "template.new"          # 先在临时目录里做好并全部核对通过，才替换已确认的模板；失败时原模板不动
     if tpl.exists():
         shutil.rmtree(tpl)
     tpl.mkdir(parents=True)
@@ -250,6 +251,15 @@ def confirm(out: Path, by: str, note: str = "", data: list[Path] | None = None) 
     if diff or set(got) != set(want):
         shutil.rmtree(tpl)
         raise ConfirmError(f"按模板复算与第 {rnd['n']} 轮结果不一致：{diff[:10]}（数据文件是否换过？）")
+    old = out / "template.old"
+    if old.exists():
+        shutil.rmtree(old)
+    if final.exists():
+        final.rename(old)
+    tpl.rename(final)
+    if old.exists():
+        shutil.rmtree(old)
+    tpl = final
     rec = {**manifest["confirmed"], "template": str(tpl)}
     case.setdefault("confirmations", []).append(rec)
     case["confirmed"] = rec
