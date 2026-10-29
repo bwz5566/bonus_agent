@@ -25,6 +25,11 @@ def explain(error: str) -> dict:
                 "advice": (f"{why}{RETRY}；如果重试还卡在同一处，{TELL}（例如“没有回款的销售单按 0 处理”），"
                            "或把下面的详细信息发给开发。"),
                 "detail": err}
+    m = re.search(r"「([^」]+)」反复建了又删", err)
+    if m:
+        return {"title": f"智能体对「{m.group(1)}」反复建了又删，没有进展，已自动停下。",
+                "advice": f"多半是它拿不准这张表或这个参数该怎么定义。{TELL}（例如说明这张表的每行代表什么、用哪一列关联），然后点「重试」。",
+                "detail": err}
     if "反复重复相同的调用" in err or "原样调用" in err:
         return {"title": "智能体在原地打转（反复做同一件事），已自动停下。",
                 "advice": f"{RETRY}；{TELL}，比如指出它下一步该做什么。", "detail": err}

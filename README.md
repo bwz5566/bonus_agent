@@ -227,6 +227,22 @@ bonus-agent serve --data /srv/bonus --host 127.0.0.1 --port 8080 [--model local]
 
 在 `bonus_agent/config/models.yaml`（或自己的 `config/models.yaml`）的 `local_vllm` 里填 vLLM 地址，把 `default` 改成本地模型即可；本地 vLLM 支持 `json_mode: json_schema` 约束解码，输出更稳定。
 
+已配好两个本地模型（`models.yaml` 里的 `local`、`local-deepseek`），用 vLLM 启动后 `--model local` 即可。下面是参考命令，
+工具调用解析器（`--tool-call-parser`）和显存参数以模型卡说明和实际显卡为准：
+
+```bash
+# Qwen3.6-35B-A3B：1 张 48GB 卡（FP8），量化版 1 张 24GB 卡也能跑
+vllm serve Qwen/Qwen3.6-35B-A3B --port 8000 --max-model-len 131072 \
+  --enable-prefix-caching --enable-auto-tool-choice --tool-call-parser hermes
+
+# DeepSeek-V4-Flash：284B（激活 13B），约 4 张 80GB 卡
+vllm serve deepseek-ai/DeepSeek-V4-Flash --port 8000 --tensor-parallel-size 4 --max-model-len 131072 \
+  --enable-prefix-caching --enable-auto-tool-choice --tool-call-parser <见模型卡>
+```
+
+- 一定要开 `--enable-prefix-caching`：每次调用的前面大半（系统提示、材料包、历史）都相同，命中缓存后预填充快很多。
+- 部署后先跑验收再上线：用验收样例走一遍「提问 → 答复 → 核对期望结果 → `negcheck` 坏数据回归」，全部通过再把 `default` 改成本地模型。
+
 ## 下一步
 
 - 计算说明 Word 生成（模板 + 数字占位符校验）

@@ -226,3 +226,16 @@ def test_tiers_under_one_name_are_not_a_conflict(tmp_path):
     ws2.record_facts(tier)
     assert len(ws2.pending) == 1                           # 两个文件各给一个不同的值：仍是冲突
     assert "撤回问题 q1" in ws2.remove_facts(tier[0]["name"]) and not ws2.pending
+
+
+def test_define_remove_oscillation_stops(tmp_path):
+    """建了又删、删了又建（每次都成功，不算失败也不算原样重复）：同一张表删到第 3 次就停下，不再耗 tokens。"""
+    from bonus_agent.agent import run_agent
+    from bonus_agent.failure import explain
+    from bonus_agent.llm import FakeLLM
+    rm = {"tool": "remove_dataset", "args": {"name": "人员"}}
+    ar = run_agent(FakeLLM([DATASET, rm] * 4 + [{"tool": "finish", "args": {"summary": "x"}}]),
+                   [_materials(tmp_path / "m")], tmp_path / "out")
+    assert "反复建了又删" in ar.error and len(ar.steps) == 6, ar.error
+    assert "删了 2 次" in ar.steps[3].result
+    assert "「人员」" in explain(ar.error)["title"]

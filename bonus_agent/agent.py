@@ -91,7 +91,7 @@ TOOLS: list[dict] = [
                     "quote 逐字复制包含该取值的原文（不超过 200 字），程序会核对 quote 在文件里、value 在 quote 里。",
      "parameters": _obj({"facts": {"type": "array", "items": _obj({
          "name": {**_S, "description": "参数名，写清适用范围，如 季度奖-部门净利润提成比例"},
-         "value": {**_S, "description": "原文写法"}, "file": _S, "quote": _S,
+         "value": {**_S, "description": "原文写法，一条只写一个值（阶梯、系数表每一档分开登记）"}, "file": _S, "quote": _S,
          "meaning": {**_S, "description": "可选：文字口径的规范说法，如 含税"},
          "override": {"type": "boolean", "description": "原文明确写了修改旧规定（修改为 / 以本通知为准）时为 true，"
                                                          "quote 要包含这句话"}}, ["name", "value", "file", "quote"])}},
@@ -1247,6 +1247,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     last_write: tuple[str, str] | None = None
     fails: dict[str, int] = {}         # 工具 -> 连续失败次数
     stuck = ""
+    undo: dict[tuple[str, str], int] = {}
     for turn in range(max_steps):
         used = llm.usage.prompt_tokens + llm.usage.completion_tokens
         if max_tokens and used >= max_tokens:
@@ -1344,6 +1345,16 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 last_write = (sig, result)
                 seen.clear()   # 工作区变了，重新读取是合理的
             fails[c["name"]] = 0 if ok else fails.get(c["name"], 0) + 1
+            if ok and c["name"] in ("remove_dataset", "remove_facts"):     # 建了又删、删了又建：没有进展的来回改
+                what = str((args or {}).get("name", ""))
+                undo[(c["name"], what)] = undo.get((c["name"], what), 0) + 1
+                if undo[(c["name"], what)] >= MAX_STUCK:
+                    repeats = MAX_STUCK
+                    stuck = f"「{what}」反复建了又删（{undo[(c['name'], what)]} 次），没有进展"
+                elif undo[(c["name"], what)] == MAX_STUCK - 1:
+                    result += (f"\n注意：「{what}」已经删了 {MAX_STUCK - 1} 次。先想清楚它该怎么定义再动手，"
+                               f"再删一次程序会停下；拿不准就用 ask_question 问财务")
+                    step.result = result
             if fails[c["name"]] >= MAX_STUCK:
                 stuck = f"{c['name']} 连续 {fails[c['name']]} 次失败，最后一次：{result[:300]}"
             steps.append(step)

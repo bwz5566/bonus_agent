@@ -120,7 +120,11 @@ def main(argv=None) -> int:
             print(f"{a.out} 里没有案卷记录（case.json）")
             return 1
         sheets = dict(s.split("=", 1) for s in a.sheet)
-        res = replay(case["workspace"], collect_files(a.files), json.loads(Path(a.cases).read_text(encoding="utf-8")), sheets)
+        try:
+            res = replay(case["workspace"], collect_files(a.files), json.loads(Path(a.cases).read_text(encoding="utf-8")), sheets)
+        except ValueError as e:
+            print(f"失败：{e}")
+            return 1
         print("\n".join(report(res)))
         return 0 if all(r.blocked for r in res) else 3
     if a.cmd == "serve":

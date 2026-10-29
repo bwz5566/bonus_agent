@@ -104,9 +104,14 @@ models:
 
   # ---- 私有化部署后 ----
   # 部署时把 model 改成选型胜出的模型（vLLM 启动时的 --served-model-name 或权重路径）
-  local:
+  local:                        # 1 张 48GB 卡即可（FP8）；启动命令见 README「本地模型」
     provider: local_vllm
     model: Qwen/Qwen3.6-35B-A3B
+    json_mode: json_schema
+    extra_body: {chat_template_kwargs: {enable_thinking: false}}
+  local-deepseek:               # 约 4 张 80GB 卡；分析能力更强
+    provider: local_vllm
+    model: deepseek-ai/DeepSeek-V4-Flash
     json_mode: json_schema
 
 # 选型时参与对比的模型（bonus-eval 默认跑 candidates，也可用 --models open,reference 等指定分组）

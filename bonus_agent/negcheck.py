@@ -61,6 +61,8 @@ def replay(snapshot: dict, files: list[Path], cases: list[dict], sheets: dict[st
     from bonus_agent.auto import build_inventory
     from bonus_agent.llm import FakeLLM
 
+    if not any(s != "共用" and d.get("pool") for s, d in (snapshot.get("drafts") or {}).items()):
+        raise ValueError("这个案卷还没有写好的方案（智能体没跑完或失败了），没法做坏数据回归")
     out = []
     for c in cases:
         p = c.get("patch") or {}

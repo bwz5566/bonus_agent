@@ -85,6 +85,9 @@ def check_fact(f: Fact, corpus: dict[str, str]) -> str | None:
     if q not in corpus[f.file] and not (len(parts) > 1 and all(p in corpus[f.file] for p in parts)):   # 多行引用逐行核对
         return f"quote 在「{f.file}」里找不到，要逐字复制原文（图片要先 view_image 转写）"
     if norm(f.value) not in q:
+        if len(re.findall(r"\d+(?:\.\d+)?", f.value)) > 1 and re.search(r"[,，;；:：、]|\s", f.value.strip()):
+            return (f"value「{f.value}」把好几个值写在了一条里。一条只登记一个值：阶梯、系数表每一档分开登记，"
+                    f"名字带上档位（如「{f.name}-第1档」value 8%，quote 写那一档所在的行）")
         return f"value「{f.value}」不在 quote 里，value 写原文的写法（如 5%、30万元），换算交给程序"
     if f.override and not any(w in q for w in OVERRIDE_WORDS):
         return f"quote 里没有写明修改旧规定（如 {'、'.join(OVERRIDE_WORDS[:5])}），不能标为 override"
