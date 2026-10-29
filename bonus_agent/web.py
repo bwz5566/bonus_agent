@@ -347,7 +347,10 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
 
     def user(c: HTTPBasicCredentials = Depends(basic)) -> dict:
         u = store.users.check(c.username, c.password)
-        if u is None:
+        if u is None:       # 原因只打在服务端控制台，不告诉浏览器
+            known = c.username in store.users.load()
+            print(f"登录失败：{'口令不对' if known else '没有这个用户'}（用户名「{c.username}」，数据目录 {store.root.resolve()}）",
+                  flush=True)
             raise HTTPException(401, "用户名或口令不对", headers={"WWW-Authenticate": 'Basic realm="bonus-agent"'})
         return u
 
@@ -646,7 +649,10 @@ def serve(root: str, host: str = "127.0.0.1", port: int = 8080, model: str | Non
     from bonus_agent.llm import LLM, load_config
     cfg = load_config()
     name = LLM.from_config(model, cfg).name          # 启动时就核对模型配置
-    if not Store(Path(root)).users.load():
+    users = Store(Path(root)).users.load()
+    if not users:
         raise SystemExit(f"还没有用户，先运行：bonus-agent user add --data {root} 用户名 --roles editor,approver")
+    print(f"数据目录：{Path(root).resolve()}；用户：{'、'.join(users)}；模型：{name}；浏览器打开 http://{host}:{port}",
+          flush=True)
     app = create_app(root, lambda: LLM.from_config(model, cfg), model_name=name, **kw)
     uvicorn.run(app, host=host, port=port)
