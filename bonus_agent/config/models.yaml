@@ -94,10 +94,12 @@ models:
     provider: deepseek
     model: deepseek-flash
     json_mode: json_object
+    extra_body: {thinking: {type: disabled}}     # 默认开思考且 effort=high，一步就能把 8192 个输出 tokens 用完
   deepseek-v4-pro:              # DeepSeek-V4-Pro，只有文本，图片交给 deepseek-flash 转写
     provider: deepseek
     model: deepseek-v4-pro
     json_mode: json_object
+    extra_body: {thinking: {type: disabled}}
     vision: deepseek-flash
 
   # ---- 私有化部署后 ----

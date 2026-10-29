@@ -128,6 +128,10 @@ def detect(facts: list[Fact], conflicts: dict[str, Conflict], questions: list[Qu
             by.setdefault(same_value(f), []).append(f)
         if len(by) < 2 or len({number(g[0].value) is None for g in by.values()}) > 1:
             continue      # 一处是数、一处是文字（如 0.1 和 “MIN(工龄,5)÷5”）：是两个参数用了同一个名字，不算冲突（record_facts 会提示改名）
+        files = {f.file for f in fs}
+        sets = {fl: frozenset(same_value(f) for f in fs if f.file == fl) for fl in files}
+        if len(files) == 1 or (len(set(sets.values())) == 1 and not any(f.override for f in fs)):
+            continue      # 只在一个文件里出现多个取值，或各文件给出的整组取值相同（如阶梯几档）：多半是把几档登记成了一个名字，不算冲突（record_facts 会提示）
         over, at = _override(fs)
         if len(over) == 1 and len(by) == 2 and not any(
                 not f.override and same_value(f) not in over and f.round > at for f in fs):
@@ -146,6 +150,21 @@ def detect(facts: list[Fact], conflicts: dict[str, Conflict], questions: list[Qu
         questions.append(q)
         new.append(q)
     return new
+
+
+def multi_valued(facts: list[Fact]) -> list[str]:
+    """同一个参数名下有几个取值、但不构成冲突的（一个文件里几个值，或各文件整组取值相同）。"""
+    groups: dict[str, list[Fact]] = {}
+    for f in facts:
+        groups.setdefault(f.name.strip(), []).append(f)
+    out = []
+    for n, fs in groups.items():
+        if len({same_value(f) for f in fs}) < 2 or len({number(f.value) is None for f in fs}) > 1:
+            continue
+        sets = {fl: frozenset(same_value(f) for f in fs if f.file == fl) for fl in {f.file for f in fs}}
+        if len(sets) == 1 or len(set(sets.values())) == 1:
+            out.append(n)
+    return out
 
 
 def mixed_names(facts: list[Fact]) -> list[str]:

@@ -46,7 +46,8 @@ MAX_STUCK = 3                  # 同一调用原样重复、或同一工具连�
 KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保留全文
 BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
 READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate"}
-WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", "ask_question", "answer_question"}
+WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", "remove_facts", "ask_question",
+               "answer_question"}
 RULE_SUFFIXES = {".docx", ".pptx", ".png", ".jpg", ".jpeg", ".txt", ".md"}   # 规则文档：要登记参数
 PIN_DOC_CHARS = 12000          # 不超过这么长的文档全文附在任务里（材料包），不必用工具读
 PIN_TOTAL_CHARS = 40000        # 材料包里文档全文的总长上限
@@ -95,6 +96,9 @@ TOOLS: list[dict] = [
          "override": {"type": "boolean", "description": "原文明确写了修改旧规定（修改为 / 以本通知为准）时为 true，"
                                                          "quote 要包含这句话"}}, ["name", "value", "file", "quote"])}},
          ["facts"])},
+    {"name": "remove_facts",
+     "description": "删掉台账里某个参数名的全部登记（登记错了时用，如把阶梯几档登记成了同一个名字）；依据它的、还没答复的冲突问题会被撤回。",
+     "parameters": _obj({"name": _S}, ["name"])},
     {"name": "define_dataset",
      "description": "定义（或重新定义）一张数据表。实体表写 key（每行一个对象，如员工、小组，以及被别的表按编号引用的项目、销售单）；"
                     "明细表写 link（每行挂到某层级对象或某个实体上，如回款 link=sales_id）；公司级表 key、link 都不写。"
@@ -422,6 +426,9 @@ class Workspace:
                             + f"\n下一步（程序判断）：{self.next_hint()}")
         new = fx.detect(self.facts, self.conflicts, self.questions, self.round)
         out = [f"已登记 {added} 条（台账共 {len(self.facts)} 条）。" + (f"另有 {dup} 条之前已登记过，已跳过。" if dup else "")] + lines
+        for n in fx.multi_valued(self.facts):
+            out.append(f"注意：「{n}」登记了几个不同的取值。如果是阶梯的几档、几个区域的系数这类一组参数，请用 remove_facts 删掉它，"
+                       "每档（每项）用不同的名字重新登记（如 …-第1档）；如果同一参数在材料里前后写法矛盾，用 ask_question 问财务")
         for n in fx.mixed_names(self.facts):
             out.append(f"注意：「{n}」下既有数值又有文字说明，像是两个不同的参数（如权重 10% 和归一化公式），"
                        "请换成两个名字分别登记（如 …-权重、…-公式）；同一参数的不同写法才用同一个名字")
@@ -812,9 +819,20 @@ class Workspace:
         self.reply_text, self.done = text.strip(), True
         return "已回复"
 
+    def remove_facts(self, name: str) -> str:
+        """删掉某个参数名下的全部登记（登记错了时用）；依据它的、还没答复的冲突问题由程序撤回。"""
+        before = len(self.facts)
+        self.facts = [f for f in self.facts if f.name.strip() != name.strip()]
+        if len(self.facts) == before:
+            raise ToolError(f"台账里没有「{name}」，已有：{'、'.join(dict.fromkeys(f.name for f in self.facts))[:800]}")
+        gone = fx.withdraw_stale(self.facts, self.conflicts, self.questions)
+        return (f"已删除「{name}」的 {before - len(self.facts)} 条登记" +
+                (f"，撤回问题 {'、'.join(q.id for q in gone)}" if gone else "") + "。请按正确的名字重新登记")
+
     def answer_question(self, id: str, answer: str) -> str:
         if not self.chat_by:
-            raise ToolError("只有对话中财务明确答复时才能用")
+            raise ToolError("现在不是和财务对话，待确认问题只能由财务答复，你不能替财务回答。如果是程序因为你登记错了而误报的冲突（如把阶梯几档登记成"
+                            "同一个名字），用 remove_facts 删掉那个名字的登记、按正确的名字重新登记，程序会自动撤回问题")
         q = next((q for q in self.questions if q.id == id), None)
         if q is None or q.withdrawn:
             raise ToolError(f"没有待答复的问题 {id}")
