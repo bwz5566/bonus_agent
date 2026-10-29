@@ -10,6 +10,9 @@ providers:
     # 可在 secrets.yaml 里用 base_url 覆盖，旧域名目前仍可用。
     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
     api_key_env: DASHSCOPE_API_KEY
+  deepseek:         # DeepSeek 官方 API，OpenAI 兼容
+    base_url: https://api.deepseek.com/v1
+    api_key_env: DEEPSEEK_API_KEY
   local_vllm:       # 自建 vLLM，部署后使用
     base_url: http://127.0.0.1:8000/v1
     api_key_env: VLLM_API_KEY
@@ -84,6 +87,20 @@ models:
     extra_body: {enable_thinking: false}
     cache: explicit
 
+  # ---- DeepSeek（只有文本，不能看图）----
+  # vision：不能看图的模型写 false，或写另一个能看图的模型名，由它转写图片；不写默认能看图。
+  # 不能看图又没配看图模型时，图片里的规则由智能体向财务提问，不会猜。
+  deepseek-chat:                # 非思考模式，支持工具调用和 JSON 输出
+    provider: deepseek
+    model: deepseek-chat
+    json_mode: json_object
+    vision: false
+  deepseek-reasoner:            # 思考模式（较慢，tokens 多）
+    provider: deepseek
+    model: deepseek-reasoner
+    json_mode: json_object
+    vision: false
+
   # ---- 私有化部署后 ----
   # 部署时把 model 改成选型胜出的模型（vLLM 启动时的 --served-model-name 或权重路径）
   local:
@@ -97,4 +114,5 @@ candidates: [qwen3.6-35b-a3b, qwen3.6-27b, qwen3.5-35b-a3b, qwen3.5-27b]
 groups:
   open: [qwen3.6-35b-a3b, qwen3.6-27b, qwen3.5-35b-a3b, qwen3.5-27b, qwen3.5-122b-a10b]
   reference: [qwen3-vl-plus, qwen3.6-flash]
+  deepseek: [deepseek-chat, deepseek-reasoner]
   legacy: [qwen3-vl-32b, qwen3-vl-30b-a3b, qwen3-vl-8b]

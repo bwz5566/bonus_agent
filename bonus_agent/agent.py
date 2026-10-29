@@ -273,7 +273,8 @@ class Workspace:
             if b.kind == "image":
                 k += 1
                 t = self.transcripts.get(f"{d.name}#{k}")
-                parts.append(f"{b.label()} 图片 #{k}" + (f"（已转写）\n{t}" if t else "（用 view_image 查看）"))
+                parts.append(f"{b.label()} 图片 #{k}" + (f"（已转写）\n{t}" if t else "（用 view_image 查看）"
+                                                          if self.llm.image_llm else "（当前模型不能看图，未转写）"))
             elif b.text:
                 parts.append(f"{b.label()}\n{b.text}")
         text = "\n\n".join(parts)
@@ -288,8 +289,12 @@ class Workspace:
         if not 1 <= index <= len(imgs):
             raise ToolError(f"{file} 中有 {len(imgs)} 张图片，index 应在 1~{len(imgs)}")
         b = imgs[index - 1]
+        seer = self.llm.image_llm
+        if seer is None:
+            raise ToolError(f"当前模型 {self.llm.name} 不能看图，也没有配置看图的模型（models.yaml 里的 vision）。"
+                            "图片里的规则如果影响计算，用 ask_question 请财务提供文字版，不要猜")
         ask = "请转写这张图片。" + (f"重点看清：{focus}" if focus else "")
-        text = self.llm.chat([{"role": "system", "content": prompt("transcribe")},
+        text = seer.chat([{"role": "system", "content": prompt("transcribe")},
                               {"role": "user", "content": [image_part(b.image, b.mime), {"type": "text", "text": ask}]}],
                              temperature=0).strip()
         self.transcripts[f"{d.name}#{index}"] = text
@@ -323,6 +328,8 @@ class Workspace:
 
     def transcribe_all(self):
         """开工前把所有图片转写好，材料包里直接给文字，模型不必逐张查看。"""
+        if self.llm.image_llm is None:
+            return
         for d in self.inv.docs:
             for k, _ in enumerate([b for b in d.blocks if b.kind == "image"], start=1):
                 if f"{d.name}#{k}" not in self.transcripts:

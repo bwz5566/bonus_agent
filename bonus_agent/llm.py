@@ -152,6 +152,8 @@ class LLM:
     timeout: float = 300
     cache: str | None = None          # explicit：在消息上加 cache_control 标记（百炼显式缓存）；不写则不加
     tools_extra_body: dict | None = None   # 智能体工具调用时覆盖 extra_body（如打开思考模式），抽取等其他调用不受影响
+    vision: bool = True               # 能否看图；不能看图时由 vision_llm 转写图片（没配置就不转写）
+    vision_llm: "LLM | None" = None
     usage: Usage = field(default_factory=Usage)
 
     @classmethod
@@ -162,9 +164,23 @@ class LLM:
             raise LLMError(f"未配置的模型 {name}，可选：{', '.join(cfg['models'])}")
         m = cfg["models"][name]
         prov = cfg["providers"][m["provider"]]
-        return cls(name, m["model"], prov["base_url"], provider_key(prov), m.get("json_mode", "json_object"),
-                   m.get("extra_body"), m.get("tool_mode", "native"), cache=m.get("cache"),
-                   tools_extra_body=m.get("tools_extra_body"))
+        llm = cls(name, m["model"], prov["base_url"], provider_key(prov), m.get("json_mode", "json_object"),
+                  m.get("extra_body"), m.get("tool_mode", "native"), cache=m.get("cache"),
+                  tools_extra_body=m.get("tools_extra_body"))
+        v = m.get("vision", True)       # true：自己看图；false：不能看图；模型名：用那个模型转写图片
+        if isinstance(v, str):
+            if v == name or cfg["models"].get(v, {}).get("vision", True) is not True:
+                raise LLMError(f"模型 {name} 的 vision 应是另一个能看图的模型名，得到 {v}")
+            llm.vision, llm.vision_llm = False, cls.from_config(v, cfg)
+            llm.vision_llm.usage = llm.usage          # 看图的用量记在同一处
+        else:
+            llm.vision = bool(v)
+        return llm
+
+    @property
+    def image_llm(self) -> "LLM | None":
+        """用来看图的模型：自己能看图就是自己，否则是配置的 vision 模型，都没有返回 None。"""
+        return self if self.vision else self.vision_llm
 
     def _usage(self, resp, t0: float):
         u = Usage(calls=1, latency_s=time.monotonic() - t0)

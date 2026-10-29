@@ -118,11 +118,16 @@ def system_prompt(datasets: dict[str, DatasetDef]) -> str:
 def transcribe(llm: LLM, docs: list[ParsedDoc]) -> list[str]:
     """把图片块转写为文字块（原地替换），返回转写文本列表。"""
     out = []
+    seer = getattr(llm, "image_llm", llm)
     for d in docs:
         for i, b in enumerate(d.blocks):
             if b.kind != "image" or not b.image:
                 continue
-            text = llm.chat([
+            if seer is None:     # 模型不能看图、也没有配置看图的模型：留占位，抽取时会提问
+                d.blocks[i] = Block(b.doc, b.page, "transcript", "【图片未转写：当前模型不能看图，内容需财务提供文字版】",
+                                    b.image, b.mime)
+                continue
+            text = seer.chat([
                 {"role": "system", "content": prompt("transcribe")},
                 {"role": "user", "content": [image_part(b.image, b.mime), {"type": "text", "text": "请转写这张图片。"}]},
             ], temperature=0)
