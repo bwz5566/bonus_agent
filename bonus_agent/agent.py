@@ -48,6 +48,9 @@ BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
 READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate"}
 WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", "ask_question", "answer_question"}
 RULE_SUFFIXES = {".docx", ".pptx", ".png", ".jpg", ".jpeg", ".txt", ".md"}   # 规则文档：要登记参数
+PIN_DOC_CHARS = 12000          # 不超过这么长的文档全文附在任务里（材料包），不必用工具读
+PIN_TOTAL_CHARS = 40000        # 材料包里文档全文的总长上限
+PIN_SHEET_ROWS = 30            # 不超过这么多行的工作表整表附上，更长的只附表头和前几行
 
 
 class ToolError(Exception):
@@ -188,6 +191,7 @@ class Workspace:
     conflicts: dict[str, fx.Conflict] = field(default_factory=dict)   # 已提问的参数冲突
     _sheet_corpus: dict[str, str] = field(default_factory=dict)
     progress: tuple[int, int] = (0, 0)                      # 已用步数、上限
+    pinned: set[str] = field(default_factory=set)           # 全文已附在材料包里的文件 / 工作表
 
     @property
     def data_files(self) -> list[Path]:
@@ -220,11 +224,17 @@ class Workspace:
                 lines.append(f"- {f.name}（{f.suffix[1:]}，约 {len(d.full_text())} 字" + (f"，{imgs} 张图片" if imgs else "") + "）")
         return "\n".join(lines)
 
-    def read_document(self, file: str, offset: int = 0) -> str:
+    def read_document(self, file: str, offset: int = 0, limit: int = MAX_RESULT_CHARS - 200) -> str:
         f = self._file(file)
         d = next((d for d in self.inv.docs if d.name == f.name), None)
         if d is None:
             raise ToolError(f"{file} 是 Excel，请用 read_sheet")
+        if f.name in self.pinned and limit < 10 ** 9:
+            return f"{f.name} 的全文已在任务开头的【材料包】里（每轮都在），直接看那里，不必再读。"
+        summary = _json_data_summary(f)
+        if summary and limit < 10 ** 9:
+            return (summary + "\n这是结构化数据文件，不能逐页读、也不能直接定义成数据表。"
+                    "同样的数据在 Excel 里有时用 Excel 的工作表定义数据表；它是唯一来源时请用 ask_question 请财务提供 Excel。")
         parts, k = [], 0
         for b in d.blocks:
             if b.kind == "image":
@@ -234,7 +244,7 @@ class Workspace:
             elif b.text:
                 parts.append(f"{b.label()}\n{b.text}")
         text = "\n\n".join(parts)
-        chunk = text[offset:offset + MAX_RESULT_CHARS - 200]
+        chunk = text[offset:offset + limit]
         more = len(text) - offset - len(chunk)
         return chunk + (f"\n\n……还有 {more} 字，用 offset={offset + len(chunk)} 继续读取" if more > 0 else "")
 
@@ -254,6 +264,8 @@ class Workspace:
 
     def read_sheet(self, file: str, sheet: str, start_row: int = 1, rows: int = 40) -> str:
         f = self._file(file)
+        if f"{f.name}/{sheet}" in self.pinned:
+            return f"{f.name}/{sheet} 整表已在任务开头的【材料包】里（每轮都在），直接看那里，不必再读。"
         if f"{f.name}/{sheet}" not in self.inv.sheet_text:
             sheets = [r.split("/", 1)[1] for r in self.inv.sheet_text if r.startswith(f.name + "/")]
             raise ToolError(f"{f.name} 中没有工作表「{sheet}」，可选：{sheets}")
@@ -275,6 +287,46 @@ class Workspace:
         tail = (f"\n（还有第 {end + 1}~{total} 行，用 start_row={end + 1} 继续；数据表不必读完，define_dataset 会读取全部行）"
                 if end < total else "\n（已到末尾）")
         return head + "\n" + "\n".join(out) + tail
+
+    def transcribe_all(self):
+        """开工前把所有图片转写好，材料包里直接给文字，模型不必逐张查看。"""
+        for d in self.inv.docs:
+            for k, _ in enumerate([b for b in d.blocks if b.kind == "image"], start=1):
+                if f"{d.name}#{k}" not in self.transcripts:
+                    try:
+                        self.view_image(d.name, k)
+                    except (LLMError, ToolError):
+                        pass       # 转写失败的图片留给模型自己用 view_image 看
+
+    def briefing(self) -> str:
+        """材料包：短文档全文（含图片转写）、小工作表整表、大工作表的表头和前几行。附在任务里，每轮都在，
+        较早的对话被裁剪也不会丢，模型不用反复读。"""
+        self.pinned = set()
+        parts, used = [], 0
+        for d in self.inv.docs:
+            text = self.read_document(d.name, 0, limit=10 ** 9)
+            summary = _json_data_summary(self._file(d.name)) if len(text) > PIN_DOC_CHARS else ""
+            if summary:
+                parts.append(f"## 文件 {d.name}（结构化数据，共 {len(text)} 字，不要逐页读）\n{summary}")
+                continue
+            if len(text) <= PIN_DOC_CHARS and used + len(text) <= PIN_TOTAL_CHARS:
+                used += len(text)
+                self.pinned.add(d.name)
+                parts.append(f"## 文件 {d.name}（全文）\n{text}")
+            else:
+                parts.append(f"## 文件 {d.name}（共 {len(text)} 字，太长未全附，以下为开头；需要时用 read_document 按 offset 读）\n"
+                             + text[:1500])
+        for f in self.data_files:
+            for ref in [r for r in self.inv.sheet_text if r.startswith(f.name + "/")]:
+                sheet = ref.split("/", 1)[1]
+                full = self.read_sheet(f.name, sheet, 1, PIN_SHEET_ROWS + 1)
+                if "（已到末尾）" in full:
+                    self.pinned.add(ref)
+                    parts.append(f"## 工作表 {ref}（整表）\n{full.split(chr(10), 1)[1].removesuffix('（已到末尾）').rstrip()}")
+                else:
+                    parts.append(f"## 工作表 {ref}（数据表，只附前 5 行；define_dataset 会读取全部行）\n"
+                                 + self.read_sheet(f.name, sheet, 1, 6))
+        return "\n\n".join(parts)
 
     def note(self, topic: str, text: str) -> str:
         if text.strip():
@@ -368,8 +420,54 @@ class Workspace:
             sample.append({fn: fmt(convert(vals[st.headers.index(c)], d.fields[fn])) for fn, c in m.columns.items()})
         lines = [f"已保存「{name}」（{kind}），{len(st.rows)} 行" + (f"，另有 {len(st.totals)} 行合计（不计入）" if st.totals else "")]
         lines += [f"注意：{w}" for w in warnings]
+        lines += [f"关联提示：{h}" for h in self._relation_hints(name)]
         lines.append("前 3 行（金额已换算为元）：" + json.dumps(sample, ensure_ascii=False))
         return "\n".join(lines)
+
+    def _values(self, name: str, fld: str) -> list[str]:
+        """数据表某个字段的全部取值（文字），用来判断表之间的关联。"""
+        from bonus_core.data.mapping import cell_text
+        m = self.mapping[name]
+        st = table_at(Path(m.file) if Path(m.file).exists() else self._file(Path(m.file).name), m.sheet, m.header_rows) \
+            if m.header_rows else self.inv.sheet(f"{Path(m.file).name}/{m.sheet}")
+        if st is None or fld not in m.columns:
+            return []
+        st, _ = filter_sheet(st, m.filter or None)
+        i = st.headers.index(m.columns[fld])
+        return [cell_text(v[i]) for _, v in st.rows if v[i] not in (None, "")]
+
+    def _relation_hints(self, name: str) -> list[str]:
+        """程序按数据判断的关联问题：编号列取值是别的表的主键却没同名、link 找不到被关联的表、该写 key 的没写。"""
+        d, out = self.datasets[name], []
+        keys = {o.key: n for n, o in self.datasets.items() if o.key and n != name}
+        try:
+            for f, fd in d.fields.items():
+                if fd.type not in ("id", "text") or f == d.key:
+                    continue
+                vals = set(self._values(name, f))
+                if not vals:
+                    continue
+                for k, n in keys.items():
+                    if k != f and k not in d.fields and vals <= set(self._values(n, k)):
+                        out.append(f"字段 {f} 的取值都是「{n}」的主键 {k}（如 {sorted(vals)[0]}）。要和「{n}」关联，"
+                                   f"请把这个字段命名为 {k}（column 不变）" + ("，并写 link" if not d.link and not d.key else ""))
+            if d.link and d.link not in keys and not any(d.link == o.link for n, o in self.datasets.items() if n != name):
+                own = [n for n, o in self.datasets.items() if n != name and d.link in o.fields]
+                out.append(f"link={d.link} 目前没有以 {d.link} 为主键的表" + (
+                    f"；「{own[0]}」有 {d.link} 列，如果它每行一个 {d.link}，把它重新定义为 key={d.link} 的实体表"
+                    if own else "；它应该是某个层级（如部门、小组、个人）或关联实体的主键"))
+            if not d.key and not d.link:
+                ids = [f for f in d.fields if f in keys]
+                if ids:
+                    out.append(f"这张表有 {ids[0]} 字段却没写 link，会被当作公司级表；按 {ids[0]} 挂到「{keys[ids[0]]}」上请写 link={ids[0]}")
+            for n, o in self.datasets.items():
+                if n != name and o.link and o.link in d.fields and d.key != o.link and o.link not in keys:
+                    vals = self._values(name, o.link)
+                    if vals and len(set(vals)) == len(vals):
+                        out.append(f"「{n}」按 {o.link} 关联，而本表每行一个不同的 {o.link}：本表应写 key={o.link}（成为关联实体）")
+        except Exception:      # 提示只是辅助，取值失败不影响保存
+            pass
+        return out
 
     def remove_dataset(self, name: str) -> str:
         if name not in self.datasets:
@@ -742,6 +840,27 @@ class Workspace:
         return "\n".join(lines)
 
 
+def _json_data_summary(path: Path) -> str:
+    """大 JSON 数据文件的结构摘要：各数组的条数、字段和第一条记录。不是 JSON 或不是数据时返回空。"""
+    if path.suffix.lower() != ".json":
+        return ""
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    arrays = ({k: v for k, v in obj.items() if isinstance(v, list)} if isinstance(obj, dict)
+              else {"（顶层）": obj} if isinstance(obj, list) else {})
+    if not arrays:
+        return ""
+    lines = ["结构摘要（程序生成）："]
+    for k, v in arrays.items():
+        first = v[0] if v else None
+        cols = list(first) if isinstance(first, dict) else []
+        lines.append(f"- {k}：{len(v)} 条" + (f"，字段 {cols}" if cols else "")
+                     + (f"，第一条 {json.dumps(first, ensure_ascii=False)[:300]}" if first is not None else ""))
+    return "\n".join(lines)
+
+
 def _revisions(revs) -> list[dict]:
     """修订版本：[{"name": "R1", "adjust": [{"node": "小组:G01", "amount": 900000, "reason": ...}]}, ...]。
     后一个修订包含前面所有修订的调整（逐步累加），R0 是不做调整的基准。"""
@@ -893,8 +1012,8 @@ def _answers_text(answers: list[dict] | None) -> str:
 
 
 def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = None, *,
-              answers: list[dict] | None = None, max_steps: int = 80, max_history_chars: int = 24000,
-              max_files: int = MAX_FILES, max_tokens: int | None = 1_000_000, exclude: list[str | Path] = (),
+              answers: list[dict] | None = None, max_steps: int = 80, max_history_chars: int = 40000,
+              max_files: int = MAX_FILES, max_tokens: int | None = 2_000_000, exclude: list[str | Path] = (),
               on_step: Callable[[int, Step], None] | None = None, resume: bool = True,
               message: str | None = None, by: str = "", chat: list[dict] | None = None) -> AgentResult:
     """max_steps 和 max_tokens 都是安全上限：模型调用 finish 就结束，正常不会用满。
@@ -929,6 +1048,9 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                         for i, a in enumerate(answers or []) if a.get("text") and a.get("answer") not in (None, "")]
     fresh = cs.apply_answers(ws.questions, answers)
     handlers = {t["name"]: getattr(ws, t["name"]) for t in TOOLS}
+    ws.transcribe_all()
+    pack = ("\n\n【材料包】以下是本批次材料的内容（程序读取，图片已转写），每轮都附在这里、不会被裁剪。"
+            "标了“全文 / 整表”的不要再用工具读；数据表只附了前几行，define_dataset 会读取全部行。\n\n" + ws.briefing())
     if message:             # 对话：财务的一条消息。先按现有规则试算一遍，便于回答和查算式
         ws.chat_by = by or "财务"
         for s in ws._order(ws.schemes):
@@ -942,6 +1064,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     else:
         task = ("请完成本批次的奖金计算。文件清单：\n" + ws.list_files() + _answers_text(answers)
                 + "\n\n完成后调用 finish。")
+    task += pack
     mode = llm.tool_mode
     sys = system_prompt()
     history: list[dict] = []

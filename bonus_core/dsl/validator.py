@@ -213,8 +213,16 @@ class _ScopeCheck:
                 else:
                     tl = self.lay.table_level[ds]
                     if tl < ctx:
+                        d = self.rs.datasets[ds]
+                        key = self.rs.allocation[ctx].key if 0 <= ctx < len(self.rs.allocation) else None
+                        if key and key in d.fields and d.key != key:
+                            fix = (f"「{ds}」有 {key} 字段：多半是数据表挂错了层，用 define_dataset 重新定义「{ds}」并写 link={key}，"
+                                   f"挂到「{lab(ctx)}」层（行里的其他编号仍能取到对应实体的字段和变量）；不要把计算移到上层")
+                        else:
+                            fix = (f"如果「{ds}」的行应属于「{lab(ctx)}」层的对象，给它加上该层的编号字段并写 link；"
+                                   f"确实是上层的数据，才把这个计算放到「{lab(tl)}」层或更上层")
                         self._block("agg_above", f"{node.fn}(...) 聚合的数据表「{ds}」挂在「{lab(tl)}」层，在「{lab(ctx)}」层"
-                                                 f"聚合不到任何行；请把这个计算放到「{lab(tl)}」层或更上层")
+                                                 f"聚合不到任何行。{fix}")
                 inner = ds if ds in self.lay.aux else ent
                 for a in list(args) + [v for k, v in kws if k == "where"]:
                     self._visit(a, ctx, inner, ds)
@@ -253,7 +261,12 @@ class _ScopeCheck:
             return
         if n in lay.entity_level and lay.entity_level[n] <= ctx:
             return
-        if n in lay.row_only:
+        if n in lay.row_only and agg is not None:
+            own = "、".join(sorted(lay.row_only[n]))
+            self._block("detail_outside_agg", f"正在对「{agg}」聚合，但 {n} 是「{own}」的字段，「{agg}」的行里取不到它。"
+                                              f"先在被引用的实体上定义变量（如 scope=项目 的 x = sum({n}, of: \"{own}\", where: ...)），"
+                                              f"再在「{agg}」的聚合里用这个变量（如 sum(x * share, of: \"{agg}\")）")
+        elif n in lay.row_only:
             self._block("detail_outside_agg", f"{n} 是明细表字段（每行一个值），必须放在 sum/avg/count 等聚合函数里使用；"
                                               f"逐行乘系数要写在聚合里面，如 sum({n} * lookup(表, 字段))")
         elif n in lay.entity_level:

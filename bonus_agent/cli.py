@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from decimal import Decimal
 import sys
 from pathlib import Path
@@ -77,7 +78,7 @@ def main(argv=None) -> int:
     p.add_argument("--new", action="store_true", help="忽略案卷目录里上一轮的工作，从头开始")
     p.add_argument("--max-files", type=int, default=30, help="一批最多处理的文件数，防止误传整个目录")
     p.add_argument("--max-steps", type=int, default=80, help="安全上限：智能体最多调用工具的轮数，完成即停，正常用不满")
-    p.add_argument("--max-tokens", type=int, default=1_000_000, help="安全上限：本次最多消耗的 tokens，超过即停止")
+    p.add_argument("--max-tokens", type=int, default=2_000_000, help="安全上限：本次最多消耗的 tokens，超过即停止")
     p.add_argument("--expected", help="期望结果 Excel，只在算完后用来逐个对象核对，不会交给智能体；不要放在输入文件夹里")
     p.add_argument("--expected-column", help="期望结果中应得金额的列名（自动识别不出或有几列时指定）")
     p.add_argument("--pipeline", action="store_true", help="使用固定流程（规划 → 抽取 → 计算），不让模型自主调度")
@@ -225,11 +226,17 @@ def _agent(a, cfg) -> int:
     from bonus_agent.agent import ToolError, run_agent
     answers = yaml.safe_load(Path(a.answers).read_text(encoding="utf-8")) if a.answers else None
     llm = LLM.from_config(a.model, cfg)
-    hist = cfg["models"][llm.name].get("max_history_chars", 24000)
+    hist = cfg["models"][llm.name].get("max_history_chars", 40000)
     print(f"使用模型 {llm.name}，智能体开始工作 ...", flush=True)
+
+    trace = os.environ.get("BONUS_AGENT_TRACE")     # 调试用：每一步的完整参数和结果逐行写入这个文件（JSON Lines）
 
     def show(n, step):
         args = json.dumps(step.args, ensure_ascii=False)
+        if trace:
+            with open(trace, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"n": n, "tool": step.tool, "args": step.args, "ok": step.ok, "result": step.result},
+                                   ensure_ascii=False) + "\n")
         print(f"  [{n:02d}] {step.tool} {args[:100]}{'…' if len(args) > 100 else ''}", flush=True)
         lines = step.result.splitlines() or [""]
         if step.ok:

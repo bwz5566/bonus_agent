@@ -193,7 +193,7 @@ class Runner:
     """每个案卷同时只跑一轮；全局最多同时跑 max_parallel 轮（大模型调用量大）。"""
 
     def __init__(self, store: Store, llm_factory: Callable[[], object], max_parallel: int = 2, max_steps: int = 80,
-                 max_tokens: int = 1_000_000):
+                 max_tokens: int = 2_000_000):
         self.store, self.llm_factory = store, llm_factory
         self.jobs: dict[str, Job] = {}
         self.lock = threading.Lock()
@@ -360,7 +360,7 @@ def files_table(base: Path, href: str, csrf: str | None = None, delete: str | No
 
 
 def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_parallel: int = 2, model_name: str = "",
-               max_steps: int = 80, max_tokens: int = 1_000_000):
+               max_steps: int = 80, max_tokens: int = 2_000_000):
     from fastapi import Depends, FastAPI, HTTPException, Request
     from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 

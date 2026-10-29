@@ -213,12 +213,13 @@ def test_agent_json_mode_and_state_in_every_turn():
     case, script = _agent_case()
     texts = [json.dumps({"thought": "", "tool": s["tool"], "args": s.get("args", {})}, ensure_ascii=False) for s in script]
     llm = FakeLLM(["这不是 JSON"] + texts)
-    llm.tool_mode = "json"
+    llm.tool_mode, llm.images = "json", "（图片转写）"
     q = next(s["args"] for s in script if s["tool"] == "ask_question")      # 财务已答复过同一个问题
     ar = run_agent(llm, [ANNUAL], answers=[{"text": q["text"], "options": q["options"], "answer": 0}])
     assert ar.ok, ar.error
-    assert all("【当前工作区状态】" in c[-1]["content"] for c in llm.calls)
-    assert "格式不对" in json.dumps(llm.calls[1], ensure_ascii=False)
+    agent_calls = [c for c in llm.calls if "材料包" in json.dumps(c, ensure_ascii=False)]
+    assert all("【当前工作区状态】" in c[-1]["content"] for c in agent_calls)
+    assert "格式不对" in json.dumps(agent_calls[1], ensure_ascii=False)
 
 
 def test_agent_history_shrink_keeps_prefix_until_needed():
@@ -245,9 +246,11 @@ def test_explicit_cache_markers():
     assert plain == [{"role": "user", "content": "任务"}]
 
 
-def test_agent_stops_looping_and_paginates():
+def test_agent_stops_looping_and_paginates(monkeypatch):
     from bonus_agent.agent import run_agent
     same = {"tool": "read_sheet", "args": {"file": "年度数据.xlsx", "sheet": "员工花名册", "rows": 5}}
+    import bonus_agent.agent as agent_mod
+    monkeypatch.setattr(agent_mod, "PIN_SHEET_ROWS", 10)       # 花名册不整表附进材料包，才需要翻页
     llm = FakeLLM([{"tool": "note", "args": {"topic": "总包", "text": "净利润 8%"}}] + [same] * 10)
     ar = run_agent(llm, [ANNUAL], max_steps=30)
     assert not ar.ok and "卡住" in ar.error and "反复调用 read_sheet" in ar.error and len(ar.steps) == 5
@@ -263,3 +266,20 @@ def test_agent_token_budget():
     llm.usage.prompt_tokens = 2_000_000
     ar = run_agent(llm, [ANNUAL], max_tokens=1_000_000)
     assert not ar.ok and "tokens" in ar.error and not ar.steps
+
+
+def test_briefing_pins_short_docs_and_small_sheets():
+    from bonus_agent.agent import Workspace
+    from bonus_agent.auto import build_inventory, collect_files
+    inp = ROOT / "evals" / "cases" / "syn_acceptance" / "inputs"
+    ws = Workspace(FakeLLM(["（图片转写）"]), build_inventory(collect_files([inp])))
+    ws.transcribe_all()
+    pack = ws.briefing()
+    # 规则文档、确认单、参数表整份附上；大的 JSON 和长数据表只附开头
+    assert {"01_奖金制度.docx", "02_规则补充.pptx", "finance_answers.json", "毛利率系数图.png",
+            "04_计算参数.xlsx/阶梯与系数"} <= ws.pinned
+    assert "business_data.json" not in ws.pinned and "03_业务输入.xlsx/销售明细" not in ws.pinned
+    assert "Q_OFFSET" in pack and "R_Q_TIER" in pack and "（图片转写）" in pack and len(pack) < 30000
+    assert "材料包" in ws.read_document("01_奖金制度.docx")
+    assert "材料包" in ws.read_sheet("04_计算参数.xlsx", "数值参数")
+    assert "第7行" in ws.read_sheet("03_业务输入.xlsx", "销售明细", start_row=7, rows=3)

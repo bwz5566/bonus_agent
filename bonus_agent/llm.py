@@ -237,6 +237,7 @@ class FakeLLM(LLM):
         self._responder = responder
         self._i = 0
         self.calls: list[list[dict]] = []
+        self.images: str | None = None      # 设置后，看图的调用一律返回它，不消耗预设回答
 
     def _next(self, *args):
         if callable(self._responder):
@@ -248,7 +249,13 @@ class FakeLLM(LLM):
     def chat(self, messages, **kw) -> str:
         self.calls.append(messages)
         self.usage += Usage(calls=1)
-        return self._next(messages) if callable(self._responder) else self._next()
+        if callable(self._responder):
+            return self._responder(messages)
+        has_image = any(isinstance(m.get("content"), list) and any(p.get("type") == "image_url" for p in m["content"])
+                        for m in messages)
+        if has_image and (self.images is not None or not isinstance(self._responder[min(self._i, len(self._responder) - 1)], str)):
+            return self.images or "（图片转写）"   # 智能体开工前转写图片；脚本里接下来是工具调用，不消耗脚本
+        return self._next()
 
     def chat_tools(self, messages, tools, **kw) -> dict:
         """预设回答为 {"tool": 名称, "args": {...}}、它们的列表，或纯文本。"""
