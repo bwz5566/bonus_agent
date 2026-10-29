@@ -22,7 +22,7 @@ from pydantic import ValidationError
 
 from bonus_agent.auto import (DATA_SUFFIXES, MAX_FILES, Inventory, PlanDataset, TooManyFiles, build_inventory,
                               check_dataset, collect_files, filter_sheet)
-from bonus_agent import case as cs
+from bonus_agent import case as cs, failure
 from bonus_agent import facts as fx
 from bonus_agent.extract_rules import Extraction, Question, check_quotes, prompt
 from bonus_agent.llm import LLM, LLMError, image_part, parse_json
@@ -367,7 +367,7 @@ class Workspace:
             if len(text) <= PIN_DOC_CHARS and used + len(text) <= PIN_TOTAL_CHARS:
                 used += len(text)
                 self.pinned.add(d.name)
-                parts.append(f"## 文件 {d.name}（全文）\n{text}")
+                parts.append(f"## 文件 {d.name}（全文）\n{_strip_tags(text, d.name)}")
             else:
                 parts.append(f"## 文件 {d.name}（共 {len(text)} 字，太长未全附，以下为开头；需要时用 read_document 按 offset 读）\n"
                              + text[:1500])
@@ -956,9 +956,9 @@ class Workspace:
         else:
             lines.append("- 尚未定义数据表")
         if self.drafts:
-            for s, d in self.drafts.items():
+            for s, text in _rules_briefs(self.drafts).items():
                 title = "共用部分（合并进每个方案）" if s == SHARED else f"方案「{s}」"
-                lines.append(f"- {title}规则摘要（不含出处；修改时按名字只传要改的部分）：\n" + _rules_brief(d))
+                lines.append(f"- {title}规则摘要（不含出处；修改时按名字只传要改的部分）：\n" + text)
         else:
             lines.append("- 尚未写入规则")
         if self.facts:
@@ -979,6 +979,16 @@ class Workspace:
             lines.append(f"- 试算「{s}」：" + ("最近修改后尚未试算" if s in self.untested or not r else
                                              f"已试算，奖金池 {fmt(Decimal(r['R0'].pool))}" + (f"，修订 {list(r)[1:]}" if len(r) > 1 else "")))
         return "\n".join(lines)
+
+
+def _strip_tags(text: str, name: str) -> str:
+    """材料包里每段前的 [文件名 · text] 标记去掉文件名（标题已写明）；只剩 text 的整行删掉，页码和表格、图片标记保留。"""
+    def sub(m):
+        rest = m.group(1).removeprefix(name).strip()
+        kind = m.group(2)
+        label = " · ".join(x for x in (rest, "" if kind == "text" else kind) if x)
+        return f"[{label}]\n" if label else ""
+    return re.sub(r"^\[([^\]\n]*?) · (\w+)\]\n", sub, text, flags=re.M)
 
 
 def _json_data_summary(path: Path) -> str:
@@ -1018,28 +1028,48 @@ def _revisions(revs) -> list[dict]:
     return out
 
 
-def _rules_brief(draft: dict, limit: int = 3000) -> str:
+def _rules_lines(draft: dict) -> list[tuple[str, str]]:
+    """规则摘要的每一行：(名字, 行)。"""
     out = []
     for n, t in (draft.get("tables") or {}).items():
         if t.get("kind") == "lookup" or "mapping" in t:
-            out.append(f"  表 {n}：查找表 {json.dumps(t.get('mapping'), ensure_ascii=False)}")
+            out.append((f"表 {n}", f"  表 {n}：查找表 {json.dumps(t.get('mapping'), ensure_ascii=False)}"))
         else:
-            out.append(f"  表 {n}：{t.get('mode', '')} 阶梯 {json.dumps(t.get('steps'), ensure_ascii=False)}")
+            out.append((f"表 {n}", f"  表 {n}：{t.get('mode', '')} 阶梯 {json.dumps(t.get('steps'), ensure_ascii=False)}"))
     for n, v in (draft.get("variables") or {}).items():
-        out.append(f"  变量 {n}[{v.get('scope', 'global')}] = {v.get('expr')}")
+        out.append((n, f"  变量 {n}[{v.get('scope', 'global')}] = {v.get('expr')}"))
     if "pool" in draft:
         p = draft["pool"] or {}
-        out.append(f"  pool[{p.get('scope', 'global')}] = {p.get('expr')}")
+        out.append(("pool", f"  pool[{p.get('scope', 'global')}] = {p.get('expr')}"))
     for lv in draft.get("allocation") or []:
-        out.append(f"  分配 {lv.get('level')}（key={lv.get('key')}, parent_key={lv.get('parent_key')}）权重 = {lv.get('weight')}")
+        out.append((f"分配 {lv.get('level')}", f"  分配 {lv.get('level')}（key={lv.get('key')}, parent_key={lv.get('parent_key')}）"
+                                              f"权重 = {lv.get('weight')}"))
     for p in draft.get("payout") or []:
-        out.append(f"  发放 {p.get('id')}[{p.get('scope')}] 暂缓比例 = {p.get('hold_ratio')}")
+        out.append((f"发放 {p.get('id')}", f"  发放 {p.get('id')}[{p.get('scope')}] 暂缓比例 = {p.get('hold_ratio')}"))
     for c in draft.get("checks") or []:
-        out.append(f"  校验 {c.get('id')}[{c.get('scope', 'global')}]：{c.get('expr')}")
+        out.append((f"校验 {c.get('id')}", f"  校验 {c.get('id')}[{c.get('scope', 'global')}]：{c.get('expr')}"))
     for r in draft.get("revisions") or []:
-        out.append(f"  修订 {r.get('name')}：" + "，".join(f"{a.get('node')}={a.get('amount')}" for a in r.get("adjust") or []))
-    text = "\n".join(out)
-    return text if len(text) <= limit else text[:limit] + "……"
+        out.append((f"修订 {r.get('name')}", f"  修订 {r.get('name')}："
+                    + "，".join(f"{a.get('node')}={a.get('amount')}" for a in r.get("adjust") or [])))
+    return out
+
+
+def _rules_briefs(drafts: dict, limit: int = 6000) -> dict[str, str]:
+    """各方案的规则摘要；和前面某个方案完全相同的行只列名字，不重复全文（每轮都附在状态里，省 tokens）。"""
+    seen: dict[str, str] = {}
+    out = {}
+    for s, d in drafts.items():
+        keep, same = [], {}
+        for key, line in _rules_lines(d):
+            if s != SHARED and seen.get(line, s) != s:
+                same.setdefault(seen[line], []).append(key)
+            else:
+                seen.setdefault(line, s)
+                keep.append(line)
+        keep += [f"  与「{x}」相同（不重复列出）：{'、'.join(names)}" for x, names in same.items()]
+        text = "\n".join(keep)
+        out[s] = text if len(text) <= limit else text[:limit] + "……"
+    return out
 
 
 # ---------------- 主循环 ----------------
@@ -1340,7 +1370,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     if message and not ws.changed and not fresh and not any((changes or {}).values()):
         # 对话里只是问答、没有改动：不算新的一轮，不改案卷和输出
         ar = AgentResult(ws, steps, None, None, error, round=(last or {}).get("n", 0))
-        ar.reply = ws.reply_text or (f"（没有完成：{error}）" if error else "")
+        ar.reply = ws.reply_text or (f"（没有完成）{failure.to_text(error)}" if error else "")
         return ar
     tested = {s: ws.results[s] for s in ws.schemes if s in ws.results and s not in ws.untested}
     rss = {s: ws._ruleset(s) for s in tested}

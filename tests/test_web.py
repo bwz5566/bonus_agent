@@ -200,3 +200,19 @@ def test_chat_window(env):
     assert "奖金池怎么来的？" in page and "发送" in page and "第 2 轮" in page
     assert post(c, store, f"/cases/{cid}/chat", {"text": "x"}, user="carol").status_code == 403
     assert any(a["action"] == "对话" for a in store.audit_log(cid))
+
+
+def test_failure_explained_with_retry(env):
+    app, store, scripts, c, m = env
+    from bonus_agent.failure import explain
+    x = explain("智能体卡住了，已停止以免继续消耗 tokens：trial_run 连续 3 次失败，最后一次：错误：方案「Q」试算失败："
+                "- [阻断] eval_error: min 没有可计算的明细行（回款明细）")
+    assert "「试算」" in x["title"] and "没有对应的明细行" in x["advice"] and "重试" in x["advice"]
+    assert "欠费" in explain("Error code: 400 - Arrearage")["title"]
+    cid = store.create("失败", "张会计")
+    (store.dir(cid) / "materials" / "数据.xlsx").write_bytes((m / "数据.xlsx").read_bytes())
+    scripts.append([{"tool": "trial_run"}] * 3)          # 连续失败 3 次，自动停下
+    post(c, store, f"/cases/{cid}/run")
+    wait(app, cid)
+    page = c.get(f"/cases/{cid}").text
+    assert "已自动停下" in page and ">重试<" in page and "详细信息" in page

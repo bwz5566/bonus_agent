@@ -34,6 +34,7 @@ from urllib.parse import quote
 import yaml
 
 from bonus_agent import case as cs
+from bonus_agent.failure import explain as explain_failure, to_text
 from bonus_agent.parsing.docs import PARSERS
 
 ROLES = {"editor": "传材料、答复问题、运行、按模板计算", "approver": "确认结果"}
@@ -244,7 +245,7 @@ class Runner:
             if message:
                 made = bool(ar.outputs)          # 对话里改了东西才会生成新的一轮
                 note = (f"\n\n（已按修改生成第 {ar.round} 轮：{job.message}）" if made else "")
-                self.store.chat_add(job.cid, "agent", "智能体", (ar.reply or (f"（没有回复：{ar.error}）" if ar.error else f"（已处理：{ar.ws.summary or job.message}）")) + note)
+                self.store.chat_add(job.cid, "agent", "智能体", (ar.reply or (f"（没有完成）{to_text(ar.error)}" if ar.error else f"（已处理：{ar.ws.summary or job.message}）")) + note)
                 if not made:
                     job.result, job.message = "", "已回复"
             if ar.outputs or not message:
@@ -300,7 +301,7 @@ table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid var(--li
 th{color:var(--mut);font-weight:500}td:not(:last-child),th{white-space:nowrap}.mut{color:var(--mut)}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
 button{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:6px 14px;cursor:pointer;font:inherit}
 button.link{background:none;color:var(--bad);padding:0}header button.link{color:var(--acc)}input[type=text],input[type=password],textarea{width:100%;padding:6px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);font:inherit}
-.q{border-top:1px solid var(--line);padding:10px 0}.q:first-of-type{border-top:0}.opt{display:block;margin:2px 0}
+.fail{border:1px solid var(--bad);border-radius:8px;padding:8px 12px;margin:8px 0} .q{border-top:1px solid var(--line);padding:10px 0}.q:first-of-type{border-top:0}.opt{display:block;margin:2px 0}
 pre{white-space:pre-wrap;background:var(--bg);padding:8px;border-radius:6px;max-height:320px;overflow:auto;margin:0}
 .wrap{overflow-x:auto}.chat{max-height:480px;overflow-y:auto;margin-bottom:10px}
 .msg{margin:8px 0;display:flex;flex-direction:column}.msg.user{align-items:flex-end}
@@ -498,8 +499,12 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         info = f"<p>{status_text(case)}</p>"
         if last.get("summary"):
             info += f"<p class='mut'>方案概述：{e(last['summary'])}</p>"
-        if last.get("error"):
-            info += f"<p class='bad'>{e(last['error'])}</p>"
+        failed = (job.status == "failed" if job and not busy else False) or (last.get("status") == "FAILED" and not busy)
+        if last.get("error") or (job and job.status == "failed" and not busy):
+            x = explain_failure((job.message if job and job.status == "failed" else "") or last.get("error", ""))
+            info += (f"<div class='fail'><p class='bad'><b>{e(x['title'])}</b></p><p>{e(x['advice'])}</p>"
+                     + (form(f"/cases/{cid}/run", "<p><button>重试</button></p>", csrf) if editor and failed else "")
+                     + f"<details><summary class='mut'>详细信息（给开发排查）</summary><pre>{e(x['detail'])}</pre></details></div>")
         if model_name:
             info += f"<p class='mut'>模型：{e(model_name)}</p>"
         check = out / "expected_check.txt"
@@ -507,7 +512,8 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             info += f"<p class='mut'>与期望结果核对：</p><pre>{e(check.read_text(encoding='utf-8'))}</pre>"
         if job:
             cls = "warn" if job.status == "running" else "bad" if job.status == "failed" else STATUS.get(job.result, ("", "mut"))[1]
-            head = "正在运行……" if job.status == "running" else job.message
+            head = ("正在运行……" if job.status == "running" else
+                    "本轮未完成（原因和处理办法见上方）" if job.status == "failed" or job.result == "FAILED" else job.message)
             info += (f"<p class='{cls}'>{e(head)}（{e(job.by)}，{e(job.started[11:16])} 开始）</p>"
                      + (f"<pre>{e(chr(10).join(job.steps[-15:]))}</pre>" if job.steps else ""))
         if editor and not busy:

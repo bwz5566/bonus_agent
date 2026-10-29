@@ -308,7 +308,8 @@ def _agent(a, cfg) -> int:
         print(f"  下一步：在 {Path(a.out) / 'questions.yaml'} 的 answer 填写答复（有补充材料放进材料文件夹），"
               f"然后用同一个 --out 再运行一次，会从这一轮接着做。")
     if ar.error:
-        print(f"\n未完成：{ar.error}")
+        from bonus_agent.failure import to_text
+        print(f"\n未完成：{to_text(ar.error).replace('点「重试」', '用同一个 --out 再运行一次')}\n  详细信息：{ar.error}")
     print(f"\n输出目录：{a.out}（result*.xlsx、rules*.yaml、mapping.yaml、questions.yaml、agent_log.json）")
     u = llm.usage
     cached = f"（其中命中缓存 {u.cached_tokens}）" if u.cached_tokens else ""
