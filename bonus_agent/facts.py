@@ -90,6 +90,16 @@ def check_fact(f: Fact, corpus: dict[str, str]) -> str | None:
     return None
 
 
+def nearest(f: Fact, lines: list[str]) -> str:
+    """引用找不到时，给出原文里最接近的一句（优先含取值的），让模型照着改，不用重读文件。"""
+    import difflib
+    q, v = norm(f.quote), norm(f.value)
+    cands = [ln.strip() for ln in lines if norm(ln)]
+    with_v = [ln for ln in cands if v and v in norm(ln)]
+    best = max(with_v or cands, key=lambda ln: difflib.SequenceMatcher(None, q, norm(ln)).ratio(), default="")
+    return best[:MAX_QUOTE]
+
+
 class Conflict(BaseModel):
     """一个冲突问题：参数名、各种取值（与问题选项一一对应）。"""
     name: str

@@ -153,3 +153,14 @@ def test_conflict_rounds(tmp_path):
     assert ar.status == "OK" and ar.ws.questions[1].withdrawn, ar.error
     q = yaml.safe_load((out / "questions.yaml").read_text(encoding="utf-8"))
     assert q[1]["withdrawn"] and ar.result.pool == "24000.00"
+
+
+def test_quote_miss_suggests_original_and_hints_next_step(tmp_path):
+    ws = Workspace(FakeLLM([]), build_inventory(sorted(_materials(tmp_path / "m").iterdir())))
+    out = ws.record_facts([fact("5%", "方案.docx", "季度奖按销售额 5% 计提")])
+    assert "最接近的一句：季度奖按部门销售额的 5% 计提奖金池" in out
+    ws.record_facts([F5])
+    assert "之前已登记过" in ws.record_facts([F5])
+    assert "define_dataset" in ws.next_hint() and "补充说明.docx" in ws.next_hint()
+    ws.progress = (30, 80)
+    assert "下一步（程序判断）" in ws.state()

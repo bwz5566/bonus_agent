@@ -175,6 +175,7 @@ class Workspace:
     facts: list[fx.Fact] = field(default_factory=list)      # 参数台账：从材料里登记的参数和口径
     conflicts: dict[str, fx.Conflict] = field(default_factory=dict)   # 已提问的参数冲突
     _sheet_corpus: dict[str, str] = field(default_factory=dict)
+    progress: tuple[int, int] = (0, 0)                      # 已用步数、上限
 
     @property
     def data_files(self) -> list[Path]:
@@ -271,26 +272,27 @@ class Workspace:
         return f"已记录「{topic}」（共 {len(self.notes)} 条笔记，每轮都会附在工作区状态里）"
 
     # ---- 参数台账 ----
+    def _lines(self, name: str) -> list[str]:
+        """文件的原文，按行：文档文字、图片转写、Excel 每行单元格。"""
+        f = self._file(name)
+        if f.suffix.lower() in DATA_SUFFIXES:
+            if f.name not in self._sheet_corpus:
+                import openpyxl
+                wb = openpyxl.load_workbook(f, data_only=True, read_only=True)
+                self._sheet_corpus[f.name] = "\n".join(
+                    " | ".join("" if v is None else str(v) for v in r) for w in wb.worksheets
+                    for r in w.iter_rows(values_only=True))
+            return self._sheet_corpus[f.name].splitlines()
+        d = next(d for d in self.inv.docs if d.name == f.name)
+        return (d.full_text() + "\n" + "\n".join(t for k, t in self.transcripts.items()
+                                                   if k.rsplit("#", 1)[0] == f.name)).splitlines()
+
     def _corpus(self) -> dict[str, str]:
-        """每个文件规范化后的全文：文档文字、图片转写、Excel 各单元格。"""
-        out = {}
-        for f in self.inv.files:
-            if f.suffix.lower() in DATA_SUFFIXES:
-                if f.name not in self._sheet_corpus:
-                    import openpyxl
-                    wb = openpyxl.load_workbook(f, data_only=True, read_only=True)
-                    self._sheet_corpus[f.name] = "".join(
-                        fx.norm("".join("" if v is None else str(v) for v in r)) for w in wb.worksheets
-                        for r in w.iter_rows(values_only=True))
-                out[f.name] = self._sheet_corpus[f.name]
-            else:
-                d = next(d for d in self.inv.docs if d.name == f.name)
-                out[f.name] = fx.norm(d.full_text() + "".join(t for k, t in self.transcripts.items()
-                                                             if k.rsplit("#", 1)[0] == f.name))
-        return out
+        """每个文件规范化后的全文，用来核对引用。"""
+        return {f.name: fx.norm("".join(self._lines(f.name))) for f in self.inv.files}
 
     def record_facts(self, facts: list[dict]) -> str:
-        corpus, lines, added = self._corpus(), [], 0
+        corpus, lines, added, dup = self._corpus(), [], 0, 0
         for i, a in enumerate(facts, start=1):
             try:
                 f = fx.Fact.model_validate({**a, "round": self.round}) if isinstance(a, dict) else None
@@ -302,14 +304,17 @@ class Workspace:
                 continue
             bad = fx.check_fact(f, corpus)
             if bad:
-                lines.append(f"第 {i} 条「{f.name}」未登记：{bad}")
+                near = fx.nearest(f, self._lines(f.file)) if f.file in corpus and "找不到" in bad else ""
+                lines.append(f"第 {i} 条「{f.name}」未登记：{bad}" + (f"。原文里最接近的一句：{near}（照这句改 quote，不必重读文件）"
+                                                                      if near else ""))
                 continue
             if any((g.name, g.file, fx.norm(g.quote)) == (f.name, f.file, fx.norm(f.quote)) for g in self.facts):
+                dup += 1
                 continue
             self.facts.append(f)
             added += 1
         new = fx.detect(self.facts, self.conflicts, self.questions, self.round)
-        out = [f"已登记 {added} 条（台账共 {len(self.facts)} 条）。"] + lines
+        out = [f"已登记 {added} 条（台账共 {len(self.facts)} 条）。" + (f"另有 {dup} 条之前已登记过，已跳过。" if dup else "")] + lines
         if new:
             out.append("程序发现取值冲突，已自动向财务提问（阻断，不要自行取舍，相关规则先按待定处理）：")
             out += [f"- {q.id} {q.text}" for q in new]
@@ -639,9 +644,29 @@ class Workspace:
         self.summary, self.ignored, self.done = summary, ignored, True
         return "已完成"
 
+    def next_hint(self) -> str:
+        """程序根据工作区判断的下一步（模型原地打转或步数用得多时提示）。"""
+        docs = [f.name for f in self.inv.files if f.suffix.lower() in RULE_SUFFIXES]
+        bare = [d for d in docs if not any(f.file == d for f in self.facts)
+                and d not in {str(i.get("ref", "")) for i in self.ignored}]
+        if not self.datasets:
+            step = f"用 define_dataset 定义数据表（数据文件：{'、'.join(f.name for f in self.data_files) or '无'}）"
+        elif not self.schemes:
+            step = "用 set_rules 写入规则（笔记和参数台账里已有的内容不必重读）"
+        elif any(s in self.untested or s not in self.results for s in self.schemes):
+            step = "用 trial_run 试算"
+        elif bare:
+            step = f"用 record_facts 登记这些文档的参数：{'、'.join(bare)}"
+        else:
+            step = "核对后调用 finish"
+        return step + (f"；还没登记参数的规则文档：{'、'.join(bare)}" if bare and "record_facts" not in step else "")
+
     def state(self) -> str:
         """每轮附在请求末尾的工作区摘要。"""
         lines = ["【当前工作区状态】" + (f"（{self.budget}）" if self.budget else "")]
+        used, limit = self.progress
+        if limit and used >= limit * 0.3:
+            lines.append(f"- 已用 {used}/{limit} 步，下一步（程序判断）：{self.next_hint()}")
         if self.notes:
             lines.append("- 笔记：")
             lines += [f"  · {k}：{v}" for k, v in self.notes.items()]
@@ -882,6 +907,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         if max_tokens and used >= max_tokens:
             error = f"tokens 用量 {used} 达到上限 {max_tokens}，已停止"
             break
+        ws.progress = (len(steps), max_steps)
         ws.budget = f"已用 {len(steps)} 步，上限 {max_steps} 步" + (f"；tokens 已用 {used}，上限 {max_tokens}" if max_tokens else "")
         if _shrink(history, max_history_chars):
             seen.clear()       # 较早的结果已省略，重新读取是合理的
@@ -931,7 +957,8 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             if c["name"] in READ_ONLY and sig in seen:
                 repeats += 1
                 result = (f"这次调用与第 {seen[sig]} 步完全相同，内容没有变化，已跳过。不要重复调用；"
-                          f"需要更多内容请换参数（如 start_row、offset），否则根据已有信息进行下一步（定义数据表、写规则、试算）。")
+                          f"需要更多内容请换参数（如 start_row、offset），否则根据已有信息进行下一步。"
+                          f"程序判断的下一步：{ws.next_hint()}")
                 steps.append(Step(c["name"], {}, result, False))
                 if on_step:
                     on_step(len(steps), steps[-1])
