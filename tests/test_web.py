@@ -219,8 +219,9 @@ def test_failure_explained_with_retry(env):
     page = c.get(f"/cases/{cid}").text
     assert "已自动停下" in page and ">重试<" in page and "详细信息" in page
     said = store.chat(cid)[-1]["text"]                 # 对话里先说原因，再说需要什么帮助、想了解什么
-    assert said.index("原因：") < said.index("需要你帮忙：") < said.index("想了解：")
-    assert "点「发送」" in said and "不建议直接重试" in said
+    assert said.index("已自动停下") < said.index("想请你确认：") < said.index("怎么继续：")
+    assert "点「发送」" in said and "直接重试多半还会卡" in said and "原因：" not in said
+    assert "程序内部出错" in explain("'list' object has no attribute 'items'")["title"]
     # 上一轮没完成时发文字：作为说明接着做这一轮（不是只回答问题的对话）
     scripts.append([{"tool": "finish", "args": {"summary": "x"}}])
     post(c, store, f"/cases/{cid}/chat", {"text": "没有回款的销售单按 0 处理"})
@@ -272,3 +273,12 @@ def test_chat_text_is_citable_source(tmp_path):
                            {"name": "在线客服上限", "value": "800.00", "file": "03_说明.pdf", "quote": "800.00"}])
     assert "已登记 1 条" in out and f"file 只能是：01_制度.md、{CHAT_SOURCE}" in out
     assert CHAT_SOURCE in ws.list_files() and "上限作用于用工折算后的最终金额" in ws.briefing()
+
+
+def test_list_where_object_expected_is_tolerated(tmp_path):
+    """模型把对象写成列表（[{"C1": "pool"}]、[{"name": "x", "expr": ...}]）时程序改回来；改不回来的报参数错，不让整轮崩掉。"""
+    from bonus_agent.agent import _coerce_args
+    assert _coerce_args("cover_clauses", {"items": [{"C1": "pool"}, {"C2": "tables.t"}]}) == {"items": {"C1": "pool", "C2": "tables.t"}}
+    assert _coerce_args("cover_clauses", {"items": [{"id": "C1", "where": "pool"}]}) == {"items": {"C1": "pool"}}
+    v = _coerce_args("set_rules", {"variables": [{"name": "n", "expr": "1", "scope": "个人"}]})["variables"]
+    assert v == {"n": {"expr": "1", "scope": "个人"}}

@@ -264,7 +264,7 @@ class Runner:
                            }.get(ar.status, f"未完成：{ar.error}")
             if message:
                 made = bool(ar.outputs)          # 对话里改了东西才会生成新的一轮
-                note = (f"\n\n（已按修改生成第 {ar.round} 轮：{job.message}）" if made else "")
+                note = (f"\n\n（已按修改生成第 {ar.round} 轮" + ("" if ar.error else f"：{job.message}") + "）" if made else "")
                 self.store.chat_add(job.cid, "agent", "智能体", (ar.reply or (f"（没有完成）{to_text(ar.error)}" if ar.error else f"（已处理：{ar.ws.summary or job.message}）")) + note)
                 if not made:
                     job.result, job.message = "", "已回复"
@@ -274,13 +274,36 @@ class Runner:
                 self.store.audit(job.cid, job.by, "本轮结束", round=ar.round, status=ar.status, error=ar.error)
         except Exception as e:  # 失败要如实显示，不能当作完成
             job.status, job.message = "failed", f"运行失败：{e}"
-            self.store.chat_add(job.cid, "agent", "智能体", f"第 {job.started[11:16]} 开始的这一轮运行出错，没有完成。\n{to_text(str(e))}")
+            self.store.chat_add(job.cid, "agent", "智能体", f"这一轮（{job.started[11:16]} 开始）中断了。\n{to_text(f'{type(e).__name__}: {e}')}")
             self.store.audit(job.cid, job.by, "本轮失败", error=str(e))
+
+
+OUT_GROUPS = ("给财务核对", "留档：计算口径（确认后作为模板，每期复用）", "排查用（开发看）")
+
+
+def output_kind(name: str) -> tuple[str, str]:
+    """输出文件属于哪一类、有什么用。"""
+    if name == "result.xlsx":
+        return OUT_GROUPS[0], "奖金结果（有多个方案时是总览）"
+    if name.startswith("result_") and name.endswith(".xlsx"):
+        return OUT_GROUPS[0], f"方案 {name[7:-5]} 的逐人结果和计算过程"
+    if name.startswith("待确认问题"):
+        return OUT_GROUPS[0], "需要你答复的问题"
+    if name.startswith("rules"):
+        return OUT_GROUPS[1], "计算规则（参数、公式、分配层级）"
+    if name == "mapping.yaml":
+        return OUT_GROUPS[1], "数据表和 Excel 列的对应关系"
+    if name == "questions.yaml":
+        return OUT_GROUPS[1], "问题和你的答复记录"
+    if name.startswith("adjust"):
+        return OUT_GROUPS[1], "人工调整记录"
+    return OUT_GROUPS[2], {"agent_log.json": "智能体每一步的完整记录", "running_steps.txt": "运行过程（逐步落盘）",
+                           "expected_check.txt": "和期望结果的核对"}.get(name, "")
 
 
 def round_text(ar) -> str:
     if ar.error:
-        return f"第 {ar.round} 轮没有完成。\n{to_text(ar.error)}"
+        return f"第 {ar.round} 轮没做完。{to_text(ar.error)}"
     if ar.status == "NEEDS_CONFIRMATION":
         qs = [q for q in ar.pending][:8]
         return (f"第 {ar.round} 轮暂停：有 {len(ar.pending)} 个问题需要你确认，确认前不出结果。\n"
@@ -605,10 +628,19 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             parts.append(f"<section><h2>问题</h2>{body}</section>")
         # 结果
         top = [p for p in sorted(out.glob("*")) if p.is_file() and p.name != cs.CASE_FILE]
-        res = "".join(f"<li><a href='/cases/{cid}/dl/out/{e(p.name)}'>{e(p.name)}</a></li>" for p in top)
+        groups: dict[str, list[str]] = {}
+        for p in top:
+            g, note = output_kind(p.name)
+            groups.setdefault(g, []).append(f"<li><a href='/cases/{cid}/dl/out/{e(p.name)}'>{e(p.name)}</a> "
+                                            f"<span class='mut'>{e(note)}</span></li>")
+        res = "".join((f"<p><b>{e(g)}</b></p><ul>{''.join(groups[g])}</ul>" if g == OUT_GROUPS[0] else
+                       f"<details><summary>{e(g)}（{len(groups[g])} 个）</summary><ul>{''.join(groups[g])}</ul></details>")
+                      for g in OUT_GROUPS if g in groups)
         hist = sorted((out / "history").glob("*")) if (out / "history").exists() else []
-        res = (f"<ul>{res}</ul>" if res else "<p class='mut'>无</p>") + "".join(
-            f"<details><summary>{e(h.name)}</summary>{files_table(h, f'/cases/{cid}/dl/out/history/{h.name}')}</details>" for h in hist)
+        res = (res or "<p class='mut'>无</p>") + (
+            "<details><summary>历次存档（每轮的全部文件）</summary>" + "".join(
+                f"<details><summary>{e(h.name)}</summary>{files_table(h, f'/cases/{cid}/dl/out/history/{h.name}')}</details>"
+                for h in hist) + "</details>" if hist else "")
         parts.append(f"<section><h2>本轮输出</h2>{res}</section>")
         # 确认
         conf = (case or {}).get("confirmed")

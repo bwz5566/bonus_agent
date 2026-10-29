@@ -219,6 +219,9 @@ def _coerce_args(tool: str, args: dict) -> dict:
                 out[k] = json.loads(v)
             except ValueError:
                 pass
+    for k, v in list(out.items()):         # 对象写成了列表：[{"x": {...}}, ...] 或 [{"name"/"id": "x", ...}, ...]
+        if props.get(k, {}).get("type") == "object" and isinstance(v, list) and v and all(isinstance(i, dict) for i in v):
+            out[k] = _list_to_obj(v)
     if tool == "set_rules":
         for k in ("tables", "variables"):
             v = out.get(k)
@@ -226,6 +229,19 @@ def _coerce_args(tool: str, args: dict) -> dict:
                 item = {a: b for a, b in v.items() if a != "name"}
                 out[k] = {v["name"]: item}
     return out
+
+
+def _list_to_obj(items: list[dict]):
+    if all(len(i) == 1 for i in items):
+        return {k: v for i in items for k, v in i.items()}
+    for key in ("name", "id"):
+        if all(isinstance(i.get(key), str) for i in items):
+            out = {}
+            for i in items:
+                rest = {k: v for k, v in i.items() if k != key}
+                out[i[key]] = next(iter(rest.values())) if len(rest) == 1 else rest
+            return out
+    return items
 
 
 def openai_tools() -> list[dict]:
@@ -1585,6 +1601,9 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 result, ok = f"错误：参数不是合法 JSON：{e}", False
             except TypeError as e:
                 result, ok = f"错误：参数不对：{e}", False
+            except (AttributeError, KeyError, IndexError, ValueError) as e:     # 参数结构和工具说明不一致（如对象写成了列表）
+                result, ok = (f"错误：参数结构不对（{type(e).__name__}: {e}）。请按工具说明的格式重写："
+                              "要求对象 {...} 的地方不要写成列表 [...]，反之亦然"), False
             if len(result) > MAX_RESULT_CHARS:
                 result = result[:MAX_RESULT_CHARS] + "……（已截断）"
             step = Step(c["name"], args if isinstance(args, dict) else {}, result, ok)
@@ -1798,6 +1817,11 @@ def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None =
     if ar.single:
         paths["excel"] = out / "result.xlsx"
         write_excel(ar.ruleset, ar.result, paths["excel"], extra_sheets=_sheets(ar, qrows))
+        return paths
+    if len(ar.results) == 1 and list(next(iter(ar.results.values()))) == ["R0"]:     # 一个方案、没有修订：只出一份结果
+        name = next(iter(ar.results))
+        paths["excel"] = out / "result.xlsx"
+        write_excel(ar.rulesets[name], ar.results[name]["R0"], paths["excel"], extra_sheets=_sheets(ar, qrows))
         return paths
     for name, revs in ar.results.items():
         for rev, res in revs.items():
