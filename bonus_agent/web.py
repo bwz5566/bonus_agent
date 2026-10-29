@@ -233,7 +233,11 @@ class Runner:
                 if expected and ar.results:
                     from bonus_agent.compare import compare_expected, report
                     lines = report(compare_expected(ar.results, expected[0]))
-                    (d / "out" / "expected_check.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+                    text = "\n".join(lines) + "\n"
+                    (d / "out" / "expected_check.txt").write_text(text, encoding="utf-8")
+                    hist = d / "out" / "history" / f"第{ar.round}轮"     # 每轮的核对结果随该轮存档
+                    if ar.outputs and hist.is_dir():
+                        (hist / "expected_check.txt").write_text(text, encoding="utf-8")
             job.status, job.result = "done", ar.status
             job.message = {"OK": "已出结果，请核对", "NEEDS_CONFIRMATION": f"有 {len(ar.pending)} 个问题等答复，本轮不出结果"
                            }.get(ar.status, f"未完成：{ar.error}")
@@ -498,6 +502,9 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             info += f"<p class='bad'>{e(last['error'])}</p>"
         if model_name:
             info += f"<p class='mut'>模型：{e(model_name)}</p>"
+        check = out / "expected_check.txt"
+        if check.exists() and not busy:
+            info += f"<p class='mut'>与期望结果核对：</p><pre>{e(check.read_text(encoding='utf-8'))}</pre>"
         if job:
             cls = "warn" if job.status == "running" else "bad" if job.status == "failed" else STATUS.get(job.result, ("", "mut"))[1]
             head = "正在运行……" if job.status == "running" else job.message
