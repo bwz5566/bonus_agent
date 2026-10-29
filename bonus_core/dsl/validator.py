@@ -219,8 +219,17 @@ class _ScopeCheck:
                             fix = (f"「{ds}」有 {key} 字段：多半是数据表挂错了层，用 define_dataset 重新定义「{ds}」并写 link={key}，"
                                    f"挂到「{lab(ctx)}」层（行里的其他编号仍能取到对应实体的字段和变量）；不要把计算移到上层")
                         else:
-                            fix = (f"如果「{ds}」的行应属于「{lab(ctx)}」层的对象，给它加上该层的编号字段并写 link；"
-                                   f"确实是上层的数据，才把这个计算放到「{lab(tl)}」层或更上层")
+                            ents = self.lay.reach(ds) | ({ds} if ds in self.lay.aux else set())
+                            bridge = [(n, e) for n, dd in self.rs.datasets.items() if key and dd.link == key
+                                      for e in sorted(self.lay.reach(n) & ents)]
+                            if bridge:
+                                n, e = bridge[0]
+                                fix = (f"「{ds}」的行能关联到「{e}」，而「{n}」的每行属于「{lab(ctx)}」层又引用「{e}」："
+                                       f"先定义 scope={e} 的变量（如 x = sum(..., of: \"{ds}\", where: ...)），"
+                                       f"再在「{lab(ctx)}」层写 sum(x * 比例字段, of: \"{n}\")；不要把计算移到上层")
+                            else:
+                                fix = (f"如果「{ds}」的行应属于「{lab(ctx)}」层的对象，给它加上该层的编号字段并写 link；"
+                                       f"确实是上层的数据，才把这个计算放到「{lab(tl)}」层或更上层")
                         self._block("agg_above", f"{node.fn}(...) 聚合的数据表「{ds}」挂在「{lab(tl)}」层，在「{lab(ctx)}」层"
                                                  f"聚合不到任何行。{fix}")
                 inner = ds if ds in self.lay.aux else ent

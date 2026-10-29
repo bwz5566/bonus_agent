@@ -729,6 +729,9 @@ class Workspace:
             over = sum(Decimal(p.overpaid or 0) for p in base.payouts.values())
             lines.append(f"发放：本次实发合计 {paid:,.2f}，暂缓合计 {held:,.2f}"
                          + (f"，已发抵扣 {off:,.2f}，超发待核对 {over:,.2f}" if off or over else ""))
+            if held == 0 and any(p.get("pay_ratio") or p.get("hold_ratio") for p in self._merged(name).get("payout") or []):
+                lines.append("请核对：写了按比例发放，但所有对象都全额可发、暂缓为 0。比例的分子分母是否写反"
+                             "（如应为 回款 ÷ 销售），筛选条件是否对")
         if refs:
             lines.append("引用：" + "、".join(refs))
         mismatch = self._period_mismatch(name)
