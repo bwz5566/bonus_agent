@@ -166,20 +166,24 @@ def _fix_arguments(text: str) -> str:
         return text or "{}"
     except ValueError:
         pass
-    try:
-        obj, _ = json.JSONDecoder().raw_decode((text or "").strip())
-        if isinstance(obj, dict):
-            return json.dumps(obj, ensure_ascii=False)
-    except ValueError as e:
-        err = str(e)
-    else:
-        err = "参数不是 JSON 对象"
-    return json.dumps({"_invalid_json": f"参数不是合法 JSON（{err}），未执行。请重新调用，参数写成一个合法的 JSON 对象"},
-                      ensure_ascii=False)
+    raw = (text or "").strip()
+    err, pos = "参数不是 JSON 对象", None
+    for cand in (raw, re.sub(r",\s*([}\]])", r"\1", raw)):        # 原样；去掉多余的结尾逗号
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(cand)
+            if isinstance(obj, dict):
+                return json.dumps(obj, ensure_ascii=False)
+        except json.JSONDecodeError as e:
+            if cand is raw:
+                err, pos = e.msg, e.pos
+    near = f"，出错位置附近：…{raw[max(0, pos - 60):pos + 40]}…" if pos is not None else ""
+    return json.dumps({"_invalid_json": f"参数不是合法 JSON（{err}{near}），未执行。请重新调用：字符串用双引号，"
+                                        "表达式里的双引号要转义成 \\\"，不要有注释和多余的逗号"}, ensure_ascii=False)
 
 
 def _coerce_args(tool: str, args: dict) -> dict:
-    """数组、对象类参数被模型写成了 JSON 字符串（思考模式下常见）时，解析回来。"""
+    """常见的参数写法偏差改回来：数组、对象被写成 JSON 字符串（思考模式下常见）；tables / variables 只写了一项、
+    把名字放进了 name 字段（{"name": "x", "expr": ...} → {"x": {"expr": ...}}）。"""
     props = next((t["parameters"]["properties"] for t in TOOLS if t["name"] == tool), {})
     out = dict(args)
     for k, v in args.items():
@@ -188,6 +192,12 @@ def _coerce_args(tool: str, args: dict) -> dict:
                 out[k] = json.loads(v)
             except ValueError:
                 pass
+    if tool == "set_rules":
+        for k in ("tables", "variables"):
+            v = out.get(k)
+            if isinstance(v, dict) and isinstance(v.get("name"), str) and ("expr" in v or "kind" in v):
+                item = {a: b for a, b in v.items() if a != "name"}
+                out[k] = {v["name"]: item}
     return out
 
 
@@ -448,6 +458,13 @@ class Workspace:
             raise ToolError(str(e)) from None
         if st is None:
             raise ToolError(f"{f.name}/{sheet} 没有自动识别出表格，请先 read_sheet 查看，再用 header_rows 指定表头行")
+        fixed = []
+        if isinstance(fields, dict):     # key / link 写成了 Excel 列名（如 entity_id），而字段已改名（dept_id ← entity_id）
+            for which, val in (("key", key), ("link", link)):
+                hit = [f for f, d in fields.items() if isinstance(d, dict) and d.get("column") == val] if val and val not in fields else []
+                if len(hit) == 1:
+                    fixed.append(f"{which} 写的是列名 {val}，已改成对应的字段名 {hit[0]}（key / link 要写字段名）")
+                    key, link = (hit[0], link) if which == "key" else (key, hit[0])
         try:
             pd = PlanDataset(sheet=sheet, key=key or None, link=link or None, desc=desc, fields=fields)
         except ValidationError as e:
@@ -459,7 +476,11 @@ class Workspace:
         flt = {str(k): ([str(x) for x in v] if isinstance(v, list) else str(v)) for k, v in (filter or {}).items()}
         d, m, warnings, errors = check_dataset(name, pd, st, types, header_rows, flt)
         if errors:
-            raise ToolError("未保存，请修正：\n" + "\n".join(f"- {e}" for e in errors))
+            owner = next((n for n, o in self.datasets.items() if n != name and key and o.key == key), None)
+            if owner and any("重复值" in e for e in errors):
+                errors.append(f"{key} 是「{owner}」的主键，这张表应写 link={key}（不写 key），每行挂到对应的{owner}上")
+            raise ToolError("未保存，请修正：\n" + "\n".join(f"- {e}" for e in fixed + errors))
+        warnings = fixed + warnings
         self.datasets[name], self.mapping[name] = d, m
         self.untested |= set(self.schemes)
         kind = f"实体表，主键 {d.key}" if d.key else f"明细表，关联 {d.link}" if d.link else "公司级表"
