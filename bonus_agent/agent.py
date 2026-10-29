@@ -1213,6 +1213,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
               answers: list[dict] | None = None, max_steps: int = 80, max_history_chars: int = 40000,
               max_files: int = MAX_FILES, max_tokens: int | None = 2_000_000, exclude: list[str | Path] = (),
               on_step: Callable[[int, Step], None] | None = None, resume: bool = True,
+              should_stop: Callable[[], bool] | None = None,
               message: str | None = None, by: str = "", chat: list[dict] | None = None) -> AgentResult:
     """max_steps 和 max_tokens 都是安全上限：模型调用 finish 就结束，正常不会用满。
 
@@ -1277,6 +1278,9 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     undo: dict[tuple[str, str], int] = {}
     same_block, prev_block = 0, set()
     for turn in range(max_steps):
+        if should_stop and should_stop():
+            error = f"已手动停止（第 {len(steps)} 步）"
+            break
         used = llm.usage.prompt_tokens + llm.usage.completion_tokens
         if max_tokens and used >= max_tokens:
             error = f"tokens 用量 {used} 达到上限 {max_tokens}，已停止"

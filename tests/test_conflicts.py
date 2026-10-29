@@ -265,3 +265,15 @@ def test_saving_rules_with_same_blocking_issue_stops(tmp_path):
     assert "同样的阻断问题" in ar.error and len(ar.steps) == 4, ar.error
     assert "连续两次没改掉" in ar.steps[2].result
     assert "同一个问题一直没改掉" in explain(ar.error)["title"]
+
+
+def test_manual_stop_keeps_steps(tmp_path):
+    """页面上点「停止」：下一步开始前停下，已做的步骤照常保存。"""
+    from bonus_agent.agent import run_agent
+    from bonus_agent.failure import explain
+    from bonus_agent.llm import FakeLLM
+    calls = []
+    ar = run_agent(FakeLLM([DATASET, rules(0.1), {"tool": "finish", "args": {"summary": "x"}}]),
+                   [_materials(tmp_path / "m")], tmp_path / "out", should_stop=lambda: bool(calls.append(1)) or len(calls) > 1)
+    assert ar.error.startswith("已手动停止") and len(ar.steps) == 1
+    assert "手动停止" in explain(ar.error)["title"] and (tmp_path / "out" / "agent_log.json").exists()

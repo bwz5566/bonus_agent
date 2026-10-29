@@ -216,3 +216,14 @@ def test_failure_explained_with_retry(env):
     wait(app, cid)
     page = c.get(f"/cases/{cid}").text
     assert "已自动停下" in page and ">重试<" in page and "详细信息" in page
+
+
+def test_steps_written_while_running(env):
+    app, store, scripts, c, m = env
+    cid = store.create("过程", "张会计")
+    (store.dir(cid) / "materials" / "数据.xlsx").write_bytes((m / "数据.xlsx").read_bytes())
+    scripts.append([{"tool": "trial_run"}] * 3)
+    post(c, store, f"/cases/{cid}/run")
+    wait(app, cid)
+    log = (store.dir(cid) / "out" / "running_steps.txt").read_text(encoding="utf-8")
+    assert log.count("trial_run") == 3 and "结果：" in log

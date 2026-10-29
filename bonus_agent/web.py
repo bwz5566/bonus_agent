@@ -188,6 +188,7 @@ class Job:
     message: str = ""
     steps: list[str] = field(default_factory=list)
     thread: threading.Thread | None = None
+    cancel: bool = False            # 页面上点了「停止」：下一步开始前停下
 
 
 class Runner:
@@ -219,6 +220,16 @@ class Runner:
         job.thread.start()
         return job
 
+    @staticmethod
+    def _step(job: Job, out: Path, n: int, s) -> None:
+        line = f"[{n:02d}] {s.tool} {'✓' if s.ok else '✗'} {(s.result.splitlines() or [''])[0][:160]}"
+        job.steps.append(line)
+        try:     # 逐步落盘：强制关掉服务时也留下过程，便于排查
+            with open(out / "running_steps.txt", "a" if n > 1 else "w", encoding="utf-8") as f:
+                f.write(f"{line}\n    参数：{json.dumps(s.args, ensure_ascii=False)[:600]}\n    结果：{s.result[:600]}\n")
+        except OSError:
+            pass
+
     def _run(self, job: Job, new: bool, message: str | None = None) -> None:
         from bonus_agent.agent import run_agent
         d = self.store.dir(job.cid)
@@ -228,8 +239,7 @@ class Runner:
                 ar = run_agent(llm, [d / "materials"], d / "out", resume=not new, max_steps=self.max_steps,
                                max_tokens=self.max_tokens, message=message, by=job.by,
                                chat=self.store.chat(job.cid)[:-1] if message else None,
-                               on_step=lambda n, s: job.steps.append(f"[{n:02d}] {s.tool} {'✓' if s.ok else '✗'} "
-                                                                      f"{(s.result.splitlines() or [''])[0][:160]}"))
+                               on_step=lambda n, s: self._step(job, d / "out", n, s), should_stop=lambda: job.cancel)
                 expected = sorted((d / "expected").glob("*.xlsx"))
                 if expected and ar.results:
                     from bonus_agent.compare import compare_expected, report
@@ -516,6 +526,9 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
                     "本轮未完成（原因和处理办法见上方）" if job.status == "failed" or job.result == "FAILED" else job.message)
             info += (f"<p class='{cls}'>{e(head)}（{e(job.by)}，{e(job.started[11:16])} 开始）</p>"
                      + (f"<pre>{e(chr(10).join(job.steps[-15:]))}</pre>" if job.steps else ""))
+        if editor and busy and job and job.status == "running":
+            info += form(f"/cases/{cid}/stop", "<p><button>停止</button> <span class='mut'>当前这一步做完后停下，已做的部分会保存</span></p>"
+                         if not job.cancel else "<p class='mut'>正在停止……</p>", csrf)
         if editor and not busy:
             info += form(f"/cases/{cid}/run", "<p><button>运行下一轮</button> <label class='mut'><input type='checkbox' "
                                               "name='new' value='1'> 从头开始（不接着上一轮）</label></p>", csrf)
@@ -676,6 +689,17 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             runner.start(cid, u["display"], new=f.get("new") == "1")
         except RuntimeError as err:
             raise HTTPException(409, str(err)) from None
+        return back(cid)
+
+    @app.post("/cases/{cid}/stop")
+    async def stop(cid: str, request: Request, u: dict = Depends(user)):
+        need(u, "editor")
+        case_dir(cid)
+        await posted(request, u)
+        job = runner.jobs.get(cid)
+        if job and runner.running(cid):
+            job.cancel = True
+            store.audit(cid, u["display"], "停止运行")
         return back(cid)
 
     @app.post("/cases/{cid}/chat")
