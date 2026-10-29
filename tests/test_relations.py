@@ -262,3 +262,64 @@ offsets:
     bad.allocation[1].key, bad.allocation[1].level = "emp_id", "个人"
     msgs = [i.message for i in validate(bad) if i.code == "parent_key_missing"]
     assert msgs and "offsets 的 scope" in msgs[0]
+
+
+def test_data_patches_append_and_correct():
+    """数据修订：补充表并入原表（按单号去重、取值对照）；长表 / 宽表更正（核对旧值）；有歧义直接报错。"""
+    from bonus_core.data.table import from_records
+    base = yaml.safe_load('''
+name: 修订
+version: v2
+datasets:
+  项目: {key: project_id, fields: {project_id: {type: id}, grade: {type: text}, budget: {type: money}}}
+  参与: {key: part_id, fields: {part_id: {type: id}, project_id: {type: id}, score: {type: number}}}
+  收款: {link: project_id, fields: {receipt_id: {type: id}, project_id: {type: id}, amount: {type: money}, approved: {type: text}}}
+  补充收款: {link: project_id, fields: {receipt_id: {type: id}, project_id: {type: id}, amount: {type: money}, approved: {type: text}}}
+  项目更正: {fields: {project_id: {type: id}, field_name: {type: text}, new_value: {type: text}}}
+  评分修订: {fields: {part_id: {type: id}, old_score: {type: number}, new_score: {type: number}}}
+pool: {scope: global, expr: 'sum(amount, of: "收款", where: approved == "是")'}
+allocation:
+  - {level: 项目, key: project_id, weight: 'if(grade == "优", 2, 1)'}
+  - {level: 参与记录, key: part_id, parent_key: project_id, weight: score}
+patches:
+  - {kind: append, source: 补充收款, into: 收款, unique: receipt_id, values: {approved: {通过: 是, 驳回: 否}}}
+  - {kind: correct, source: 项目更正, target: 项目, key: project_id, field: field_name, value: new_value, labels: {交付评级: grade}}
+  - {kind: correct, source: 评分修订, target: 参与, key: part_id, set: {score: new_score}, expect: {score: old_score}}
+''')
+    recs = {
+        "项目": [{"project_id": "J1", "grade": "合格", "budget": 1}, {"project_id": "J2", "grade": "合格", "budget": 1}],
+        "参与": [{"part_id": "A1", "project_id": "J1", "score": 80}, {"part_id": "A2", "project_id": "J1", "score": 20},
+                 {"part_id": "A3", "project_id": "J2", "score": 50}],
+        "收款": [{"receipt_id": "R1", "project_id": "J1", "amount": 1000, "approved": "是"}],
+        "补充收款": [{"receipt_id": "R1", "project_id": "J1", "amount": 1000, "approved": "通过"},     # 重传：跳过
+                     {"receipt_id": "R2", "project_id": "J2", "amount": 500, "approved": "通过"},
+                     {"receipt_id": "R3", "project_id": "J2", "amount": 700, "approved": "驳回"}],
+        "项目更正": [{"project_id": "J1", "field_name": "交付评级", "new_value": "优"},
+                     {"project_id": "J2", "field_name": "交付评级", "new_value": "合格"}],                # 同值：不算变化
+        "评分修订": [{"part_id": "A2", "old_score": 20, "new_score": 30}],
+    }
+    rs = RuleSet.model_validate(base)
+    assert not [i for i in validate(rs) if i.severity == "blocking"], validate(rs)
+    res = compute(rs, from_records(rs, recs))
+    assert res.pool == "1500.00"                                      # 1000 + 500，驳回的 700 不计，R1 不重复
+    assert res.nodes["项目:J1"].final == "1000.00"                    # J1 改成“优”权重 2
+    assert res.nodes["参与记录:A1"].final == "727.27" and res.nodes["参与记录:A2"].final == "272.73"   # 80 : 30
+    notes = [i.message for i in res.issues if i.code == "data_patch"]
+    assert "2 行并入「收款」，1 行重复已跳过" in notes[0], notes
+    assert any("J1 grade：合格 → 优" in n for n in notes) and any("A2 score：20 → 30" in n for n in notes)
+    # 没有修订的方案（V1）不受影响
+    v1 = RuleSet.model_validate({**base, "patches": []})
+    assert compute(v1, from_records(v1, recs)).pool == "1000.00"
+
+    def fails(**change):
+        r = {**recs, **change}
+        with pytest.raises(EngineError) as ei:
+            compute(rs, from_records(rs, r))
+        return str(ei.value.issues[0].message)
+    assert "内容不同" in fails(补充收款=[{"receipt_id": "R1", "project_id": "J1", "amount": 999, "approved": "通过"}])
+    assert "对不上" in fails(评分修订=[{"part_id": "A2", "old_score": 25, "new_score": 30}])
+    assert "重复修订" in fails(评分修订=[{"part_id": "A2", "old_score": 20, "new_score": 30}] * 2)
+    assert "找不到" in fails(评分修订=[{"part_id": "A9", "old_score": 20, "new_score": 30}])
+    assert "新值不同" in fails(项目更正=[{"project_id": "J1", "field_name": "交付评级", "new_value": "优"},
+                                      {"project_id": "J1", "field_name": "交付评级", "new_value": "合格"}])
+    assert "没有字段" in fails(项目更正=[{"project_id": "J1", "field_name": "项目经理", "new_value": "x"}])

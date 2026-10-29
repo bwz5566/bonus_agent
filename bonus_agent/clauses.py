@@ -76,6 +76,7 @@ def known_refs(drafts: dict, datasets: dict) -> set[str]:
         for k in ("payout", "offsets", "checks"):
             out |= {f"{k}.{x['id']}" for x in d.get(k) or [] if isinstance(x, dict) and x.get("id")}
         out |= {f"revisions.{r['name']}" for r in d.get("revisions") or [] if isinstance(r, dict) and r.get("name")}
+        out |= {f"patches.{x['source']}" for x in d.get("patches") or [] if isinstance(x, dict) and x.get("source")}
     return out
 
 

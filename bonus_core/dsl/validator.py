@@ -97,6 +97,40 @@ def validate(rs: RuleSet) -> list[Issue]:
     for lv in _weighted(rs):
         if not lv.weight.strip():
             issues.append(Issue.block("weight_missing", f"层级「{lv.level}」需要权重表达式 weight", f"allocation.{lv.level}"))
+    for p in rs.patches:                         # 数据修订：表和字段都要存在
+        p_w = f"patches.{p.source}"
+        p_names = [p.source, p.into] if p.kind == "append" else [p.source, p.target]
+        p_miss = [n for n in p_names if n not in rs.datasets]
+        if p_miss:
+            issues.append(Issue.block("patch_dataset", f"数据修订引用的数据表 {p_miss} 不存在", p_w))
+            continue
+        p_src, p_dst = rs.datasets[p_names[0]], rs.datasets[p_names[1]]
+        if p.kind == "append":
+            p_u = p.unique or p_dst.key
+            if not p_u:
+                issues.append(Issue.block("patch_field", f"并入「{p.into}」要写 unique（去重用的单号字段）", p_w))
+            elif p_u not in p_src.fields or p_u not in p_dst.fields:
+                issues.append(Issue.block("patch_field", f"去重字段 {p_u} 要在「{p.source}」和「{p.into}」里都有（补充表按原表的字段名定义）", p_w))
+            p_lost = [f for f in p_dst.fields if f not in p_src.fields]
+            if p_lost:
+                issues.append(Issue.warn("patch_field", f"「{p.source}」没有「{p.into}」的字段 {p_lost}，并入的行这些字段为空", p_w))
+            p_bad = [f for f in p.values if f not in p_dst.fields]
+            if p_bad:
+                issues.append(Issue.block("patch_field", f"values 里的字段 {p_bad} 不在「{p.into}」里", p_w))
+        else:
+            if p.key not in p_src.fields or p.key not in p_dst.fields:
+                issues.append(Issue.block("patch_field", f"编号字段 {p.key} 要在「{p.source}」和「{p.target}」里都有", p_w))
+            if bool(p.field) == bool(p.set):
+                issues.append(Issue.block("patch_field", "更正要在 field + value（长表：更正字段列、新值列）和 set（宽表）里写且只写一种", p_w))
+            p_cols = [c for c in [p.field, p.value] if c] + list(p.set.values()) + list(p.expect.values())
+            if p.field and not p.value:
+                issues.append(Issue.block("patch_field", "长表更正要同时写 value（新值所在的字段）", p_w))
+            p_bad = [c for c in p_cols if c not in p_src.fields]
+            if p_bad:
+                issues.append(Issue.block("patch_field", f"字段 {p_bad} 不在「{p.source}」里", p_w))
+            p_bad = [f for f in list(p.set) + list(p.expect) + list(p.labels.values()) if f not in p_dst.fields]
+            if p_bad:
+                issues.append(Issue.block("patch_field", f"字段 {p_bad} 不在「{p.target}」里", p_w))
     for c in rs.checks:
         if c.scope != "global" and c.scope not in levels and c.scope not in lay.aux:
             issues.append(Issue.block("scope_bad", f"校验 {c.id} 的 scope「{c.scope}」不是 global、分配层级或关联实体表名", f"checks.{c.id}"))

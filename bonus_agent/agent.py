@@ -144,6 +144,13 @@ TOOLS: list[dict] = [
                                      "description": '已发抵扣：[{"id": "prior", "scope": "个人", "expr": "已发金额表达式"}]，'
                                                     '可用 scheme_paid("QUARTER", "R2") 引用另一个方案某修订的本次实发'},
                          "checks": {"type": "array", "items": {"type": "object"}},
+                         "patches": {"type": "array", "items": {"type": "object"},
+                                     "description": '数据修订（只影响本方案）：并入补充表 {"kind": "append", "source": "补充收款", "into": "收款流水", '
+                                                    '"unique": "receipt_id", "values": {"approved": {"通过": "是", "驳回": "否"}}}；'
+                                                    '更正 {"kind": "correct", "source": "项目更正", "target": "项目", "key": "project_id", '
+                                                    '"field": "field_name", "value": "new_value", "labels": {"交付评级": "grade"}} 或 '
+                                                    '{"kind": "correct", "source": "评分修订", "target": "参与分配", "key": "part_id", '
+                                                    '"set": {"contrib_score": "new_score"}, "expect": {"contrib_score": "old_score"}}'},
                          "revisions": {"type": "array", "items": {"type": "object"},
                                        "description": '人工调整的修订版本，后一个包含前面的调整：[{"name": "R1", "adjust": '
                                                       '[{"node": "小组:G01", "amount": 900000, "reason": "..."}]}]；R0 为不调整的基准'}})},
@@ -653,7 +660,7 @@ class Workspace:
                     draft.setdefault(k, {}).pop(n, None)
                 else:
                     draft.setdefault(k, {})[n] = v
-        for k in ("pool", "allocation", "payout", "offsets", "checks", "revisions"):
+        for k in ("pool", "allocation", "payout", "offsets", "checks", "patches", "revisions"):
             if parts.get(k) is not None:
                 draft[k] = parts[k]
         for lv in draft.get("allocation") or []:       # 最上层不需要权重，模型常写成 null

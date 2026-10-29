@@ -149,6 +149,36 @@ class Offset(RuleItem):
     expr: str                  # 已发金额
 
 
+class AppendRows(RuleItem):
+    """数据修订：把补充表的行并入原表（如补充收款并入收款流水）。补充表要先按原表的字段名定义（列名、单位可以不同）。
+    按 unique 字段去重：原表已有同号且内容相同的跳过（同一文件重传不重复累加），内容不同的报错。"""
+    kind: Literal["append"] = "append"
+    source: str                # 补充表（数据表名）
+    into: str                  # 原表
+    unique: str | None = None  # 去重字段（单号）；不写时用原表的 key
+    values: dict[str, dict[str, str]] = {}   # 取值对照：字段 -> {补充表写法: 原表写法}，如 approved: {通过: 是, 驳回: 否}
+
+
+class CorrectRows(RuleItem):
+    """数据修订：按编号更正原表的字段值。两种写法二选一：
+    - 长表（每行改一个字段）：field 写“更正字段”列、value 写“新值”列，labels 把更正字段的写法对照到原表字段名；
+    - 宽表：set 写 {原表字段: 补充表里新值的字段}。
+    expect 写 {原表字段: 补充表里旧值的字段}：先核对旧值，不符就报错。找不到编号、同一对象同一字段改成不同的值也报错；
+    新值与原值相同不算变化（可重复执行）。"""
+    kind: Literal["correct"] = "correct"
+    source: str
+    target: str
+    key: str                   # 编号字段（两张表同名）
+    field: str | None = None
+    value: str | None = None
+    labels: dict[str, str] = {}
+    set: dict[str, str] = {}
+    expect: dict[str, str] = {}
+
+
+DataPatch = Annotated[Union[AppendRows, CorrectRows], Field(discriminator="kind")]
+
+
 class GoldenCase(_Base):
     """财务手算的金标样例。datasets 直接给标准表的行。"""
     name: str
@@ -169,6 +199,7 @@ class RuleSet(_Base):
     payout: list[PayoutCondition] = []
     offsets: list[Offset] = []
     checks: list[Check] = []
+    patches: list[DataPatch] = []        # 数据修订：计算前按顺序作用在数据上（只影响本方案）
     tests: list[GoldenCase] = []
 
     # ---- 便捷方法 ----

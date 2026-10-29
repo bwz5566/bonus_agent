@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
 
+from bonus_core.data.patches import apply_patches
 from bonus_core.data.table import Datasets
 from bonus_core.dsl.models import RuleSet
 from bonus_core.dsl.validator import _weighted, validate
@@ -142,8 +143,10 @@ class Engine:
         if issues:
             raise EngineError(issues)
         self.rs = rs
+        data, patched = apply_patches(rs, data)
         self.data = data
         root, by_level, issues = build_tree(rs, data)
+        issues = patched + issues
         blocking = [i for i in issues if i.severity == "blocking"]
         if blocking:
             raise EngineError(blocking)
