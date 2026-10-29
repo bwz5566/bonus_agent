@@ -197,7 +197,7 @@ bonus-agent map --model qwen3-vl-32b --rules draft.yaml 数据.xlsx
 pip install -e ".[agent,web]"
 bonus-agent user add --data /srv/bonus 张会计账号 --roles editor --display 张会计       # 口令在终端输入，只存 PBKDF2 哈希
 bonus-agent user add --data /srv/bonus 李经理账号 --roles approver --display 李经理
-bonus-agent serve --data /srv/bonus --host 127.0.0.1 --port 8000 [--model 本地模型]
+bonus-agent serve --data /srv/bonus --host 127.0.0.1 --port 8080 [--model local]
 ```
 
 - 角色：`editor`（经办）传材料、答复问题、运行、按模板计算；`approver`（审批）确认结果；其他登录用户只读。

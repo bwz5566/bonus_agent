@@ -12,7 +12,7 @@
   confirm --out 案卷目录 --by 确认人 [--note 说明] [数据文件...]
                                            财务确认最新一轮结果：复算核对后把规则、映射和调整冻结为 案卷目录/template/，
                                            以后每期用 bonus run-template 计算，不再调用大模型
-  serve --data 数据目录 [--host 127.0.0.1] [--port 8000] [--model M]
+  serve --data 数据目录 [--host 127.0.0.1] [--port 8080] [--model M]
                                            内网网页服务：看问题、填答复、传材料、运行下一轮、确认、按模板计算
   user add --data 数据目录 用户名 --roles editor,approver [--display 姓名]
                                            添加或修改网页用户（口令从终端输入，只存哈希）
@@ -60,7 +60,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("serve")
     p.add_argument("--data", required=True, help="数据目录：用户、案卷、材料和结果都在这里")
     p.add_argument("--host", default="127.0.0.1", help="默认只监听本机；内网访问请放在 HTTPS 反向代理后面")
-    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--port", type=int, default=8080, help="默认 8080（8000 留给本地 vLLM）")
     p.add_argument("--model")
     p.add_argument("--max-parallel", type=int, default=2, help="同时最多运行几个案卷")
     p = sub.add_parser("user")

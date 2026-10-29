@@ -640,7 +640,7 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
     return app
 
 
-def serve(root: str, host: str = "127.0.0.1", port: int = 8000, model: str | None = None, **kw) -> None:
+def serve(root: str, host: str = "127.0.0.1", port: int = 8080, model: str | None = None, **kw) -> None:
     import uvicorn
 
     from bonus_agent.llm import LLM, load_config
