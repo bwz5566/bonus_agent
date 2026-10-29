@@ -290,11 +290,11 @@ def test_text_only_model_and_vision_model():
     from bonus_agent.auto import build_inventory, collect_files
     from bonus_agent.llm import LLM, load_config
     cfg = load_config(ROOT / "bonus_agent" / "config" / "models.yaml")
-    ds = LLM.from_config("deepseek-chat", cfg)
-    assert ds.image_llm is None and ds.base_url.startswith("https://api.deepseek.com")
-    cfg["models"]["deepseek-chat"]["vision"] = "qwen3.6-35b-a3b"       # 不能看图的模型可以配一个看图的模型
-    ds2 = LLM.from_config("deepseek-chat", cfg)
-    assert ds2.image_llm.name == "qwen3.6-35b-a3b" and ds2.image_llm.usage is ds2.usage
+    ds = LLM.from_config("deepseek-v4-pro", cfg)          # 只有文本，图片交给配置的看图模型
+    assert ds.image_llm.name == "deepseek-flash" and ds.image_llm.usage is ds.usage
+    assert ds.base_url.startswith("https://api.deepseek.com") and LLM.from_config("deepseek-flash", cfg).image_llm.name == "deepseek-flash"
+    cfg["models"]["deepseek-v4-pro"]["vision"] = False
+    assert LLM.from_config("deepseek-v4-pro", cfg).image_llm is None
     # 不能看图又没配看图模型：不转写，材料包里写明，view_image 让智能体去问财务
     text_only = FakeLLM([])
     text_only.vision = False

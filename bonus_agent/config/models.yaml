@@ -87,19 +87,18 @@ models:
     extra_body: {enable_thinking: false}
     cache: explicit
 
-  # ---- DeepSeek（只有文本，不能看图）----
+  # ---- DeepSeek（2026-10-29 用 /models 实测：deepseek-flash 能看图，deepseek-v4-pro 只有文本；deepseek-chat 是 flash 的别名）----
   # vision：不能看图的模型写 false，或写另一个能看图的模型名，由它转写图片；不写默认能看图。
   # 不能看图又没配看图模型时，图片里的规则由智能体向财务提问，不会猜。
-  deepseek-chat:                # 非思考模式，支持工具调用和 JSON 输出
+  deepseek-flash:               # DeepSeek-V4.1-Flash，文本 + 图片，上下文 1M
     provider: deepseek
-    model: deepseek-chat
+    model: deepseek-flash
     json_mode: json_object
-    vision: false
-  deepseek-reasoner:            # 思考模式（较慢，tokens 多）
+  deepseek-v4-pro:              # DeepSeek-V4-Pro，只有文本，图片交给 deepseek-flash 转写
     provider: deepseek
-    model: deepseek-reasoner
+    model: deepseek-v4-pro
     json_mode: json_object
-    vision: false
+    vision: deepseek-flash
 
   # ---- 私有化部署后 ----
   # 部署时把 model 改成选型胜出的模型（vLLM 启动时的 --served-model-name 或权重路径）
@@ -114,5 +113,5 @@ candidates: [qwen3.6-35b-a3b, qwen3.6-27b, qwen3.5-35b-a3b, qwen3.5-27b]
 groups:
   open: [qwen3.6-35b-a3b, qwen3.6-27b, qwen3.5-35b-a3b, qwen3.5-27b, qwen3.5-122b-a10b]
   reference: [qwen3-vl-plus, qwen3.6-flash]
-  deepseek: [deepseek-chat, deepseek-reasoner]
+  deepseek: [deepseek-flash, deepseek-v4-pro]
   legacy: [qwen3-vl-32b, qwen3-vl-30b-a3b, qwen3-vl-8b]

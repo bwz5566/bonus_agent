@@ -157,11 +157,11 @@ bonus-eval --modes agent,auto --repeats 3             # 对比智能体和固定
 | open | 以上 + qwen3.5-122b-a10b | 开源模型全集 |
 | reference | qwen3-vl-plus / qwen3.6-flash | 商业版，不能私有化，只看效果上限 |
 | legacy | qwen3-vl-32b / 30b-a3b / 8b | 已在百炼下线，仅作记录 |
-| deepseek | deepseek-chat / deepseek-reasoner | DeepSeek 官方 API，只有文本 |
+| deepseek | deepseek-flash / deepseek-v4-pro | DeepSeek 官方 API；flash 能看图，v4-pro 只有文本（图片交给 flash 转写） |
 
 **换用其他模型**：任何 OpenAI 兼容接口（百炼、DeepSeek、vLLM、其他云厂商）都可以用。在 `models.yaml` 的 `providers` 里加服务商地址和 Key 的环境变量名，
-在 `models` 里加模型，运行时用 `--model 模型名`，或把 `default` 改掉。例：`DEEPSEEK_API_KEY=sk-... bonus-agent auto --model deepseek-chat --out 案卷目录 材料文件夹`。
-只有文本的模型（如 DeepSeek）写 `vision: false`，或写 `vision: 另一个能看图的模型名` 由它转写图片；不能看图又没配看图模型时，
+在 `models` 里加模型，运行时用 `--model 模型名`，或把 `default` 改掉。例：`DEEPSEEK_API_KEY=sk-... bonus-agent auto --model deepseek-flash --out 案卷目录 材料文件夹`。
+只有文本的模型（如 deepseek-v4-pro）写 `vision: false`，或写 `vision: 另一个能看图的模型名` 由它转写图片；不能看图又没配看图模型时，
 图片里的规则由智能体向财务提问，不会猜。不支持原生工具调用的模型会自动改用 JSON 动作协议。
 
 报告在 `evals/reports/`：Markdown 汇总、CSV 明细，以及每次调用的原始输出、图片转写和抽取出的规则。
