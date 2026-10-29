@@ -48,6 +48,12 @@ DATASET = {"tool": "define_dataset", "args": {"name": "人员", "file": "数据.
     "eid": {"column": "员工编号", "type": "id"}, "sales": {"column": "销售额", "type": "money", "unit": "元"}}}}
 
 
+CLAUSES = [{"tool": "record_clauses", "args": {"clauses": [
+    {"point": "奖金池按部门销售额 5% 计提", "file": "方案.docx", "quote": F5["quote"]},
+    {"point": "计提比例 6%", "file": "补充说明.docx", "quote": F6["quote"]}]}},
+    {"tool": "cover_clauses", "args": {"items": {"C1": "引擎自带：测试", "C2": "引擎自带：测试"}}}]
+
+
 def rules(rate):
     return {"tool": "set_rules", "args": {"pool": {"expr": f"sum(sales) * {rate}"},
                                           "allocation": [{"level": "个人", "key": "eid", "weight": "sales"}]}}
@@ -106,10 +112,19 @@ def test_finish_requires_facts_and_uses_them(tmp_path):
     except Exception as e:
         assert "方案.docx" in str(e) and "补充说明.docx" in str(e)
     ws.record_facts([F5])
-    try:
+    with pytest.raises(ToolError, match="方案.docx」还没有摘出条款"):
         ws.finish("x", ignored=[{"ref": "补充说明.docx", "reason": "只是重复"}])
+    ws.record_clauses([{"point": "按销售额 5% 计提", "file": "方案.docx", "quote": F5["quote"]}])
+    with pytest.raises(ToolError, match="C1「按销售额 5% 计提」：没有写落在哪里"):
+        ws.finish("x")
+    with pytest.raises(ToolError, match="variables.rate 不存在"):
+        ws.cover_clauses({"C1": "variables.rate"})
+    ws.cover_clauses({"C1": "pool"})
+    assert "C1 [方案.docx] 按销售额 5% 计提 → pool" in ws.state()
+    try:
+        ws.finish("x")
         raise AssertionError("登记的 5% 没用到也能完成")
-    except Exception as e:
+    except ToolError as e:
         assert f"{NAME}（5%）" in str(e)
     ws.set_rules(**rules("5%")["args"])
     ws.trial_run()
@@ -119,7 +134,7 @@ def test_finish_requires_facts_and_uses_them(tmp_path):
 def test_conflict_rounds(tmp_path):
     m, out = _materials(tmp_path / "m"), tmp_path / "案卷"
     # 第 1 轮：两份材料比例不同，程序自动提问，不出结果
-    r1 = [{"tool": "record_facts", "args": {"facts": [F5, F6]}}, DATASET, {"tool": "finish", "args": {"summary": "季度奖"}}]
+    r1 = [{"tool": "record_facts", "args": {"facts": [F5, F6]}}, *CLAUSES, DATASET, {"tool": "finish", "args": {"summary": "季度奖"}}]
     ar = run_agent(FakeLLM(r1), [m], out)
     assert ar.status == "NEEDS_CONFIRMATION" and not (out / "result.xlsx").exists()
     q = yaml.safe_load((out / "questions.yaml").read_text(encoding="utf-8"))
@@ -147,6 +162,8 @@ def test_conflict_rounds(tmp_path):
     _doc(m / "通知.docx", "季度奖计提比例修改为 6%，以本通知为准。")
     r4 = [{"tool": "record_facts", "args": {"facts": [
         fact("6%", "通知.docx", "季度奖计提比例修改为 6%，以本通知为准", override=True)]}},
+        {"tool": "record_clauses", "args": {"clauses": [{"point": "改为 6%", "file": "通知.docx", "quote": "以本通知为准"}]}},
+        {"tool": "cover_clauses", "args": {"items": {"C3": "pool"}}},
         {"tool": "trial_run"}, {"tool": "finish", "args": {"summary": "季度奖"}}]
     llm = FakeLLM(r4)
     ar = run_agent(llm, [m], out)
@@ -175,7 +192,7 @@ def test_quote_miss_suggests_original_and_hints_next_step(tmp_path):
 
 def test_chat_answers_and_changes(tmp_path):
     m, out = _materials(tmp_path / "m"), tmp_path / "案卷"
-    r1 = [{"tool": "record_facts", "args": {"facts": [F5, F6]}}, DATASET, {"tool": "finish", "args": {"summary": "季度奖"}}]
+    r1 = [{"tool": "record_facts", "args": {"facts": [F5, F6]}}, *CLAUSES, DATASET, {"tool": "finish", "args": {"summary": "季度奖"}}]
     assert run_agent(FakeLLM(r1), [m], out).status == "NEEDS_CONFIRMATION"
     # 对话里财务明确答复了问题：记下原话、按答复改规则，程序自动试算并检查，生成第 2 轮
     llm = FakeLLM([{"tool": "answer_question", "args": {"id": "q1", "answer": "以补充说明为准，6%"}}, rules("6%"),

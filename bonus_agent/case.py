@@ -17,6 +17,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from bonus_agent.extract_rules import Question
+from bonus_agent.clauses import Clause
 from bonus_agent.facts import Conflict, Fact
 from bonus_core.data.mapping import DatasetMapping
 from bonus_core.dsl.models import DatasetDef
@@ -47,6 +48,7 @@ def snapshot(ws) -> dict:
         "drafts": ws.drafts, "notes": ws.notes, "transcripts": ws.transcripts, "summary": ws.summary,
         "ignored": ws.ignored, "questions": [q.model_dump() for q in ws.questions],
         "facts": [f.model_dump() for f in ws.facts],
+        "clauses": [c.model_dump() for c in ws.clauses],
         "conflicts": {k: c.model_dump() for k, c in ws.conflicts.items()},
     }
 
@@ -61,6 +63,7 @@ def restore(ws, snap: dict) -> None:
     ws.ignored = snap.get("ignored", [])
     ws.questions = [Question.model_validate(q) for q in snap.get("questions", [])]
     ws.facts = [Fact.model_validate(f) for f in snap.get("facts", [])]
+    ws.clauses = [Clause.model_validate(c) for c in snap.get("clauses", [])]
     ws.conflicts = {k: Conflict.model_validate(c) for k, c in snap.get("conflicts", {}).items()}
     ws.untested = set(ws.schemes)            # 数据或答复可能变了，每个方案都要重新试算
 

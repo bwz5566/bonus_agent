@@ -22,7 +22,7 @@ from pydantic import ValidationError
 
 from bonus_agent.auto import (DATA_SUFFIXES, MAX_FILES, Inventory, PlanDataset, TooManyFiles, build_inventory,
                               check_dataset, collect_files, filter_sheet)
-from bonus_agent import case as cs, failure
+from bonus_agent import case as cs, clauses as cl, failure
 from bonus_agent import facts as fx
 from bonus_agent.extract_rules import Extraction, Question, check_quotes, prompt
 from bonus_agent.llm import LLM, LLMError, image_part, parse_json
@@ -47,6 +47,7 @@ KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保�
 BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
 READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate"}
 WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", "remove_facts", "ask_question",
+               "record_clauses", "cover_clauses",
                "answer_question"}
 RULE_SUFFIXES = {".docx", ".pptx", ".png", ".jpg", ".jpeg", ".txt", ".md"}   # 规则文档：要登记参数
 PIN_DOC_CHARS = 12000          # 不超过这么长的文档全文附在任务里（材料包），不必用工具读
@@ -96,6 +97,21 @@ TOOLS: list[dict] = [
          "override": {"type": "boolean", "description": "原文明确写了修改旧规定（修改为 / 以本通知为准）时为 true，"
                                                          "quote 要包含这句话"}}, ["name", "value", "file", "quote"])}},
          ["facts"])},
+    {"name": "record_clauses",
+     "description": "读完一份规则文档后，把其中与计算有关的条款逐条摘进条款清单（取数口径、筛选和排除、公式、阶梯、系数、舍入、"
+                    "分配方法、发放和暂缓、抵扣、校验和报错要求、版本和调整要求等），一条一个要求，不要合并。"
+                    "清单每一步都附给你，不会被裁剪；写完规则后用 cover_clauses 标注每条落在哪里，finish 前程序会检查。",
+     "parameters": _obj({"clauses": {"type": "array", "items": _obj({
+         "point": {**_S, "description": "要点：用自己的话写这条要求什么（不超过 100 字）"},
+         "file": _S, "quote": {**_S, "description": "逐字复制原文关键句（不超过 200 字）"}}, ["point", "file", "quote"])}},
+         ["clauses"])},
+    {"name": "cover_clauses",
+     "description": "标注条款清单里每条落在规则的哪里：{\"C1\": \"variables.net_receipt\", \"C2\": \"checks.grade_known、pool\"}。"
+                    "可写 tables.名字 / variables.名字 / pool / allocation.层级 / payout.编号 / offsets.编号 / checks.编号 / "
+                    "revisions.R1 / datasets.表名（单位换算、筛选等在数据表定义里完成的）；"
+                    "引擎已自动保证的写「引擎自带：说明」（如 主键重复报错、最大余数法、各级合计等于上级）；"
+                    "本批不涉及的写「不适用：原因」；等财务答复的写「已提问 q1」。",
+     "parameters": _obj({"items": {"type": "object", "additionalProperties": _S}}, ["items"])},
     {"name": "remove_facts",
      "description": "删掉台账里某个参数名的全部登记（登记错了时用，如把阶梯几档登记成了同一个名字）；依据它的、还没答复的冲突问题会被撤回。",
      "parameters": _obj({"name": _S}, ["name"])},
@@ -236,6 +252,7 @@ class Workspace:
     budget: str = ""
     round: int = 1                                          # 第几轮（同一案卷和财务来回的次数）
     facts: list[fx.Fact] = field(default_factory=list)      # 参数台账：从材料里登记的参数和口径
+    clauses: list[cl.Clause] = field(default_factory=list)  # 条款清单：每份规则文档的计算条款，及落在规则的哪里
     conflicts: dict[str, fx.Conflict] = field(default_factory=dict)   # 已提问的参数冲突
     _sheet_corpus: dict[str, str] = field(default_factory=dict)
     progress: tuple[int, int] = (0, 0)                      # 已用步数、上限
@@ -447,6 +464,66 @@ class Workspace:
             out.append("程序发现取值冲突，已自动向财务提问（阻断，不要自行取舍，相关规则先按待定处理）：")
             out += [f"- {q.id} {q.text}" for q in new]
         return "\n".join(out)
+
+    # ---- 条款清单 ----
+    def record_clauses(self, clauses: list[dict]) -> str:
+        corpus, lines, added = self._corpus(), [], []
+        for i, a in enumerate(clauses or [], start=1):
+            if not isinstance(a, dict) or not str(a.get("point", "")).strip():
+                lines.append(f"第 {i} 条要写 point（要点）、file、quote")
+                continue
+            file, quote, point = str(a.get("file", "")), str(a.get("quote", "")), str(a["point"]).strip()
+            bad = cl.check_quote(file, quote, corpus)
+            if bad:
+                lines.append(f"第 {i} 条未登记：{bad}")
+                continue
+            if any(c.file == file and fx.norm(c.quote) == fx.norm(quote) and c.point == point for c in self.clauses):
+                lines.append(f"第 {i} 条之前已登记过")
+                continue
+            c = cl.Clause(id=cl.next_id(self.clauses), point=point[:cl.MAX_POINT], file=file, quote=quote, round=self.round)
+            self.clauses.append(c)
+            added.append(c.id)
+        if not added:
+            raise ToolError("没有登记任何条款。\n" + "\n".join(lines))
+        return (f"已登记 {len(added)} 条：{added[0]}～{added[-1]}（清单共 {len(self.clauses)} 条，每一步都附在工作区状态里）。"
+                + ("\n" + "\n".join(lines) if lines else "") + "\n写好规则后用 cover_clauses 标注每条落在哪里")
+
+    def cover_clauses(self, items: dict) -> str:
+        if not isinstance(items, dict) or not items:
+            raise ToolError('items 写成 {"C1": "variables.net_receipt", ...}')
+        byid = {c.id: c for c in self.clauses}
+        known, qids = cl.known_refs(self.drafts, self.datasets), {q.id for q in self.questions}
+        ok, bad = [], []
+        for cid, where in items.items():
+            c = byid.get(str(cid).strip())
+            if c is None:
+                bad.append(f"{cid}：清单里没有这条")
+                continue
+            err = cl.check_where(str(where), known, qids)
+            if err:
+                bad.append(f"{cid}：{err}")
+                continue
+            c.where = str(where).strip()
+            ok.append(c.id)
+        left = [c.id for c in self.clauses if not c.where]
+        if not ok:
+            raise ToolError("没有标注任何条款：\n" + "\n".join(bad))
+        return (f"已标注 {len(ok)} 条。" + ("\n未标注成功：\n" + "\n".join(bad) if bad else "")
+                + (f"\n还没落实的条款：{'、'.join(left[:30])}" if left else "\n条款清单已全部落实"))
+
+    def _clause_gaps(self, skipped: set[str]) -> list[str]:
+        """结束前检查：每份规则文档都有条款；每条条款都落到了现有的规则元素上（规则改过后会重新核对）。"""
+        docs = [f.name for f in self.inv.files if f.suffix.lower() in RULE_SUFFIXES]
+        out = [f"规则文档「{d}」还没有摘出条款（用 record_clauses；确实与计算无关的写进 ignored，ref 写文件名）"
+               for d in docs if d not in skipped and not any(c.file == d for c in self.clauses)]
+        known, qids = cl.known_refs(self.drafts, self.datasets), {q.id for q in self.questions}
+        for c in self.clauses:
+            if c.file in skipped or c.id in skipped:
+                continue
+            err = cl.check_where(c.where, known, qids)
+            if err:
+                out.append(f"{c.id}「{c.point}」：{err}")
+        return out
 
     # ---- 数据表 ----
     def define_dataset(self, name: str, file: str, sheet: str, fields: dict, key: str | None = None,
@@ -892,6 +969,10 @@ class Workspace:
         pending = [s for s in self.schemes if s in self.untested or s not in self.results]
         if pending:
             raise ToolError(f"方案 {pending} 最近一次修改之后还没有成功试算，请先 trial_run")
+        gaps = self._clause_gaps(skipped)
+        if gaps:
+            raise ToolError("条款清单还有没落实的（逐条处理后再 finish；用 cover_clauses 标注）：\n"
+                            + "\n".join(f"- {g}" for g in gaps[:15]) + (f"\n……共 {len(gaps)} 条" if len(gaps) > 15 else ""))
         miss = [n for n in fx.unused(self.facts, self.drafts, self.conflicts, self.questions) if n.split("（")[0] not in skipped]
         if miss:
             raise ToolError(f"台账里这些参数的数值在规则里没有出现：{'、'.join(miss)}。请核对规则是否漏了或写错；"
@@ -946,6 +1027,8 @@ class Workspace:
             step = "用 trial_run 试算"
         elif bare:
             step = f"用 record_facts 登记这些文档的参数：{'、'.join(bare)}"
+        elif self._clause_gaps({str(i.get("ref", "")) for i in self.ignored}):
+            step = "用 record_clauses / cover_clauses 把条款清单逐条落实"
         else:
             step = "核对后调用 finish"
         return step + (f"；还没登记参数的规则文档：{'、'.join(bare)}" if bare and "record_facts" not in step else "")
@@ -979,6 +1062,12 @@ class Workspace:
                 by.setdefault(f.file, []).append(f.name)
             lines.append(f"- 参数台账 {len(self.facts)} 条（再登记同一参数请用相同的名字）：")
             lines += [f"  · {k}：{'、'.join(dict.fromkeys(v))}" for k, v in by.items()]
+        if self.clauses:
+            left = sum(1 for c in self.clauses if not c.where)
+            lines.append(f"- 条款清单 {len(self.clauses)} 条" + (f"（{left} 条还没落实）" if left else "") + "，逐条对照，不要遗漏：")
+            lines += [f"  · {c.id} [{c.file}] {c.point} → {c.where or '未落实'}" for c in self.clauses]
+        else:
+            lines.append("- 条款清单：还没有。读完每份规则文档就用 record_clauses 逐条摘出计算条款")
         if self.questions:
             lines.append("- 问题：")
             lines += [f"  · {q.id} {q.text} → " + (f"财务答复：{q.answer}" if q.answer else f"已撤回：{q.withdrawn}" if q.withdrawn
@@ -1241,6 +1330,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         changes = cs.file_changes(last["files"] if last else {}, prints)
         gone = set(changes["修改"]) | set(changes["删除"])
         ws.facts = [f for f in ws.facts if f.file not in gone]       # 这些文件的参数要按新内容重新登记
+        ws.clauses = [c for c in ws.clauses if c.file not in gone]   # 条款也按新内容重新摘
         withdrawn = fx.withdraw_stale(ws.facts, ws.conflicts, ws.questions)
     else:   # 首轮就带了答复（如上一次单轮运行的 questions.yaml）：作为已答复的问题放进工作区
         ws.questions = [Question(id=a.get("id") or f"q{i + 1}", text=a["text"], options=a.get("options") or [])
@@ -1475,7 +1565,7 @@ def _chat_task(ws: Workspace, message: str, chat: list[dict] | None, fresh: list
         lines.append("\n财务在问题表里的新答复（必须照做）：" + "；".join(f"{q.id} → {q.answer}" for q in fresh))
     if changes and any(changes.values()):
         lines.append("\n文件变化：" + "；".join(f"{k} {'、'.join(v)}" for k, v in changes.items() if v)
-                     + "（新增、修改的规则文档要读并 record_facts 登记）")
+                     + "（新增、修改的规则文档要读并 record_facts 登记参数、record_clauses 摘条款）")
     lines += ["", f"财务的消息：{message}", "",
               "请：",
               "1. 是提问：查清楚后用 reply 回答，金额和算式来自 explain / evaluate，不要自己算；",
@@ -1506,7 +1596,8 @@ def _resume_task(ws: Workspace, last: dict | None, changes: dict | None, fresh: 
         lines.append("- 仍在等待答复：" + "；".join(f"{q.id} {q.text}" for q in ws.pending))
     lines += ["", "请：",
               "1. 按新答复修改规则（答复只影响它相关的部分，其余保持不变）；",
-              "2. 阅读新增、修改的文件，用 record_facts 登记其中的参数（与已有台账同一参数用相同的名字），"
+              "2. 阅读新增、修改的文件，用 record_facts 登记其中的参数（与已有台账同一参数用相同的名字）、record_clauses 摘出条款"
+              "（修改过的文件，原来的条款已删除，要重新摘），"
               "取值不一致时程序会自动提问；口径前后矛盾、新增内容不明确时用 ask_question 提问，写明出处，不要自行取舍；",
               "3. 删除的文件如果被数据表用到，改映射或提问；",
               "4. 试算全部方案，确认结果合理后 finish。还有问题等答复时，做完不受影响的部分就 finish 结束本轮。",

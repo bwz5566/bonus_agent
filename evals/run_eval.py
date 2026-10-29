@@ -96,6 +96,9 @@ def fake_agent_script(case: Case) -> list:
     facts = case.spec.get("facts") or []
     if facts:
         script.append({"tool": "record_facts", "args": {"facts": facts}})
+        first = list({f["file"]: f for f in reversed(facts)}.values())      # 每份登记了参数的文档摘一条条款
+        script.append({"tool": "record_clauses", "args": {"clauses": [
+            {"point": f["name"], "file": f["file"], "quote": f["quote"]} for f in first]}})
     for n, d in plan["datasets"].items():
         file, sheet = d["sheet"].split("/", 1)
         script.append({"tool": "define_dataset", "args": {"name": n, "file": file, "sheet": sheet, "key": d["key"],
@@ -106,6 +109,8 @@ def fake_agent_script(case: Case) -> list:
         "pool": ref.pool.model_dump(mode="json"),
         "allocation": [a.model_dump(mode="json") for a in ref.allocation],
         "payout": [p.model_dump(mode="json") for p in ref.payout]}})
+    if facts:
+        script.append({"tool": "cover_clauses", "args": {"items": {f"C{i + 1}": "pool" for i in range(len({f['file'] for f in facts}))}}})
     script.append({"tool": "trial_run"})
     for c in case.spec["checks"]:
         if c["type"] == "question":

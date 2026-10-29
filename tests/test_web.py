@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from bonus_agent.llm import FakeLLM  # noqa: E402
 from bonus_agent.web import create_app, safe_name  # noqa: E402
-from tests.test_conflicts import DATASET, F5, F6, _materials, rules  # noqa: E402
+from tests.test_conflicts import CLAUSES, DATASET, F5, F6, _materials, rules  # noqa: E402
 
 PW = "password-123"
 
@@ -67,7 +67,7 @@ def test_web_rounds_confirm_and_template(env):
     assert post(c, store, f"/cases/{cid}/materials", files=files).status_code == 303
     assert post(c, store, f"/cases/{cid}/materials", files=[("files", ("a.exe", b"x"))]).status_code == 400
     # 第 1 轮：材料冲突，程序提问，不出结果
-    scripts.append([{"tool": "record_facts", "args": {"facts": [F5, F6]}}, DATASET,
+    scripts.append([{"tool": "record_facts", "args": {"facts": [F5, F6]}}, *CLAUSES, DATASET,
                     {"tool": "finish", "args": {"summary": "季度奖"}}])
     assert post(c, store, f"/cases/{cid}/run").status_code == 303
     job = wait(app, cid)
@@ -180,7 +180,7 @@ def test_chat_window(env):
     cid = store.create("对话", "张会计")
     for p in m.iterdir():
         (store.dir(cid) / "materials" / p.name).write_bytes(p.read_bytes())
-    scripts.append([{"tool": "record_facts", "args": {"facts": [F5, F6]}}, DATASET,
+    scripts.append([{"tool": "record_facts", "args": {"facts": [F5, F6]}}, *CLAUSES, DATASET,
                     {"tool": "finish", "args": {"summary": "季度奖"}}])
     post(c, store, f"/cases/{cid}/run")
     wait(app, cid)
