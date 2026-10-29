@@ -160,6 +160,13 @@ class Store:
         return hmac.new(self.secret, f"csrf:{user}".encode(), hashlib.sha256).hexdigest()[:32]
 
 
+def _unfinished(out: Path) -> bool:
+    """还没有完成过的案卷，或最近一轮失败 / 中断：财务发的文字应当作为说明接着处理，而不是只回答问题。"""
+    case = cs.load_case(out)
+    rounds = (case or {}).get("rounds") or []
+    return not rounds or rounds[-1].get("status") in (None, "FAILED")
+
+
 def safe_name(name: str) -> str:
     """上传文件名只取文件名部分，拒绝隐藏文件、临时文件和不支持的格式。"""
     n = Path(str(name).replace("\\", "/")).name.strip()
@@ -528,7 +535,9 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         if last.get("error") or (job and job.status == "failed" and not busy):
             x = explain_failure((job.message if job and job.status == "failed" else "") or last.get("error", ""))
             info += (f"<div class='fail'><p class='bad'><b>{e(x['title'])}</b></p><p>{e(x['advice'])}</p>"
-                     + (form(f"/cases/{cid}/run", "<p><button>重试</button></p>", csrf) if editor and failed else "")
+                     + (form(f"/cases/{cid}/run", "<p><button>重试</button> <span class='mut'>不补充信息，从上一轮做到的地方接着做"
+                                                 "（网络断了、步数或用量用完、手动停止后用）。需要补充说明或材料时，"
+                                                 "在下方对话框写清楚后点「发送」</span></p>", csrf) if editor and failed else "")
                      + f"<details><summary class='mut'>详细信息（给开发排查）</summary><pre>{e(x['detail'])}</pre></details></div>")
         if model_name:
             info += f"<p class='mut'>模型：{e(model_name)}</p>"
@@ -556,8 +565,9 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
                                          "让智能体修改（如：华东区域系数改为 1.05），或者附上材料并说明'></textarea>"
                                          "<p><input type='file' name='files' multiple> <label class='mut'><input type='checkbox' "
                                          "name='expected' value='1'> 附件是期望结果（只用于核对，不交给智能体）</label></p>"
-                                         "<p><button>发送</button> <span class='mut'>附上材料（规则文档、Excel、补充文件，同名覆盖）会按新材料处理一轮；"
-                                         "只发文字时，改了规则会重新试算，只是提问不会生成新的一轮</span></p>", csrf, upload=True) \
+                                         "<p><button>发送</button> <span class='mut'>附上材料（规则文档、Excel、PDF，同名覆盖）会按新材料处理一轮；"
+                                         "上一轮没完成时，发的文字作为说明，智能体带着它接着做；已完成时，提问直接回答，"
+                                         "要求修改会改完重新试算</span></p>", csrf, upload=True) \
             if editor and not busy else ""
         mats = files_table(d / "materials", f"/cases/{cid}/dl/materials", csrf, f"/cases/{cid}/materials/delete" if editor and not busy else None)
         exps = files_table(d / "expected", f"/cases/{cid}/dl/expected", csrf, f"/cases/{cid}/expected/delete" if editor and not busy else None)
@@ -740,6 +750,9 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
                 names = await _save(cid, u, files, "materials")
                 store.chat_add(cid, "user", u["display"], f"上传了材料：{'、'.join(names)}" + (f"\n{text}" if text else ""))
                 runner.start(cid, u["display"], instruction=text or None)
+            elif _unfinished(case_dir(cid) / "out"):      # 上一轮没完成：文字作为说明，接着做这一轮
+                store.chat_add(cid, "user", u["display"], text)
+                runner.start(cid, u["display"], instruction=text)
             else:
                 runner.start(cid, u["display"], message=text)
         except RuntimeError as err:

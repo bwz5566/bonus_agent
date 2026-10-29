@@ -220,6 +220,13 @@ def test_failure_explained_with_retry(env):
     assert "已自动停下" in page and ">重试<" in page and "详细信息" in page
     said = store.chat(cid)[-1]["text"]                 # 对话里先说原因，再说需要什么帮助、想了解什么
     assert said.index("原因：") < said.index("需要你帮忙：") < said.index("想了解：")
+    assert "点「发送」" in said and "不建议直接重试" in said
+    # 上一轮没完成时发文字：作为说明接着做这一轮（不是只回答问题的对话）
+    scripts.append([{"tool": "finish", "args": {"summary": "x"}}])
+    post(c, store, f"/cases/{cid}/chat", {"text": "没有回款的销售单按 0 处理"})
+    wait(app, cid)
+    audit = (store.dir(cid) / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+    assert "运行下一轮" in audit[-2] and any(m["text"] == "没有回款的销售单按 0 处理" for m in store.chat(cid))
 
 
 def test_upload_in_chat(env):
