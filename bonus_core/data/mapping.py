@@ -118,24 +118,27 @@ def used_fields(rs: RuleSet) -> set[str]:
     return used & set(rs.field_owner())
 
 
+def _sheet_names(path) -> list[str]:
+    import openpyxl
+    try:
+        wb = openpyxl.load_workbook(path, read_only=True)
+    except Exception:
+        return []
+    try:
+        return list(wb.sheetnames)
+    finally:
+        wb.close()
+
+
 def rebind_files(mapping: Mapping, files: list[str | Path]) -> Mapping:
     """模板按期复用时，下一期的文件名通常会变（如 2026-10 → 2026-11）。映射里记的文件名不在本批时，
     找出包含它对应全部工作表的那个新文件，换成新文件名；只在能唯一对上时才换，否则原样返回，照常报“文件不在本批”。"""
-    import openpyxl
-
     paths = {Path(f).name: Path(f) for f in files}
     stale = sorted({m.file for m in mapping.values() if m.file is not None and m.file not in paths})
     if not stale:
         return mapping
     fresh = [n for n in paths if n not in {m.file for m in mapping.values()}]
-    sheets: dict[str, set[str]] = {}
-    for n in fresh:
-        try:
-            wb = openpyxl.load_workbook(paths[n], read_only=True)
-            sheets[n] = set(wb.sheetnames)
-            wb.close()
-        except Exception:
-            continue
+    sheets = {n: set(_sheet_names(paths[n])) for n in fresh}
     to: dict[str, str] = {}
     for old in stale:
         want = {m.sheet for m in mapping.values() if m.file == old and m.sheet}
@@ -166,7 +169,13 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping) -> tup
             issues.append(Issue.block("file_missing", f"「{ds_name}」指定的文件「{m.file}」不在本批输入中", ds_name))
             continue
         if m.header_rows and m.sheet:
-            f = next((Path(x) for x in files if m.file is None or Path(x).name == m.file), None)
+            cand = [Path(x) for x in files if Path(x).name == m.file] if m.file is not None else \
+                [Path(x) for x in files if m.sheet in _sheet_names(x)]
+            if len(cand) > 1:
+                issues.append(Issue.block("sheet_ambiguous", f"「{ds_name}」的工作表「{m.sheet}」在多个文件中都有："
+                                          + "、".join(x.name for x in cand) + "，请指定文件", ds_name))
+                continue
+            f = cand[0] if cand else None
             try:
                 st = table_at(f, m.sheet, m.header_rows) if f else None
             except (KeyError, ValueError):

@@ -297,3 +297,29 @@ def test_trial_summary_with_empty_level(tmp_path):
     w.set_rules(scheme="月度", pool={"expr": "n * 10", "scope": "个人"}, allocation=[{"level": "个人", "key": "emp_id"}])
     out = w.trial_run()
     assert "「个人」0 个" in out
+
+
+def test_header_rows_without_file_finds_the_right_file(tmp_path):
+    """#10 写了 header_rows 和 sheet、没写 file：读包含这张工作表的文件，不是固定读第一个；两个文件都有时报歧义。"""
+    import openpyxl
+
+    from bonus_core.data.mapping import DatasetMapping, apply_mapping
+
+    def book(name, sheet):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = sheet
+        ws.append(["说明行"])
+        ws.append(["工号", "金额"])
+        ws.append(["E1", 100])
+        wb.save(tmp_path / name)
+        return tmp_path / name
+    rs = rules(datasets={"人员": ds("eid", eid="id", amt="money")}, pool={"expr": "sum(amt)"},
+               allocation=[{"level": "人员", "key": "eid"}])
+    m = {"人员": DatasetMapping(sheet="人员", header_rows=[2], columns={"eid": "工号", "amt": "金额"})}
+    first, target = book("a_其他.xlsx", "其他"), book("b_人员.xlsx", "人员")
+    data, issues = apply_mapping(rs, [first, target], m)
+    assert not [i for i in issues if i.severity == "blocking"], issues
+    assert data["人员"].rows[0].values["eid"] == "E1"
+    _, issues = apply_mapping(rs, [target, book("c_人员副本.xlsx", "人员")], m)
+    assert any(i.code == "sheet_ambiguous" for i in issues)
