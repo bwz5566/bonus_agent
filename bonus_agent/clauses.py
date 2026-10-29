@@ -42,7 +42,9 @@ def check_quote(file: str, quote: str, corpus: dict[str, str]) -> str | None:
 
 
 def refs(where: str) -> list[str]:
-    return [x.strip() for x in re.split(r"[、,，;；]\s*", where or "") if x.strip()]
+    """位置列表；每项后面括号里的说明（如 pool（仅求和））不算位置的一部分。"""
+    w = re.sub(r"\s*[（(][^（）()]*[）)]", "", where or "")
+    return [x.strip() for x in re.split(r"[、,，;；]\s*", w) if x.strip()]
 
 
 def check_where(where: str, known: set[str], questions: set[str]) -> str | None:

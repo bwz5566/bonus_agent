@@ -734,6 +734,13 @@ class Workspace:
             issues = self._validate(t, rs)
             if "pool" not in full:
                 issues = [i for i in issues if i.where != "pool"]
+            later = ""
+            if not full.get("allocation"):     # 还没写分配层级：层级名的 scope 先不算错，写好 allocation 后再校验
+                wait = sorted({m.group(1) for i in issues if i.code == "scope_bad"
+                               for m in [re.search(r"scope「([^」]*)」", i.message)] if m})
+                issues = [i for i in issues if i.code not in ("no_levels", "scope_bad")]
+                later = ("还没有分配层级（allocation）" + (f"，用到的层级 {'、'.join(wait)} 先记下" if wait else "")
+                         + "；写好 allocation 后再完整校验。")
             blocking = [str(i) for i in issues if i.severity == "blocking"]
             warns = [str(i) for i in issues if i.severity == "warning"]
             head = f"「{t}」" + ("（尚未设定 pool）" if "pool" not in full else "")
@@ -743,6 +750,8 @@ class Workspace:
                            + fixes.hints([i for i in issues if i.severity == "blocking"]))
             else:
                 out.append(head + "静态校验通过。" + ("\n提示：\n" + "\n".join(f"- {w}" for w in warns) if warns else ""))
+            if later:
+                out.append(later)
         tiers = [_tier_text(n, t) for n, t in (parts.get("tables") or {}).items() if isinstance(t, dict) and t.get("kind") == "tier"]
         if tiers:
             out.append("阶梯表按下面的意思计算，请和材料原文逐档核对：\n" + "\n".join(f"- {t}" for t in tiers if t))

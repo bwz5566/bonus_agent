@@ -11,6 +11,8 @@ FIXES = {
     "fn_args": "参数个数不对：sum(字段, of: \"表名\", where: 条件)，ratio(分子, 分母, zero: 0)，if(条件, 是, 否)。",
     "fn_kwarg": "聚合函数只支持 of（表名）、where（筛选条件）；ratio 支持 zero（分母为 0 时的取值）。",
     "cycle": "变量之间互相引用了：把公共部分拆成一个新变量，让依赖只朝一个方向。",
+    "pool_negative": "奖金池（按层计算时是某个对象的金额）为负。按人直接算金额时，材料有“扣减后归零 / 不低于 0”就写 max(…, 0)；"
+                     "材料没说负数怎么处理时用 ask_question 问，不要自己加。",
     "scope_bad": "scope 只能写 global、allocation 里的层级名，或关联实体表名（如 人员、项目）。",
     "scope_var": "下层变量不能在上层直接引用：在上层直接对明细表聚合（如项目层 sum(hours, of: \"工时明细\", where: ...)）；"
                  "奖金池按项目各自计提时，pool 的 scope 写项目。",
