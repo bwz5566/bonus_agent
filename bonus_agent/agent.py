@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import re
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -610,6 +610,9 @@ class Workspace:
                 out.append(head + "静态校验发现问题，需要修正：\n" + "\n".join(f"- {e}" for e in blocking))
             else:
                 out.append(head + "静态校验通过。" + ("\n提示：\n" + "\n".join(f"- {w}" for w in warns) if warns else ""))
+        tiers = [_tier_text(n, t) for n, t in (parts.get("tables") or {}).items() if isinstance(t, dict) and t.get("kind") == "tier"]
+        if tiers:
+            out.append("阶梯表按下面的意思计算，请和材料原文逐档核对：\n" + "\n".join(f"- {t}" for t in tiers if t))
         if not self.schemes:
             out.append("还没有具体方案；用 set_rules(scheme=方案名, pool=...) 写入各方案后再完整校验。")
         return "\n".join(out)
@@ -988,6 +991,21 @@ class Workspace:
             lines.append(f"- 试算「{s}」：" + ("最近修改后尚未试算" if s in self.untested or not r else
                                              f"已试算，奖金池 {fmt(Decimal(r['R0'].pool))}" + (f"，修订 {list(r)[1:]}" if len(r) > 1 else "")))
         return "\n".join(lines)
+
+
+def _tier_text(name: str, t: dict) -> str:
+    """把阶梯表翻译成一句话，便于和材料原文对照（如第一档误写成 [0, 0] 时能看出来）。"""
+    try:
+        steps = [(Decimal(str(a)), Decimal(str(b))) for a, b in t.get("steps") or []]
+    except (InvalidOperation, TypeError, ValueError):
+        return ""
+    excess = t.get("mode") == "excess"
+    parts = []
+    for i, (lo, r) in enumerate(steps):
+        hi = steps[i + 1][0] if i + 1 < len(steps) else None
+        rng = f"{lo:,.0f} 至 {hi:,.0f}" if hi is not None else f"{lo:,.0f} 以上"
+        parts.append(f"{rng}{'的部分' if excess else '时全部金额'}按 {(r * 100).normalize():f}%")
+    return f"{name}（{'超额累进' if excess else '全额累进'}）：" + "；".join(parts)
 
 
 def _strip_tags(text: str, name: str) -> str:
