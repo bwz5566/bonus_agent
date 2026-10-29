@@ -81,7 +81,8 @@ def check_fact(f: Fact, corpus: dict[str, str]) -> str | None:
         return "quote 不能为空，要逐字复制包含取值的原文"
     if len(f.quote) > MAX_QUOTE:
         return f"quote 太长（{len(f.quote)} 字），只复制包含取值的那一句（不超过 {MAX_QUOTE} 字）"
-    if q not in corpus[f.file]:
+    parts = [norm(x) for x in str(f.quote).splitlines() if norm(x)]
+    if q not in corpus[f.file] and not (len(parts) > 1 and all(p in corpus[f.file] for p in parts)):   # 多行引用逐行核对
         return f"quote 在「{f.file}」里找不到，要逐字复制原文（图片要先 view_image 转写）"
     if norm(f.value) not in q:
         return f"value「{f.value}」不在 quote 里，value 写原文的写法（如 5%、30万元），换算交给程序"
@@ -125,8 +126,8 @@ def detect(facts: list[Fact], conflicts: dict[str, Conflict], questions: list[Qu
         by: dict[str, list[Fact]] = {}
         for f in fs:
             by.setdefault(same_value(f), []).append(f)
-        if len(by) < 2:
-            continue
+        if len(by) < 2 or len({number(g[0].value) is None for g in by.values()}) > 1:
+            continue      # 一处是数、一处是文字（如 0.1 和 “MIN(工龄,5)÷5”）：是两个参数用了同一个名字，不算冲突（record_facts 会提示改名）
         over, at = _override(fs)
         if len(over) == 1 and len(by) == 2 and not any(
                 not f.override and same_value(f) not in over and f.round > at for f in fs):
@@ -145,6 +146,14 @@ def detect(facts: list[Fact], conflicts: dict[str, Conflict], questions: list[Qu
         questions.append(q)
         new.append(q)
     return new
+
+
+def mixed_names(facts: list[Fact]) -> list[str]:
+    """同一个参数名下既有数又有文字的：多半是把两个参数（如权重和归一化公式）登记成了一个名字。"""
+    groups: dict[str, set[bool]] = {}
+    for f in facts:
+        groups.setdefault(f.name.strip(), set()).add(number(f.value) is None)
+    return [n for n, kinds in groups.items() if len(kinds) > 1]
 
 
 def withdraw_stale(facts: list[Fact], conflicts: dict[str, Conflict], questions: list[Question]) -> list[Question]:

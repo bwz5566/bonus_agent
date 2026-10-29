@@ -154,6 +154,19 @@ TOOLS: list[dict] = [
 ]
 
 
+def _coerce_args(tool: str, args: dict) -> dict:
+    """数组、对象类参数被模型写成了 JSON 字符串（思考模式下常见）时，解析回来。"""
+    props = next((t["parameters"]["properties"] for t in TOOLS if t["name"] == tool), {})
+    out = dict(args)
+    for k, v in args.items():
+        if isinstance(v, str) and props.get(k, {}).get("type") in ("array", "object") and v.strip()[:1] in "[{":
+            try:
+                out[k] = json.loads(v)
+            except ValueError:
+                pass
+    return out
+
+
 def openai_tools() -> list[dict]:
     return [{"type": "function", "function": t} for t in TOOLS]
 
@@ -382,6 +395,9 @@ class Workspace:
                             + f"\n下一步（程序判断）：{self.next_hint()}")
         new = fx.detect(self.facts, self.conflicts, self.questions, self.round)
         out = [f"已登记 {added} 条（台账共 {len(self.facts)} 条）。" + (f"另有 {dup} 条之前已登记过，已跳过。" if dup else "")] + lines
+        for n in fx.mixed_names(self.facts):
+            out.append(f"注意：「{n}」下既有数值又有文字说明，像是两个不同的参数（如权重 10% 和归一化公式），"
+                       "请换成两个名字分别登记（如 …-权重、…-公式）；同一参数的不同写法才用同一个名字")
         if new:
             out.append("程序发现取值冲突，已自动向财务提问（阻断，不要自行取舍，相关规则先按待定处理）：")
             out += [f"- {q.id} {q.text}" for q in new]
@@ -1125,6 +1141,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                     break
                 history.append({"role": "user", "content": "请调用工具继续工作；全部完成后调用 finish。"})
                 continue
+        turn_start, skipped = len(history) - 1, 0     # 本轮 assistant 消息的位置；被拦下的重复调用数
         for c in calls:
             args = {}
             sig = f"{c['name']}:{c['arguments']}"
@@ -1139,12 +1156,14 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                     on_step(len(steps), steps[-1])
                 history.append({"role": "user", "content": f"【{c['name']} 的结果】\n{result}"} if mode == "json"
                                else {"role": "tool", "tool_call_id": c["id"], "content": result})
+                skipped += 1
                 continue
             try:
                 args = json.loads(c["arguments"] or "{}")
                 fn = handlers.get(c["name"])
                 if not isinstance(args, dict):
                     raise ToolError("参数必须是 JSON 对象")
+                args = _coerce_args(c["name"], args)
                 if fn is None:
                     raise ToolError(f"没有工具 {c['name']}，可用：{list(handlers)}")
                 result, ok = str(fn(**args)), True
@@ -1177,6 +1196,11 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 history.append({"role": "user", "content": f"【{c['name']} 的结果】\n{result}"})
             else:
                 history.append({"role": "tool", "tool_call_id": c["id"], "content": result})
+        if skipped and skipped == len(calls):
+            # 整轮都是被拦下的重复调用：不把它留在历史里，否则小模型会照着历史接着重复；只留一句说明
+            del history[turn_start:]
+            history.append({"role": "user", "content": f"（你刚才又要原样调用 {calls[0]['name']}，和之前完全相同，程序已拦下、没有执行。"
+                                                       f"不要再重复；下一步（程序判断）：{ws.next_hint()}）"})
         if ws.done:
             break
         if repeats >= MAX_STUCK or any(n >= MAX_STUCK for n in fails.values()):

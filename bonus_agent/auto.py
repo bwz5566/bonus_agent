@@ -279,7 +279,12 @@ def check_dataset(name: str, pd: PlanDataset, st: SheetTable, field_types: dict[
                              values=values)
         cols[f] = col
     for k in (pd.key, pd.link):
-        if k and k not in fields:
+        if k and ("," in k or "+" in k or " " in k.strip()):
+            errors.append(f"数据表「{name}」的 {'key' if k == pd.key else 'link'} 只能写一个字段，不能写 {k}。"
+                          "key 是“每行一个对象”的编号（如员工表的 employee_id）；一行属于某个对象的明细（如项目参与表每行属于"
+                          "一个员工）不写 key，写 link=该对象的编号（如 link=employee_id），行里的其他编号（如 project_id）"
+                          "仍能取到对应实体的字段和变量")
+        elif k and k not in fields:
             errors.append(f"数据表「{name}」的 {'key' if k == pd.key else 'link'} 字段 {k} 不在它的 fields 里")
     # 试转换全部行，类型判断错了（如把文字当成金额）尽早发现
     bad = []
@@ -291,6 +296,13 @@ def check_dataset(name: str, pd: PlanDataset, st: SheetTable, field_types: dict[
             except Exception as e:  # 任何转换失败都反馈给模型，而不是中断
                 bad.append(f"{f}（{fd.type}）第 {excel_row} 行：{e}")
                 break
+    if pd.key in cols:
+        from collections import Counter
+        i = st.headers.index(cols[pd.key])
+        dup = [(k, n) for k, n in Counter(cell_text(v[i]) for _, v in st.rows if v[i] not in (None, "")).items() if n > 1]
+        if dup:
+            errors.append(f"「{name}」的 key={pd.key} 有重复值（如 {dup[0][0]} 出现 {dup[0][1]} 次），说明不是每行一个对象："
+                          f"这是明细表，去掉 key，写 link=它所属对象的编号")
     if bad:
         errors.append(f"「{name}」有字段类型与数据不符：" + "；".join(bad[:5])
                       + "。请改成与数据相符的类型；月份、期间这类标签如果不参与日期计算，用 text 即可")

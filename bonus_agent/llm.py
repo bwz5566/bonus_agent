@@ -151,6 +151,7 @@ class LLM:
     tool_mode: str = "native"         # native：OpenAI 兼容的工具调用；json：模型输出 JSON 动作（不支持工具调用时用）
     timeout: float = 300
     cache: str | None = None          # explicit：在消息上加 cache_control 标记（百炼显式缓存）；不写则不加
+    tools_extra_body: dict | None = None   # 智能体工具调用时覆盖 extra_body（如打开思考模式），抽取等其他调用不受影响
     usage: Usage = field(default_factory=Usage)
 
     @classmethod
@@ -162,7 +163,8 @@ class LLM:
         m = cfg["models"][name]
         prov = cfg["providers"][m["provider"]]
         return cls(name, m["model"], prov["base_url"], provider_key(prov), m.get("json_mode", "json_object"),
-                   m.get("extra_body"), m.get("tool_mode", "native"), cache=m.get("cache"))
+                   m.get("extra_body"), m.get("tool_mode", "native"), cache=m.get("cache"),
+                   tools_extra_body=m.get("tools_extra_body"))
 
     def _usage(self, resp, t0: float):
         u = Usage(calls=1, latency_s=time.monotonic() - t0)
@@ -215,8 +217,9 @@ class LLM:
         """工具调用。返回 {"content": 文本, "tool_calls": [{"id", "name", "arguments"(JSON 字符串)}]}。"""
         kwargs = dict(model=self.model, messages=self._prepare(messages), tools=tools, temperature=temperature,
                       max_tokens=max_tokens)
-        if self.extra_body:
-            kwargs["extra_body"] = self.extra_body
+        body = {**(self.extra_body or {}), **(self.tools_extra_body or {})}
+        if body:
+            kwargs["extra_body"] = body
         t0 = time.monotonic()
         try:
             resp = self._client().chat.completions.create(**kwargs)
