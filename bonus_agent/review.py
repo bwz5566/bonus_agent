@@ -321,11 +321,21 @@ def build(ws, results: dict | None = None) -> list[dict]:
         add("数据", "数据范围", ds, body, [ds, f"datasets.{ds}"], flag=_flags(all_lint, [f"「{ds}」"]))
     # 待定事项：智能体决定不处理的地方、财务的答复
     for i in getattr(ws, "ignored", []) or []:
-        add("待定事项", "智能体说明不处理", str(i.get("ref", "")), str(i.get("reason", "")), [str(i.get("ref", ""))],
-            flag="智能体决定不处理这一项，请确认理由成立")
+        ref = str(i.get("ref", ""))
+        add("待定事项", "智能体说明不处理", ref, str(i.get("reason", "")), [ref],
+            flag="独立复读和规则在这里不一致，智能体认为规则是对的，请核对材料原文" if ref.startswith("复读 ")
+            else "智能体决定不处理这一项，请确认理由成立")
+    rr = getattr(ws, "reread", None) or {}
+    if rr.get("error"):
+        add("待定事项", "独立复读", "独立复读没有完成", f"复读调用失败：{rr['error']}。这一轮没有第二份独立理解做对照，请逐行仔细核对",
+            [], flag="独立复读没有完成")
+    elif rr.get("unclear"):
+        add("待定事项", "独立复读", "复读认为材料没写清的地方", "\n".join(f"- {u}" for u in rr["unclear"]), [])
     for q in getattr(ws, "questions", []) or []:
         if q.answer not in (None, "") and not getattr(q, "withdrawn", ""):
-            add("待定事项", "财务答复", f"问题 {q.id}", f"{q.text}\n答复：{q.answer}", [q.id])
+            by_doc = str(getattr(q, "answered_by", "") or "").startswith("材料")
+            add("待定事项", "财务答复", f"问题 {q.id}", f"{q.text}\n答复：{q.answer}", [q.id],
+                flag="智能体按材料原文关闭了这个问题，请确认材料确实答复了它" if by_doc else "")
     seen: set[str] = set()
     out = []
     for r in rows:                    # 同名同内容的行只留一次

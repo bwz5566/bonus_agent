@@ -132,6 +132,8 @@ class RunRecord:
     check: list[str] = field(default_factory=list)   # 核对明细（与 expected_check.txt 相同）
     review_rows: int = 0             # 口径单行数
     review_flagged: int = 0          # 口径单上标了疑点的行数
+    reread_ignored: int = 0          # 独立复读的出入里，智能体认为规则对、写进 ignored 的处数
+    reread_error: str = ""           # 独立复读调用失败的原因
     steps: int = 0
     calls: int = 0
     prompt_tokens: int = 0
@@ -187,6 +189,9 @@ def run_once(sc: Scenario, i: int, out: Path, llm_factory: Callable[[], object],
     if u is not None:
         rec.calls, rec.prompt_tokens, rec.completion_tokens = u.calls, u.prompt_tokens, u.completion_tokens
     rec.steps = steps
+    if ar is not None:
+        rec.reread_ignored = sum(1 for i in ar.ws.ignored if str(i.get("ref", "")).startswith("复读 "))
+        rec.reread_error = (ar.ws.reread or {}).get("error", "")
     if ar is not None and ar.status == "OK" and ar.results:
         rows = rv.load(out)
         rec.review_rows, rec.review_flagged = len(rows), sum(1 for r in rows if r["flag"])

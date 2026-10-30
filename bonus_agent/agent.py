@@ -184,8 +184,12 @@ TOOLS: list[dict] = [
                     "不通过会把原因返回给你修正。回复里的金额要来自 evaluate / explain / 试算结果，不要自己算。",
      "parameters": _obj({"text": _S, "ignored": {"type": "array", "items": _obj({"ref": _S, "reason": _S})}}, ["text"])},
     {"name": "answer_question",
-     "description": "对话时用：财务在消息里明确答复了某个待确认问题时，把他的原话记为该问题的答复。他没说清楚的不要替他选，用 reply 反问。",
-     "parameters": _obj({"id": _S, "answer": {**_S, "description": "财务的原话或他选的选项"}}, ["id", "answer"])},
+     "description": "记录待确认问题的答复，两种情况：① 对话时，财务在消息里明确答复了，把他的原话记为答复（没说清楚的不要替他选，用 reply 反问）；"
+                    "② 材料里（如后来补充的答复文件、确认单）已经明确答复了这个问题，file 写那个文件、quote 逐字复制答复原文，"
+                    "程序核对原文后关闭问题，口径单上会请财务确认。材料没有明确答复的，不能自己关闭。",
+     "parameters": _obj({"id": _S, "answer": {**_S, "description": "财务的原话、他选的选项，或材料答复的要点"},
+                         "file": {**_S, "description": "不在对话时必填：答复所在的材料文件"},
+                         "quote": {**_S, "description": "不在对话时必填：逐字复制的答复原文"}}, ["id", "answer"])},
     {"name": "verify",
      "description": "独立验算一个对象的金额：不看规则，按材料原文从原始字段另写一遍算式，由引擎在节点 at 上算出，和试算结果对到分。"
                     "要验算哪些对象由程序指定（见工作区状态的“待独立验算”），全部通过才能 finish。算式里不能引用规则变量（只能用字段、"
@@ -392,6 +396,7 @@ class Workspace:
     _verify_note: str = ""
     _probe_cache: dict = field(default_factory=dict)
     _gap_cache: tuple | None = None
+    reread: dict = field(default_factory=dict)              # 独立复读的结果（见 reread.py），材料没变时复用
     check_vars: dict = field(default_factory=dict)          # 独立验算定义过的辅助变量 {名字: {scope, expr}}，后面的验算直接引用，不必重写
     verified: dict = field(default_factory=dict)            # "方案|对象" -> 独立验算记录 {expr, at, basis}，结束前按最新规则重新比对
     read_nums: dict = field(default_factory=dict)           # 方案 -> 规则读取的数据字段里出现的数（直接读表的参数算用上了）
@@ -1097,6 +1102,13 @@ class Workspace:
                 if f"{d.name}#{k}" not in self.transcripts)
         return f"材料里有 {n} 张图片还没转写" if n else ""
 
+    def _reread_gaps(self, skipped: set[str]) -> list[tuple[str, str]]:
+        """独立复读和规则的出入里还没处理的：写进 ignored 或已有问题提到的算处理过。复读调用失败不拦，口径单上会标出。"""
+        from bonus_agent import reread as rr
+        res = rr.run(self)
+        asked = " ".join(f"{q.text} {q.answer or ''}" for q in self.questions)
+        return [(k, t) for k, t in rr.compare(self, res) if k not in skipped and k.split(" ", 2)[2] not in asked]
+
     def _open_gates(self, rep) -> list[str]:
         """还没处理的程序检查项：已写进 ignored，或已有问题提到这个取值 / 常数的，算处理过。
         有两类不能由智能体自己放过：照抄数据表的查找表（下一期悄悄算错），只能改规则或问财务；
@@ -1438,6 +1450,13 @@ class Workspace:
             raise ToolError("程序检查还有没处理的（逐条改规则；需要财务确认的用 ask_question；确实无关的写进 ignored，"
                             "ref 写“常数 x”或“取值 x”并说明原因）：\n" + "\n".join(f"- {g}" for g in gates[:12])
                             + (f"\n……共 {len(gates)} 处" if len(gates) > 12 else ""))
+        diffs = self._reread_gaps(skipped)
+        if diffs:
+            raise ToolError("独立复读（同一模型另起一次，只看材料和表头，没看你的规则）和规则有这些出入。逐条对照材料原文核对："
+                            "规则错了就改规则；规则是对的（复读理解错了）就写进 finish 的 ignored，ref 写行首方括号里的编号，"
+                            "reason 引用材料原文说明依据；材料没写清、需要财务定的用 ask_question：\n"
+                            + "\n".join(f"- [{k}] {t}" for k, t in diffs[:15])
+                            + (f"\n……共 {len(diffs)} 处" if len(diffs) > 15 else ""))
         left = self._verify_gaps()
         if left:
             raise ToolError("独立验算还没全部通过（金额错一分都不能出结果）。对下面每个对象用 verify：按材料原文从原始字段另写算式，"
@@ -1475,15 +1494,26 @@ class Workspace:
         return (f"已删除「{name}」的 {before - len(self.facts)} 条登记" +
                 (f"，撤回问题 {'、'.join(q.id for q in gone)}" if gone else "") + "。请按正确的名字重新登记")
 
-    def answer_question(self, id: str, answer: str) -> str:
-        if not self.chat_by:
-            raise ToolError("现在不是和财务对话，待确认问题只能由财务答复，你不能替财务回答。如果是程序因为你登记错了而误报的冲突（如把阶梯几档登记成"
-                            "同一个名字），用 remove_facts 删掉那个名字的登记、按正确的名字重新登记，程序会自动撤回问题")
+    def answer_question(self, id: str, answer: str, file: str = "", quote: str = "") -> str:
+        """对话时记录财务的原话；不在对话时，只能引用材料原文（如后来补充的答复文件）关闭问题，程序核对原文确实在材料里。"""
+        if not self.chat_by and (not file or not quote.strip()):
+            raise ToolError("现在不是和财务对话，你不能替财务回答。材料里（如后来补充的答复文件）已经有这个问题的答复时，"
+                            "file 写那个文件、quote 逐字复制答复原文，程序核对后关闭问题；材料里没有就继续等财务答复。"
+                            "如果是程序因为你登记错了而误报的冲突（如把阶梯几档登记成同一个名字），用 remove_facts 删掉那个名字的登记、"
+                            "按正确的名字重新登记，程序会自动撤回问题")
         q = next((q for q in self.questions if q.id == id), None)
         if q is None or q.withdrawn:
             raise ToolError(f"没有待答复的问题 {id}")
         from datetime import datetime
-        q.answer, q.answered_by = answer.strip(), f"{self.chat_by}（对话）"
+        if self.chat_by:
+            q.answer, q.answered_by = answer.strip(), f"{self.chat_by}（对话）"
+        else:
+            bad = fx.check_fact(fx.Fact(name=f"问题 {id} 的答复", value=quote, file=file, quote=quote),
+                                self._corpus())
+            if bad:
+                raise ToolError(f"引用核对没通过：{bad}")
+            q.answer = f"{answer.strip()}（依据《{file}》原文：{quote.strip()}）"
+            q.answered_by = f"材料《{file}》"
         q.answered_at = datetime.now().isoformat(timespec="seconds")
         return f"已记录 {id} 的答复：{q.answer}。请按答复修改规则"
 

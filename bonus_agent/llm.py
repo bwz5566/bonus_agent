@@ -257,6 +257,7 @@ class FakeLLM(LLM):
         self._i = 0
         self.calls: list[list[dict]] = []
         self.images: str | None = None      # 设置后，看图的调用一律返回它，不消耗预设回答
+        self.reread: str | None = None      # 独立复读的回答（JSON 文本）；不设时复读结果为空
 
     def _next(self, *args):
         if callable(self._responder):
@@ -268,6 +269,9 @@ class FakeLLM(LLM):
     def chat(self, messages, **kw) -> str:
         self.calls.append(messages)
         self.usage += Usage(calls=1)
+        if str(messages[0].get("content", "")).startswith("【独立复读】") and \
+                (self.reread is not None or not callable(self._responder)):
+            return self.reread or '{"items": []}'    # 独立复读：不消耗预设回答（脚本里接下来是工具调用）
         if callable(self._responder):
             return self._responder(messages)
         has_image = any(isinstance(m.get("content"), list) and any(p.get("type") == "image_url" for p in m["content"])
