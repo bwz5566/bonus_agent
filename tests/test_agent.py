@@ -383,3 +383,12 @@ def test_same_mistake_on_different_tables_is_not_stuck():
     assert len(ar.steps) == 4 and "卡住" not in (ar.error or "")
     ar = run_agent(FakeLLM([bad("部门目标")] * 4), [ANNUAL], max_steps=6, reflect=0)
     assert "卡住" in ar.error and len(ar.steps) == 3
+
+
+def test_lan_model_service_bypasses_system_proxy():
+    """内网模型服务直连，不走系统代理（Windows 上 httpx 会读系统代理，内网请求被转给代理就连不上）。"""
+    from bonus_agent.llm import direct, openai_client
+    assert direct("http://192.168.81.98:9705/v1") and direct("http://127.0.0.1:8000/v1") and direct("http://localhost:8000/v1")
+    assert not direct("https://api.deepseek.com/v1")
+    assert openai_client("http://10.0.0.5:8000/v1", "k", 5)._client._trust_env is False
+    assert openai_client("https://api.deepseek.com/v1", "k", 5)._client._trust_env is True

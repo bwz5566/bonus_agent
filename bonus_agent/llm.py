@@ -91,12 +91,31 @@ def provider_key(prov: dict) -> str:
     return os.environ.get(prov.get("api_key_env", ""), "") or prov.get("api_key") or "EMPTY"
 
 
+def direct(base_url: str) -> bool:
+    """内网地址（本机、局域网 IP）：直连，不走系统代理。Windows 上 httpx 会读系统代理设置，
+    内网模型服务的请求被转给代理就连不上。"""
+    import ipaddress
+    from urllib.parse import urlparse
+    host = urlparse(base_url).hostname or ""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_private
+    except ValueError:
+        return False
+
+
+def openai_client(base_url: str, api_key: str, timeout: float):
+    from openai import DefaultHttpxClient, OpenAI
+    http = DefaultHttpxClient(trust_env=False) if direct(base_url) else None
+    return OpenAI(base_url=base_url, api_key=api_key, timeout=timeout, http_client=http)
+
+
 def list_remote(provider: str, cfg: dict) -> list[str]:
     """用当前 Key 向服务商查询可调用的模型 ID（/models 接口）。"""
-    from openai import OpenAI
     prov = cfg["providers"][provider]
     try:
-        client = OpenAI(base_url=prov["base_url"], api_key=provider_key(prov), timeout=60)
+        client = openai_client(prov["base_url"], provider_key(prov), 60)
         return sorted(m.id for m in client.models.list())
     except Exception as e:
         raise LLMError(f"查询 {provider} 模型列表失败：{e}") from e
@@ -204,8 +223,7 @@ class LLM:
         return out
 
     def _client(self):
-        from openai import OpenAI
-        return OpenAI(base_url=self.base_url, api_key=self.api_key, timeout=self.timeout)
+        return openai_client(self.base_url, self.api_key, self.timeout)
 
     def chat(self, messages: list[dict], *, schema: dict | None = None, json_out: bool = False,
              temperature: float = 0.1, max_tokens: int = 8192) -> str:
