@@ -68,6 +68,11 @@ def test_unused_money_field_and_tier_scale_are_gated(tmp_path):
     bad = lint.check(rs.model_copy(update={"variables": v}), data, "")
     assert any("成本费用" in g and "expense_amount" in g for g in bad.gates)
     assert "金额 expense_amount" in bad.keys
+    # 拦下时告诉模型放过要写的 ref；照写就放过（Q1：模型自己拼的 ref 对不上，同一条拦了 6 次）
+    shown = ws._open_gates(bad)
+    assert any("〔放过时 ignored 的 ref 写「金额 expense_amount」〕" in g for g in shown)
+    ws.ignored = [{"ref": "金额 expense_amount", "reason": "费用不计入本奖金"}]
+    assert not [g for g in ws._open_gates(bad) if "expense_amount" in g]
     # 其他方案用到了就不算漏用
     assert not [g for g in lint.check(rs.model_copy(update={"variables": v}), data, "", used_elsewhere={"expense_amount"}).gates
                 if "expense_amount" in g]

@@ -1115,7 +1115,9 @@ class Workspace:
         已发抵扣写进奖金池（发放表应得、抵扣、超发三列错），写进 ignored 或提问都不算，只能改成 offsets。"""
         skipped = {str(i.get("ref", "")) for i in self.ignored if not str(i.get("ref", "")).startswith(NO_IGNORE)}
         asked = " ".join(f"{q.text} {q.answer or ''}" for q in self.questions)
-        return [g for g, k in zip(rep.gates, rep.keys)
+        # 每条后面给出写进 ignored 用的 ref（模型自己拼的 ref 常对不上，同一条拦了又拦）
+        return [g + ("" if k.startswith(NO_IGNORE) else f"〔放过时 ignored 的 ref 写「{k}」〕")
+                for g, k in zip(rep.gates, rep.keys)
                 if k.startswith(MUST_FIX) or (k not in skipped and k.split(" ", 1)[1] not in asked)]
 
     def _period_mismatch(self, name: str) -> str:
@@ -1448,7 +1450,7 @@ class Workspace:
         gates = [f"方案「{s}」：{g}" for s in self.schemes if s in self.lint for g in self._open_gates(self.lint[s])]
         if gates:
             raise ToolError("程序检查还有没处理的（逐条改规则；需要财务确认的用 ask_question；确实无关的写进 ignored，"
-                            "ref 写“常数 x”或“取值 x”并说明原因）：\n" + "\n".join(f"- {g}" for g in gates[:12])
+                            "ref 照抄每条末尾〔〕里给出的写法，reason 说明原因）：\n" + "\n".join(f"- {g}" for g in gates[:12])
                             + (f"\n……共 {len(gates)} 处" if len(gates) > 12 else ""))
         diffs = self._reread_gaps(skipped)
         if diffs:
