@@ -211,6 +211,9 @@ def test_failure_explained_with_retry(env):
     assert "「试算」" in x["title"] and "没有对应的明细行" in x["title"] and "重试" in x["advice"]
     assert "按 0 处理" in x["ask"] and "min 没有可计算的明细行" in x["where"]
     assert "欠费" in explain("Error code: 400 - Arrearage")["title"]
+    x = explain("智能体卡住了，已停止以免继续消耗 tokens：verify 连续 3 次失败，最后一次：错误：验算式算不出来：计算失败："
+                "变量 v_ew 属于「员工」层级，不能在「个人」层直接引用（需要聚合）（位置：个人:E007）")
+    assert "算不出来" in x["title"] and "没对上" not in x["title"] and "不需要你回答" in x["title"]   # 写法问题，不问财务
     cid = store.create("失败", "张会计")
     (store.dir(cid) / "materials" / "数据.xlsx").write_bytes((m / "数据.xlsx").read_bytes())
     scripts.append([{"tool": "trial_run"}] * 3)          # 连续失败 3 次，自动停下

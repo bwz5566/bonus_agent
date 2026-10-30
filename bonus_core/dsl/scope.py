@@ -114,7 +114,8 @@ class Layout:
             of = kw["of"]
             name = getattr(of, "value", None)
             if name not in self.rs.datasets:
-                return None, f"{c.fn} 的 of 参数必须是数据表名字符串"
+                return None, (f"{c.fn} 的 of 参数必须是数据表名字符串（写的是 {name if name is not None else '非字符串'}；"
+                              f"可用：{'、'.join(self.rs.datasets)}）")
             return name, ""
         refs = set()
         for a in list(c.args) + [v for k, v in c.kwargs if k == "where"]:

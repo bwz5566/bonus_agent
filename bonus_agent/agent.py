@@ -33,6 +33,7 @@ from bonus_core.dsl.functions import describe as describe_functions
 from bonus_core.dsl.models import DatasetDef, RuleSet, Variable
 from bonus_core.dsl.parser import Call, ExprError, Num, parse, walk
 from bonus_core.dsl.parser import names as parse_names
+from bonus_core.dsl.scope import Layout
 from bonus_core.dsl.validator import validate
 from bonus_core.engine.allocation import AdjustConflict
 from bonus_core.engine.evaluator import EvalError, Evaluator, fmt
@@ -202,6 +203,19 @@ TOOLS: list[dict] = [
      "parameters": _obj({"summary": {**_S, "description": "两三句话说明：什么奖金、奖金池怎么来、怎么分、发放条件"},
                          "ignored": {"type": "array", "items": _obj({"ref": _S, "reason": _S})}}, ["summary"])},
 ]
+
+
+def _helper_scope(rs: RuleSet, name: str, scope: str) -> str:
+    """辅助变量的 scope：层级名、关联实体表名或 global。写成层级的实体表名（如「个人」层的「员工」表）时换成层级名，两者是同一个对象。"""
+    levels = {lv.level for lv in rs.allocation}
+    lay = Layout(rs)
+    if scope in levels or scope in lay.aux or scope in ("global", ROOT_LEVEL):
+        return "global" if scope == ROOT_LEVEL else scope
+    d = rs.datasets.get(scope)
+    if d is not None and d.key in lay.key_level:
+        return rs.allocation[lay.key_level[d.key]].level
+    raise ToolError(f"辅助变量 {name} 的 scope「{scope}」不对：只能写层级（{'、'.join(levels)}）、"
+                    f"关联实体表（{'、'.join(lay.aux) or '无'}）或 global")
 
 
 def _verify_key(scheme: str, node: str, amount: str) -> str:
@@ -1135,9 +1149,11 @@ class Workspace:
             self._probe_cache[name] = (key, rs, data, patched)
         if helpers is not None:
             try:
-                rs = rs.model_copy(update={"variables": {k: Variable.model_validate(v) for k, v in helpers.items()}})
+                hv = {k: Variable.model_validate(v) for k, v in helpers.items()}
             except ValueError as e:
                 raise ToolError(f"辅助变量写法不对：{e}") from None
+            hv = {k: v.model_copy(update={"scope": _helper_scope(rs, k, v.scope)}) for k, v in hv.items()}
+            rs = rs.model_copy(update={"variables": hv})
         root, by_level, issues = build_tree(rs, data)
         blocking = [i for i in patched + issues if i.severity == "blocking"]
         if blocking:

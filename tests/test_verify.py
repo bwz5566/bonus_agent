@@ -139,6 +139,13 @@ def test_helpers_reach_across_tables_like_q1(tmp_path):
     with pytest.raises(ToolError, match="引用了规则变量 proj_sales"):
         w.verify("个人:E1", 'round(sum(v_proj * share, of: "项目参与") * 1%, 2)', "x",
                  helpers={"v_proj": {"scope": "项目", "expr": "proj_sales"}})
+    # Q11 第 3 次：辅助变量的 scope 写成「个人」层的实体表名「员工」，是同一个对象，按「个人」算；写错的 scope 说清能写什么
+    emp = {**helpers, "v_emp": {"scope": "员工", "expr": 'sum(v_proj * share, of: "项目参与")'}}
+    assert "一致" in w.verify("个人:E1", "round(v_emp * 1%, 2)", "个人奖金 = Σ(项目销售额 × 参与份额) × 1%", helpers=emp)
+    with pytest.raises(ToolError, match="scope「销售明细」不对：只能写层级（个人）、关联实体表（项目）或 global"):
+        w.verify("个人:E1", "round(v_emp * 1%, 2)", "x", helpers={**emp, "v_emp": {**emp["v_emp"], "scope": "销售明细"}})
+    with pytest.raises(ToolError, match="of 参数必须是数据表名字符串（写的是 参与；可用：员工、项目"):
+        w.verify("个人:E1", 'round(sum(v_proj * share, of: "参与") * 1%, 2)', "x", helpers=helpers)
 
 
 def test_mismatch_shows_which_group_and_department_the_object_belongs_to(tmp_path):
