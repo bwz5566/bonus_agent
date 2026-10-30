@@ -277,7 +277,8 @@ def test_steps_written_while_running(env):
     post(c, store, f"/cases/{cid}/run")
     wait(app, cid)
     log = (store.dir(cid) / "out" / "running_steps.txt").read_text(encoding="utf-8")
-    assert log.count("[0") == 3 and log.count("行动：trial_run") == 3 and "观察：" in log and "思考：" in log
+    # 连续失败 3 次算卡住，先停下来反思、换做法接着做（2 次），都没过去才停
+    assert log.count("行动：trial_run") == 9 and log.count("行动：（反思）") == 2 and "观察：" in log and "思考：" in log
 
 
 def test_chat_text_is_citable_source(tmp_path):

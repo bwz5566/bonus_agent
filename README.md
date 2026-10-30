@@ -242,6 +242,8 @@ bonus-agent serve --data /srv/bonus --host 127.0.0.1 --port 8080 [--model local]
 
 在 `bonus_agent/config/models.yaml`（或自己的 `config/models.yaml`）的 `local_vllm` 里填 vLLM 地址，把 `default` 改成本地模型即可；本地 vLLM 支持 `json_mode: json_schema` 约束解码，输出更稳定。
 
+现在默认用内网 Qwen 服务（`models.yaml` 里的 `qwen-local`，地址在 `local_qwen`，Key 写进 `config/secrets.yaml` 的 `local_qwen` 或环境变量 `LOCAL_QWEN_API_KEY`）；要换回 DeepSeek 用 `--model deepseek-flash`。
+
 已配好两个本地模型（`models.yaml` 里的 `local`、`local-deepseek`），用 vLLM 启动后 `--model local` 即可。下面是参考命令，
 工具调用解析器（`--tool-call-parser`）和显存参数以模型卡说明和实际显卡为准：
 

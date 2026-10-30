@@ -47,7 +47,8 @@ DEFAULT_SCHEME = "默认"        # 只有一个方案时的方案名
 SCHEME_REF = re.compile(r"""scheme_paid\(\s*["']([^"']+)["']\s*(?:,\s*["']([^"']+)["']\s*)?\)""")   # 规则里引用别的方案
 SHARED = "共用"                # 多个方案共用的部分（权重、校验、共用变量），合并进每个方案
 AGENT_TEMPERATURE = 0          # 工作循环用 0：同样的材料和状态尽量走同样的路，过程稳定、可复现
-MAX_STUCK = 3                  # 同一调用原样重复、或同一工具连续失败达到这个次数就停下，把卡住的原因报给财务
+MAX_STUCK = 3                  # 同一调用原样重复、或同一工具连续失败达到这个次数就算卡住
+MAX_REFLECT = 2                # 卡住时先让智能体停下来反思、换做法接着做，最多这么多次；再卡住才停下，把原因报给财务
 KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保留全文
 BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
 READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate"}
@@ -1876,8 +1877,10 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
               max_files: int = MAX_FILES, max_tokens: int | None = 4_000_000, exclude: list[str | Path] = (),
               on_step: Callable[[int, Step], None] | None = None, resume: bool = True,
               should_stop: Callable[[], bool] | None = None, instruction: str | None = None,
-              message: str | None = None, by: str = "", chat: list[dict] | None = None) -> AgentResult:
+              message: str | None = None, by: str = "", chat: list[dict] | None = None,
+              reflect: int = MAX_REFLECT) -> AgentResult:
     """max_steps 和 max_tokens 都是安全上限：模型调用 finish 就结束，正常不会用满。
+    reflect：卡住时在本轮内反思、换做法的次数上限（清掉打转的对话历史，带上卡在哪、试过什么，工作区保留），用完再停下。
 
     out_dir 是案卷目录：里面已有上一轮的 case.json 时（resume=True），从上一轮的工作区接着做，
     财务答复默认读取案卷里的 questions.yaml。"""
@@ -1944,6 +1947,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     stuck = ""
     undo: dict[tuple[str, str], int] = {}
     same_block, prev_full, long_block, prev_block = 0, set(), 0, set()
+    reflected = 0
     for turn in range(max_steps):
         if should_stop and should_stop():
             error = f"已手动停止（第 {len(steps)} 步）"
@@ -2089,7 +2093,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                     stuck = f"「{what}」反复建了又删（{undo[(c['name'], what)]} 次），没有进展"
                 elif undo[(c["name"], what)] == MAX_STUCK - 1:
                     result += (f"\n注意：「{what}」已经删了 {MAX_STUCK - 1} 次。先想清楚它该怎么定义再动手，"
-                               f"再删一次程序会停下；拿不准就用 ask_question 问财务")
+                               f"再删一次就算卡住；拿不准就用 ask_question 问财务")
                     step.result = result
             if ok and c["name"] == "set_rules":      # 保存了但阻断问题一直没改掉：同样算没有进展
                 # 每次都改掉了几个（阻断问题在减少）是在推进，只是一次没改完，不算卡住；
@@ -2104,7 +2108,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                     n = same_block if same_block >= MAX_STUCK else long_block
                     stuck = f"set_rules 连续 {n} 次保存后仍有同样的阻断问题，最后一次：{result[:300]}"
                 elif same_block == MAX_STUCK - 1 or long_block == 2 * MAX_STUCK - 1:
-                    result += ("\n注意：同样的阻断问题已经连续几次没改掉。再出现一次程序会停下；"
+                    result += ("\n注意：同样的阻断问题已经连续几次没改掉。再出现一次就算卡住；"
                                "如果是规则写法表达不了材料的要求，用 ask_question 问财务或说明卡在哪里")
                     step.result = result
             if fails[c["name"]] >= MAX_STUCK:
@@ -2123,9 +2127,25 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                                                        f"不要再重复；下一步（程序判断）：{ws.next_hint()}）"})
         if ws.done:
             break
+        if (repeats >= MAX_STUCK or any(n >= MAX_STUCK for n in fails.values())) and reflected < reflect:
+            # 卡住了先不停：清掉原地打转的对话历史（小模型会照着历史接着重复，也白占上下文），
+            # 只留卡在哪、试过什么、程序的判断，让智能体回到材料和数据重新想、换一种做法。工作区（数据表、规则、台账）都保留
+            reflected += 1
+            note = _reflection(ws, stuck, steps, reflected, reflect)
+            history.clear()
+            history.append({"role": "user", "content": note})
+            repeats, last_write, stuck = 0, None, ""
+            for d in (fails, fail_why, seen, undo):
+                d.clear()
+            same_block, prev_full, long_block, prev_block = 0, set(), 0, set()
+            steps.append(Step("（反思）", {}, note, True))
+            if on_step:
+                on_step(len(steps), steps[-1])
+            continue
         if repeats >= MAX_STUCK or any(n >= MAX_STUCK for n in fails.values()):
             error = (f"智能体卡住了，已停止以免继续消耗 tokens：{stuck}。"
-                     f"已用 {len(steps)} 步。请把这条信息反馈给开发，或在对话里告诉智能体怎么处理")
+                     f"已用 {len(steps)} 步" + (f"，中途停下来反思、换做法 {reflected} 次仍没过去" if reflected else "")
+                     + "。请把这条信息反馈给开发，或在对话里告诉智能体怎么处理")
             break
     else:
         error = f"达到最大步数 {max_steps} 仍未完成"
@@ -2233,6 +2253,30 @@ def _resume_task(ws: Workspace, last: dict | None, changes: dict | None, fresh: 
               "3. 删除的文件如果被数据表用到，改映射或提问；",
               "4. 试算全部方案，确认结果合理后 finish。还有问题等答复时，做完不受影响的部分就 finish 结束本轮。",
               "", "当前文件清单：", ws.list_files()]
+    return "\n".join(lines)
+
+
+def _reflection(ws: Workspace, stuck: str, steps: list[Step], n: int, limit: int) -> str:
+    """卡住时的反思提示：卡在哪、最近试过什么、程序的判断，要求先想清楚原因再换一种做法。"""
+    tried = []
+    for st in steps[-8:]:
+        if st.tool.startswith("（"):
+            continue
+        head = st.result.split("\n", 1)[0][:200]
+        why = (st.thought or "").replace("\n", " ")[:120]
+        tried.append(f"  · {st.tool}{'（失败）' if not st.ok else ''}：{head}" + (f"｜当时的想法：{why}" if why else ""))
+    lines = [f"【停下来反思（第 {n} 次，最多 {limit} 次）】你在同一个地方已经连续几次没有进展：{stuck[:600]}",
+             "前面的对话已清掉，工作区（数据表、列映射、规则、台账、条款）都保留，见工作区状态。最近几步：", *tried[-5:],
+             "", "不要再按原来的写法小修小补。先在 thought 里写清楚：",
+             "1. 报错或阻断问题到底在说什么，前几次改了什么、为什么没解决；",
+             "2. 回到材料原文和数据核对真正的要求：相关条款怎么说，数据表里实际是什么（列、取值、哪一层的编号），需要就用工具看一眼；",
+             "3. 换一种做法（如换一种写法、拆表或换挂靠的层级、删掉不需要的定义、把复杂的算式拆成辅助变量逐步算），"
+             "并说明为什么这次能解决；",
+             "4. 确实是材料没写清或规则写法表达不了，用 ask_question 说明卡在哪里，不要硬凑。"]
+    lines += [f"提示：{t}" for t in _lessons(stuck)]
+    lines.append(f"程序判断的下一步：{ws.next_hint()}")
+    if n >= limit:
+        lines.append("这是最后一次反思机会，再卡住本轮就会停下。")
     return "\n".join(lines)
 
 

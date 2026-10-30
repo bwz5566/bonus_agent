@@ -233,7 +233,7 @@ def test_chat_answers_and_changes(tmp_path):
 def test_stops_after_three_identical_failures(tmp_path):
     m = _materials(tmp_path / "m")
     bad = {"tool": "record_facts", "args": {"facts": [fact("5%", "方案.docx", "原文没有这句 5%")]}}
-    ar = run_agent(FakeLLM([bad] * 20), [m])
+    ar = run_agent(FakeLLM([bad] * 20), [m], reflect=0)
     assert "卡住" in ar.error and len(ar.steps) == 3 and "record_facts" in ar.error
 
 
@@ -256,7 +256,7 @@ def test_define_remove_oscillation_stops(tmp_path):
     from bonus_agent.llm import FakeLLM
     rm = {"tool": "remove_dataset", "args": {"name": "人员"}}
     ar = run_agent(FakeLLM([DATASET, rm] * 4 + [{"tool": "finish", "args": {"summary": "x"}}]),
-                   [_materials(tmp_path / "m")], tmp_path / "out")
+                   [_materials(tmp_path / "m")], tmp_path / "out", reflect=0)
     assert "反复建了又删" in ar.error and len(ar.steps) == 6, ar.error
     assert "删了 2 次" in ar.steps[3].result
     assert "「人员」" in explain(ar.error)["title"]
@@ -282,10 +282,29 @@ def test_saving_rules_with_same_blocking_issue_stops(tmp_path):
         return {"tool": "set_rules", "args": {"pool": {"expr": f"sum(sales) * 0.0{i}"},
                                               "allocation": [{"level": "个人", "key": "eid", "weight": "no_such_var"}]}}
     ar = run_agent(FakeLLM([DATASET, bad(1), bad(2), bad(3), bad(4), {"tool": "finish", "args": {"summary": "x"}}]),
-                   [_materials(tmp_path / "m")], tmp_path / "out")
+                   [_materials(tmp_path / "m")], tmp_path / "out", reflect=0)
     assert "同样的阻断问题" in ar.error and len(ar.steps) == 4, ar.error
     assert "连续几次没改掉" in ar.steps[2].result
     assert "同一个问题一直没改掉" in explain(ar.error)["title"]
+
+
+def test_stuck_reflects_and_continues_before_stopping(tmp_path):
+    """卡住先不停：清掉打转的对话，带上卡在哪、试过什么，让智能体反思换做法接着做；反思次数用完还卡住才停。"""
+    from bonus_agent.agent import run_agent
+    from bonus_agent.llm import FakeLLM
+
+    def bad(i):
+        return {"tool": "set_rules", "args": {"pool": {"expr": f"sum(sales) * 0.0{i}"},
+                                              "allocation": [{"level": "个人", "key": "eid", "weight": "no_such_var"}]}}
+    llm = FakeLLM([DATASET, bad(1), bad(2), bad(3), {"tool": "list_files"}, {"tool": "finish", "args": {"summary": "x"}}])
+    ar = run_agent(llm, [_materials(tmp_path / "m")], tmp_path / "out", reflect=1)
+    tools = [s.tool for s in ar.steps]
+    assert tools[:6] == ["define_dataset", "set_rules", "set_rules", "set_rules", "（反思）", "list_files"], tools
+    note = ar.steps[4].result
+    assert "停下来反思" in note and "同样的阻断问题" in note and "set_rules（" not in note[:20] and "最后一次" in note
+    after = json.dumps(llm.calls[5], ensure_ascii=False)       # 反思后的那次调用：打转的对话已清掉，只留反思提示
+    assert "停下来反思" in after and "sum(sales) * 0.02" not in after
+    assert "同样的阻断问题" not in (ar.error or "")
 
 
 def test_blocking_issues_shrinking_is_progress(tmp_path):
@@ -303,7 +322,7 @@ def test_blocking_issues_shrinking_is_progress(tmp_path):
     assert "同样的阻断问题" not in ar.error and len(ar.steps) >= 5, ar.error
     assert all("需要修正" in s.result for s in ar.steps[1:5])          # 每次都还有阻断（权重一直没改），但没被停下
     ar = run_agent(FakeLLM([DATASET] + [save(*"abcdef"[:6 - i]) for i in range(7)]
-                           + [{"tool": "finish", "args": {"summary": "x"}}]), [_materials(tmp_path / "m2")], tmp_path / "out2")
+                           + [{"tool": "finish", "args": {"summary": "x"}}]), [_materials(tmp_path / "m2")], tmp_path / "out2", reflect=0)
     assert "同样的阻断问题" in ar.error and len(ar.steps) == 7, ar.error     # 权重问题连挂 6 次：停下
 
 

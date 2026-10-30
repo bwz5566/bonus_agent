@@ -174,6 +174,10 @@ def test_errors_are_explicit():
     bad = rs.model_copy(update={"pool": rs.pool.model_copy(update={"expr": "ratio(1, 0)"})})
     with pytest.raises(EngineError, match="分母为 0"):
         compute(bad, data)
+    # 说清分母是哪个式子、在哪个对象上为 0，智能体能直接去查
+    bad = rs.model_copy(update={"pool": rs.pool.model_copy(update={"expr": "1 / sum(w, of: \"小组\", where: w < 0)"})})
+    with pytest.raises(EngineError, match="在对象「全部」上是 0"):
+        compute(bad, data)
     bad = rs.model_copy(update={"pool": rs.pool.model_copy(update={"expr": "unknown_x + 1"})})
     with pytest.raises(EngineError, match="unknown_x"):
         compute(bad, data)

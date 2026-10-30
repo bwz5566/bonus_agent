@@ -212,7 +212,7 @@ class Evaluator:
                 a, b = self.ev(l, ctx), self.ev(r, ctx)
                 x, y = self._num(a, ctx.where), self._num(b, ctx.where)
                 if op == "/" and y == 0:
-                    raise EvalError(f"除数为 0：{a.text} / {b.text}", ctx.where)
+                    raise EvalError(f"除数为 0：{a.text} / {b.text}。{self._zero_hint(r, ctx)}", ctx.where)
                 deps, rows = _merge(a, b)
                 text = f"{_paren(l, a.text, op, False)} {op} {_paren(r, b.text, op, True)}"
                 return Val(_ARITH[op](x, y), text, deps, rows)
@@ -337,7 +337,7 @@ class Evaluator:
             deps, rows = _merge(a, b)
             if y == 0:
                 if "zero" not in kw:
-                    raise EvalError(f"ratio 分母为 0：{a.text} / {b.text}，且没有给 zero 默认值", ctx.where)
+                    raise EvalError(f"ratio 分母为 0：{a.text} / {b.text}，且没有给 zero 默认值。{self._zero_hint(c.args[1], ctx)}", ctx.where)
                 z = self.ev(kw["zero"], ctx)
                 return Val(self._num(z, ctx.where), f"{a.text} / {b.text}(=0 → {z.text})", deps, rows)
             return Val(x / y, f"{a.text} / {b.text}", deps, rows)
@@ -392,6 +392,12 @@ class Evaluator:
             r = Decimal(d.year if fn == "year" else d.month if fn == "month" else (d.month - 1) // 3 + 1)
             return Val(r, f"{fn}({a.text})", a.deps, a.rows)
         raise EvalError(f"不支持的函数 {fn}", ctx.where)
+
+    @staticmethod
+    def _zero_hint(den, ctx: Ctx) -> str:
+        """分母为 0 时说清是哪个对象、哪个式子，智能体能直接去查数据或筛选条件。"""
+        return (f"分母 {unparse(den)} 在对象「{ctx.node.id}」上是 0：查这个对象的数据是否缺失，"
+                "筛选条件（期间、取值、所属对象）是否写对，或者材料对分母为 0 有没有规定")
 
     def _seen(self, ctx: Ctx, kind: str, what, outcome: str) -> None:
         item = ctx.where.split("/", 1)[-1]

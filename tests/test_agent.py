@@ -255,7 +255,7 @@ def test_agent_stops_looping_and_paginates(monkeypatch):
     import bonus_agent.agent as agent_mod
     monkeypatch.setattr(agent_mod, "PIN_SHEET_ROWS", 10)       # 花名册不整表附进材料包，才需要翻页
     llm = FakeLLM([{"tool": "note", "args": {"topic": "总包", "text": "净利润 8%"}}] + [same] * 10)
-    ar = run_agent(llm, [ANNUAL], max_steps=30)
+    ar = run_agent(llm, [ANNUAL], max_steps=30, reflect=0)
     assert not ar.ok and "卡住" in ar.error and "反复调用 read_sheet" in ar.error and len(ar.steps) == 5
     first = ar.steps[1].result
     assert "start_row=6" in first and "共 28 行" in first
@@ -330,7 +330,7 @@ def test_agent_stops_only_on_same_failure_reason():
              {"tool": "list_files"}]
     ar = run_agent(FakeLLM(calls), [ANNUAL], max_steps=4)
     assert len(ar.steps) == 4 and "卡住" not in ar.error
-    ar = run_agent(FakeLLM([{"tool": "finish", "args": {"summary": "x"}}] * 4), [ANNUAL], max_steps=6)
+    ar = run_agent(FakeLLM([{"tool": "finish", "args": {"summary": "x"}}] * 4), [ANNUAL], max_steps=6, reflect=0)
     assert "卡住" in ar.error and len(ar.steps) == 3
 
 
@@ -364,7 +364,7 @@ def test_repeated_successful_write_is_not_kept_in_history():
     from bonus_agent.agent import run_agent
     same = {"thought": "记下总包口径", "tool": "note", "args": {"topic": "总包", "text": "净利润 8%"}}
     llm = FakeLLM([same] * 5)
-    ar = run_agent(llm, [ANNUAL], max_steps=10)
+    ar = run_agent(llm, [ANNUAL], max_steps=10, reflect=0)
     assert "卡住" in ar.error and "反复提交相同的 note" in ar.error and len(ar.steps) == 4
     assert ar.steps[0].result != ar.steps[1].result and "上一步已经生效" in ar.steps[1].result
     third = llm.calls[-2]                # 重复两次之后的请求：历史里只有第一次的调用，重复的换成了说明
@@ -381,5 +381,5 @@ def test_same_mistake_on_different_tables_is_not_stuck():
                                                         "fields": {"a": {"column": "b", "type": "id"}}}}
     ar = run_agent(FakeLLM([bad("部门目标"), bad("小组目标"), bad("个人目标"), {"tool": "list_files"}]), [ANNUAL], max_steps=4)
     assert len(ar.steps) == 4 and "卡住" not in (ar.error or "")
-    ar = run_agent(FakeLLM([bad("部门目标")] * 4), [ANNUAL], max_steps=6)
+    ar = run_agent(FakeLLM([bad("部门目标")] * 4), [ANNUAL], max_steps=6, reflect=0)
     assert "卡住" in ar.error and len(ar.steps) == 3

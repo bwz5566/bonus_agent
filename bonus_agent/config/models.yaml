@@ -16,8 +16,11 @@ providers:
   local_vllm:       # 自建 vLLM，部署后使用
     base_url: http://127.0.0.1:8000/v1
     api_key_env: VLLM_API_KEY
+  local_qwen:       # 内网 Qwen 服务（vLLM，OpenAI 兼容，max-model-len 1M）。Key 写在 secrets.yaml 或环境变量 LOCAL_QWEN_API_KEY
+    base_url: http://192.168.81.98:9705/v1
+    api_key_env: LOCAL_QWEN_API_KEY
 
-default: deepseek-flash
+default: qwen-local
 
 # 智能体相关的可选项（写在每个模型下）：
 #   tool_mode: native | json      native 为原生工具调用（默认）；服务不支持时会自动改用 json
@@ -101,6 +104,16 @@ models:
     json_mode: json_object
     extra_body: {thinking: {type: disabled}}
     vision: deepseek-flash
+
+  # ---- 内网 Qwen（2026-10-30 起默认）----
+  # 深度思考默认关（和 deepseek-flash 一致，Q1–Q7 都是在不思考下算对的）；要试思考时把 tools_extra_body 打开，
+  # 只对智能体每一步生效，抽取、复读等要 JSON 的调用仍然不思考
+  qwen-local:
+    provider: local_qwen
+    model: qwen-chat
+    json_mode: json_object
+    extra_body: {chat_template_kwargs: {enable_thinking: false}}
+    # tools_extra_body: {chat_template_kwargs: {enable_thinking: true}}
 
   # ---- 私有化部署后 ----
   # 部署时把 model 改成选型胜出的模型（vLLM 启动时的 --served-model-name 或权重路径）

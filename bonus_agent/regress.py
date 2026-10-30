@@ -125,6 +125,7 @@ class RunRecord:
     error: str = ""
     rounds: int = 0
     auto_continued: int = 0
+    reflections: int = 0             # 卡住时在本轮内停下来反思、换做法的次数
     answered_rounds: int = 0
     questions: list[str] = field(default_factory=list)
     checked: int = 0                 # 核对的金额个数
@@ -164,6 +165,7 @@ def run_once(sc: Scenario, i: int, out: Path, llm_factory: Callable[[], object],
                            max_history_chars=max_history_chars)
             new = False
             steps += len(ar.steps)
+            rec.reflections += sum(1 for s in ar.steps if s.tool == "（反思）")
             rec.rounds += 1
             log(f"  {sc.name} 第 {i} 次 · 第 {ar.round} 轮：{ar.status}" + (f"（{ar.error[:80]}）" if ar.error else ""))
             rec.questions += [q.text for q in ar.ws.pending if q.text not in rec.questions]
@@ -222,6 +224,7 @@ def summarize(records: list[RunRecord], meta: dict) -> dict:
         return {"次数": n, "出结果": len(done), "金额正确": sum(1 for r in rs if r.correct),
                 "算错没拦住": sum(1 for r in rs if r.missed),
                 "自动接续过": sum(1 for r in rs if r.auto_continued),     # 中途卡住、自动接着做才完成的次数（稳定性）
+                "反思过": sum(1 for r in rs if r.reflections),           # 卡住时在本轮内停下来反思、换做法的次数
                 "完成率": round(len(done) / n, 3) if n else 0,
                 "正确率": round(sum(1 for r in rs if r.correct) / n, 3) if n else 0,
                 "卡住原因": causes,
@@ -233,10 +236,10 @@ def summarize(records: list[RunRecord], meta: dict) -> dict:
 
 
 def lines(summary: dict) -> list[str]:
-    out = [f"{'场景':<8}{'次数':>4}{'出结果':>6}{'正确':>6}{'算错没拦住':>10}{'自动接续过':>10}  卡住原因"]
+    out = [f"{'场景':<8}{'次数':>4}{'出结果':>6}{'正确':>6}{'算错没拦住':>10}{'自动接续过':>10}{'反思过':>6}  卡住原因"]
     for name, s in list(summary["场景"].items()) + [("总计", summary["总计"])]:
         why = "、".join(f"{k} {v}" for k, v in s["卡住原因"].items()) or "—"
-        out.append(f"{name:<8}{s['次数']:>4}{s['出结果']:>6}{s['金额正确']:>6}{s['算错没拦住']:>10}{s['自动接续过']:>10}  {why}")
+        out.append(f"{name:<8}{s['次数']:>4}{s['出结果']:>6}{s['金额正确']:>6}{s['算错没拦住']:>10}{s['自动接续过']:>10}{s.get('反思过', 0):>6}  {why}")
     return out
 
 
