@@ -285,6 +285,8 @@ class Evaluator:
             return Val(self.rs.tables[n], n)
         if n in self.detail_fields:
             raise EvalError(f"{n} 是明细字段，需要放在 sum/avg/count 等聚合函数里使用", ctx.where)
+        if n in self.rs.datasets:
+            raise EvalError(f"{n} 是数据表名，不能直接当数用：对它的字段聚合，表名写在 of 里，如 sum(字段, of: \"{n}\")", ctx.where)
         raise EvalError(f"无法识别的名字 {n}", ctx.where)
 
     # ---- 函数 ----
@@ -427,6 +429,10 @@ class Evaluator:
             if c.fn == "count_distinct":
                 r = Decimal(len(set(vals)))
             else:
+                text = next((v for v in vals if isinstance(v, str)), None)
+                if text is not None:
+                    raise EvalError(f"{c.fn} 要对数字求值，这里取到的是 {fmt(text)}（{ds} 的行）。数行数用 count(of: \"{ds}\", where: 条件)，"
+                                    f"数不同取值的个数用 count_distinct(字段, of: \"{ds}\")", ctx.where)
                 nums = [self._num(Val(v, fmt(v)), ctx.where) for v in vals]
                 if c.fn == "sum":
                     r = sum(nums, Decimal(0))

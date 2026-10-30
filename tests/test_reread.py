@@ -99,3 +99,41 @@ def test_finish_blocks_until_reread_diff_handled(tmp_path):
     ar = run_agent(llm, [run_case.XLSX], tmp_path / "c")
     assert ar.status == "OK" and ar.ws.reread["error"]
     assert any(r["item"] == "独立复读没有完成" and r["flag"] for r in rv.load(tmp_path / "c"))
+
+
+def _calc(pool, helpers=None):
+    tables = {"r": {"kind": "lookup", "mapping": {"华东": 1.1, "华南": 1.0, "华北": 0.9, "西部": 1.2}},
+              "d": {"kind": "lookup", "mapping": {"1": 1.0, "2": 1.1, "3": 1.25}}}
+    return json.dumps({"schemes": {"PROCESS": {"tables": tables, "helpers": helpers or {}, "pool": pool}}}, ensure_ascii=False)
+
+
+PROCESS_OK = ('sum(round(base_bonus * lookup(r, region) * if(contract_date >= "2026-01-01", 1.10, 0.95) * lookup(d, difficulty), 2), '
+              'of: "里程碑", where: status == "已验收" and between(acceptance_date, "2026-07-01", "2026-09-30"))')
+
+
+def test_independent_pool_formula_compared_on_data(tmp_path):
+    """复读只按材料另写奖金池算式（自己的参数表和辅助变量），放到同一份数据上和规则逐个对象比数：
+    写法和规则不同但算出来一样的不拦；漏了系数、算出来不一样的拦下；算式写错先带着报错让它自己改。"""
+    from bonus_agent.agent import run_agent
+    from bonus_agent.llm import FakeLLM
+    from tests.test_syn_acceptance import _script, run_case
+    llm = FakeLLM(_script())
+    llm.calc = _calc(PROCESS_OK)
+    ar = run_agent(llm, [run_case.XLSX], tmp_path / "a")
+    assert ar.status == "OK", ar.error
+    calc = ar.ws.reread["calc"]
+    assert "PROCESS" in calc["schemes"] and "PROCESS" not in calc["error"]          # 没写的方案只是不比
+    # 漏乘难度系数：两个部门都对不上，结束前拦下，写明两边的金额和复读的算式
+    llm = FakeLLM(_script())
+    llm.calc = _calc(PROCESS_OK.replace(" * lookup(d, difficulty)", ""))
+    ar = run_agent(llm, [run_case.XLSX], tmp_path / "b")
+    blocked = [s for s in ar.steps if s.tool == "finish" and not s.ok]
+    assert ar.status != "OK" and blocked and "[复读 奖金池 PROCESS]" in blocked[0].result
+    assert "部门:D01 复读" in blocked[0].result and "规则 222,727.50" in blocked[0].result
+    # 第一次写了不存在的字段：把报错交还它，第二次写对了就用第二次的
+    llm = FakeLLM(_script())
+    llm.calc = [_calc(PROCESS_OK.replace("base_bonus", "no_such_field")), _calc(PROCESS_OK)]
+    ar = run_agent(llm, [run_case.XLSX], tmp_path / "c")
+    assert ar.status == "OK" and "PROCESS" not in ar.ws.reread["calc"]["error"], ar.ws.reread["calc"]
+    fix = [m for m in llm.calls if str(m[0].get("content", "")).startswith("【独立算式】") and len(m) > 2]
+    assert fix and "算不出来" in fix[0][-1]["content"]

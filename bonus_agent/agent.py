@@ -1107,7 +1107,8 @@ class Workspace:
         from bonus_agent import reread as rr
         res = rr.run(self)
         asked = " ".join(f"{q.text} {q.answer or ''}" for q in self.questions)
-        return [(k, t) for k, t in rr.compare(self, res) if k not in skipped and k.split(" ", 2)[2] not in asked]
+        return [(k, t) for k, t in rr.compare(self, res) if k not in skipped and k.split(" ", 2)[2] not in asked] \
+            + [(k, t) for k, t in rr.calc_gaps(self, res) if k not in skipped]
 
     def _open_gates(self, rep) -> list[str]:
         """还没处理的程序检查项：已写进 ignored，或已有问题提到这个取值 / 常数的，算处理过。
@@ -1222,6 +1223,47 @@ class Workspace:
         except (EvalError, ValueError) as e:
             raise ToolError(f"计算失败：{e}") from None
         return v, ev.traces["probe"].rendered
+
+    def _independent_pool(self, name: str, spec: dict) -> dict[str, Decimal]:
+        """独立复读按材料写的奖金池算式：只用它自己的辅助变量和参数表（不带规则的变量和参数表），
+        在奖金池所在层的每个对象上计算。返回 {对象: 金额}；写法不对、算不出来抛 ToolError。"""
+        rs = self._ruleset(name)
+        data, _ = self._data(rs)
+        data, patched = apply_patches(rs, data)
+        try:
+            tables = Extraction.model_validate({"pool": {"expr": "0"}, "allocation": [],
+                                                "tables": spec.get("tables") or {}}).tables
+            hv = {k: Variable.model_validate(v) for k, v in (spec.get("helpers") or {}).items()}
+            parse(str(spec.get("pool") or ""))
+            for v in hv.values():
+                parse(v.expr)
+        except (ValueError, ExprError) as e:
+            raise ToolError(f"写法不对：{str(e)[:400]}") from None
+        hv = {k: v.model_copy(update={"scope": _helper_scope(rs, k, v.scope)}) for k, v in hv.items()}
+        rs = rs.model_copy(update={"variables": hv, "tables": tables})
+        root, by_level, issues = build_tree(rs, data)
+        blocking = [i for i in patched + issues if i.severity == "blocking"]
+        if blocking:
+            raise ToolError("建树失败：" + "；".join(str(i) for i in blocking[:3]))
+        targets = [root] if rs.pool.scope == "global" else by_level.get(rs.pool.scope, [])
+        ev = Evaluator(rs, root, by_level, self._refs(name))
+        ev.peer_scope = True
+        out = {}
+        for n in targets:
+            try:
+                v = ev.evaluate(str(spec["pool"]), n, f"{n.id}/复读奖金池", "复读")
+            except (EvalError, ValueError) as e:
+                raise ToolError(f"{n.id} 上算不出来：{str(e)[:300]}") from None
+            if isinstance(v, bool) or not isinstance(v, Decimal):
+                raise ToolError(f"{n.id} 上算出的不是金额：{v}")
+            out[n.id] = v
+        return out
+
+    def _pool_values(self, name: str) -> dict[str, Decimal]:
+        """规则算出的奖金池（未修订的 R0），按奖金池所在层的对象。"""
+        res = self.results[name]["R0"]
+        return {k.removesuffix("/奖金池"): Decimal(str(t.value)) for k, t in res.traces.items()
+                if k.endswith("/奖金池") and k.count("/") == 1}
 
     # ---- 独立验算 ----
     def verify(self, node: str, expr: str, basis: str, at: str | None = None, scheme: str | None = None,

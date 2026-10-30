@@ -10,6 +10,11 @@
 
 比对完全由程序做（不让模型当裁判），只比能机械判断的几类：用到的列、常数（允许百分数、万元换算）、分档点、
 筛选取值、日期范围。复读本身对不对不重要：它只用来把可疑的地方挑出来。
+
+独立算式：只比列名、常数看不出“公式本身写错”（如分子分母取错、该减的没减）。所以复读之后再调用一次，
+让它只按材料把每个方案的奖金池写成算式（给数据字典和分配层级，不给规则的算式），程序把它放到同一份数据上算，
+和规则算出的奖金池逐个对象比数。不预设会错在哪里：两份独立理解只要不一样，数就对不上。
+算式写不对时把报错交还它自己改（最多 CALC_TRIES 次）；还是算不出来不拦，口径单上注明。
 """
 from __future__ import annotations
 
@@ -23,6 +28,9 @@ from bonus_agent.extract_rules import prompt
 from bonus_agent.llm import LLMError, parse_json
 
 MARK = "【独立复读】"            # 系统提示的开头；测试用的 FakeLLM 靠它认出复读调用
+CALC_MARK = "【独立算式】"
+CALC_TRIES = 3                   # 独立算式写不对时，带着报错让它自己改，最多试这么多次
+CALC_SHOW = 3                    # 奖金池对不上时，列出几个对象的两边金额
 PARAM_ROWS = 80                  # 没定义成数据表、不超过这么多行的工作表当作参数表，整表给复读
 DOC_CHARS = 60000                # 单个文档最多给这么多字
 DATA_JSON_CHARS = 20000          # 超过这么长的 JSON 数组文件当作数据，不给（财务答复这类短 JSON 照给）
@@ -91,9 +99,10 @@ def run(ws) -> dict:
     sig = signature(text)
     old = getattr(ws, "reread", None) or {}
     if old.get("sig") == sig and not old.get("error"):
+        calc(ws, old)
         return old
     msgs = [{"role": "system", "content": prompt("reread")}, {"role": "user", "content": text}]
-    out = {"sig": sig, "items": [], "unclear": [], "error": ""}
+    out = {"sig": sig, "items": [], "unclear": [], "error": "", "calc": old.get("calc") or {}}
     for attempt in range(2):
         try:
             raw = ws.llm.chat(msgs, json_out=True, temperature=0, max_tokens=8192)
@@ -110,7 +119,133 @@ def run(ws) -> dict:
             if attempt == 0:
                 msgs = msgs + [{"role": "user", "content": "上次的输出不是合法的 JSON，请只输出 JSON 对象。"}]
     ws.reread = out
+    if not out["error"]:
+        calc(ws, out)
     return out
+
+
+# ---- 独立算式 ----
+
+def structure(ws) -> str:
+    """独立算式要用的结构：数据字典（字段名、对应表头、类型）和每个方案的分配层级、奖金池在哪一层算。不给规则的算式。"""
+    from bonus_agent.extract_rules import data_dictionary
+    heads = []
+    for ds, m in ws.mapping.items():
+        cols = "、".join(f"{f} ← {c}" for f, c in m.columns.items())
+        heads.append(f"- {ds}：{m.file}/{m.sheet}" + (f"（只取 {m.filter}）" if m.filter else "") + f"；{cols}")
+    out = ["# 数据字典（规则里只能用这些字段名）", data_dictionary(ws.datasets), "", "## 字段对应的原表头", *heads, "", "# 方案"]
+    for name in schemes(ws):
+        full = ws._merged(name)
+        levels = " → ".join(f"{lv.get('level')}（主键 {lv.get('key')}）" for lv in full.get("allocation") or [])
+        scope = (full.get("pool") or {}).get("scope") or "global"
+        where = "整批一个奖金池（global）" if scope == "global" else f"在「{scope}」层每个对象上分别算"
+        out.append(f"- 方案「{name}」：分配层级 {levels or '无'}；奖金池{where}")
+    return "\n".join(out)
+
+
+def schemes(ws) -> list[str]:
+    return [n for n in ws.schemes if (ws._merged(n).get("pool") or {}).get("expr") and n in ws.results]
+
+
+def calc(ws, rr: dict) -> dict:
+    """让复读按材料写出每个方案的奖金池算式，写不对就带着报错让它改。结果存在 rr["calc"]：
+    {"sig", "schemes": {方案: {"tables", "helpers", "pool"}}, "unclear", "error", "second"}。
+    材料、数据字典、方案结构没变时用上次的。
+    和规则算出的数对不上的方案，再独立写一次（新开对话）：第二次和规则一致，就当是第一次写错了，用第二次的；
+    两次都和规则不一致才交给智能体核对。这样复读自己偶尔理解错，不会把对的规则带偏。"""
+    names = schemes(ws)
+    if not names:
+        return {}
+    from bonus_core.dsl.functions import describe
+    full = prompt("extract_rules")
+    dsl = full[full.index("## 表达式语法"):full.index("## 发放与抵扣")].replace("{functions}", describe())
+    text = (material(ws) + "\n\n# 你上一步列出的计算项\n" + json.dumps(rr.get("items") or [], ensure_ascii=False)
+            + "\n\n" + structure(ws))
+    sig = signature(text)
+    old = rr.get("calc") or {}
+    if old.get("sig") == sig and old.get("schemes"):
+        return old
+    base = [{"role": "system", "content": prompt("reread_calc").replace("{dsl}", dsl)},
+            {"role": "user", "content": text}]
+    out = {"sig": sig, **_sample(ws, base, names), "second": []}
+    for n in [n for n in out["schemes"] if _disagree(ws, n, out["schemes"][n])]:
+        again = _sample(ws, base, [n])
+        out["second"].append(n)
+        if n in again["schemes"] and not _disagree(ws, n, again["schemes"][n]):
+            out["schemes"][n] = again["schemes"][n]
+    rr["calc"] = out
+    return out
+
+
+def _sample(ws, base: list[dict], names: list[str]) -> dict:
+    """独立写一次算式；算不出来的带着报错让它改，最多 CALC_TRIES 次。返回 {"schemes", "unclear", "error"}。"""
+    msgs, out = list(base), {"schemes": {}, "unclear": [], "error": ""}
+    for attempt in range(CALC_TRIES):
+        try:
+            raw = ws.llm.chat(msgs, json_out=True, temperature=0, max_tokens=8192)
+            data = parse_json(raw)
+            got = data.get("schemes") if isinstance(data, dict) else None
+            if not isinstance(got, dict):
+                raise LLMError("没有 schemes")
+        except (LLMError, ValueError, AttributeError) as e:
+            out["error"] = str(e)[:300]
+            msgs = msgs + [{"role": "user", "content": "上次的输出不是合法的 JSON，请只输出 JSON 对象。"}]
+            continue
+        out["schemes"] = {n: v for n, v in got.items() if n in names and isinstance(v, dict) and v.get("pool")}
+        out["unclear"] = [str(u) for u in (data.get("unclear") or []) if u]
+        errs = []
+        for n in names:
+            if n not in out["schemes"]:
+                errs.append(f"方案「{n}」：没有写奖金池算式")
+                continue
+            try:
+                ws._independent_pool(n, out["schemes"][n])
+            except Exception as e:          # 算式是模型写的，任何报错都交还它自己改
+                errs.append(f"方案「{n}」：{str(e)[:400]}")
+                out["schemes"].pop(n)
+        out["error"] = "；".join(errs)[:600]
+        if not errs:
+            break
+        msgs = msgs + [{"role": "assistant", "content": raw},
+                       {"role": "user", "content": "这些算式算不出来，请按报错改正后重新输出完整的 JSON：\n" + "\n".join(errs)}]
+    return out
+
+
+def _disagree(ws, name: str, spec: dict) -> list[tuple[str, Decimal, Decimal]]:
+    """独立算式和规则算出的奖金池差超过 1 分的对象：[(对象, 复读, 规则)]。算不出来的不算对不上。"""
+    if name not in ws.results or name in ws.untested:
+        return []
+    try:
+        mine = ws._independent_pool(name, spec)
+    except Exception:
+        return []
+    theirs = ws._pool_values(name)
+    return [(k, v, theirs[k]) for k, v in mine.items() if k in theirs and abs(v - theirs[k]) > Decimal("0.01")]
+
+
+def calc_gaps(ws, rr: dict) -> list[tuple[str, str]]:
+    """独立算式和规则算出的奖金池逐个对象比；差超过 1 分的方案列出来。"""
+    c = (rr or {}).get("calc") or {}
+    out = []
+    for name, spec in (c.get("schemes") or {}).items():
+        bad = _disagree(ws, name, spec)
+        if not bad:
+            continue
+        total = len(ws._pool_values(name))
+        eg = "；".join(f"{k} 复读 {_money(v)}、规则 {_money(t)}" for k, v, t in bad[:CALC_SHOW])
+        helpers = "；".join(f"{k}[{(h or {}).get('scope', 'global')}] = {(h or {}).get('expr', '')}"
+                            for k, h in (spec.get("helpers") or {}).items())
+        tables = "；".join(f"{k} = {json.dumps(t, ensure_ascii=False)}" for k, t in (spec.get("tables") or {}).items())
+        out.append((f"复读 奖金池 {name}",
+                    f"复读只按材料独立写了方案「{name}」的奖金池算式，放到同一份数据上算，{len(bad)}/{total} 个对象和规则对不上（复读另写了一次也是这样）："
+                    f"{eg}。复读的写法：奖金池 = {spec.get('pool')}" + (f"；辅助变量 {helpers}" if helpers else "")
+                    + (f"；参数表 {tables}" if tables else "")
+                    + "。用 evaluate 把两边的中间数（如某个比率、某项合计）分别算出来，找到从哪一步开始不一样，再对照材料原文判断哪边对"))
+    return out
+
+
+def _money(v: Decimal) -> str:
+    return f"{v.quantize(Decimal('0.01')):,}"
 
 
 # ---- 程序比对 ----

@@ -331,6 +331,10 @@ def build(ws, results: dict | None = None) -> list[dict]:
             [], flag="独立复读没有完成")
     elif rr.get("unclear"):
         add("待定事项", "独立复读", "复读认为材料没写清的地方", "\n".join(f"- {u}" for u in rr["unclear"]), [])
+    calc = rr.get("calc") or {}
+    if calc.get("error") and not rr.get("error"):
+        add("待定事项", "独立复读", "独立算式没有算出来", f"复读按材料写的奖金池算式没能在数据上算出来（{calc['error'][:200]}），"
+            "这些方案没有用独立算式比对金额", [])
     for q in getattr(ws, "questions", []) or []:
         if q.answer not in (None, "") and not getattr(q, "withdrawn", ""):
             by_doc = str(getattr(q, "answered_by", "") or "").startswith("材料")

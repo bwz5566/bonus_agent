@@ -197,7 +197,8 @@ def validate(rs: RuleSet) -> list[Issue]:
                         issues.append(Issue.block("fn_table", f"{node.fn} 的第一个参数必须是{'阶梯表' if want == 'tier' else '查找表'}名", where))
         unknown = names(ast) - known
         for n in unknown:
-            issues.append(Issue.block("name_unknown", f"无法识别的名字 {n}", where))
+            hint = f"：{n} 是数据表名，对它的字段聚合，表名写在 of 里，如 sum(字段, of: \"{n}\")" if n in rs.datasets else ""
+            issues.append(Issue.block("name_unknown", f"无法识别的名字 {n}{hint}", where))
         if not unknown and levels:
             issues += _ScopeCheck(rs, where).run(ast, scope)
         if where.startswith("variables."):
