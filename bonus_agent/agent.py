@@ -31,7 +31,7 @@ from bonus_core.data.patches import apply_patches
 from bonus_core.data.table_detect import table_at
 from bonus_core.dsl.functions import describe as describe_functions
 from bonus_core.dsl.models import DatasetDef, RuleSet
-from bonus_core.dsl.parser import ExprError, parse
+from bonus_core.dsl.parser import Call, ExprError, Num, parse, walk
 from bonus_core.dsl.parser import names as parse_names
 from bonus_core.dsl.validator import validate
 from bonus_core.engine.allocation import AdjustConflict
@@ -1020,7 +1020,9 @@ class Workspace:
         warns = [str(i) for i in list(issues) + list(base.issues) if i.severity == "warning"]
         if warns:
             lines.append("数据提示：\n" + "\n".join(f"- {w}" for w in warns[:8]))
-        rep = self.lint[name] = lint.check(rs, data, self._rule_text(), base.traces, sourced=self._sources_readable())
+        heads = {f"{n}.{f}": f"{m.sheet or ''} {c}" for n, m in self.mapping.items() for f, c in m.columns.items()}
+        rep = self.lint[name] = lint.check(rs, data, self._rule_text(), base.traces, sourced=self._sources_readable(),
+                                           headers=heads)
         if rep.warns:
             lines.append("程序检查提示：\n" + "\n".join(f"- {w}" for w in rep.warns[:8]))
         gates = self._open_gates(rep)
@@ -1181,6 +1183,15 @@ class Workspace:
         except ExprError as e:
             return f"验算式写错了：{e}"
         rs = self._ruleset(name)
+        ast = parse(rec["expr"])
+        if not (names & set(rs.field_owner())) and not any(isinstance(c, Call) and c.fn == "count" for c in walk(ast)):
+            return "验算式没有用到任何数据字段。独立验算要从原始数据算起（字段、参数表），不能直接写结果数字"
+        digits = {id(c.args[1]) for c in walk(ast) if isinstance(c, Call) and c.fn == "round" and len(c.args) > 1}
+        loose = [k for k in (lint._key(abs(n.value)) for n in walk(ast) if isinstance(n, Num) and id(n) not in digits)
+                 if Decimal(k) not in lint.FREE and k not in lint.material_numbers(self._rule_text())]
+        if loose:
+            return (f"验算式里的数 {'、'.join(dict.fromkeys(loose))} 在材料里找不到。独立验算只能用材料写明的数"
+                    "（比例、系数、阈值）和数据字段，不能把结果或中间结果直接写成数字")
         own = sorted(names & set(rs.variables))
         if own:
             return (f"验算式引用了规则变量 {'、'.join(own)}。独立验算不能借用规则的中间结果，"

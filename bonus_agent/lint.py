@@ -136,8 +136,10 @@ def _compared(rs: RuleSet, negated: set[str] | None = None) -> dict[str, dict[st
     return out
 
 
-def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, sourced: str = "") -> Report:
-    """text：规则材料原文（规则文档、财务的话和答复）。sourced 非空时（如有图片没转写）常数出处无法核对，只提示。"""
+def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, sourced: str = "",
+          headers: dict[str, str] | None = None) -> Report:
+    """text：规则材料原文（规则文档、财务的话和答复）。sourced 非空时（如有图片没转写）常数出处无法核对，只提示。
+    headers：字段 -> Excel 表头原文（含工作表名），判断字段含义时不只看智能体起的名字。"""
     rep = Report()
     norm = unicodedata.normalize("NFKC", text)
     nums = material_numbers(text)
@@ -148,7 +150,7 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
                          f"删掉这张查找表，直接引用字段 {fld}（行上有 {key} 的表都能按编号读到）")
         rep.keys.append(f"查找表 {name}")
     # 0'. 已发金额扣在 pool 里：应得、已发抵扣、超发登记三列都会错（实发碰巧对）
-    paid = _paid_in_pool(rs)
+    paid = _paid_in_pool(rs, headers or {})
     if paid:
         rep.gates.append(f"奖金池用 max(… − …, 0) 直接扣减了已发 / 预发金额（{'、'.join(paid)}）。这样「发放」表会把实发当成应得，"
                          "已发抵扣、超发待核对都显示为 0。改法：pool 写扣减前的应得；已发金额写进 offsets（scope 最末层或人员表，"
@@ -207,10 +209,11 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
 _PAID = re.compile(r"预发|预付|预支|已发|已付|已支付|已领|prepa|paid|advance", re.I)
 
 
-def _paid_in_pool(rs: RuleSet) -> list[str]:
-    """奖金池（顺着变量展开）里 max(a − b, 0) 的 b 取自预发 / 已发类数据的字段名。"""
+def _paid_in_pool(rs: RuleSet, headers: dict[str, str]) -> list[str]:
+    """奖金池（顺着变量展开）里 max(a − b, 0) 的 b 取自预发 / 已发类数据的字段。字段含义按表名、字段名、说明和
+    Excel 表头原文判断（表头是数据里的原文，改字段名绕不过去）。"""
     paid_fields = {f for n, d in rs.datasets.items() for f, fd in d.fields.items()
-                   if _PAID.search(n) or _PAID.search(f) or _PAID.search(fd.desc or "")}
+                   if any(_PAID.search(x or "") for x in (n, f, fd.desc, headers.get(f"{n}.{f}")))}
 
     def names_of(node, seen=()) -> set[str]:
         out = set()

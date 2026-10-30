@@ -57,7 +57,7 @@ def test_share_allocation_rounding_remainder_is_accepted(tmp_path):
     assert "尾差" in w.verify(top, '100 / count(of: "人员")', "三人平分", at="全部")
     assert "一致" in w.verify(low, '100 / count(of: "人员")', "三人平分", at="全部")
     with pytest.raises(ToolError, match="对不上"):
-        w.verify(top, '100 / 2', "错的算式", at="全部")
+        w.verify(top, '100 / (count(of: "人员") - 1)', "错的算式", at="全部")
 
 
 def test_thought_is_recorded_and_not_passed_to_tools():
