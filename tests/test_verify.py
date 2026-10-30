@@ -179,3 +179,11 @@ def test_mismatch_shows_which_group_and_department_the_object_belongs_to(tmp_pat
     with pytest.raises(ToolError, match="对不上") as e:
         w.verify("个人:E1", '900 / count(of: "小组")', "按人数平分", at="全部")
     assert "个人:E1 属于 小组:G1" in str(e.value) and "引擎权重" in str(e.value)
+
+
+def test_tier_text_keeps_fractional_thresholds():
+    """Q11：毛利率系数表的档位是 0.15 / 0.25 / 0.35，自查文字把它们显示成了“0 至 0”，财务和模型都没法对照原文。"""
+    from bonus_agent.agent import _tier_text
+    t = _tier_text("margin_coef", {"steps": [[0, 0], [0.15, 0.8], [0.25, 1], [0.35, 1.2]]})
+    assert "0 至 0.15时全部金额按 0%；0.15 至 0.25时全部金额按 80%" in t and "0.35 以上时全部金额按 120%" in t
+    assert "10,000,000 至 20,000,000" in _tier_text("a", {"steps": [[0, 0.05], [10000000, 0.08], [20000000, 0.1]], "mode": "excess"})

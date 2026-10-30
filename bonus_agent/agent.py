@@ -1526,7 +1526,8 @@ def _tier_text(name: str, t: dict) -> str:
     parts = []
     for i, (lo, r) in enumerate(steps):
         hi = steps[i + 1][0] if i + 1 < len(steps) else None
-        rng = f"{lo:,.0f} 至 {hi:,.0f}" if hi is not None else f"{lo:,.0f} 以上"
+        num = lambda x: f"{x:,.0f}" if x == x.to_integral_value() else f"{x.normalize():f}"   # noqa: E731  比例档（0.15）不能显示成 0
+        rng = f"{num(lo)} 至 {num(hi)}" if hi is not None else f"{num(lo)} 以上"
         parts.append(f"{rng}{'的部分' if excess else '时全部金额'}按 {(r * 100).normalize():f}%")
     return f"{name}（{'超额累进' if excess else '全额累进'}）：" + "；".join(parts)
 
