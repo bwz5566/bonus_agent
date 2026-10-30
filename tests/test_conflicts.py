@@ -284,8 +284,27 @@ def test_saving_rules_with_same_blocking_issue_stops(tmp_path):
     ar = run_agent(FakeLLM([DATASET, bad(1), bad(2), bad(3), bad(4), {"tool": "finish", "args": {"summary": "x"}}]),
                    [_materials(tmp_path / "m")], tmp_path / "out")
     assert "同样的阻断问题" in ar.error and len(ar.steps) == 4, ar.error
-    assert "连续两次没改掉" in ar.steps[2].result
+    assert "连续几次没改掉" in ar.steps[2].result
     assert "同一个问题一直没改掉" in explain(ar.error)["title"]
+
+
+def test_blocking_issues_shrinking_is_progress(tmp_path):
+    """每次保存都改掉了几个阻断问题、只有一个一直挂着：在推进，不算卡住（同一问题挂满两倍次数才停）。"""
+    from bonus_agent.agent import run_agent
+    from bonus_agent.llm import FakeLLM
+
+    def save(*bad):
+        return {"tool": "set_rules", "args": {"pool": {"expr": "sum(sales) * 0.05"},
+                                              "variables": {v: {"expr": f"{v}_undefined + 1" if v in bad else "1"}
+                                                            for v in "abcdef"},
+                                              "allocation": [{"level": "个人", "key": "eid", "weight": "no_such_var"}]}}
+    script = [DATASET, save("a", "b", "c"), save("a", "b"), save("a"), save(), {"tool": "finish", "args": {"summary": "x"}}]
+    ar = run_agent(FakeLLM(script), [_materials(tmp_path / "m")], tmp_path / "out")
+    assert "同样的阻断问题" not in ar.error and len(ar.steps) >= 5, ar.error
+    assert all("需要修正" in s.result for s in ar.steps[1:5])          # 每次都还有阻断（权重一直没改），但没被停下
+    ar = run_agent(FakeLLM([DATASET] + [save(*"abcdef"[:6 - i]) for i in range(7)]
+                           + [{"tool": "finish", "args": {"summary": "x"}}]), [_materials(tmp_path / "m2")], tmp_path / "out2")
+    assert "同样的阻断问题" in ar.error and len(ar.steps) == 7, ar.error     # 权重问题连挂 6 次：停下
 
 
 def test_manual_stop_keeps_steps(tmp_path):

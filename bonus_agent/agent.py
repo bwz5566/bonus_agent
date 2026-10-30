@@ -1900,7 +1900,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     fail_why: dict[str, str | None] = {}   # 工具 -> 上次失败的原因（报错第一行的开头）
     stuck = ""
     undo: dict[tuple[str, str], int] = {}
-    same_block, prev_block = 0, set()
+    same_block, prev_full, long_block, prev_block = 0, set(), 0, set()
     for turn in range(max_steps):
         if should_stop and should_stop():
             error = f"已手动停止（第 {len(steps)} 步）"
@@ -2049,14 +2049,19 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                                f"再删一次程序会停下；拿不准就用 ask_question 问财务")
                     step.result = result
             if ok and c["name"] == "set_rules":      # 保存了但阻断问题一直没改掉：同样算没有进展
+                # 每次都改掉了几个（阻断问题在减少）是在推进，只是一次没改完，不算卡住；
+                # 一个也没改掉才算原地打转。某一个问题一直挂着、别的在改，放宽到两倍次数再停
                 now = getattr(ws, "last_blocking", set())
-                same_block = same_block + 1 if now and now & prev_block else (1 if now else 0)
-                prev_block = now if same_block <= 1 else now & prev_block
-                if same_block >= MAX_STUCK:
+                same_block = same_block + 1 if now and prev_full and not (prev_full - now) else (1 if now else 0)
+                stay = now & prev_block if prev_block else now
+                long_block = long_block + 1 if now and stay and prev_block else (1 if now else 0)
+                prev_full, prev_block = now, (stay if stay and long_block > 1 else now)
+                if same_block >= MAX_STUCK or long_block >= 2 * MAX_STUCK:
                     repeats = MAX_STUCK
-                    stuck = f"set_rules 连续 {same_block} 次保存后仍有同样的阻断问题，最后一次：{result[:300]}"
-                elif same_block == MAX_STUCK - 1:
-                    result += ("\n注意：同样的阻断问题已经连续两次没改掉。再出现一次程序会停下；"
+                    n = same_block if same_block >= MAX_STUCK else long_block
+                    stuck = f"set_rules 连续 {n} 次保存后仍有同样的阻断问题，最后一次：{result[:300]}"
+                elif same_block == MAX_STUCK - 1 or long_block == 2 * MAX_STUCK - 1:
+                    result += ("\n注意：同样的阻断问题已经连续几次没改掉。再出现一次程序会停下；"
                                "如果是规则写法表达不了材料的要求，用 ask_question 问财务或说明卡在哪里")
                     step.result = result
             if fails[c["name"]] >= MAX_STUCK:
