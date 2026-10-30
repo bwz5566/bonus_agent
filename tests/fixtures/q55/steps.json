@@ -1,0 +1,575 @@
+{
+ "source": "Q55 第 1 轮真实模型（DeepSeek）的调用记录，原样回放",
+ "steps": [
+  {
+   "tool": "record_facts",
+   "thought": "材料包已给出全部内容，先登记规则文档中的参数与口径。这份文档主要是口径，参数有：统计期间 2026-09-01 至 2026-09-30、舍入位数 2 位、费率与系数区间 0~1、审批状态允许值。",
+   "args": {
+    "facts": [
+     {
+      "name": "提成统计期间-起",
+      "value": "2026-09-01",
+      "file": "01_计算规则说明.docx",
+      "quote": "回款日期在 2026-09-01 至 2026-09-30（含首尾）之间的金额"
+     },
+     {
+      "name": "提成统计期间-止",
+      "value": "2026-09-30",
+      "file": "01_计算规则说明.docx",
+      "quote": "回款日期在 2026-09-01 至 2026-09-30（含首尾）之间的金额"
+     },
+     {
+      "name": "订单提成舍入位数",
+      "value": "2",
+      "file": "01_计算规则说明.docx",
+      "quote": "订单提成 = ROUND(计提基数 × 提成率, 2)"
+     },
+     {
+      "name": "人员应得提成舍入位数",
+      "value": "2",
+      "file": "01_计算规则说明.docx",
+      "quote": "应得提成 = ROUND(订单提成合计 × 人员表计奖系数, 2)"
+     },
+     {
+      "name": "费率与系数允许区间下限",
+      "value": "0",
+      "file": "01_计算规则说明.docx",
+      "quote": "费率与系数在 0 至 1 之间"
+     },
+     {
+      "name": "费率与系数允许区间上限",
+      "value": "1",
+      "file": "01_计算规则说明.docx",
+      "quote": "费率与系数在 0 至 1 之间"
+     },
+     {
+      "name": "审批状态允许值",
+      "value": "已审批",
+      "file": "01_计算规则说明.docx",
+      "quote": "审批状态只允许“已审批”“待审批”"
+     },
+     {
+      "name": "审批状态允许值",
+      "value": "待审批",
+      "file": "01_计算规则说明.docx",
+      "quote": "审批状态只允许“已审批”“待审批”"
+     },
+     {
+      "name": "计提基数下限",
+      "value": "0",
+      "file": "01_计算规则说明.docx",
+      "quote": "计提基数 = min(合同额, max(当月审批净回款, 0))"
+     }
+    ]
+   }
+  },
+  {
+   "tool": "record_clauses",
+   "thought": "同时把与计算有关的条款逐条摘进条款清单。",
+   "args": {
+    "clauses": [
+     {
+      "point": "回款流水按订单号关联订单，订单按品类编码关联品类费率、按员工编号关联人员，预发记录按员工编号关联人员",
+      "file": "01_计算规则说明.docx",
+      "quote": "回款流水按订单号关联订单，是多条回款对应一笔订单。订单按品类编码关联品类费率，按员工编号关联人员。预发记录也按员工编号关联人员，同一员工可以有多条预发。"
+     },
+     {
+      "point": "先在订单层计算提成，再按员工编号汇总到人员层发放；不设奖金池、不做人员间权重分配",
+      "file": "01_计算规则说明.docx",
+      "quote": "先在订单层计算提成，再按员工编号汇总到人员层发放。每笔订单只归属于一名员工，不设项目奖金池，不进行人员之间的权重分配。"
+     },
+     {
+      "point": "人员表 4 人全部输出，包括零奖金人员",
+      "file": "01_计算规则说明.docx",
+      "quote": "人员表中的 4 人全部输出，包括零奖金人员。"
+     },
+     {
+      "point": "员工编号、品类编码为文本，保留前导零；姓名可重名，不能作关联键；费率与计奖系数直接读参数表",
+      "file": "01_计算规则说明.docx",
+      "quote": "员工编号和品类编码均为文本，必须保留前导零。姓名允许重名，不能作为关联键。费率与计奖系数直接读取参数表，不从姓名或品类名称推断。"
+     },
+     {
+      "point": "订单当月审批净回款：只汇总审批状态为已审批、回款日期在 2026-09-01 至 2026-09-30（含首尾）的金额，待审批与跨月不计，负数退款参与求和，无符合条件回款时净回款为 0",
+      "file": "01_计算规则说明.docx",
+      "quote": "每笔订单分别汇总回款流水中“审批状态”为“已审批”、回款日期在 2026-09-01 至 2026-09-30（含首尾）之间的金额。待审批和跨月流水均不计入。负数为退款，参与求和；没有符合条件的回款时，净回款为 0。"
+     },
+     {
+      "point": "计提基数 = min(合同额, max(当月审批净回款, 0))，先求净额再保底封顶",
+      "file": "01_计算规则说明.docx",
+      "quote": "计提基数 = min(合同额, max(当月审批净回款, 0))。先对当月回款和退款求净额，再做保底和封顶。"
+     },
+     {
+      "point": "订单提成 = ROUND(计提基数 × 品类提成率, 2)，逐单先四舍五入到分再按人求和",
+      "file": "01_计算规则说明.docx",
+      "quote": "订单提成 = ROUND(计提基数 × 提成率, 2)。每笔订单先独立四舍五入到分，再按人求和。"
+     },
+     {
+      "point": "人员应得提成 = ROUND(该员工所有订单提成之和 × 计奖系数, 2)；无订单员工订单提成合计为 0",
+      "file": "01_计算规则说明.docx",
+      "quote": "订单提成合计 = 该员工所有订单提成之和。应得提成 = ROUND(订单提成合计 × 人员表计奖系数, 2)。没有订单的员工，订单提成合计为 0。"
+     },
+     {
+      "point": "预发合计 = 该员工全部预发记录金额之和，不筛日期，无记录为 0",
+      "file": "01_计算规则说明.docx",
+      "quote": "预发合计 = 该员工全部预发记录金额之和；预发记录表仅包含本批预发，无须再筛日期。没有预发记录时为 0。"
+     },
+     {
+      "point": "本次实发 = max(应得提成 − 预发合计, 0)；超预发登记 = max(预发合计 − 应得提成, 0)，只登记不追回不转他人",
+      "file": "01_计算规则说明.docx",
+      "quote": "本次实发 = max(应得提成 − 预发合计, 0)。超预发登记 = max(预发合计 − 应得提成, 0)，只登记，不产生负数发放，也不转给其他员工。"
+     },
+     {
+      "point": "ROUND 为十进制四舍五入、半分向上进位；只在订单提成和人员应得提成两处舍入，其余保留原值，最终显示两位小数",
+      "file": "01_计算规则说明.docx",
+      "quote": "ROUND 使用十进制四舍五入，恰好半分时向上进位，例如 100.005 元为 100.01 元。只在订单提成和人员应得提成两处舍入，其余步骤保留原值；最终金额显示两位小数。"
+     },
+     {
+      "point": "不计算税、暂缓款或其他扣款",
+      "file": "01_计算规则说明.docx",
+      "quote": "不计算税、暂缓款或其他扣款。"
+     },
+     {
+      "point": "唯一键不得为空或重复；关联键必须存在且唯一匹配；必填金额、日期、费率、系数不得为空",
+      "file": "01_计算规则说明.docx",
+      "quote": "唯一键不允许为空或重复；所有关联键必须存在且唯一匹配；必填金额、日期、费率、系数不得为空。"
+     },
+     {
+      "point": "合同额和预发金额不得为负；费率与计奖系数在 0 至 1 之间",
+      "file": "01_计算规则说明.docx",
+      "quote": "合同额和预发金额不得为负，费率与系数在 0 至 1 之间。"
+     },
+     {
+      "point": "审批状态只允许“已审批”“待审批”；违反校验要求应说明表、行、字段并先补正材料，不得默认为 0 或继续给出结论",
+      "file": "01_计算规则说明.docx",
+      "quote": "审批状态只允许“已审批”“待审批”。违反上述要求应说明具体表、行和字段，先补正材料，不应默认为 0 或继续给出完整发放结论。"
+     },
+     {
+      "point": "需输出订单过程（订单号、员工编号、品类编码、合同额、审批净回款、计提基数、提成率、订单提成）与人员结果（含预发合计、本次实发、超预发登记）并汇总各金额列",
+      "file": "01_计算规则说明.docx",
+      "quote": "需要输出订单过程：订单号、员工编号、品类编码、合同额、审批净回款、计提基数、提成率、订单提成。"
+     }
+    ]
+   }
+  },
+  {
+   "tool": "define_dataset",
+   "thought": "定义人员表（实体表，key=员工编号），员工编号为文本保留前导零。",
+   "args": {
+    "name": "人员",
+    "file": "03_人员与费率.xlsx",
+    "sheet": "人员",
+    "key": "emp_id",
+    "fields": {
+     "emp_id": {
+      "column": "员工编号",
+      "type": "id",
+      "desc": "员工编号，文本保留前导零"
+     },
+     "emp_name": {
+      "column": "姓名",
+      "type": "text",
+      "desc": "姓名，允许重名"
+     },
+     "bonus_coef": {
+      "column": "计奖系数",
+      "type": "ratio",
+      "desc": "计奖系数，0~1"
+     }
+    }
+   }
+  },
+  {
+   "tool": "define_dataset",
+   "thought": "定义品类费率表（实体表，key=品类编码）。",
+   "args": {
+    "name": "品类费率",
+    "file": "03_人员与费率.xlsx",
+    "sheet": "品类费率",
+    "key": "cat_code",
+    "fields": {
+     "cat_code": {
+      "column": "品类编码",
+      "type": "id",
+      "desc": "品类编码，文本保留前导零"
+     },
+     "cat_name": {
+      "column": "品类名称",
+      "type": "text"
+     },
+     "rate": {
+      "column": "提成率",
+      "type": "ratio",
+      "desc": "提成率，0~1"
+     }
+    }
+   }
+  },
+  {
+   "tool": "define_dataset",
+   "thought": "定义预发记录表，按员工编号关联人员（明细表 link=emp_id）。",
+   "args": {
+    "name": "预发记录",
+    "file": "03_人员与费率.xlsx",
+    "sheet": "预发记录",
+    "link": "emp_id",
+    "fields": {
+     "prepay_id": {
+      "column": "预发单号",
+      "type": "id"
+     },
+     "emp_id": {
+      "column": "员工编号",
+      "type": "id",
+      "desc": "关联人员"
+     },
+     "prepay_amount": {
+      "column": "预发金额",
+      "type": "money",
+      "unit": "元",
+      "desc": "预发金额，不得为负"
+     }
+    }
+   }
+  },
+  {
+   "tool": "define_dataset",
+   "thought": "定义订单表（实体表，key=订单号），按员工编号关联人员、按品类编码关联品类费率。",
+   "args": {
+    "name": "订单",
+    "file": "02_订单与回款.xlsx",
+    "sheet": "订单",
+    "key": "order_id",
+    "fields": {
+     "order_id": {
+      "column": "订单号",
+      "type": "id"
+     },
+     "emp_id": {
+      "column": "员工编号",
+      "type": "id",
+      "desc": "关联人员"
+     },
+     "cat_code": {
+      "column": "品类编码",
+      "type": "id",
+      "desc": "关联品类费率"
+     },
+     "contract_amount": {
+      "column": "合同额",
+      "type": "money",
+      "unit": "元",
+      "desc": "合同额，不得为负"
+     }
+    }
+   }
+  },
+  {
+   "tool": "define_dataset",
+   "thought": "定义回款流水表，按订单号关联订单（明细表 link=order_id）。",
+   "args": {
+    "name": "回款流水",
+    "file": "02_订单与回款.xlsx",
+    "sheet": "回款流水",
+    "link": "order_id",
+    "fields": {
+     "receipt_id": {
+      "column": "流水号",
+      "type": "id"
+     },
+     "order_id": {
+      "column": "订单号",
+      "type": "id",
+      "desc": "关联订单"
+     },
+     "receipt_date": {
+      "column": "回款日期",
+      "type": "date"
+     },
+     "approval_status": {
+      "column": "审批状态",
+      "type": "enum",
+      "desc": "已审批/待审批"
+     },
+     "receipt_amount": {
+      "column": "金额",
+      "type": "money",
+      "unit": "元",
+      "desc": "回款金额，负数表示退款"
+     }
+    }
+   }
+  },
+  {
+   "tool": "set_rules",
+   "thought": "按文档口径写规则。方案只有一个（销售提成），不写 scheme。分配层级只有最末一层「个人」，pool 的 scope 写「个人」、expr 写本次实发（每人按公式直接算，无奖金池、无权重）。订单层变量在关联实体「订单」作用域计算，人员层变量在「个人」层计算。",
+   "args": {
+    "variables": {
+     "net_receipt": {
+      "scope": "订单",
+      "expr": "sum(receipt_amount, where: approval_status == \"已审批\" and between(receipt_date, \"2026-09-01\", \"2026-09-30\"))",
+      "desc": "订单当月审批净回款：已审批且回款日期在 2026-09-01 至 2026-09-30（含首尾）的金额合计，退款负数参与求和，无符合条件回款为 0",
+      "sources": [
+       {
+        "doc": "01_计算规则说明.docx",
+        "page": null,
+        "quote": "每笔订单分别汇总回款流水中“审批状态”为“已审批”、回款日期在 2026-09-01 至 2026-09-30（含首尾）之间的金额。待审批和跨月流水均不计入。负数为退款，参与求和；没有符合条件的回款时，净回款为 0。"
+       }
+      ]
+     },
+     "base_amount": {
+      "scope": "订单",
+      "expr": "min(contract_amount, max(net_receipt, 0))",
+      "desc": "计提基数 = min(合同额, max(当月审批净回款, 0))",
+      "sources": [
+       {
+        "doc": "01_计算规则说明.docx",
+        "page": null,
+        "quote": "计提基数 = min(合同额, max(当月审批净回款, 0))。先对当月回款和退款求净额，再做保底和封顶。"
+       }
+      ]
+     },
+     "order_commission": {
+      "scope": "订单",
+      "expr": "round(base_amount * rate, 2)",
+      "desc": "订单提成 = ROUND(计提基数 × 品类提成率, 2)，逐单四舍五入到分",
+      "sources": [
+       {
+        "doc": "01_计算规则说明.docx",
+        "page": null,
+        "quote": "订单提成 = ROUND(计提基数 × 提成率, 2)。每笔订单先独立四舍五入到分，再按人求和。"
+       }
+      ]
+     },
+     "order_commission_total": {
+      "scope": "个人",
+      "expr": "sum(order_commission, of: \"订单\")",
+      "desc": "订单提成合计 = 该员工所有订单提成之和，无订单为 0",
+      "sources": [
+       {
+        "doc": "01_计算规则说明.docx",
+        "page": null,
+        "quote": "订单提成合计 = 该员工所有订单提成之和。"
+       }
+      ]
+     },
+     "earned_commission": {
+      "scope": "个人",
+      "expr": "round(order_commission_total * bonus_coef, 2)",
+      "desc": "应得提成 = ROUND(订单提成合计 × 计奖系数, 2)",
+      "sources": [
+       {
+        "doc": "01_计算规则说明.docx",
+        "page": null,
+        "quote": "应得提成 = ROUND(订单提成合计 × 人员表计奖系数, 2)。"
+       }
+      ]
+     },
+     "prepay_total": {
+      "scope": "个人",
+      "expr": "sum(prepay_amount, of: \"预发记录\")",
+      "desc": "预发合计 = 该员工全部预发记录金额之和，不筛日期，无记录为 0",
+      "sources": [
+       {
+        "doc": "01_计算规则说明.docx",
+        "page": null,
+        "quote": "预发合计 = 该员工全部预发记录金额之和；预发记录表仅包含本批预发，无须再筛日期。没有预发记录时为 0。"
+       }
+      ]
+     },
+     "final_pay": {
+      "scope": "个人",
+      "expr": "max(earned_commission - prepay_total, 0)",
+      "desc": "本次实发 = max(应得提成 − 预发合计, 0)",
+      "sources": [
+       {
+        "doc": "01_计算规则说明.docx",
+        "page": null,
+        "quote": "本次实发 = max(应得提成 − 预发合计, 0)。"
+       }
+      ]
+     },
+     "over_prepay": {
+      "scope": "个人",
+      "expr": "max(prepay_total - earned_commission, 0)",
+      "desc": "超预发登记 = max(预发合计 − 应得提成, 0)，只登记不追回",
+      "sources": [
+       {
+        "doc": "01_计算规则说明.docx",
+        "page": null,
+        "quote": "超预发登记 = max(预发合计 − 应得提成, 0)，只登记，不产生负数发放，也不转给其他员工。"
+       }
+      ]
+     }
+    },
+    "pool": {
+     "expr": "final_pay",
+     "scope": "个人",
+     "desc": "每人按公式直接计算本次实发，无奖金池、无人员间权重分配",
+     "sources": [
+      {
+       "doc": "01_计算规则说明.docx",
+       "page": null,
+       "quote": "每笔订单只归属于一名员工，不设项目奖金池，不进行人员之间的权重分配。"
+      }
+     ]
+    },
+    "allocation": [
+     {
+      "level": "个人",
+      "key": "emp_id",
+      "parent_key": null,
+      "desc": "人员表 4 人全部输出，包括零奖金人员",
+      "weight": ""
+     }
+    ],
+    "checks": [
+     {
+      "id": "contract_nonneg",
+      "scope": "订单",
+      "expr": "contract_amount >= 0",
+      "message": "订单表合同额不得为负"
+     },
+     {
+      "id": "prepay_nonneg",
+      "scope": "个人",
+      "expr": "count(prepay_amount, of: \"预发记录\", where: prepay_amount < 0) == 0",
+      "message": "预发记录表预发金额不得为负"
+     },
+     {
+      "id": "rate_range",
+      "scope": "订单",
+      "expr": "rate >= 0 and rate <= 1",
+      "message": "品类费率表提成率须在 0 至 1 之间"
+     },
+     {
+      "id": "coef_range",
+      "scope": "个人",
+      "expr": "bonus_coef >= 0 and bonus_coef <= 1",
+      "message": "人员表计奖系数须在 0 至 1 之间"
+     },
+     {
+      "id": "approval_status_valid",
+      "scope": "订单",
+      "expr": "count(receipt_amount, of: \"回款流水\", where: approval_status != \"已审批\" and approval_status != \"待审批\") == 0",
+      "message": "回款流水审批状态只允许“已审批”“待审批”"
+     }
+    ]
+   }
+  },
+  {
+   "tool": "set_rules",
+   "thought": "count 只接受 0 个参数（计数明细行），要按条件计数改用 sum(1, of: 表, where: 条件)。修正两条校验。",
+   "args": {
+    "checks": [
+     {
+      "expr": "contract_amount >= 0",
+      "id": "contract_nonneg",
+      "message": "订单表合同额不得为负",
+      "scope": "订单"
+     },
+     {
+      "expr": "sum(1, of: \"预发记录\", where: prepay_amount < 0) == 0",
+      "id": "prepay_nonneg",
+      "message": "预发记录表预发金额不得为负",
+      "scope": "个人"
+     },
+     {
+      "expr": "rate >= 0 and rate <= 1",
+      "id": "rate_range",
+      "message": "品类费率表提成率须在 0 至 1 之间",
+      "scope": "订单"
+     },
+     {
+      "expr": "bonus_coef >= 0 and bonus_coef <= 1",
+      "id": "coef_range",
+      "message": "人员表计奖系数须在 0 至 1 之间",
+      "scope": "个人"
+     },
+     {
+      "expr": "sum(1, of: \"回款流水\", where: approval_status != \"已审批\" and approval_status != \"待审批\") == 0",
+      "id": "approval_status_valid",
+      "message": "回款流水审批状态只允许“已审批”“待审批”",
+      "scope": "订单"
+     }
+    ]
+   }
+  },
+  {
+   "tool": "trial_run",
+   "thought": "规则静态校验通过，试算看各人金额是否合理（预期：001 订单 O101 净回款 10500 封顶 10000×3%=300，O102 净回款 2000.1×5%=100.005→100.01，合计 400.01，系数 1 → 400.01，预发 150 → 实发 250.01；002 O103 净回款 3000×3%=90，O104 净回款 4000（8月31日排除）封顶 4000×2%=80，合计 170×0.8=136，预发 150 → 实发 0、超预发 14；003 O105 净回款 2500（10月1日排除）×5%=125，O106 净回款 -100 → 基数 0 → 0，合计 125 → 实发 125；004 无订单 → 0）。",
+   "args": {}
+  },
+  {
+   "tool": "explain",
+   "thought": "试算结果与预期一致。抽查订单 O102（含退款、半分舍入 100.005→100.01）和 O104（跨月排除、合同额封顶）的计算链。",
+   "args": {
+    "id": "订单:O102"
+   }
+  },
+  {
+   "tool": "explain",
+   "thought": "同时抽查 O104：8月31日回款应排除，9月25日 4000 计入，合同额 8000 封顶后基数 4000，费率 2% → 80。",
+   "args": {
+    "id": "订单:O104"
+   }
+  },
+  {
+   "tool": "cover_clauses",
+   "thought": "逐条标注 16 条条款落在哪个规则元素。",
+   "args": {
+    "items": {
+     "C1": "datasets.回款流水（link=order_id）、datasets.订单（emp_id、cat_code）、datasets.预发记录（link=emp_id）",
+     "C2": "allocation.个人、pool（scope=个人，无权重分配）",
+     "C3": "allocation.个人（人员表全部 4 人输出，无订单者金额为 0）",
+     "C4": "datasets.人员（emp_id 为 id 文本）、datasets.品类费率（cat_code 为 id 文本）、variables.order_commission（直接读 rate）、variables.earned_commission（直接读 bonus_coef）",
+     "C5": "variables.net_receipt",
+     "C6": "variables.base_amount",
+     "C7": "variables.order_commission",
+     "C8": "variables.order_commission_total、variables.earned_commission",
+     "C9": "variables.prepay_total",
+     "C10": "variables.final_pay、variables.over_prepay",
+     "C11": "variables.order_commission、variables.earned_commission（仅两处 round 到 2 位，其余保留原值）",
+     "C12": "不适用：本批不计算税、暂缓款或其他扣款，规则中未设 payout/offsets",
+     "C13": "引擎自带：主键重复/为空报错、关联键不存在报错；checks.contract_nonneg、checks.rate_range、checks.coef_range 覆盖必填与区间",
+     "C14": "checks.contract_nonneg、checks.prepay_nonneg、checks.rate_range、checks.coef_range",
+     "C15": "checks.approval_status_valid（校验不通过时阻断计算，不默认为 0）",
+     "C16": "variables.net_receipt、variables.base_amount、variables.order_commission、variables.earned_commission、variables.prepay_total、variables.final_pay、variables.over_prepay（订单过程与人员结果均可由引擎输出）"
+    }
+   }
+  },
+  {
+   "tool": "verify",
+   "thought": "独立验算个人:001：按原文从原始字段重写算式——订单 O101 净回款 4000+6500=10500 封顶 10000×3%=300；O102 净回款 2100.1-100=2000.1×5%=100.005→100.01；合计 400.01×系数 1=400.01；预发 100+50=150；实发 250.01。验算式不引用规则变量，直接在个人节点上对订单聚合。",
+   "args": {
+    "node": "个人:001",
+    "expr": "max(round(sum(round(min(contract_amount, max(sum(receipt_amount, of: \"回款流水\", where: approval_status == \"已审批\" and between(receipt_date, \"2026-09-01\", \"2026-09-30\")), 0)) * rate, 2), of: \"订单\") * bonus_coef, 2) - sum(prepay_amount, of: \"预发记录\"), 0)",
+    "basis": "01_计算规则说明.docx：计提基数 = min(合同额, max(当月审批净回款, 0))；订单提成 = ROUND(计提基数 × 提成率, 2)；应得提成 = ROUND(订单提成合计 × 计奖系数, 2)；本次实发 = max(应得提成 − 预发合计, 0)"
+   }
+  },
+  {
+   "tool": "verify",
+   "thought": "独立验算个人:003：O105 净回款只算 9-30 的 2500（10-01 跨月排除）×5%=125；O106 净回款 200-300=-100 → 基数 0 → 0；合计 125×系数 1=125，无预发 → 实发 125。",
+   "args": {
+    "basis": "01_计算规则说明.docx：计提基数 = min(合同额, max(当月审批净回款, 0))；订单提成 = ROUND(计提基数 × 提成率, 2)；应得提成 = ROUND(订单提成合计 × 计奖系数, 2)；本次实发 = max(应得提成 − 预发合计, 0)",
+    "expr": "max(round(sum(round(min(contract_amount, max(sum(receipt_amount, of: \"回款流水\", where: approval_status == \"已审批\" and between(receipt_date, \"2026-09-01\", \"2026-09-30\")), 0)) * rate, 2), of: \"订单\") * bonus_coef, 2) - sum(prepay_amount, of: \"预发记录\"), 0)",
+    "node": "个人:003"
+   }
+  },
+  {
+   "tool": "verify",
+   "thought": "独立验算个人:002：O103 净回款 3000（待审批 2000 排除）×3%=90；O104 净回款 4000（8-31 排除）×2%=80；合计 170×0.8=136；预发 150 → 实发 max(136-150,0)=0，超预发 14。",
+   "args": {
+    "basis": "01_计算规则说明.docx：订单提成 = ROUND(计提基数 × 提成率, 2)；应得提成 = ROUND(订单提成合计 × 计奖系数, 2)；本次实发 = max(应得提成 − 预发合计, 0)",
+    "expr": "max(round(sum(round(min(contract_amount, max(sum(receipt_amount, of: \"回款流水\", where: approval_status == \"已审批\" and between(receipt_date, \"2026-09-01\", \"2026-09-30\")), 0)) * rate, 2), of: \"订单\") * bonus_coef, 2) - sum(prepay_amount, of: \"预发记录\"), 0)",
+    "node": "个人:002"
+   }
+  },
+  {
+   "tool": "finish",
+   "thought": "试算成功（奖金池 375.01 元），订单层与人员层算式抽查与材料口径一致，程序指定的三个对象（个人:001、个人:003、个人:002）独立验算全部对到分，16 条条款全部落实，5 项数据校验均通过。可以完成。",
+   "args": {
+    "summary": "本批为 2026 年 9 月销售提成（无奖金池、无人员间权重分配）：逐笔订单先算当月审批净回款（仅\"已审批\"且回款日期在 2026-09-01 至 2026-09-30，退款负数参与求和），计提基数 = min(合同额, max(净回款, 0))，订单提成 = ROUND(基数 × 品类提成率, 2) 逐单舍入后按人汇总，再乘人员计奖系数并舍入得应得提成；本次实发 = max(应得提成 − 预发合计, 0)，超预发登记 = max(预发合计 − 应得提成, 0) 只登记不追回。人员表 4 人全部输出（含零奖金者），本批实发合计 375.01 元，无暂缓、无税或其他扣款。"
+   }
+  }
+ ]
+}

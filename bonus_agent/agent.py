@@ -1777,6 +1777,9 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 calls = [{"id": "", "name": act["tool"], "arguments": json.dumps(a, ensure_ascii=False)}]
             except (LLMError, KeyError, TypeError, ValueError):
                 history.append({"role": "user", "content": '格式不对：请只输出 {"thought": ..., "tool": ..., "args": {...}}'})
+                steps.append(Step("（格式不对）", {"_raw": (text or "")[:20000]}, "回复不是 {thought, tool, args} 格式，未执行", False))
+                if on_step:
+                    on_step(len(steps), steps[-1])
                 continue
         else:
             msgs = [{"role": "system", "content": sys}] + body + tail
@@ -1788,7 +1791,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                     continue
                 error = str(e)
                 break
-            calls = [{**c, "arguments": _fix_arguments(c["arguments"])} for c in reply["tool_calls"]]
+            calls = [{**c, "raw": c["arguments"], "arguments": _fix_arguments(c["arguments"])} for c in reply["tool_calls"]]
             history.append({"role": "assistant", "content": reply["content"],
                             **({"tool_calls": [{"id": c["id"], "type": "function",
                                                 "function": {"name": c["name"], "arguments": c["arguments"]}}
@@ -1847,6 +1850,8 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             if not thought:
                 result += "\n（提醒：每次调用都先在 thought 里写思考：上一步观察到了什么、为什么做这一步、预期看到什么。）"
             step = Step(c["name"], args if isinstance(args, dict) else {}, result, ok, thought)
+            if c.get("raw") and c["raw"] != c["arguments"]:     # 模型的原文（格式有误、程序改过或没能执行）留档，便于做回放用例
+                step.args = {**step.args, "_raw": c["raw"][:20000]}
             if ok and c["name"] in WRITE_TOOLS:
                 ws.changed = True
             if c["name"] in READ_ONLY and ok:
