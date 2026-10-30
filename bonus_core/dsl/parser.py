@@ -192,3 +192,43 @@ def walk(node):
 
 def names(node) -> set[str]:
     return {n.id for n in walk(node) if isinstance(n, Name)}
+
+
+_PREC = {"or": 1, "and": 2, "not": 3, "cmp": 4, "+": 5, "-": 5, "*": 6, "/": 6, "neg": 7, "atom": 8}
+
+
+def unparse(node) -> str:
+    """AST 写回表达式文字（报告里引用条件用）。"""
+    return _unparse(node)[0]
+
+
+def _unparse(n) -> tuple[str, int]:
+    def wrap(x, p):
+        t, q = _unparse(x)
+        return f"({t})" if q < p else t
+    match n:
+        case Num(value=v):
+            return format(v.normalize(), "f"), _PREC["atom"]
+        case Str(value=v):
+            return f'"{v}"', _PREC["atom"]
+        case Const(value=v):
+            return ("true" if v else "false"), _PREC["atom"]
+        case Name(id=i):
+            return i, _PREC["atom"]
+        case Call(fn=fn, args=args, kwargs=kws):
+            parts = [unparse(a) for a in args] + [f"{k}: {unparse(v)}" for k, v in kws]
+            return f"{fn}({', '.join(parts)})", _PREC["atom"]
+        case BinOp(op=op, left=l, right=r):
+            p = _PREC[op]
+            return f"{wrap(l, p)} {op} {wrap(r, p + 1)}", p
+        case Cmp(op=op, left=l, right=r):
+            p = _PREC["cmp"]
+            return f"{wrap(l, p + 1)} {op} {wrap(r, p + 1)}", p
+        case BoolOp(op=op, left=l, right=r):
+            p = _PREC[op]
+            return f"{wrap(l, p)} {op} {wrap(r, p)}", p
+        case Not(operand=x):
+            return f"not {wrap(x, _PREC['not'])}", _PREC["not"]
+        case Neg(operand=x):
+            return f"-{wrap(x, _PREC['neg'])}", _PREC["neg"]
+    return str(n), _PREC["atom"]

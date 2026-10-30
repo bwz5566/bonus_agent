@@ -1073,7 +1073,8 @@ class Workspace:
         others = {w for k, d in self.drafts.items() if k != name
                   for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", json.dumps(d, ensure_ascii=False))}
         rep = self.lint[name] = lint.check(rs, data, self._rule_text(), base.traces, sourced=self._sources_readable(),
-                                           headers=heads, tiers=base.tier_stats, used_elsewhere=others)
+                                           headers=heads, tiers=base.tier_stats, used_elsewhere=others,
+                                           coverage=base.coverage)
         if rep.warns:
             lines.append("程序检查提示：\n" + "\n".join(f"- {w}" for w in rep.warns[:8]))
         gates = self._open_gates(rep)

@@ -220,6 +220,23 @@ def _sources(clauses, refs: list[str]) -> str:
     return "\n".join(dict.fromkeys(out))
 
 
+def _merge_seen(seens) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for seen in seens:
+        for k, n in seen.items():
+            out[k] = out.get(k, 0) + n
+    return out
+
+
+def _branches(res, item: str, nm: Names) -> str:
+    """计算项里每个条件在数据上成立、不成立各多少次（覆盖报告）。"""
+    parts = []
+    for c in (getattr(res, "coverage", []) or []) if res is not None else []:
+        if c["kind"] == "if" and c["item"] == item:
+            parts.append(f"条件「{plain(c['what'], nm)}」成立 {c['seen'].get('是', 0)} 次、不成立 {c['seen'].get('否', 0)} 次")
+    return "；".join(parts)
+
+
 def _flags(texts: list[str], needles: list[str]) -> str:
     return "\n".join(t for t in texts if any(n in t for n in needles))
 
@@ -263,17 +280,21 @@ def build(ws, results: dict | None = None) -> list[dict]:
                                      for b, n in sorted(st["bands"].items()))
                     stats = f"实际传入 {st['n']} 个值，范围 {_num(st['min'])}～{_num(st['max'])}；{bands}"
                     break
-            add(scheme, "参数表", f"{tables[t]}（{t}）", body, [t, f"tables.{t}"], flag=_flags(texts, [f"分档表 {t} ", f"{t}（"]),
-                extra=stats)
+                seen = _merge_seen(c["seen"] for c in (getattr(r, "coverage", []) or []) if c["kind"] == "lookup" and c["what"] == t) if r else {}
+                if seen:
+                    stats = f"实际查了 {sum(seen.values())} 次：" + "、".join(f"{k} {n} 次" for k, n in seen.items())
+                    break
+            add(scheme, "参数表", f"{tables[t]}（{t}）", body, [t, f"tables.{t}"],
+                flag=_flags(texts, [f"分档表 {t} ", f"参数表 {t} ", f"查找表 {t} ", f"{t}（"]), extra=stats)
         for v, spec in (d.get("variables") or {}).items():
             spec = spec or {}
             add(scheme, "计算项", f"{variables[v]}（{v}）", plain(spec.get("expr", ""), nm), [v, f"variables.{v}"],
                 rule_item=v, res=res, flag=_flags(texts, [f"变量 {v} ", f"变量 {v}、", f"、{v} "]),
-                extra=f"计算对象：{spec.get('scope')}" if spec.get("scope") else "")
+                extra="\n".join(x for x in (f"计算对象：{spec.get('scope')}" if spec.get("scope") else "", _branches(res, v, nm)) if x))
         pool = d.get("pool") or {}
         if pool.get("expr"):
             add(scheme, "奖金池", f"奖金池（按{pool.get('scope') or '全部'}计算）", plain(pool["expr"], nm), ["pool"],
-                rule_item="pool", res=res)
+                rule_item="pool", res=res, extra=_branches(res, "奖金池", nm))
         for lv in d.get("allocation") or []:
             w = str(lv.get("weight") or "")
             add(scheme, "分配", f"{lv.get('level')}层分配",

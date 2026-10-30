@@ -80,22 +80,47 @@ def test_unused_money_field_and_tier_scale_are_gated(tmp_path):
     stats = {"contrib_tier": {"n": 6, "min": Decimal("0.2"), "max": Decimal("3.5"), "bands": {0: 6}}}
     rep = lint.check(rs, data, "", tiers=stats)
     assert any("contrib_tier" in g and "量纲" in g for g in rep.gates) and "分档 contrib_tier" in rep.keys
-    # 都落在同一档但量级相近：只提示
+    # 都落在同一档但量级相近、次数不多：不拦
     near = {"contrib_tier": {"n": 6, "min": Decimal("20000"), "max": Decimal("90000"), "bands": {0: 6}}}
     rep = lint.check(rs, data, "", tiers=near)
-    assert not [g for g in rep.gates if "分档表" in g] and any("分档表 contrib_tier" in w for w in rep.warns)
-    # 传入很多个值、表有三档以上却全部落在同一档（Q1：毛利率写成成本率，216 个值全落在最高档）：要处理
+    assert not [k for k in rep.keys if k.endswith(" contrib_tier")]
+    # 传入很多个值、表有三种以上比例却全部落在同一档（Q1：毛利率写成成本率，216 个值全落在最高档）：覆盖报告要处理
     many = {"contrib_tier": {"n": 30, "min": Decimal("20000"), "max": Decimal("90000"), "bands": {0: 30}}}
-    if len(rs.tables["contrib_tier"].steps) >= 3:
+    if len({r for _, r in rs.tables["contrib_tier"].steps}) >= 3:
         rep = lint.check(rs, data, "", tiers=many)
-        assert any("contrib_tier" in g and "传错了数" in g for g in rep.gates) and "分档 contrib_tier" in rep.keys
+        assert any("contrib_tier" in g and "等于一个常数" in g for g in rep.gates) and "参数表 contrib_tier" in rep.keys
+
+
+def test_coverage_report_lookup_and_conditions():
+    """覆盖报告：查表全部落到默认值、查表很多次只用上一项要处理；条件始终一种结果只提示；正常分布不报。"""
+    from bonus_core.dsl.models import LookupTable
+    from bonus_core.dsl.models import RuleSet as RS
+    rs = RS.model_validate({"name": "t", "version": "1", "datasets": {}, "pool": {"expr": "0"}, "allocation": [],
+                            "tables": {"area": {"kind": "lookup", "mapping": {"东": 1.1, "西": 0.9, "南": 1.0}, "default": 1.0},
+                                       "flag": {"kind": "lookup", "mapping": {"是": 1, "否": 0}}}})
+    assert isinstance(rs.tables["area"], LookupTable)
+    cov = [{"item": "w", "kind": "lookup", "what": "area", "seen": {"默认值": 12}}]
+    rep = lint.check(rs, {}, "", coverage=cov)
+    assert "参数表 area" in rep.keys and any("默认值" in g for g in rep.gates)
+    cov = [{"item": "w", "kind": "lookup", "what": "area", "seen": {"东": 8}}, {"item": "v", "kind": "lookup", "what": "area", "seen": {"东": 4}}]
+    rep = lint.check(rs, {}, "", coverage=cov)
+    assert "参数表 area" in rep.keys and any("12 次" in g and "等于一个常数" in g for g in rep.gates)
+    # 只有两种取值的表、或分布正常：不拦
+    cov = [{"item": "w", "kind": "lookup", "what": "flag", "seen": {"是": 40}},
+           {"item": "v", "kind": "lookup", "what": "area", "seen": {"东": 8, "西": 4}},
+           {"item": "v", "kind": "if", "what": "qc_count == 0", "seen": {"否": 10}}]
+    rep = lint.check(rs, {}, "", coverage=cov)
+    assert not [k for k in rep.keys if k.startswith("参数表")]
+    assert any("v 里的 qc_count == 0 始终不成立（10 次）" in w for w in rep.warns)
 
 
 def test_engine_records_tier_inputs(tmp_path):
     ws = _delivery(tmp_path)
     st = ws.results["V1"]["R0"].tier_stats["contrib_tier"]
     assert st["n"] > 0 and st["min"] <= st["max"] and sum(st["bands"].values()) == st["n"]
-    assert "tier_stats" not in ws.results["V1"]["R0"].to_dict()
+    assert "tier_stats" not in ws.results["V1"]["R0"].to_dict() and "coverage" not in ws.results["V1"]["R0"].to_dict()
+    cov = ws.results["V1"]["R0"].coverage
+    assert cov and all(c["kind"] in ("if", "lookup") and sum(c["seen"].values()) > 0 for c in cov)
 
 
 def test_unfiltered_status_and_period_are_flagged(tmp_path):

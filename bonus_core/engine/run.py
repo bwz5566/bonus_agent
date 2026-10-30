@@ -101,6 +101,7 @@ class Result:
     rollups: dict[str, RollupResult] = field(default_factory=dict)
     inputs: dict[str, dict[str, object]] = field(default_factory=dict)   # 过程复核表的取数：节点 -> {字段或变量: 引擎值}
     tier_stats: dict[str, dict] = field(default_factory=dict)            # 分档表实际取值分布（程序检查用，不进输出）
+    coverage: list[dict] = field(default_factory=list)                   # 条件分支、查找表的命中分布（程序检查用，不进输出）
 
     def payout_rows(self) -> list:
         """发放的最终口径：有按实体汇总的抵扣时用汇总行，否则用最末层。"""
@@ -115,6 +116,7 @@ class Result:
     def to_dict(self) -> dict:
         d = asdict(self)
         d.pop("tier_stats", None)
+        d.pop("coverage", None)
         return json.loads(json.dumps(d, default=str, ensure_ascii=False))
 
 
@@ -268,6 +270,7 @@ class Engine:
             levels=[lv.level for lv in self.rs.allocation], nodes=nodes, payouts=payouts,
             traces=dict(self.ev.traces), adjustments=adjustments, issues=list(self.issues), rollups=rollups,
             inputs=self._sheet_inputs(), tier_stats=dict(self.ev.tier_stats),
+            coverage=self.ev.coverage(),
         )
 
     def _sheet_inputs(self) -> dict[str, dict[str, object]]:

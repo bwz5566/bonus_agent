@@ -9,7 +9,8 @@
 - 漏筛状态：规则读了某张数据表，表里有审批 / 状态这类列（取值只有几种），规则却没按它筛选；
 - 漏筛期间：带日期的明细表没按日期或期间筛选，数据又跨了几个月（只提示）；
 - 分档量纲：分档表的实际传入值全部落在同一档，而且和分档点差一个数量级以上（如传入比值、分档点却按分钟写），其他档从来用不上；
-  传入值很多（≥10 个）、表有三档以上却全部落在同一档，也要处理（多半传错了数）；
+- 覆盖报告：参数表（分档、查表）写了三种以上比例 / 取值，用了很多次（≥10）却只用上一种，等于常数，要对照材料判断；
+  查表全部落到默认值（键和数据写法不一致）；条件分支始终只有一种结果（只提示）。程序只如实列出，不预设哪种分布算错；
 - 结构提示：筛选后全部为 0、定义了却没用到的变量。
 
 gates 在 finish 时必须处理（改规则、问财务，或写进 ignored 说明原因）；warns 只附在试算结果里。
@@ -145,10 +146,11 @@ def _compared(rs: RuleSet, negated: set[str] | None = None) -> dict[str, dict[st
 
 
 def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, sourced: str = "",
-          headers: dict[str, str] | None = None, tiers: dict | None = None, used_elsewhere: set[str] | None = None) -> Report:
+          headers: dict[str, str] | None = None, tiers: dict | None = None, used_elsewhere: set[str] | None = None,
+          coverage: list | None = None) -> Report:
     """text：规则材料原文（规则文档、财务的话和答复）。sourced 非空时（如有图片没转写）常数出处无法核对，只提示。
     headers：字段 -> Excel 表头原文（含工作表名），判断字段含义时不只看智能体起的名字。
-    tiers：引擎记录的分档表实际取值分布；used_elsewhere：其他方案用到的名字（一个金额字段只要有方案用到就不算漏用）。"""
+    tiers：引擎记录的分档表实际取值分布；coverage：查找表、条件分支的命中分布；used_elsewhere：其他方案用到的名字（一个金额字段只要有方案用到就不算漏用）。"""
     rep = Report()
     norm = unicodedata.normalize("NFKC", text)
     nums = material_numbers(text)
@@ -222,12 +224,17 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
         rep.warns.append(f"规则汇总了数据表「{ds}」，但没有按日期（{fld}）或期间筛选，数据跨 {span}，会把这些月份的记录全部算进来。"
                          "核对材料规定的统计期间；本来就该全算的可以不管")
     # 5. 分档表的传入值和分档点量纲不一致
-    for name, msg, hard in _tier_scale(rs, tiers or {}):
-        if hard:
+    for name, msg in _tier_scale(rs, tiers or {}):
+        rep.gates.append(msg)
+        rep.keys.append(f"分档 {name}")
+    # 6. 覆盖报告：参数表写了几档 / 几项却只用上一种，条件始终一种结果
+    scaled = {k.removeprefix("分档 ") for k in rep.keys}
+    cov_gates, cov_warns = _coverage(rs, tiers or {}, coverage or [])
+    for name, msg in cov_gates:
+        if name not in scaled:
             rep.gates.append(msg)
-            rep.keys.append(f"分档 {name}")
-        else:
-            rep.warns.append(msg)
+            rep.keys.append(f"参数表 {name}")
+    rep.warns += cov_warns
     # 结构提示
     used = _reachable(rs)
     idle = [n for n in rs.variables if n not in used]
@@ -330,11 +337,11 @@ def _fmt(x) -> str:
     return format(Decimal(str(x)).normalize(), "f")
 
 
-SPREAD_N = 10                  # 分档表传入值不少于这么多个、却全部落在同一档（表有三档以上）：要处理
+SPREAD_N = 10                  # 参数表用了不少于这么多次、却只用上同一档 / 同一项（表里三种以上取值）：要处理
 
 
-def _tier_scale(rs: RuleSet, tiers: dict) -> list[tuple[str, str, bool]]:
-    """(表名, 提示, 是否必须处理)。全部传入值落在同一档才看；和相邻分档点差 5 倍以上算量纲不一致（必须处理），否则只提示。"""
+def _tier_scale(rs: RuleSet, tiers: dict) -> list[tuple[str, str]]:
+    """(表名, 提示)。全部传入值落在同一档、而且和相邻分档点差 5 倍以上：量纲多半不一致，必须处理。"""
     out = []
     for name, st in tiers.items():
         t = rs.tables.get(name)
@@ -345,20 +352,56 @@ def _tier_scale(rs: RuleSet, tiers: dict) -> list[tuple[str, str, bool]]:
         band = next(iter(st["bands"]))
         nxt = cuts[band + 1] if band + 1 < len(cuts) else None
         cur = cuts[band] if band >= 0 else None
-        far = (nxt is not None and nxt > 0 and hi >= 0 and hi * 5 < nxt) or \
-              (cur is not None and cur > 0 and lo > cur * 5 and nxt is None)
-        msg = (f"分档表 {name} 的分档点是 {'、'.join(_fmt(c) for c in cuts)}，实际传入的 {st['n']} 个值在 {_fmt(lo)}～{_fmt(hi)} 之间，"
-               "全部落在同一档，其他档从来没用上。")
-        if far:
-            out.append((name, msg + "传入值和分档点差了一个数量级以上，量纲多半不一致（如一个是比值、一个是分钟数或百分数，"
-                              "一个是元、一个是万元）。核对传入的表达式和分档点是否同一单位；确实如此就写进 ignored 说明原因", True))
-        elif st["n"] >= SPREAD_N and len(t.steps) >= 3:
-            # 传入很多个值、表有三档以上却只用上一档：多半传错了数（如分子分母写反、该传差额传成了原值）
-            out.append((name, msg + "传入的值这么多却只落在一档，多半传错了数：对照材料核对传入的表达式（分子分母、"
-                              "相减的项、比值还是百分数）；数据确实都在这一档就写进 ignored 说明原因", True))
-        else:
-            out.append((name, msg + "如果数据本来就都在这一档可以不管，否则核对分档点和传入值", False))
+        if (nxt is not None and nxt > 0 and hi >= 0 and hi * 5 < nxt) or (cur is not None and cur > 0 and lo > cur * 5 and nxt is None):
+            out.append((name, f"分档表 {name} 的分档点是 {'、'.join(_fmt(c) for c in cuts)}，实际传入的 {st['n']} 个值在 "
+                              f"{_fmt(lo)}～{_fmt(hi)} 之间，全部落在同一档，而且和分档点差了一个数量级以上，量纲多半不一致"
+                              "（如一个是比值、一个是分钟数或百分数，一个是元、一个是万元）。核对传入的表达式和分档点是否同一单位；"
+                              "确实如此就写进 ignored 说明原因"))
     return out
+
+
+def _coverage(rs: RuleSet, tiers: dict, coverage: list) -> tuple[list[tuple[str, str]], list[str]]:
+    """覆盖报告：参数表（分档、查表）和条件分支在数据上实际用到了哪些档、哪些项、哪个分支。
+    程序不预设哪种分布算错，只把“写了却从没用上”的如实列出来：参数表用了很多次却只用上一档 / 一项，等于一个常数，
+    要智能体对照材料判断（改规则或写明原因）；查表全部落到默认值，说明键和数据对不上；条件始终只有一种结果只提示。
+    返回 ([(表名, 必须处理的提示)], [提示])。"""
+    hits: dict[str, dict] = {}
+    for name, st in tiers.items():
+        t = rs.tables.get(name)
+        if isinstance(t, TierTable):
+            kinds = len({r for _, r in t.steps})
+            hits[name] = {"n": st.get("n", 0), "seen": {f"第 {b + 1} 档" if b >= 0 else "第一档以下": c
+                                                        for b, c in st.get("bands", {}).items()}, "kinds": kinds, "unit": "档"}
+    for c in coverage:
+        t = rs.tables.get(c["what"]) if c["kind"] == "lookup" else None
+        if isinstance(t, LookupTable):
+            h = hits.setdefault(c["what"], {"n": 0, "seen": {}, "unit": "项",
+                                            "kinds": len(set(t.mapping.values()) | ({t.default} if t.default is not None else set()))})
+            for k, n in c["seen"].items():
+                h["n"] += n
+                h["seen"][k] = h["seen"].get(k, 0) + n
+    gates = []
+    for name, h in hits.items():
+        if len(h["seen"]) != 1:
+            continue
+        only, n = next(iter(h["seen"].items()))
+        if only == "默认值" and n >= 3:
+            gates.append((name, f"查找表 {name} 查了 {n} 次，全部没有对上表里的键、落到了默认值：表里的键和数据的写法多半不一致"
+                                f"（如“A类”和“A”、全角半角、多了空格），或者查的列不对。按数据的实际写法改键或改查的字段；"
+                                "数据确实都不在表里就写进 ignored 说明原因"))
+        elif n >= SPREAD_N and h["kinds"] >= 3:
+            gates.append((name, f"参数表 {name} 写了 {h['kinds']} 种{'比例' if h['unit'] == '档' else '取值'}，实际用了 {n} 次，"
+                                f"全部是{only}，其他{h['unit']}从来没用上，这张表在本次数据上等于一个常数。要么数据确实都在这一{h['unit']}"
+                                f"（写进 ignored 说明原因），要么传进来的值不对：对照材料核对传入的表达式（取的哪一列、分子分母、"
+                                "相减的项、比值还是百分数、先汇总还是逐个对象算）"))
+    one = [(c["item"], c["what"], *next(iter(c["seen"].items()))) for c in coverage
+           if c["kind"] == "if" and len(c["seen"]) == 1 and sum(c["seen"].values()) >= 3]
+    warns = []
+    if one:
+        warns.append("这些条件在数据上始终只有一种结果：" + "；".join(
+            f"{item} 里的 {what} {'始终成立' if r == '是' else '始终不成立'}（{n} 次）" for item, what, r, n in one[:6])
+            + ("……" if len(one) > 6 else "") + "。防零、资格这类保护条件不触发很正常；筛选、分类条件始终一种结果的，核对取值和写法")
+    return gates, warns
 
 
 _PAID = re.compile(r"预发|预付|预支|已发|已付|已支付|已领|prepa|paid|advance", re.I)

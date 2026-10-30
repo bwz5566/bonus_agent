@@ -13,7 +13,7 @@ from decimal import ROUND_HALF_UP, Decimal, localcontext
 
 from bonus_core.data.table import ConvertError, Row, to_bool, to_date
 from bonus_core.dsl.models import LookupTable, RuleSet, TierTable
-from bonus_core.dsl.parser import BinOp, BoolOp, Call, Cmp, Const, Name, Neg, Not, Num, Str, names, parse
+from bonus_core.dsl.parser import BinOp, BoolOp, Call, Cmp, Const, Name, Neg, Not, Num, Str, names, parse, unparse
 from bonus_core.dsl.scope import Layout, is_aggregate
 from bonus_core.engine.tree import Node
 
@@ -100,6 +100,8 @@ class Evaluator:
         self.peer_scope = False
         # 分档表的实际取值分布：表名 -> {n, min, max, bands: {档位序号: 次数}}，程序检查用来发现传入值和分档点量纲不一致
         self.tier_stats: dict[str, dict] = {}
+        # 条件分支、查找表实际走到哪个结果：(所在计算项, "if"/"lookup", 条件或表名) -> {结果: 次数}，覆盖报告用
+        self.outcomes: dict[tuple, dict[str, int]] = {}
         self.layout = Layout(rs)
         # 只能在聚合里使用的字段 -> 所在的明细表/公司级表（不含主键/关联键）
         self.detail_fields = self.layout.row_only
@@ -303,7 +305,9 @@ class Evaluator:
             return self._aggregate(c, ctx)
         if fn == "if":
             cond = self.ev(c.args[0], ctx)
-            branch = self.ev(c.args[1] if self._bool(cond, ctx) else c.args[2], ctx)
+            yes = self._bool(cond, ctx)
+            self._seen(ctx, "if", c.args[0], "是" if yes else "否")
+            branch = self.ev(c.args[1] if yes else c.args[2], ctx)
             deps, rows = _merge(cond, branch)
             return Val(branch.v, f"if({cond.text} → {branch.text})", deps, rows)
         if fn in ("tier", "tier_rate"):
@@ -325,6 +329,7 @@ class Evaluator:
                 r = t.v.default
             else:
                 raise EvalError(f"查找表 {c.args[0].id} 中没有 {key}，且没有默认值", ctx.where)
+            self._seen(ctx, "lookup", getattr(c.args[0], "id", t.text), key if key in t.v.mapping else "默认值")
             return Val(r, fmt(r), k.deps, k.rows)
         if fn == "ratio":
             a, b = self.ev(c.args[0], ctx), self.ev(c.args[1], ctx)
@@ -387,6 +392,16 @@ class Evaluator:
             r = Decimal(d.year if fn == "year" else d.month if fn == "month" else (d.month - 1) // 3 + 1)
             return Val(r, f"{fn}({a.text})", a.deps, a.rows)
         raise EvalError(f"不支持的函数 {fn}", ctx.where)
+
+    def _seen(self, ctx: Ctx, kind: str, what, outcome: str) -> None:
+        item = ctx.where.split("/", 1)[-1]
+        seen = self.outcomes.setdefault((item, kind, what), {})
+        seen[outcome] = seen.get(outcome, 0) + 1
+
+    def coverage(self) -> list[dict]:
+        """条件分支、查找表的命中分布：[{item, kind, what, seen}]，what 是条件原文或表名。"""
+        return [{"item": item, "kind": kind, "what": what if isinstance(what, str) and kind == "lookup" else unparse(what),
+                 "seen": dict(seen)} for (item, kind, what), seen in self.outcomes.items()]
 
     def _tier_seen(self, arg, t: Val, x: Decimal) -> None:
         name = getattr(arg, "id", None) or t.text
