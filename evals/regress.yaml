@@ -1,0 +1,25 @@
+# 固定回归的场景配置：bonus-agent regress --out 输出目录 [--runs 3] [--only Q1,Q3]
+# 路径相对本文件。期望结果只在算完后核对，不会交给智能体。
+#   inputs              材料文件夹或文件（列表也行）
+#   exclude             不当材料的文件名（可用通配符），如坏数据用例、只用来核对的答案
+#   expected            期望结果 Excel
+#   expected_column     期望结果里应得金额的列名（自动识别不出时才写）
+#   expected_where      只核对这些行，如 {版本: V1}（期望结果里有几个版本、材料只够算其中一个时）
+#   answers             智能体停下提问时作为财务答复的文件（JSON / YAML / 文本），不写就记为“停下提问”
+#   max_answer_rounds   最多答复几轮，默认 2
+scenarios:
+  - name: Q1
+    inputs: cases/syn_acceptance/inputs          # 与 examples/local_data/bonus_fixture_v1 相同，另含财务答复 finance_answers.json
+    exclude: ["negative_cases*.json"]
+    expected: cases/syn_acceptance/expected/05_期望奖金结果.xlsx
+  - name: Q2
+    inputs: ../examples/local_data/bonus_fixture_v2/input
+    exclude: ["中途需要补充的内容.txt"]           # 内容是客服奖金的答复，不属于本场景
+    expected: ../examples/local_data/bonus_fixture_v2/05_期望结果.xlsx
+    expected_where: {版本: V1}                   # V2、V3 要用补充通知和补充数据，材料里没有
+  - name: Q3
+    inputs: ../examples/local_data/bonus_fixture_v3/input
+    expected: ../examples/local_data/bonus_fixture_v3/05_最终期望结果.xlsx
+  - name: Q4
+    inputs: ../examples/local_data/bonus_fixture_v4/input
+    expected: ../examples/local_data/bonus_fixture_v4/05_最终期望结果_B批.xlsx

@@ -15,6 +15,9 @@
   negcheck --out 案卷目录 --cases negative_cases.json [--sheet 表名=工作表 ...] 材料...
                                            坏数据回归：用该案卷的规则（不调用大模型）在逐个改坏的数据上重算，
                                            列出每种坏数据有没有被拦住
+  regress [--suite 场景.yaml] [--runs 3] [--model M] [--only Q1,Q3] --out 目录
+                                           固定回归：每个场景跑 N 次（默认 3），和期望结果逐分比对，
+                                           汇总写入 目录/summary.json（完成率、正确率、算错没拦住、卡住原因）
   serve --data 数据目录 [--host 127.0.0.1] [--port 8080] [--model M]
                                            内网网页服务：看问题、填答复、传材料、运行下一轮、确认、按模板计算
   user add --data 数据目录 用户名 --roles editor,approver [--display 姓名]
@@ -67,6 +70,15 @@ def main(argv=None) -> int:
     p.add_argument("--cases", required=True, help="坏数据用例 JSON")
     p.add_argument("--sheet", action="append", default=[], help="数据表名=工作表名，可写多次")
     p.add_argument("files", nargs="+", help="原始材料文件或文件夹")
+    p = sub.add_parser("regress")
+    p.add_argument("--suite", default=str(Path(__file__).resolve().parent.parent / "evals" / "regress.yaml"),
+                   help="场景配置 YAML（默认 evals/regress.yaml）")
+    p.add_argument("--runs", type=int, default=3, help="每个场景跑几次，默认 3")
+    p.add_argument("--model")
+    p.add_argument("--only", default="", help="只跑这些场景，逗号分隔")
+    p.add_argument("--out", required=True, help="输出目录：每次运行的案卷和 summary.json")
+    p.add_argument("--max-steps", type=int, default=150)
+    p.add_argument("--max-tokens", type=int, default=4_000_000)
     p = sub.add_parser("serve")
     p.add_argument("--data", required=True, help="数据目录：用户、案卷、材料和结果都在这里")
     p.add_argument("--host", default="127.0.0.1", help="默认只监听本机；内网访问请放在 HTTPS 反向代理后面")
@@ -112,6 +124,28 @@ def main(argv=None) -> int:
             return 1
         print(f"已保存用户 {a.name}（{a.roles}）")
         return 0
+    if a.cmd == "regress":
+        from bonus_agent import regress as rg
+        scenarios = rg.load_suite(a.suite)
+        only = [x.strip() for x in a.only.split(",") if x.strip()]
+        unknown = set(only) - {s.name for s in scenarios}
+        if unknown:
+            print(f"场景配置里没有：{'、'.join(sorted(unknown))}（有：{'、'.join(s.name for s in scenarios)}）")
+            return 1
+        scenarios = [s for s in scenarios if not only or s.name in only]
+        missing = [f"{s.name}：{p}" for s in scenarios for p in s.inputs + [s.expected, s.answers] if p and not p.exists()]
+        if missing:
+            print("找不到这些文件：\n  " + "\n  ".join(missing))
+            return 1
+        cfg = load_config()
+        name = a.model or cfg["default"]
+        hist = cfg["models"].get(name, {}).get("max_history_chars", 40000)
+        summary = rg.run_suite(scenarios, Path(a.out), lambda: LLM.from_config(a.model, cfg), runs=a.runs,
+                               meta={"模型": name, "场景配置": str(a.suite)}, max_steps=a.max_steps,
+                               max_tokens=a.max_tokens, max_history_chars=hist)
+        print("\n" + "\n".join(rg.lines(summary)))
+        print(f"\n汇总已写入 {Path(a.out) / rg.SUMMARY}")
+        return 0 if summary["总计"]["算错没拦住"] == 0 else 2
     if a.cmd == "negcheck":
         from bonus_agent import case as cs
         from bonus_agent.auto import collect_files

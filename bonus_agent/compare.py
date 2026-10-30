@@ -92,9 +92,16 @@ def _figures(res: Result) -> dict[str, dict[str, Decimal]]:
     return out
 
 
-def compare_expected(results: dict[str, dict[str, Result]], path: str | Path, column: str | None = None) -> list[Match]:
-    """column：指定应得金额的列名（期望结果的列名认不出或有歧义时用）。"""
+def compare_expected(results: dict[str, dict[str, Result]], path: str | Path, column: str | None = None,
+                     where: dict[str, str] | None = None) -> list[Match]:
+    """column：指定应得金额的列名（期望结果的列名认不出或有歧义时用）。
+    where：列名 -> 取值，只核对这些行（如期望结果里有几个版本，本次只算了其中一个）；没有这一列的工作表不受影响。"""
     tables = detect(path)
+    for st in tables:
+        for col, val in (where or {}).items():
+            if col in st.headers:
+                i = st.headers.index(col)
+                st.rows = [(n, vals) for n, vals in st.rows if cell_text(vals[i]) == str(val)]
     out = []
     for scheme, revs in results.items():
         for rev, res in revs.items():
