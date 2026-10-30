@@ -181,21 +181,21 @@ class Plan(BaseModel):
 
 
 PLAN_EXAMPLE = {
-    "summary": "销售部季度奖金：按部门销售额阶梯计提奖金池，按小组绩效分到小组，组内按业绩和工龄分到个人；未回款部分暂缓发放。",
+    "summary": "销售部季度奖金：按部门销售额阶梯计提奖金池，按团队绩效分到团队，组内按业绩和工龄分到个人；未回款部分暂缓发放。",
     "rule_files": ["提成办法.docx"],
     "rule_sheets": ["业务数据.xlsx/区域系数"],
     "datasets": {
-        "人员": {"sheet": "业务数据.xlsx/人员名单", "key": "employee_id", "link": None, "desc": "每人一行",
-                 "fields": {"employee_id": {"column": "工号", "type": "id", "desc": "工号"},
+        "人员": {"sheet": "业务数据.xlsx/人员名单", "key": "staff_id", "link": None, "desc": "每人一行",
+                 "fields": {"staff_id": {"column": "工号", "type": "id", "desc": "工号"},
                             "name": {"column": "姓名", "type": "text", "desc": "姓名"},
-                            "group_id": {"column": "所属小组", "type": "id", "desc": "小组编号"},
+                            "team_id": {"column": "所属团队", "type": "id", "desc": "团队编号"},
                             "seniority": {"column": "工龄", "type": "number", "desc": "工龄（年）"}}},
-        "销售明细": {"sheet": "业务数据.xlsx/合同明细", "key": None, "link": "employee_id",
-                     "fields": {"employee_id": {"column": "负责人工号", "type": "id", "desc": "负责人"},
-                                "sales_amount": {"column": "合同金额（万元）", "type": "money", "unit": "万元", "desc": "合同额"}}},
+        "合同明细": {"sheet": "业务数据.xlsx/合同明细", "key": None, "link": "staff_id",
+                     "fields": {"staff_id": {"column": "负责人工号", "type": "id", "desc": "负责人"},
+                                "amount": {"column": "合同金额（万元）", "type": "money", "unit": "万元", "desc": "合同额"}}},
     },
-    "hierarchy": [{"level": "小组", "key": "group_id", "parent_key": None},
-                  {"level": "个人", "key": "employee_id", "parent_key": "group_id"}],
+    "hierarchy": [{"level": "团队", "key": "team_id", "parent_key": None},
+                  {"level": "个人", "key": "staff_id", "parent_key": "team_id"}],
     "ignored": [{"ref": "业务数据.xlsx/填表说明", "reason": "填写说明，不含数据"}],
     "questions": [{"id": "p1", "text": "人员名单和花名册两张表内容重复，以哪张为准？", "options": ["人员名单", "花名册"], "suggested": 0}],
 }
@@ -281,8 +281,8 @@ def check_dataset(name: str, pd: PlanDataset, st: SheetTable, field_types: dict[
     for k in (pd.key, pd.link):
         if k and ("," in k or "+" in k or " " in k.strip()):
             errors.append(f"数据表「{name}」的 {'key' if k == pd.key else 'link'} 只能写一个字段，不能写 {k}。"
-                          "key 是“每行一个对象”的编号（如员工表的 employee_id）；一行属于某个对象的明细（如项目参与表每行属于"
-                          "一个员工）不写 key，写 link=该对象的编号（如 link=employee_id），行里的其他编号（如 project_id）"
+                          "key 是“每行一个对象”的编号（如人员表的 staff_id）；一行属于某个对象的明细（如合同明细每行属于"
+                          "一个人）不写 key，写 link=该对象的编号（如 link=staff_id），行里的其他编号（如 team_id）"
                           "仍能取到对应实体的字段和变量")
         elif k and k not in fields:
             errors.append(f"数据表「{name}」的 {'key' if k == pd.key else 'link'} 字段 {k} 不在它的 fields 里")

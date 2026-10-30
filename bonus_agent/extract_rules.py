@@ -67,7 +67,7 @@ EXAMPLE = {
                               "sources": [{"doc": "示例.docx", "page": None, "quote": "回款额达到500万元的，按8%计提"}]}},
     "variables": {"total_collected": {"scope": "global", "expr": "sum(collected)", "desc": "部门回款合计"}},
     "pool": {"expr": "tier(bonus_tier, total_collected)"},
-    "allocation": [{"level": "个人", "key": "employee_id", "parent_key": None, "weight": "share(seniority)"}],
+    "allocation": [{"level": "个人", "key": "staff_id", "parent_key": None, "weight": "share(seniority)"}],
     "payout": [],
     "questions": [{"id": "q1", "text": "8% 是全额累进还是只对超过 500 万的部分计提？",
                    "options": ["全额累进", "超额累进"], "suggested": 0, "related": "tables.bonus_tier"}],

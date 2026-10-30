@@ -188,7 +188,7 @@ def validate(rs: RuleSet) -> list[Issue]:
                     if k == "of" and not (isinstance(val, Str) and val.value in rs.datasets):
                         issues.append(Issue.block("fn_of", f"{node.fn} 的 of 必须是数据表名字符串", where))
                 if node.fn == "scheme_paid" and not all(isinstance(a, Str) for a in node.args):
-                    issues.append(Issue.block("fn_args", 'scheme_paid 的参数是方案名和修订名字符串，如 scheme_paid("QUARTER", "R2")', where))
+                    issues.append(Issue.block("fn_args", 'scheme_paid 的参数是方案名和修订名字符串，如 scheme_paid("方案名", "修订名")', where))
                 if node.fn in ("tier", "tier_rate", "lookup") and node.args:
                     a0 = node.args[0]
                     want = "tier" if node.fn != "lookup" else "lookup"

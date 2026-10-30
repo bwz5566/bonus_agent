@@ -127,11 +127,11 @@ TOOLS: list[dict] = [
      "description": "删掉台账里某个参数名的全部登记（登记错了时用，如把阶梯几档登记成了同一个名字）；依据它的、还没答复的冲突问题会被撤回。",
      "parameters": _obj({"name": _S}, ["name"])},
     {"name": "define_dataset",
-     "description": "定义（或重新定义）一张数据表。实体表写 key（每行一个对象，如员工、小组，以及被别的表按编号引用的项目、销售单）；"
-                    "明细表写 link（每行挂到某层级对象或某个实体上，如回款 link=sales_id）；公司级表 key、link 都不写。"
-                    "同名字段表示关联。一张工作表混放多类数据时（如目标值表按 entity_type 区分部门/小组/个人），"
-                    "用 filter 只取其中一类，并把编号列映射成对应的字段名（如 group_id ← entity_id）。返回校验结果和换算后的样例行。",
-     "parameters": _obj({"name": {**_S, "description": "中文表名，如 人员、销售明细"}, "file": _S, "sheet": _S,
+     "description": "定义（或重新定义）一张数据表。实体表写 key（每行一个对象，如人员、团队，以及被别的表按编号引用的合同、订单）；"
+                    "明细表写 link（每行挂到某层级对象或某个实体上，如收款记录 link=合同编号字段）；公司级表 key、link 都不写。"
+                    "同名字段表示关联。一张工作表混放多类数据时（某一列区分这行属于哪类对象），"
+                    "用 filter 只取其中一类，并把通用的编号列映射成这类对象自己的编号字段名。返回校验结果和换算后的样例行。",
+     "parameters": _obj({"name": {**_S, "description": "中文表名，如 人员、合同明细"}, "file": _S, "sheet": _S,
                          "header_rows": {"type": "array", "items": _I, "description": "可选：表头所在的 Excel 行号，多行表头写多个"},
                          "key": _S, "link": _S, "desc": _S,
                          "filter": {"type": "object", "description": '可选：只取这些行，{"列名": "取值"} 或 {"列名": ["取值1", "取值2"]}'},
@@ -145,7 +145,7 @@ TOOLS: list[dict] = [
                     "一批文件里有多个方案（如季度奖、过程奖、年度奖）时，每个方案用 scheme 分别写 pool 等；"
                     "各方案相同的部分（分配层级与权重、数据校验、共用的参数表和变量）写到 scheme=\"共用\"，会合并进每个方案。"
                     "只有一个方案时不写 scheme。",
-     "parameters": _obj({"scheme": {**_S, "description": "方案名，如 QUARTER；共用部分写 共用"},
+     "parameters": _obj({"scheme": {**_S, "description": "方案名（按材料起，如 月度、年度）；共用部分写 共用"},
                          "tables": {"type": "object"}, "variables": {"type": "object"}, "pool": {"type": "object"},
                          "allocation": {"type": "array", "items": {"type": "object"}},
                          "payout": {"type": "array", "items": {"type": "object"},
@@ -153,30 +153,30 @@ TOOLS: list[dict] = [
                                                    '或 hold_ratio（挂起比例）'},
                          "offsets": {"type": "array", "items": {"type": "object"},
                                      "description": '已发抵扣：[{"id": "prior", "scope": "个人", "expr": "已发金额表达式"}]，'
-                                                    '可用 scheme_paid("QUARTER", "R2") 引用另一个方案某修订的本次实发'},
+                                                    '可用 scheme_paid("方案名", "修订名") 引用另一个方案某修订的本次实发'},
                          "checks": {"type": "array", "items": {"type": "object"}},
                          "patches": {"type": "array", "items": {"type": "object"},
-                                     "description": '数据修订（只影响本方案）：并入补充表 {"kind": "append", "source": "补充收款", "into": "收款流水", '
-                                                    '"unique": "receipt_id", "values": {"approved": {"通过": "是", "驳回": "否"}}}；'
-                                                    '更正 {"kind": "correct", "source": "项目更正", "target": "项目", "key": "project_id", '
-                                                    '"field": "field_name", "value": "new_value", "labels": {"交付评级": "grade"}} 或 '
-                                                    '{"kind": "correct", "source": "评分修订", "target": "参与分配", "key": "part_id", '
-                                                    '"set": {"contrib_score": "new_score"}, "expect": {"contrib_score": "old_score"}}'},
+                                     "description": '数据修订（只影响本方案）：并入补充表 {"kind": "append", "source": "补充表", "into": "原表", '
+                                                    '"unique": "单号字段", "values": {"flag_field": {"补充表写法": "原表写法"}}}；'
+                                                    '更正 {"kind": "correct", "source": "更正表", "target": "原表", "key": "编号字段", '
+                                                    '"field": "field_name", "value": "new_value", "labels": {"更正表里的字段写法": "原表字段名"}} 或 '
+                                                    '{"kind": "correct", "source": "修订表", "target": "原表", "key": "编号字段", '
+                                                    '"set": {"原表字段": "new_field"}, "expect": {"原表字段": "old_field"}}'},
                          "revisions": {"type": "array", "items": {"type": "object"},
                                        "description": '人工调整的修订版本，后一个包含前面的调整：[{"name": "R1", "adjust": '
-                                                      '[{"node": "小组:G01", "amount": 900000, "reason": "..."}]}]；R0 为不调整的基准'}})},
+                                                      '[{"node": "团队:T01", "amount": 900000, "reason": "..."}]}]；R0 为不调整的基准'}})},
     {"name": "trial_run", "description": "用当前数据表和规则试算，返回奖金池、各层级金额分布、各修订的变化和提示。不写 scheme 时试算全部方案。",
      "parameters": _obj({"scheme": _S})},
-    {"name": "explain", "description": "查看计算链：节点 id（如 个人:E1001、项目:P001、全部）或变量追踪 id 的公式、代入数值后的算式和结果。",
+    {"name": "explain", "description": "查看计算链：节点 id（如 人员:S01、团队:T01、全部）或变量追踪 id 的公式、代入数值后的算式和结果。",
      "parameters": _obj({"id": _S, "scheme": _S, "revision": {**_S, "description": "默认 R0"}}, ["id"])},
-    {"name": "evaluate", "description": "在某个节点上用引擎计算任意表达式（如 sum(net_profit)），用于核对数据和规则。"
-                                        "节点可以是层级对象或关联实体（如 项目:P001）。需要先在 set_rules 里设定 allocation。",
+    {"name": "evaluate", "description": "在某个节点上用引擎计算任意表达式（如 sum(amount)），用于核对数据和规则。"
+                                        "节点可以是层级对象或关联实体（如 合同:C01）。需要先在 set_rules 里设定 allocation。",
      "parameters": _obj({"expr": _S, "node": {**_S, "description": "节点 id，默认 全部"}, "scheme": _S}, ["expr"])},
     {"name": "ask_question",
      "description": "向财务提问：材料之间有冲突、缺少必要的信息（参数、口径、数据）、或能有两种理解时使用。"
                     "不要自行假设或补出算法；提问后继续做不受影响的部分，问完后调用 finish 结束本轮，"
                     "财务答复后下一轮接着做。options 列出可选的理解，suggested 是你的建议（只供财务参考，不会被采用）。"
-                    "related 写受影响的方案或规则（如 ANNUAL.offsets）。blocking=false 只用于不影响任何金额的提示。",
+                    "related 写受影响的方案或规则（如 方案名.offsets）。blocking=false 只用于不影响任何金额的提示。",
      "parameters": _obj({"text": _S, "options": {"type": "array", "items": _S}, "suggested": _I, "related": _S,
                          "blocking": {"type": "boolean"}}, ["text", "options"])},
     {"name": "reply",
@@ -191,17 +191,17 @@ TOOLS: list[dict] = [
                     "要验算哪些对象由程序指定（见工作区状态的“待独立验算”），全部通过才能 finish。算式里不能引用规则变量（只能用字段、"
                     "参数表和函数）；at 默认是该对象自己（对自己的明细求和），按份额分配的对象在 全部 上用 where 按编号筛选计算。"
                     "对不上时先想清楚是规则错了还是验算式写错了，改对的那一边；拿不准就 ask_question。",
-     "parameters": _obj({"node": {**_S, "description": "要验算的对象，如 个人:E1001"}, "expr": _S,
+     "parameters": _obj({"node": {**_S, "description": "要验算的对象，如 人员:S01"}, "expr": _S,
                          "basis": {**_S, "description": "依据的材料原文（条款号或原句）"},
                          "at": {**_S, "description": "在哪个节点上计算，默认是 node 自己"}, "scheme": _S,
                          "amount": {**_S, "enum": ["应得", "实发"], "description": "验算应得（默认）还是本次实发（扣暂缓、已发之后）"},
                          "helpers": {"type": "object", "description": "可选：验算自己定义的辅助变量 {名字: {scope, expr}}，"
                                      "写法同规则的 variables，不能和规则变量同名、不能引用规则变量。跨表的中间数先在对应层算出来，"
-                                     "如 {\"v_proj_sales\": {\"scope\": \"项目\", \"expr\": \"sum(sales_amount, of: \\\"销售明细\\\")\"}}，"
-                                     "再在参与行上引用 v_proj_sales * share。定义过的辅助变量会留着（见工作区状态），"
+                                     "如 {\"v_obj_amt\": {\"scope\": \"关联实体表名\", \"expr\": \"sum(amount, of: \\\"明细表名\\\")\"}}，"
+                                     "再在参与记录上引用 v_obj_amt * ratio_field。定义过的辅助变量会留着（见工作区状态），"
                                      "后面的 verify 直接引用，只写新的或要改的；scope 写层级名、关联实体表名或 global。"
-                                     "验算里对本层或上层的实体表求和（如在个人层 sum(v_gw, of: \"小组\", where: dept_id == \"D01\")）"
-                                     "按上一层范围取同级再用 where 筛选；share(小组层的变量) 在个人层求值时取所在小组在同级小组里的份额"}},
+                                     "验算里对本层或上层的实体表求和（如在最末层 sum(v_up_w, of: \"上层实体表\", where: 上上层编号字段 == \"某编号\")）"
+                                     "按上一层范围取同级再用 where 筛选；share(上层变量) 在下层求值时取所属上层对象在同级里的份额"}},
                         ["node", "expr", "basis"])},
     {"name": "finish", "description": "完成。要求每个方案在最近一次修改之后都已成功试算，程序指定的对象都已独立验算通过。",
      "parameters": _obj({"summary": {**_S, "description": "两三句话说明：什么奖金、奖金池怎么来、怎么分、发放条件"},
@@ -1597,12 +1597,12 @@ def _json_data_summary(path: Path) -> str:
 
 
 def _revisions(revs) -> list[dict]:
-    """修订版本：[{"name": "R1", "adjust": [{"node": "小组:G01", "amount": 900000, "reason": ...}]}, ...]。
+    """修订版本：[{"name": "R1", "adjust": [{"node": "团队:T01", "amount": 900000, "reason": ...}]}, ...]。
     后一个修订包含前面所有修订的调整（逐步累加），R0 是不做调整的基准。"""
     out = []
     for r in revs or []:
         if not isinstance(r, dict) or not r.get("name") or not isinstance(r.get("adjust"), list):
-            raise ValueError('revisions 的每一项应为 {"name": "R1", "adjust": [{"node": "小组:G01", "amount": 900000}]}')
+            raise ValueError('revisions 的每一项应为 {"name": "R1", "adjust": [{"node": "团队:T01", "amount": 900000}]}')
         if r["name"] == "R0":
             raise ValueError("R0 是不做调整的基准结果，修订从 R1 开始命名")
         for a in r["adjust"]:
