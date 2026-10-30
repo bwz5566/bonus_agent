@@ -356,6 +356,9 @@ def build(ws, results: dict | None = None) -> list[dict]:
     if calc.get("error") and not rr.get("error"):
         add("待定事项", "独立复读", "独立算式没有算出来", f"复读按材料写的奖金池算式没能在数据上算出来（{calc['error'][:200]}），"
             "这些方案没有用独立算式比对金额", [])
+    for n, kinds in (calc.get("unsettled") or {}).items():
+        add("待定事项", "独立复读", f"独立算式没有定论：{n}", f"复读按材料写的{'、'.join(kinds)}和规则对不上，但它两次独立写的结果彼此也不一致"
+            "（复读自己没读准），这一项没有拿来拦规则，请对照材料核对", [])
     for q in getattr(ws, "questions", []) or []:
         if q.answer not in (None, "") and not getattr(q, "withdrawn", ""):
             by_doc = str(getattr(q, "answered_by", "") or "").startswith("材料")

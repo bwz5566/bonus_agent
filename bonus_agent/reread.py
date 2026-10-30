@@ -12,8 +12,8 @@
 筛选取值、日期范围。复读本身对不对不重要：它只用来把可疑的地方挑出来。
 
 独立算式：只比列名、常数看不出“公式本身写错”（如分子分母取错、该减的没减）。所以复读之后再调用一次，
-让它只按材料把每个方案的奖金池写成算式（给数据字典和分配层级，不给规则的算式），程序把它放到同一份数据上算，
-和规则算出的奖金池逐个对象比数。不预设会错在哪里：两份独立理解只要不一样，数就对不上。
+让它只按材料把每个方案的奖金池、可发比例（本次可发上限 ÷ 应得，材料有按回款发放、暂缓这类规定时）写成算式
+（给数据字典和分配层级，不给规则的算式），程序把它放到同一份数据上算，和规则算出的数逐个对象比。不预设会错在哪里：两份独立理解只要不一样，数就对不上。
 算式写不对时把报错交还它自己改（最多 CALC_TRIES 次）；还是算不出来不拦，口径单上注明。
 """
 from __future__ import annotations
@@ -133,14 +133,45 @@ def structure(ws) -> str:
     for ds, m in ws.mapping.items():
         cols = "、".join(f"{f} ← {c}" for f, c in m.columns.items())
         heads.append(f"- {ds}：{m.file}/{m.sheet}" + (f"（只取 {m.filter}）" if m.filter else "") + f"；{cols}")
-    out = ["# 数据字典（规则里只能用这些字段名）", data_dictionary(ws.datasets), "", "## 字段对应的原表头", *heads, "", "# 方案"]
+    out = ["# 数据字典（规则里只能用这些字段名）", data_dictionary(ws.datasets), "", "## 字段对应的原表头", *heads]
+    levels = {lv.get("key") for n in schemes(ws) for lv in ws._merged(n).get("allocation") or []}
+    reach = {ds: v for ds, v in _reachable(ws.datasets).items() if getattr(ws.datasets[ds], "key", None) not in levels}
+    if reach:
+        out += ["", "## 行上可以直接用的被引用对象字段（行上有对象的编号，按编号取到该对象的字段，筛选、计算都能直接写字段名）"]
+        out += [f"- {ds}：" + "；".join(f"经 {via} 取到「{ent}」的 {'、'.join(fs)}" for via, ent, fs in items)
+                for ds, items in reach.items()]
+    out += ["", "# 方案"]
     for name in schemes(ws):
         full = ws._merged(name)
         levels = " → ".join(f"{lv.get('level')}（主键 {lv.get('key')}）" for lv in full.get("allocation") or [])
         scope = (full.get("pool") or {}).get("scope") or "global"
         where = "整批一个奖金池（global）" if scope == "global" else f"在「{scope}」层每个对象上分别算"
-        out.append(f"- 方案「{name}」：分配层级 {levels or '无'}；奖金池{where}")
+        leaf = ((full.get("allocation") or [{}])[-1] or {}).get("level")
+        out.append(f"- 方案「{name}」：分配层级 {levels or '无'}；奖金池{where}"
+                   + (f"；发放（可发比例）在「{leaf}」层每个对象上算" if leaf else ""))
     return "\n".join(out)
+
+
+def _reachable(datasets: dict) -> dict[str, list[tuple[str, str, list[str]]]]:
+    """每张表的行经编号字段（逐级）能取到的实体表字段：{表: [(编号字段, 实体表, [字段])]}。"""
+    by_key = {d.key: n for n, d in datasets.items() if getattr(d, "key", None)}
+    out = {}
+    for n, d in datasets.items():
+        seen, todo, items = {n}, [(f, d) for f in d.fields], []
+        while todo:
+            f, src = todo.pop(0)
+            ent = by_key.get(f)
+            if ent is None or ent in seen or f == getattr(src, "key", None):
+                continue
+            seen.add(ent)
+            e = datasets[ent]
+            fs = [x for x in e.fields if x != e.key and x not in d.fields]
+            if fs:
+                items.append((f, ent, fs))
+            todo += [(x, e) for x in e.fields]
+        if items:
+            out[n] = items
+    return out
 
 
 def schemes(ws) -> list[str]:
@@ -152,7 +183,8 @@ def calc(ws, rr: dict) -> dict:
     {"sig", "schemes": {方案: {"tables", "helpers", "pool"}}, "unclear", "error", "second"}。
     材料、数据字典、方案结构没变时用上次的。
     和规则算出的数对不上的方案，再独立写一次（新开对话）：第二次和规则一致，就当是第一次写错了，用第二次的；
-    两次都和规则不一致才交给智能体核对。这样复读自己偶尔理解错，不会把对的规则带偏。"""
+    两次都和规则不一致、而且两次彼此一致，才交给智能体核对；两次彼此也不一致的记在 unsettled（不拦，口径单注明）。
+    这样复读自己偶尔理解错，不会把对的规则带偏。"""
     names = schemes(ws)
     if not names:
         return {}
@@ -167,14 +199,37 @@ def calc(ws, rr: dict) -> dict:
         return old
     base = [{"role": "system", "content": prompt("reread_calc").replace("{dsl}", dsl)},
             {"role": "user", "content": text}]
-    out = {"sig": sig, **_sample(ws, base, names), "second": []}
+    out = {"sig": sig, **_sample(ws, base, names), "second": [], "unsettled": {}}
     for n in [n for n in out["schemes"] if _disagree(ws, n, out["schemes"][n])]:
         again = _sample(ws, base, [n])
         out["second"].append(n)
-        if n in again["schemes"] and not _disagree(ws, n, again["schemes"][n]):
-            out["schemes"][n] = again["schemes"][n]
+        first, second = out["schemes"][n], again["schemes"].get(n)
+        # 第二次要覆盖第一次写了的各项（第一次写了可发比例、第二次没写，不能算“一致”）
+        if second and not (first.get("pay_ratio") and not second.get("pay_ratio")) and not _disagree(ws, n, second):
+            out["schemes"][n] = second
+            continue
+        # 两次都和规则对不上：两次自己也一致，才是一份站得住的独立理解，交给智能体核对；
+        # 两次各算各的（复读自己都没读准），不拦，口径单上注明
+        kinds = sorted({b[0] for b in _disagree(ws, n, first)})
+        shaky = [k for k in kinds if not second or not _same(ws, n, k, first, second)]
+        if shaky:
+            out["unsettled"][n] = shaky
     rr["calc"] = out
     return out
+
+
+def _values(ws, name: str, kind: str, spec: dict) -> dict[str, Decimal]:
+    try:
+        return ws._independent_pool(name, spec) if kind == "奖金池" else ws._independent_pay(name, spec)
+    except Exception:
+        return {}
+
+
+def _same(ws, name: str, kind: str, a: dict, b: dict) -> bool:
+    """两次独立写的算式在同一份数据上算出的数是否一致（奖金池差不超过 1 分，比例差不超过万分之一）。"""
+    x, y = _values(ws, name, kind, a), _values(ws, name, kind, b)
+    tol = Decimal("0.01") if kind == "奖金池" else Decimal("0.0001")
+    return bool(x) and x.keys() == y.keys() and all(abs(x[k] - y[k]) <= tol for k in x)
 
 
 def _sample(ws, base: list[dict], names: list[str]) -> dict:
@@ -200,6 +255,7 @@ def _sample(ws, base: list[dict], names: list[str]) -> dict:
                 continue
             try:
                 ws._independent_pool(n, out["schemes"][n])
+                ws._independent_pay(n, out["schemes"][n])
             except Exception as e:          # 算式是模型写的，任何报错都交还它自己改
                 errs.append(f"方案「{n}」：{str(e)[:400]}")
                 out["schemes"].pop(n)
@@ -211,37 +267,64 @@ def _sample(ws, base: list[dict], names: list[str]) -> dict:
     return out
 
 
-def _disagree(ws, name: str, spec: dict) -> list[tuple[str, Decimal, Decimal]]:
-    """独立算式和规则算出的奖金池差超过 1 分的对象：[(对象, 复读, 规则)]。算不出来的不算对不上。"""
+def _disagree(ws, name: str, spec: dict) -> list[tuple[str, str, Decimal, Decimal]]:
+    """独立算式和规则算出的数对不上的对象：[(哪一项, 对象, 复读, 规则)]。算不出来的不算对不上。
+    奖金池差超过 1 分；可发比例按应得 × 比例四舍五入到分后和规则的可发上限比（每个发放条件允许 1 分舍入差）。"""
     if name not in ws.results or name in ws.untested:
         return []
+    out = []
     try:
         mine = ws._independent_pool(name, spec)
     except Exception:
-        return []
+        mine = {}
     theirs = ws._pool_values(name)
-    return [(k, v, theirs[k]) for k, v in mine.items() if k in theirs and abs(v - theirs[k]) > Decimal("0.01")]
+    out += [("奖金池", k, v, theirs[k]) for k, v in mine.items() if k in theirs and abs(v - theirs[k]) > Decimal("0.01")]
+    try:
+        ratio = ws._independent_pay(name, spec)
+    except Exception:
+        ratio = {}
+    caps = ws._caps(name) if ratio else {}
+    for k, r in ratio.items():
+        if k not in caps or caps[k][0] <= 0:
+            continue
+        final, cap, n = caps[k]
+        if abs((final * r).quantize(Decimal("0.01")) - cap) > Decimal("0.01") * n:
+            out.append(("可发比例", k, r, cap / final))
+    return out
 
 
 def calc_gaps(ws, rr: dict) -> list[tuple[str, str]]:
-    """独立算式和规则算出的奖金池逐个对象比；差超过 1 分的方案列出来。"""
+    """独立算式和规则算出的数逐个对象比（奖金池、可发比例）；对不上的方案和项列出来。"""
     c = (rr or {}).get("calc") or {}
     out = []
     for name, spec in (c.get("schemes") or {}).items():
-        bad = _disagree(ws, name, spec)
-        if not bad:
-            continue
-        total = len(ws._pool_values(name))
-        eg = "；".join(f"{k} 复读 {_money(v)}、规则 {_money(t)}" for k, v, t in bad[:CALC_SHOW])
+        shaky = set((c.get("unsettled") or {}).get(name) or [])
+        bad = [b for b in _disagree(ws, name, spec) if b[0] not in shaky]
         helpers = "；".join(f"{k}[{(h or {}).get('scope', 'global')}] = {(h or {}).get('expr', '')}"
                             for k, h in (spec.get("helpers") or {}).items())
         tables = "；".join(f"{k} = {json.dumps(t, ensure_ascii=False)}" for k, t in (spec.get("tables") or {}).items())
-        out.append((f"复读 奖金池 {name}",
-                    f"复读只按材料独立写了方案「{name}」的奖金池算式，放到同一份数据上算，{len(bad)}/{total} 个对象和规则对不上（复读另写了一次也是这样）："
-                    f"{eg}。复读的写法：奖金池 = {spec.get('pool')}" + (f"；辅助变量 {helpers}" if helpers else "")
-                    + (f"；参数表 {tables}" if tables else "")
-                    + "。用 evaluate 把两边的中间数（如某个比率、某项合计）分别算出来，找到从哪一步开始不一样，再对照材料原文判断哪边对"))
+        how = (f"；辅助变量 {helpers}" if helpers else "") + (f"；参数表 {tables}" if tables else "")
+        for kind in ("奖金池", "可发比例"):
+            rows = [b for b in bad if b[0] == kind]
+            if not rows:
+                continue
+            if kind == "奖金池":
+                total = len(ws._pool_values(name))
+                eg = "；".join(f"{k} 复读 {_money(v)}、规则 {_money(t)}" for _, k, v, t in rows[:CALC_SHOW])
+                expr = f"奖金池 = {spec.get('pool')}"
+            else:
+                total = sum(1 for f, _, _ in ws._caps(name).values() if f > 0)
+                eg = "；".join(f"{k} 复读 {_ratio(v)}、规则 {_ratio(t)}（可发上限 ÷ 应得）" for _, k, v, t in rows[:CALC_SHOW])
+                expr = f"可发比例 = {spec.get('pay_ratio')}"
+            out.append((f"复读 {kind} {name}",
+                        f"复读只按材料独立写了方案「{name}」的{kind}算式，放到同一份数据上算，{len(rows)}/{total} 个对象和规则对不上"
+                        f"（复读另写了一次也是这样）：{eg}。复读的写法：{expr}{how}"
+                        "。用 evaluate 把两边的中间数（如某个比率、某项合计）分别算出来，找到从哪一步开始不一样，再对照材料原文判断哪边对"))
     return out
+
+
+def _ratio(v: Decimal) -> str:
+    return f"{v.quantize(Decimal('0.0001')).normalize():f}"
 
 
 def _money(v: Decimal) -> str:

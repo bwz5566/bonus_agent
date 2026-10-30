@@ -285,6 +285,14 @@ class Evaluator:
                     return Val(v, f"{n}[{ref.key}]", rows=(ref.row,))
         if n in self.rs.tables:
             return Val(self.rs.tables[n], n)
+        if n in self.detail_fields and ctx.row is not None:
+            # 正在对某张表逐行求值，行上没有这个字段、经编号也取不到（它在另一张表上，一行对应那张表的多条记录）
+            src = "、".join(sorted(self.detail_fields[n]))
+            refs = sorted({r.level for r in self._refs(ctx.row)})
+            raise EvalError(f"{n} 是「{src}」的字段，当前这一行上没有、经编号也取不到（一行可能对应「{src}」的多条记录）。"
+                            "一行只能直接用自己的字段和经编号取到的对象的字段"
+                            + (f"（这一行能取到：{'、'.join(refs)}）" if refs else "")
+                            + f"。要用「{src}」的数：先在能取到的对象上定义变量（scope 写那个对象）把它汇总好，再在这里引用这个变量", ctx.where)
         if n in self.detail_fields:
             raise EvalError(f"{n} 是明细字段，需要放在 sum/avg/count 等聚合函数里使用", ctx.where)
         if n in self.rs.datasets:
@@ -426,6 +434,19 @@ class Evaluator:
             lvl = self.layout.key_level.get(d.key) if d is not None and d.key else None
             if lvl is not None and lvl <= self.layout.index.get(node.level, -1):
                 node = self._above(node, lvl)
+        if ctx.row is not None:
+            # 行里嵌套的聚合（如对参与记录逐行求和时，每行再汇总“这一行的项目”的销售明细）：
+            # 要汇总的表挂在某个关联实体下、当前对象又不在这个实体里时，按这一行的编号取那个实体，
+            # 否则在当前对象（如员工）下找不到这张表的行，会悄悄算成 0
+            owners, t = [], ds          # 这张表挂在哪些关联实体下（逐级往上，如回款 → 销售单 → 项目）
+            while True:
+                kind, owner, _ = self.layout.parent.get(t, (None, None, None))
+                if kind != "aux" or owner in owners:
+                    break
+                owners.append(owner)
+                t = owner
+            if owners and not any(a.level in owners for a in node.chain()):
+                node = next((a for o in owners for ref in self._refs(ctx.row) for a in ref.chain() if a.level == o), node)
         rows = node.rows(ds)
         aux = ds in self.layout.aux
 

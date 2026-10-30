@@ -1226,9 +1226,8 @@ class Workspace:
             raise ToolError(f"计算失败：{e}") from None
         return v, ev.traces["probe"].rendered
 
-    def _independent_pool(self, name: str, spec: dict) -> dict[str, Decimal]:
-        """独立复读按材料写的奖金池算式：只用它自己的辅助变量和参数表（不带规则的变量和参数表），
-        在奖金池所在层的每个对象上计算。返回 {对象: 金额}；写法不对、算不出来抛 ToolError。"""
+    def _independent_env(self, name: str, spec: dict):
+        """独立复读写的算式的计算环境：只用它自己的辅助变量和参数表（不带规则的变量和参数表）。写法不对抛 ToolError。"""
         rs = self._ruleset(name)
         data, _ = self._data(rs)
         data, patched = apply_patches(rs, data)
@@ -1236,9 +1235,9 @@ class Workspace:
             tables = Extraction.model_validate({"pool": {"expr": "0"}, "allocation": [],
                                                 "tables": spec.get("tables") or {}}).tables
             hv = {k: Variable.model_validate(v) for k, v in (spec.get("helpers") or {}).items()}
-            parse(str(spec.get("pool") or ""))
-            for v in hv.values():
-                parse(v.expr)
+            for e in [spec.get("pool"), spec.get("pay_ratio")] + [v.expr for v in hv.values()]:
+                if e not in (None, ""):
+                    parse(str(e))
         except (ValueError, ExprError) as e:
             raise ToolError(f"写法不对：{str(e)[:400]}") from None
         hv = {k: v.model_copy(update={"scope": _helper_scope(rs, k, v.scope)}) for k, v in hv.items()}
@@ -1247,19 +1246,45 @@ class Workspace:
         blocking = [i for i in patched + issues if i.severity == "blocking"]
         if blocking:
             raise ToolError("建树失败：" + "；".join(str(i) for i in blocking[:3]))
-        targets = [root] if rs.pool.scope == "global" else by_level.get(rs.pool.scope, [])
         ev = Evaluator(rs, root, by_level, self._refs(name))
         ev.peer_scope = True
+        return rs, root, by_level, ev
+
+    @staticmethod
+    def _independent_eval(ev, expr: str, nodes, label: str) -> dict[str, Decimal]:
         out = {}
-        for n in targets:
+        for n in nodes:
             try:
-                v = ev.evaluate(str(spec["pool"]), n, f"{n.id}/复读奖金池", "复读")
+                v = ev.evaluate(expr, n, f"{n.id}/复读{label}", "复读")
             except (EvalError, ValueError) as e:
-                raise ToolError(f"{n.id} 上算不出来：{str(e)[:300]}") from None
+                raise ToolError(f"{label}在 {n.id} 上算不出来：{str(e)[:300]}") from None
             if isinstance(v, bool) or not isinstance(v, Decimal):
-                raise ToolError(f"{n.id} 上算出的不是金额：{v}")
+                raise ToolError(f"{label}在 {n.id} 上算出的不是数：{v}")
             out[n.id] = v
         return out
+
+    def _independent_pool(self, name: str, spec: dict) -> dict[str, Decimal]:
+        """独立复读按材料写的奖金池算式，在奖金池所在层的每个对象上计算。返回 {对象: 金额}；写法不对、算不出来抛 ToolError。"""
+        rs, root, by_level, ev = self._independent_env(name, spec)
+        targets = [root] if rs.pool.scope == "global" else by_level.get(rs.pool.scope, [])
+        return self._independent_eval(ev, str(spec["pool"]), targets, "奖金池")
+
+    def _independent_pay(self, name: str, spec: dict) -> dict[str, Decimal]:
+        """独立复读按材料写的可发比例（本次可发上限 ÷ 应得），在发放层（最末层）每个对象上计算；没写返回 {}。"""
+        if spec.get("pay_ratio") in (None, ""):
+            return {}
+        rs, root, by_level, ev = self._independent_env(name, spec)
+        out = self._independent_eval(ev, str(spec["pay_ratio"]), by_level.get(rs.leaf.level, []), "可发比例")
+        bad = [k for k, v in out.items() if v < 0 or v > 1]
+        if bad:
+            raise ToolError(f"可发比例要在 0~1 之间，{bad[0]} 上算出 {out[bad[0]]}")
+        return out
+
+    def _caps(self, name: str) -> dict[str, tuple[Decimal, Decimal, int]]:
+        """规则算出的发放层每个对象：(应得, 可发上限, 发放条件个数)，未修订的 R0。"""
+        res = self.results[name]["R0"]
+        n = max(1, len(self._ruleset(name).payout))
+        return {k: (Decimal(p.final), Decimal(p.cap or p.final), n) for k, p in res.payouts.items()}
 
     def _pool_values(self, name: str) -> dict[str, Decimal]:
         """规则算出的奖金池（未修订的 R0），按奖金池所在层的对象。"""

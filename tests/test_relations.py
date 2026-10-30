@@ -323,3 +323,19 @@ patches:
     assert "新值不同" in fails(项目更正=[{"project_id": "J1", "field_name": "交付评级", "new_value": "优"},
                                       {"project_id": "J1", "field_name": "交付评级", "new_value": "合格"}])
     assert "没有字段" in fails(项目更正=[{"project_id": "J1", "field_name": "项目经理", "new_value": "x"}])
+
+
+def test_nested_aggregation_in_row_uses_the_rows_object():
+    """对参与记录逐行求和、每行里再汇总“这一行的项目”的销售明细：按行上的项目编号取项目，
+    和先在项目上定义变量再引用的写法结果一样（以前在个人下找不到销售明细，悄悄算成 0）。"""
+    from bonus_core.engine.evaluator import Evaluator
+    from bonus_core.engine.tree import build_tree
+    rs, _ = run("quarter")
+    data, _ = apply_mapping(rs, [XLSX], load_mapping(CASE / "mapping.yaml"))
+    root, by_level, _ = build_tree(rs, data)
+    ev = Evaluator(rs, root, by_level)
+    p = by_level["个人"][0]
+    nested = ev.evaluate('sum(share * sum(sales_amount, of: "销售明细", where: between(recognition_date, "2026-07-01", "2026-09-30")), '
+                         'of: "项目参与")', p, "t/nested", "t")
+    via_var = ev.evaluate('sum(q_sales * share, of: "项目参与")', p, "t/var", "t")
+    assert nested == via_var and nested > 0

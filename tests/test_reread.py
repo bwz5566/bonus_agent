@@ -137,3 +137,47 @@ def test_independent_pool_formula_compared_on_data(tmp_path):
     assert ar.status == "OK" and "PROCESS" not in ar.ws.reread["calc"]["error"], ar.ws.reread["calc"]
     fix = [m for m in llm.calls if str(m[0].get("content", "")).startswith("【独立算式】") and len(m) > 2]
     assert fix and "算不出来" in fix[0][-1]["content"]
+
+
+def test_independent_pay_ratio_compared_on_data(tmp_path):
+    """复读另写可发比例（本次可发上限 ÷ 应得），在发放层每个对象上和规则的可发上限比：
+    写法不同但一样的不拦；回款没按本期销售单筛选（比例偏高）的拦下，写明两边的比例。"""
+    from bonus_agent.agent import run_agent
+    from bonus_agent.llm import FakeLLM
+    from tests.test_syn_acceptance import _script, run_case
+    helpers = {"pr": {"scope": "项目", "expr": 'sum(receipt_amount, of: "回款明细", where: between(recognition_date, "2026-07-01", '
+                                               '"2026-09-30") and receipt_date <= "2026-09-30")'},
+               "ps": {"scope": "项目", "expr": 'sum(sales_amount, of: "销售明细", where: between(recognition_date, "2026-07-01", "2026-09-30"))'}}
+    pay = 'min(ratio(sum(pr * share, of: "项目参与"), sum(ps * share, of: "项目参与"), zero: 0), 1)'
+
+    def spec(h):
+        d = json.loads(_calc(PROCESS_OK, h))
+        d["schemes"]["PROCESS"]["pay_ratio"] = pay
+        return json.dumps(d, ensure_ascii=False)
+    llm = FakeLLM(_script())
+    llm.calc = spec(helpers)
+    ar = run_agent(llm, [run_case.XLSX], tmp_path / "a")
+    assert ar.status == "OK", ar.error
+    assert ar.ws.reread["calc"]["schemes"]["PROCESS"]["pay_ratio"] == pay
+    wrong = dict(helpers, pr={"scope": "项目", "expr": 'sum(receipt_amount, of: "回款明细", where: receipt_date <= "2026-09-30")'})
+    llm = FakeLLM(_script())
+    llm.calc = spec(wrong)
+    ar = run_agent(llm, [run_case.XLSX], tmp_path / "b")
+    blocked = [s for s in ar.steps if s.tool == "finish" and not s.ok]
+    assert ar.status != "OK" and blocked and "[复读 可发比例 PROCESS]" in blocked[0].result, [s.result[:300] for s in blocked]
+    assert "（可发上限 ÷ 应得）" in blocked[0].result
+
+
+def test_independent_formula_needs_two_consistent_samples(tmp_path):
+    """两次独立写的都和规则对不上、但两次彼此也不一致（复读自己没读准）：不拦，口径单注明没有定论。"""
+    from bonus_agent import review as rv
+    from bonus_agent.agent import run_agent
+    from bonus_agent.llm import FakeLLM
+    from tests.test_syn_acceptance import _script, run_case
+    llm = FakeLLM(_script())
+    # 第一次（其他方案没写，带着报错重试 3 次）都是 A，第二次独立写是 B
+    llm.calc = [_calc(PROCESS_OK.replace(" * lookup(d, difficulty)", ""))] * 3 + [_calc(PROCESS_OK.replace("1.10, 0.95", "1.2, 0.9"))]
+    ar = run_agent(llm, [run_case.XLSX], tmp_path / "a")
+    assert ar.status == "OK", ar.error
+    assert ar.ws.reread["calc"]["unsettled"] == {"PROCESS": ["奖金池"]}
+    assert any(r["item"] == "独立算式没有定论：PROCESS" for r in rv.load(tmp_path / "a"))
