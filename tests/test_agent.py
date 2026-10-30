@@ -356,3 +356,18 @@ def test_next_round_is_told_why_last_round_stopped(tmp_path):
     assert "上一轮没做完，停在这里" in task and "set_rules 分几次调用" in task
     text = to_text(err)
     assert "不需要你回答" in text and "点「重试」" in text and "想请你确认" not in text
+
+
+def test_repeated_successful_write_is_not_kept_in_history():
+    """Q11 第 2 轮：验算通过后模型把同一个 verify 原样又交了 3 次。重复的那步不留在历史里（免得照着重复），
+    换成程序判断的下一步；仍原样重复就按原地打转停下。"""
+    from bonus_agent.agent import run_agent
+    same = {"thought": "记下总包口径", "tool": "note", "args": {"topic": "总包", "text": "净利润 8%"}}
+    llm = FakeLLM([same] * 5)
+    ar = run_agent(llm, [ANNUAL], max_steps=10)
+    assert "卡住" in ar.error and "反复提交相同的 note" in ar.error and len(ar.steps) == 4
+    assert ar.steps[0].result != ar.steps[1].result and "上一步已经生效" in ar.steps[1].result
+    third = llm.calls[-2]                # 重复两次之后的请求：历史里只有第一次的调用，重复的换成了说明
+    assert sum(1 for m in third if m["role"] == "assistant") == 1
+    assert "没有任何变化" in third[-2]["content"] and "下一步（程序判断）" in third[-2]["content"]
+    assert sum(1 for m in llm.calls[-1] if "没有任何变化" in str(m.get("content"))) == 2

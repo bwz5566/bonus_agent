@@ -1235,8 +1235,39 @@ class Workspace:
                 self._verify_note = f"引擎 {fmt(final)} 元，独立验算 {fmt(v)} 元；差 {fmt(final - mine)} 元是按份额分配的舍入尾差"
                 return ""
         return (f"{node} 的{kind}对不上：引擎算出 {fmt(final)} 元，独立验算 {rec['expr']} = {rendered} = {fmt(v)}。"
+                f"{self._engine_side(name, node, kind)}"
                 f"先想清楚哪一边不符合材料（{rec['basis'][:100]}）：用 explain 查看 {node} 的计算链逐项对照，规则错了就改规则后重新试算，"
                 "验算式错了就改验算式；拿不准就 ask_question")
+
+    def _lineage(self, name: str, node: str) -> str:
+        """对象的归属链（如 个人:E015 → 小组:G04（2部1组）→ 部门:D02（行业业务部）），验算时按它取上级的池和权重合计。"""
+        nodes = self.results[name]["R0"].nodes
+        chain, cur = [], nodes.get(node)
+        while cur is not None and cur.parent and cur.parent in nodes and len(chain) < 10:
+            cur = nodes[cur.parent]
+            if cur.level == ROOT_LEVEL:
+                break
+            chain.append(cur.id + (f"（{cur.label}）" if cur.label and cur.label != cur.key else ""))
+        return f"{node} 属于 " + " → ".join(chain) if chain else ""
+
+    def _belongs(self, name: str, node: str) -> str:
+        line = self._lineage(name, node)
+        return "，" + line.removeprefix(f"{node} ") if line else ""
+
+    def _engine_side(self, name: str, node: str, kind: str) -> str:
+        """对不上时把引擎这一侧的关键数摆出来，便于逐项对照（归属、应得、暂缓、抵扣）。"""
+        res = self.results[name]["R0"]
+        parts = [self._lineage(name, node)]
+        if node in res.nodes and kind == "应得":
+            parts.append(f"引擎权重 {res.nodes[node].weight}")
+        if kind == "实发":
+            r = next((r for r in res.payout_rows() if r.node_id == node), None)
+            if r is not None:
+                parts.append(f"引擎：应得 {fmt(Decimal(r.final))}，暂缓 {fmt(Decimal(r.held))}，可发上限 {fmt(Decimal(r.cap or r.final))}，"
+                             f"已发抵扣 {fmt(Decimal(r.deducted))}，实发 {fmt(Decimal(r.paid))}"
+                             "（实发对不上时先单独核对应得，再核对比例、暂缓和抵扣）")
+        parts = [p for p in parts if p]
+        return ("；".join(parts) + "。") if parts else ""
 
     def _verify_targets(self, name: str) -> list[tuple[str, str, str]]:
         """程序指定要独立验算的 (对象, 应得 / 实发, 原因)，不由模型挑：每层应得最高的；最末层再加最低的非零对象和一个为 0 的对象。
@@ -1255,7 +1286,7 @@ class Workspace:
                 zero = [n for n in ns if Decimal(n.final) == 0]
                 if zero and zero[0] is not ns[-1]:
                     picks.append((zero[0], "金额为 0"))
-            out += [(n.id, "应得", f"应得{why}，引擎算出 {fmt(Decimal(n.final))} 元") for n, why in picks]
+            out += [(n.id, "应得", f"应得{why}，引擎算出 {fmt(Decimal(n.final))} 元" + self._belongs(name, n.id)) for n, why in picks]
         rs = self._ruleset(name)
         if rs.offsets or rs.payout:
             rows = sorted(base.payout_rows(), key=lambda r: (Decimal(r.paid), r.node_id))
@@ -1266,7 +1297,7 @@ class Workspace:
             for r, why in picks:
                 if r.node_id not in seen:
                     seen.add(r.node_id)
-                    out.append((r.node_id, "实发", f"{why}，引擎算出实发 {fmt(Decimal(r.paid))} 元"))
+                    out.append((r.node_id, "实发", f"{why}，引擎算出实发 {fmt(Decimal(r.paid))} 元" + self._belongs(name, r.node_id)))
         return out
 
     def _verify_gaps(self) -> list[str]:
@@ -1835,7 +1866,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         turn_start, skipped = len(history) - 1, 0     # 本轮 assistant 消息的位置；被拦下的重复调用数
         said = "" if mode == "json" else (reply.get("content") or "").strip()     # 原生工具调用时模型写在正文里的思考
         for c in calls:
-            args, note = {}, ""
+            args, note, dup = {}, "", False
             thought, bare = _split_thought(c["arguments"])
             thought = thought or said
             sig = f"{c['name']}:{bare}"          # 思考不同、参数相同，仍是同一个调用
@@ -1889,8 +1920,15 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 if (sig, result) == last_write:      # 写入类工具原样重复、结果也一样：同样算原地打转
                     repeats += 1
                     stuck = f"反复提交相同的 {c['name']}，结果：{result[:300]}"
+                    dup = ok
                 last_write = (sig, result)
                 seen.clear()   # 工作区变了，重新读取是合理的
+                if dup:
+                    # 成功的一步原样又做了一遍：不把它留在历史里（小模型会照着历史接着重复），改成一句说明和程序判断的下一步
+                    result = (f"这一步和上一步的 {c['name']} 完全相同，结果也一样：上一步已经生效，不需要再提交。"
+                              f"下一步（程序判断）：{ws.next_hint()}")
+                    step.result = result
+                    skipped += 1
             # 同一工具因为同一个原因连续失败才算卡住；原因变了说明在往前改（如 finish 先后被不同的检查拦下）
             why = re.sub(r"\d+", "", result.removeprefix("错误：").split("\n", 1)[0])[:15]
             fails[c["name"]] = 0 if ok else (fails.get(c["name"], 0) + 1 if fail_why.get(c["name"]) == why else 1)
@@ -1928,7 +1966,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         if skipped and skipped == len(calls):
             # 整轮都是被拦下的重复调用：不把它留在历史里，否则小模型会照着历史接着重复；只留一句说明
             del history[turn_start:]
-            history.append({"role": "user", "content": f"（你刚才又要原样调用 {calls[0]['name']}，和之前完全相同，程序已拦下、没有执行。"
+            history.append({"role": "user", "content": f"（你刚才又原样调用了 {calls[0]['name']}，和之前完全相同，没有任何变化。"
                                                        f"不要再重复；下一步（程序判断）：{ws.next_hint()}）"})
         if ws.done:
             break
@@ -2056,7 +2094,7 @@ def _lessons(error: str) -> list[str]:
     if "反复" in error or "原样调用" in error:
         out += ["上一轮在原地打转：这一轮先看工作区状态里程序判断的下一步，按它推进"]
     if "verify" in error or "独立验算" in error:
-        out += ["上一轮独立验算没对上：先用 explain 看引擎的计算链，逐项和自己的验算比；跨表的中间数用 verify 的 helpers 定义辅助变量，"
+        out += ["上一轮独立验算没对上：先用 explain 看引擎的计算链，逐项和自己的验算比（先核对对象属于哪个小组、部门，待验算清单里写了归属）；跨表的中间数用 verify 的 helpers 定义辅助变量，"
                 "不要借用规则变量。确认是规则不符合材料就改规则，拿不准就 ask_question"]
     if "连续" in error and "失败" in error and not out:
         out += ["上一轮同一个工具因为同一个原因连续失败：先在思考里写清失败原因，换一种写法再调用"]

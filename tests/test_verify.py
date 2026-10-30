@@ -139,3 +139,36 @@ def test_helpers_reach_across_tables_like_q1(tmp_path):
     with pytest.raises(ToolError, match="引用了规则变量 proj_sales"):
         w.verify("个人:E1", 'round(sum(v_proj * share, of: "项目参与") * 1%, 2)', "x",
                  helpers={"v_proj": {"scope": "项目", "expr": "proj_sales"}})
+
+
+def test_mismatch_shows_which_group_and_department_the_object_belongs_to(tmp_path):
+    """Q11：模型两次把个人放错小组 / 部门（E007 当成 G01、E015 用了 D01 的池），验算一直对不上。
+    待验算清单和对不上的提示都写出对象的归属链，按它取上级的池和权重合计。"""
+    d = tmp_path / "m"
+    d.mkdir()
+    (d / "01_规则.md").write_text("奖金 900 元按小组人数分到小组，小组内平分。", encoding="utf-8")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "小组"
+    for r in (["组号", "组名"], ["G1", "一组"], ["G2", "二组"]):
+        ws.append(r)
+    t = wb.create_sheet("人员")
+    for r in (["工号", "组号"], ["E1", "G1"], ["E2", "G2"], ["E3", "G2"]):
+        t.append(r)
+    wb.save(d / "02_数据.xlsx")
+    w = Workspace(FakeLLM([]), build_inventory(sorted(d.iterdir())))
+    f = lambda c, t: {"column": c, "type": t}   # noqa: E731
+    w.define_dataset("小组", "02_数据.xlsx", "小组", {"group_id": f("组号", "id"), "group_name": f("组名", "text")},
+                     header_rows=[1], key="group_id")
+    w.define_dataset("人员", "02_数据.xlsx", "人员", {"emp_id": f("工号", "id"), "group_id": f("组号", "id")},
+                     header_rows=[1], key="emp_id")
+    w.set_rules(scheme="S", pool={"expr": "900"},
+                allocation=[{"level": "小组", "key": "group_id", "weight": 'count(of: "人员")'},
+                            {"level": "个人", "key": "emp_id", "parent_key": "group_id", "weight": "1"}])
+    w.trial_run()
+    gaps = w._verify_gaps()
+    assert "方案「S」个人:E1（应得金额最低的非零，引擎算出 300 元，属于 小组:G1（一组））" in gaps
+    assert "方案「S」小组:G2（应得金额最高，引擎算出 600 元）" in gaps             # 上级是全部，不写归属
+    with pytest.raises(ToolError, match="对不上") as e:
+        w.verify("个人:E1", '900 / count(of: "小组")', "按人数平分", at="全部")
+    assert "个人:E1 属于 小组:G1" in str(e.value) and "引擎权重" in str(e.value)
