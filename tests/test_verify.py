@@ -72,3 +72,27 @@ def test_thought_is_recorded_and_not_passed_to_tools():
     assert ar.steps[1].ok and "thought" not in ar.steps[1].args
     assert "已跳过" in ar.steps[2].result                    # 只是思考不同、参数相同，仍算重复
     assert "提醒：每次调用都先在 thought 里写思考" in ar.steps[3].result
+
+
+def test_verify_tolerance_is_only_the_rounding_remainder(tmp_path):
+    """尾差只放过按份额分配产生的 0.01；每人按公式直接算的对象差 0.01 也要拦下，份额对象差 0.02 以上也要拦下。"""
+    w = case(tmp_path / "m")
+    rules(w, "amount * rate")
+    with pytest.raises(ToolError, match="对不上"):              # 引擎 52.00；差 0.01（无份额分配）
+        w.verify("个人:002", 'round(sum(round(amount * rate, 2), of: "订单") * coef, 2) + 0.01', "x")
+    d = tmp_path / "s"
+    d.mkdir()
+    (d / "01_规则.md").write_text("奖金 100 元由三人平分，0.02 元。", encoding="utf-8")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "人员"
+    for r in (["工号"], ["E1"], ["E2"], ["E3"]):
+        ws.append(r)
+    wb.save(d / "02_数据.xlsx")
+    s = Workspace(FakeLLM([]), build_inventory(sorted(d.iterdir())))
+    s.define_dataset("人员", "02_数据.xlsx", "人员", {"emp_id": {"column": "工号", "type": "id"}}, header_rows=[1], key="emp_id")
+    s.set_rules(scheme="S", pool={"expr": "100"}, allocation=[{"level": "个人", "key": "emp_id", "weight": "1"}])
+    s.trial_run()
+    top = s._verify_gaps()[0].split("（")[0].split("」")[1]
+    with pytest.raises(ToolError, match="对不上"):
+        s.verify(top, '100 / count(of: "人员") + 0.02', "x", at="全部")

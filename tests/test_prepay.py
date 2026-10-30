@@ -83,3 +83,14 @@ def test_prepay_gate_cannot_be_ignored_or_asked_away(tmp_path):
     w.set_rules(scheme="S", variables=EARNED, pool={"expr": "earned", "scope": "个人"}, offsets=OFFSET)
     w.trial_run()
     assert not w._open_gates(w.lint["S"])
+
+
+def test_net_pay_verification_has_no_slack(tmp_path):
+    """实发验算没有份额尾差时必须分毫不差：差 1 元要拦下。"""
+    w = case(tmp_path / "m")
+    w.set_rules(scheme="S", variables=EARNED, pool={"expr": "earned", "scope": "个人"},
+                allocation=[{"level": "个人", "key": "emp_id"}], offsets=OFFSET)
+    w.trial_run()
+    net = 'max(round(sum(amount, of: "订单") * 10%, 2) - sum(prepay_amount, of: "预发记录"), 0)'
+    with pytest.raises(ToolError, match="实发对不上"):
+        w.verify("个人:001", net + " + 1", "本次实发 = max(应得提成 − 预发合计, 0)", amount="实发")
