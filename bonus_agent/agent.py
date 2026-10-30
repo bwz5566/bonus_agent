@@ -2168,6 +2168,8 @@ def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None =
             paths["pending"] = out / "待确认问题.xlsx"
             wb.save(paths["pending"])
         return paths
+    paths["results"] = out / "results.json"      # 全部金额的明细（应得、暂缓、抵扣、超发、实发），便于程序逐分核对
+    paths["results"].write_text(json.dumps(_results_json(ar.results), ensure_ascii=False, indent=1), encoding="utf-8")
     ar.recheck = "；".join(_recheck(ar, paths, name, rev) for name, revs in ar.results.items() for rev in revs)
     if ar.single:
         paths["excel"] = out / "result.xlsx"
@@ -2186,6 +2188,23 @@ def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None =
     paths["excel"] = out / "result.xlsx"
     _overview(ar, qrows, paths["excel"])
     return paths
+
+
+def _results_json(results: dict) -> dict:
+    """方案 -> 修订 -> {奖金池, 对象: {层级, 名称, 应得, [暂缓, 可发上限, 已发抵扣, 超发待核对, 实发]}}；有按人汇总的抵扣时实发取汇总行。"""
+    out = {}
+    for s, revs in results.items():
+        for rev, r in revs.items():
+            objs = {}
+            for nid, n in r.nodes.items():
+                if n.key:
+                    objs[nid] = {"层级": n.level, "名称": n.label, "应得": n.final}
+            for nid, p in {**r.payouts, **r.rollups}.items():
+                objs.setdefault(nid, {"名称": getattr(p, "label", ""), "应得": p.final})
+                objs[nid].update({"暂缓": p.held, "可发上限": p.cap or p.final, "已发抵扣": p.deducted,
+                                  "超发待核对": p.overpaid, "实发": p.paid})
+            out.setdefault(s, {})[rev] = {"奖金池": r.pool, "对象": objs}
+    return out
 
 
 def _safe(s: str) -> str:

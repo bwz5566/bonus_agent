@@ -299,6 +299,7 @@ def output_kind(name: str) -> tuple[str, str]:
     if name.startswith("adjust"):
         return OUT_GROUPS[1], "人工调整记录"
     return OUT_GROUPS[2], {"agent_log.json": "智能体每一步的完整记录", "running_steps.txt": "运行过程（逐步落盘）",
+                           "results.json": "全部金额明细（应得、暂缓、抵扣、超发、实发），可用程序逐分核对",
                            "expected_check.txt": "和期望结果的核对"}.get(name, "")
 
 

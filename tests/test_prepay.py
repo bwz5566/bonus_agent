@@ -95,3 +95,15 @@ def test_net_pay_verification_has_no_slack(tmp_path):
     net = 'max(round(sum(amount, of: "订单") * 10%, 2) - sum(prepay_amount, of: "预发记录"), 0)'
     with pytest.raises(ToolError, match="实发对不上"):
         w.verify("个人:001", net + " + 1", "本次实发 = max(应得提成 − 预发合计, 0)", amount="实发")
+
+
+def test_results_json_has_every_payout_column(tmp_path):
+    """结果另存一份 results.json（Excel 在财务电脑上会被加密），应得、暂缓、可发上限、抵扣、超发、实发都在，便于逐分核对。"""
+    from bonus_agent.agent import _results_json
+    w = case(tmp_path / "m")
+    w.set_rules(scheme="S", variables=EARNED, pool={"expr": "earned", "scope": "个人"},
+                allocation=[{"level": "个人", "key": "emp_id"}], offsets=OFFSET)
+    w.trial_run()
+    j = _results_json(w.results)["S"]["R0"]
+    assert j["对象"]["个人:002"] == {"层级": "个人", "名称": j["对象"]["个人:002"]["名称"], "应得": "136.00", "暂缓": "0.00",
+                                   "可发上限": "136.00", "已发抵扣": "136.00", "超发待核对": "14.00", "实发": "0.00"}
