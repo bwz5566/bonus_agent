@@ -96,3 +96,46 @@ def test_verify_tolerance_is_only_the_rounding_remainder(tmp_path):
     top = s._verify_gaps()[0].split("（")[0].split("」")[1]
     with pytest.raises(ToolError, match="对不上"):
         s.verify(top, '100 / count(of: "人员") + 0.02', "x", at="全部")
+
+
+def test_helpers_reach_across_tables_like_q1(tmp_path):
+    """Q1：个人业绩 = Σ(项目销售额 × 参与份额)，项目销售额要先在项目层汇总。不能借用规则变量时，
+    用 helpers 自己在项目层定义辅助变量；辅助变量不能和规则变量同名，也不能引用规则变量。"""
+    d = tmp_path / "m"
+    d.mkdir()
+    (d / "01_规则.md").write_text("个人奖金 = Σ(项目销售额 × 参与份额) × 1%。", encoding="utf-8")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "员工"
+    for r in (["工号"], ["E1"], ["E2"]):
+        ws.append(r)
+    for name, rows in (("项目", [["项目号"], ["P1"], ["P2"]]),
+                       ("销售明细", [["单号", "项目号", "销售额"], ["S1", "P1", 1000], ["S2", "P1", 3000], ["S3", "P2", 2000]]),
+                       ("项目参与", [["参与号", "项目号", "工号", "份额"], ["A1", "P1", "E1", 0.5], ["A2", "P1", "E2", 0.5],
+                                     ["A3", "P2", "E1", 1]])):
+        t = wb.create_sheet(name)
+        for r in rows:
+            t.append(r)
+    wb.save(d / "02_数据.xlsx")
+    w = Workspace(FakeLLM([]), build_inventory(sorted(d.iterdir())))
+    f = lambda c, t: {"column": c, "type": t}   # noqa: E731
+    w.define_dataset("员工", "02_数据.xlsx", "员工", {"emp_id": f("工号", "id")}, header_rows=[1], key="emp_id")
+    w.define_dataset("项目", "02_数据.xlsx", "项目", {"project_id": f("项目号", "id")}, header_rows=[1], key="project_id")
+    w.define_dataset("销售明细", "02_数据.xlsx", "销售明细", {"sale_id": f("单号", "id"), "project_id": f("项目号", "id"),
+                                                        "sales_amount": f("销售额", "money")}, header_rows=[1], link="project_id")
+    w.define_dataset("项目参与", "02_数据.xlsx", "项目参与", {"part_id": f("参与号", "id"), "project_id": f("项目号", "id"),
+                                                        "emp_id": f("工号", "id"), "share": f("份额", "ratio")},
+                     header_rows=[1], link="emp_id")
+    w.set_rules(scheme="S", variables={"proj_sales": {"scope": "项目", "expr": 'sum(sales_amount, of: "销售明细")'},
+                                       "emp_sales": {"scope": "个人", "expr": 'sum(proj_sales * share, of: "项目参与")'}},
+                pool={"expr": "round(emp_sales * 1%, 2)", "scope": "个人"}, allocation=[{"level": "个人", "key": "emp_id"}])
+    w.trial_run()
+    assert w.results["S"]["R0"].nodes["个人:E1"].final == "40.00"          # (4000×0.5 + 2000×1) × 1%
+    helpers = {"v_proj": {"scope": "项目", "expr": 'sum(sales_amount, of: "销售明细")'}}
+    assert "一致" in w.verify("个人:E1", 'round(sum(v_proj * share, of: "项目参与") * 1%, 2)', "个人奖金 = Σ(项目销售额 × 参与份额) × 1%",
+                              helpers=helpers)
+    with pytest.raises(ToolError, match="同名"):
+        w.verify("个人:E1", 'round(sum(proj_sales * share, of: "项目参与") * 1%, 2)', "x", helpers={"proj_sales": helpers["v_proj"]})
+    with pytest.raises(ToolError, match="引用了规则变量 proj_sales"):
+        w.verify("个人:E1", 'round(sum(v_proj * share, of: "项目参与") * 1%, 2)', "x",
+                 helpers={"v_proj": {"scope": "项目", "expr": "proj_sales"}})

@@ -42,6 +42,10 @@ def _explain(err: str) -> dict:
                              "这是程序内部的核对，不需要你回答。",
                     "advice": f"{RETRY}；重试后还停在这里，请把这条消息发给开发。", "where": ""}
         why, ask = _why(last)
+        if "对不上：引擎算出" in last or "验算式" in last:       # 可能是规则错了，也可能是验算式没写对
+            return {"title": f"智能体在「独立验算」这一步连续 {n} 次没对上，已自动停下，{why}。",
+                    "advice": f"先{RETRY}（下一轮会带上这次的原因）；同一个对象还对不上，再在下方写明它按材料该怎么算，点「发送」。",
+                    "ask": ask}
         return {"title": f"智能体在「{tool}」这一步连续失败 {n} 次，已自动停下" + (f"，{why}" if why else "") + "。",
                 "advice": f"{SEND}（直接重试多半还会卡在同一处）。",
                 "ask": ask or "材料里这条规则具体怎么算？"}

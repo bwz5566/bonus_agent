@@ -77,3 +77,11 @@ def test_per_person_end_to_end_with_independent_verification(tmp_path):
     assert not first.ok and "个人:E1（应得金额最高" in first.result and "个人:E2（应得金额为 0" in first.result
     assert [s.ok for s in ar.steps if s.tool == "verify"] == [True, True, True]
     assert ar.ws.verified["月度|个人:E3"]["basis"] == basis
+
+
+@pytest.mark.verify
+def test_failed_round_writes_no_result_files(tmp_path):
+    """没做完的轮次（这里是没做独立验算、finish 连续被拦）不出 result*.xlsx，免得被当成结果用。"""
+    ar = run_agent(FakeLLM(script() + [script()[-1]] * 3), [make(tmp_path / "m")], tmp_path / "out")
+    assert ar.status == "FAILED" and "独立验算" in ar.error
+    assert not list((tmp_path / "out").glob("result*.xlsx")) and (tmp_path / "out" / "agent_log.json").exists()

@@ -30,7 +30,7 @@ from bonus_core.data.mapping import DatasetMapping, apply_mapping
 from bonus_core.data.patches import apply_patches
 from bonus_core.data.table_detect import table_at
 from bonus_core.dsl.functions import describe as describe_functions
-from bonus_core.dsl.models import DatasetDef, RuleSet
+from bonus_core.dsl.models import DatasetDef, RuleSet, Variable
 from bonus_core.dsl.parser import Call, ExprError, Num, parse, walk
 from bonus_core.dsl.parser import names as parse_names
 from bonus_core.dsl.validator import validate
@@ -192,7 +192,11 @@ TOOLS: list[dict] = [
      "parameters": _obj({"node": {**_S, "description": "要验算的对象，如 个人:E1001"}, "expr": _S,
                          "basis": {**_S, "description": "依据的材料原文（条款号或原句）"},
                          "at": {**_S, "description": "在哪个节点上计算，默认是 node 自己"}, "scheme": _S,
-                         "amount": {**_S, "enum": ["应得", "实发"], "description": "验算应得（默认）还是本次实发（扣暂缓、已发之后）"}},
+                         "amount": {**_S, "enum": ["应得", "实发"], "description": "验算应得（默认）还是本次实发（扣暂缓、已发之后）"},
+                         "helpers": {"type": "object", "description": "可选：验算自己定义的辅助变量 {名字: {scope, expr}}，"
+                                     "写法同规则的 variables，不能和规则变量同名、不能引用规则变量。跨表的中间数先在对应层算出来，"
+                                     "如 {\"v_proj_sales\": {\"scope\": \"项目\", \"expr\": \"sum(sales_amount, of: \\\"销售明细\\\")\"}}，"
+                                     "再在参与行上引用 v_proj_sales * share"}},
                         ["node", "expr", "basis"])},
     {"name": "finish", "description": "完成。要求每个方案在最近一次修改之后都已成功试算，程序指定的对象都已独立验算通过。",
      "parameters": _obj({"summary": {**_S, "description": "两三句话说明：什么奖金、奖金池怎么来、怎么分、发放条件"},
@@ -1117,8 +1121,9 @@ class Workspace:
         v, rendered = self._probe(name, expr, node)
         return f"{expr} = {rendered} = {fmt(v)}"
 
-    def _probe(self, name: str, expr: str, node: str):
-        """在方案的数据上（已应用数据修订、带上引用的其他方案结果）对某个节点计算表达式，和正式计算用同样的数据。"""
+    def _probe(self, name: str, expr: str, node: str, helpers: dict | None = None):
+        """在方案的数据上（已应用数据修订、带上引用的其他方案结果）对某个节点计算表达式，和正式计算用同样的数据。
+        helpers：独立验算自己定义的辅助变量 {名字: {scope, expr}}，给出时只认这些变量，不带规则里的变量。"""
         key = id(self.results.get(name))           # 试算结果没变时规则和数据也没变，不必重读文件
         hit = self._probe_cache.get(name)
         if hit and hit[0] == key and name in self.results and name not in self.untested:
@@ -1128,6 +1133,11 @@ class Workspace:
             data, _ = self._data(rs)
             data, patched = apply_patches(rs, data)
             self._probe_cache[name] = (key, rs, data, patched)
+        if helpers is not None:
+            try:
+                rs = rs.model_copy(update={"variables": {k: Variable.model_validate(v) for k, v in helpers.items()}})
+            except ValueError as e:
+                raise ToolError(f"辅助变量写法不对：{e}") from None
         root, by_level, issues = build_tree(rs, data)
         blocking = [i for i in patched + issues if i.severity == "blocking"]
         if blocking:
@@ -1145,7 +1155,7 @@ class Workspace:
 
     # ---- 独立验算 ----
     def verify(self, node: str, expr: str, basis: str, at: str | None = None, scheme: str | None = None,
-               amount: str = "应得") -> str:
+               amount: str = "应得", helpers: dict | None = None) -> str:
         name = self._scheme(scheme)
         if name in self.untested or name not in self.results:
             raise ToolError(f"方案「{name}」最近修改后还没有试算，先 trial_run")
@@ -1155,7 +1165,10 @@ class Workspace:
             raise ToolError(f"方案「{name}」没有对象「{node}」的{amount}金额，要验算的对象见工作区状态的“待独立验算”")
         if not basis.strip():
             raise ToolError("basis 写依据的材料原文（条款号或原句）")
-        rec = {"expr": expr, "at": at or node, "basis": basis.strip(), "amount": amount}
+        if helpers is not None and not (isinstance(helpers, dict) and all(isinstance(v, dict) for v in helpers.values())):
+            raise ToolError('helpers 写成 {"名字": {"scope": "项目", "expr": "..."}}')
+        rec = {"expr": expr, "at": at or node, "basis": basis.strip(), "amount": amount,
+               **({"helpers": helpers} if helpers else {})}
         bad = self._verify_mismatch(name, node, rec)
         if bad:
             raise ToolError(bad)
@@ -1178,30 +1191,35 @@ class Workspace:
 
     def _verify_mismatch(self, name: str, node: str, rec: dict) -> str:
         """按当前规则和数据重新比对一条验算记录；一致返回空串，并把比对说明放在 _verify_note。"""
+        helpers = rec.get("helpers") or {}
+        srcs = [rec["expr"]] + [str(h.get("expr", "")) for h in helpers.values()]
         try:
-            names = set(parse_names(parse(rec["expr"])))
+            asts = [parse(x) for x in srcs]
         except ExprError as e:
             return f"验算式写错了：{e}"
         rs = self._ruleset(name)
-        ast = parse(rec["expr"])
-        if not (names & set(rs.field_owner())) and not any(isinstance(c, Call) and c.fn == "count" for c in walk(ast)):
+        same = sorted(set(helpers) & set(rs.variables))
+        if same:
+            return f"辅助变量 {'、'.join(same)} 和规则变量同名，换个名字（如加 v_ 前缀），独立验算不能和规则混用"
+        names = set().union(*(set(parse_names(t)) for t in asts))
+        if not (names & set(rs.field_owner())) and not any(isinstance(c, Call) and c.fn == "count" for t in asts for c in walk(t)):
             return "验算式没有用到任何数据字段。独立验算要从原始数据算起（字段、参数表），不能直接写结果数字"
-        digits = {id(c.args[1]) for c in walk(ast) if isinstance(c, Call) and c.fn == "round" and len(c.args) > 1}
-        loose = [k for k in (lint._key(abs(n.value)) for n in walk(ast) if isinstance(n, Num) and id(n) not in digits)
+        digits = {id(c.args[1]) for t in asts for c in walk(t) if isinstance(c, Call) and c.fn == "round" and len(c.args) > 1}
+        loose = [k for k in (lint._key(abs(n.value)) for t in asts for n in walk(t) if isinstance(n, Num) and id(n) not in digits)
                  if Decimal(k) not in lint.FREE and k not in lint.material_numbers(self._rule_text())]
         if loose:
             return (f"验算式里的数 {'、'.join(dict.fromkeys(loose))} 在材料里找不到。独立验算只能用材料写明的数"
                     "（比例、系数、阈值）和数据字段，不能把结果或中间结果直接写成数字")
-        own = sorted(names & set(rs.variables))
+        own = sorted((names - set(helpers)) & set(rs.variables))
         if own:
-            return (f"验算式引用了规则变量 {'、'.join(own)}。独立验算不能借用规则的中间结果，"
-                    "按材料原文直接从字段、参数表重新写（需要汇总就用 sum / count，按编号筛选用 where）")
+            return (f"验算式引用了规则变量 {'、'.join(own)}。独立验算不能借用规则的中间结果，按材料原文直接从字段、参数表重新写；"
+                    "需要先在某一层算出中间数（如每个项目的有效销售额）时，用 helpers 自己定义辅助变量")
         kind = rec.get("amount", "应得")
         got = self._amounts(name, kind).get(node)
         if got is None:
             return f"{node} 现在没有{kind}金额（对象变了），按新的结果重新验算"
         try:
-            v, rendered = self._probe(name, rec["expr"], rec["at"])
+            v, rendered = self._probe(name, rec["expr"], rec["at"], helpers)
         except ToolError as e:
             return f"验算式算不出来：{e}"
         if isinstance(v, bool) or not isinstance(v, Decimal):
@@ -2037,6 +2055,9 @@ def _lessons(error: str) -> list[str]:
         out += ["上一轮同一个阻断问题反复没改掉：先用 explain / evaluate 弄清原因，确实表达不了的用 ask_question 说明卡在哪里"]
     if "反复" in error or "原样调用" in error:
         out += ["上一轮在原地打转：这一轮先看工作区状态里程序判断的下一步，按它推进"]
+    if "verify" in error or "独立验算" in error:
+        out += ["上一轮独立验算没对上：先用 explain 看引擎的计算链，逐项和自己的验算比；跨表的中间数用 verify 的 helpers 定义辅助变量，"
+                "不要借用规则变量。确认是规则不符合材料就改规则，拿不准就 ask_question"]
     if "连续" in error and "失败" in error and not out:
         out += ["上一轮同一个工具因为同一个原因连续失败：先在思考里写清失败原因，换一种写法再调用"]
     return out
@@ -2079,6 +2100,8 @@ def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None =
     paths["log"].write_text(json.dumps({"summary": ws.summary, "error": ar.error, "transcripts": ws.transcripts,
                                         "steps": [vars(s) for s in ar.steps]}, ensure_ascii=False, indent=2),
                             encoding="utf-8")
+    if ar.status == "FAILED":       # 没做完（没通过检查或独立验算）：不出结果文件，免得被当成结果用；过程在 agent_log 里
+        return paths
     if not ar.results:
         if ar.pending or ws.questions:     # 本轮不出结果：把问题、规划和工作记录给财务看
             import openpyxl
