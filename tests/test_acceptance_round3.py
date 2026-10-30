@@ -91,3 +91,18 @@ def test_engine_records_tier_inputs(tmp_path):
     st = ws.results["V1"]["R0"].tier_stats["contrib_tier"]
     assert st["n"] > 0 and st["min"] <= st["max"] and sum(st["bands"].values()) == st["n"]
     assert "tier_stats" not in ws.results["V1"]["R0"].to_dict()
+
+
+def test_unfiltered_status_and_period_are_flagged(tmp_path):
+    """读了带审批列、日期列的明细表却没按它们筛选：审批列必须处理，期间只提示；同名字段在别的表上筛选过不算。"""
+    ws = _delivery(tmp_path)
+    rs = ws._ruleset("V1")
+    data, _ = ws._data(rs)
+    clean = lint.check(rs, data, "")
+    assert not [t for t in clean.gates + clean.warns if "筛选" in t and ("审批" in t or "期间" in t)]
+    v = dict(rs.variables)
+    v["cost"] = v["cost"].model_copy(update={"expr": 'sum(expense_amount, of: "成本费用")'})   # 收款流水、工时还按 approved 筛
+    bad = lint.check(rs.model_copy(update={"variables": v}), data, "")
+    assert any("「成本费用」" in g and "approved" in g and "是、否" in g for g in bad.gates) and "状态 approved" in bad.keys
+    assert any("「成本费用」" in w and "expense_date" in w and "2026-05" in w for w in bad.warns)
+    assert not [g for g in bad.gates if "「补充费用」" in g or "「补充收款」" in g]       # 没读到的补充表不管

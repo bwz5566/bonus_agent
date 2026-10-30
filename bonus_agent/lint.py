@@ -6,6 +6,8 @@
 - 取值：规则里和字段比较的文字（如 review == "通过"）要在数据或材料里出现，防止写错取值导致整批被筛掉；
 - 未提及的取值：数据里出现了材料和规则都没提到的取值（如工单状态“挂起”），规则会把它悄悄当成不满足条件，要问财务；
 - 漏用金额：规则读了某张数据表，却没用到表里的某个金额字段（如算利润只减了成本、漏了费用），要么接进计算，要么说明为什么不用；
+- 漏筛状态：规则读了某张数据表，表里有审批 / 状态这类列（取值只有几种），规则却没按它筛选；
+- 漏筛期间：带日期的明细表没按日期或期间筛选，数据又跨了几个月（只提示）；
 - 分档量纲：分档表的实际传入值全部落在同一档，而且和分档点差一个数量级以上（如传入比值、分档点却按分钟写），其他档从来用不上；
 - 结构提示：筛选后全部为 0、定义了却没用到的变量。
 
@@ -29,6 +31,9 @@ _SCALE = {"%": Decimal("0.01"), "％": Decimal("0.01"), "‰": Decimal("0.001"),
 _NUM = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*(%|％|‰|万元|万|亿元|亿)?")
 _DATE = re.compile(r"^\d{4}-\d{1,2}(-\d{1,2})?$")
 MAX_CATEGORIES = 30          # 不同取值超过这么多的字段（编号、姓名）不查“未提及的取值”
+STATUS_VALUES = 6            # 审批 / 状态列：不同取值不超过这么多
+_STATUS = re.compile(r"审批|审核|复核|状态|有效|无效|作废|通过|驳回|撤销|撤回|生效|status|approv|valid|state|review|verif", re.I)
+_PERIOD = re.compile(r"year|period|month|quarter|年度|年份|月份|季度|期间|周期|账期", re.I)
 
 
 def _key(d: Decimal) -> str:
@@ -204,6 +209,17 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
         rep.gates.append(f"规则读了数据表「{ds}」，但没有用到它的金额字段 {fld}{f'（表头：{head}）' if head else ''}。"
                          "核对材料：这个金额是否应该计入（如利润要扣的费用、要扣的成本或已发金额）；确实与本方案无关，写进 ignored 说明原因")
         rep.keys.append(f"金额 {fld}")
+    # 4'. 读了数据表却没按审批 / 状态列筛选：未审批、作废的记录会被算进去
+    for ds, fld, vals in _unused_status(rs, data, headers or {}):
+        head = (headers or {}).get(f"{ds}.{fld}", "").strip()
+        rep.gates.append(f"规则读了数据表「{ds}」，但没有用 {fld}{f'（表头：{head}）' if head else ''} 筛选，它的取值有："
+                         f"{'、'.join(vals)}。审批、状态这类列通常决定哪些记录能计入（如只取审批通过、有效的）。"
+                         "核对材料：有要求就在 where 里加上；材料说全部计入或这一列与本方案无关，写进 ignored 说明原因")
+        rep.keys.append(f"状态 {fld}")
+    # 4''. 带日期的明细表没按期间筛选：别的期间的记录也会算进来
+    for ds, fld, span in _no_period(rs, data, headers or {}):
+        rep.warns.append(f"规则汇总了数据表「{ds}」，但没有按日期（{fld}）或期间筛选，数据跨 {span}，会把这些月份的记录全部算进来。"
+                         "核对材料规定的统计期间；本来就该全算的可以不管")
     # 5. 分档表的传入值和分档点量纲不一致
     for name, msg, hard in _tier_scale(rs, tiers or {}):
         if hard:
@@ -226,15 +242,86 @@ def _names(rs: RuleSet) -> set[str]:
     return {n.id for _, ast in _parsed(rs) for n in walk(ast) if isinstance(n, Name)}
 
 
+def _read(rs: RuleSet, names: set[str]) -> list[str]:
+    """规则读到的数据表：用到了表里键以外的字段，或按表名聚合。"""
+    text = " ".join(e for _, e in _exprs(rs))
+    return [ds for ds, d in rs.datasets.items()
+            if any(f in names for f in d.fields or {} if f not in (d.key, d.link)) or f'"{ds}"' in text]
+
+
 def _unused_money(rs: RuleSet, elsewhere: set[str]) -> list[tuple[str, str]]:
     """(数据表, 金额字段)：表里有字段被规则用到，金额字段本身却哪个方案都没用到。"""
     names = _names(rs) | elsewhere
+    return [(ds, f) for ds in _read(rs, names) for f, fd in (rs.datasets[ds].fields or {}).items()
+            if fd.type == "money" and f not in names]
+
+
+def _table_names(rs: RuleSet) -> tuple[dict[str, set[str]], set[str]]:
+    """按表区分用到的名字：({表名: 在 of: "表名" 的聚合里用到的名字}, 其他地方用到的名字)。
+    同名字段（如几张表都有 approved）在一张表上筛选了，不等于另一张表也筛选了。"""
+    by: dict[str, set[str]] = {}
+    inside: set[int] = set()
+    loose: set[str] = set()
+    for _, ast in _parsed(rs):
+        for c in walk(ast):
+            if isinstance(c, Call) and isinstance(c.kw().get("of"), Str):
+                ns = [n for n in walk(c) if isinstance(n, Name)]
+                by.setdefault(c.kw()["of"].value, set()).update(n.id for n in ns)
+                inside |= {id(n) for n in ns}
+        loose |= {n.id for n in walk(ast) if isinstance(n, Name) and id(n) not in inside}
+    return by, loose
+
+
+def _read_by_table(rs: RuleSet, by: dict[str, set[str]], loose: set[str]) -> list[str]:
+    """本方案确实读到的表：按 of: "表名" 聚合过，或用到了只有这张表才有的字段（同名字段不算，免得把没用的补充表也算进来）。"""
+    owners: dict[str, int] = {}
+    for d in rs.datasets.values():
+        for f in d.fields or {}:
+            owners[f] = owners.get(f, 0) + 1
+    return [ds for ds, d in rs.datasets.items()
+            if ds in by or any(f in loose and owners[f] == 1 for f in d.fields or {} if f not in (d.key, d.link))]
+
+
+def _label(ds: str, f: str, fd, headers: dict[str, str]) -> str:
+    return f"{f} {headers.get(f'{ds}.{f}', '')} {fd.desc or ''}"
+
+
+def _unused_status(rs: RuleSet, data: Datasets, headers: dict[str, str]) -> list[tuple[str, str, list[str]]]:
+    """(数据表, 字段, 取值)：规则读了这张表，表里有审批 / 状态这类列（取值只有几种），本方案却没按它筛选。"""
+    by, loose = _table_names(rs)
     out = []
-    for ds, d in rs.datasets.items():
-        fields = d.fields or {}
-        if not any(f in names for f in fields if f not in (d.key, d.link)) and f'"{ds}"' not in " ".join(e for _, e in _exprs(rs)):
+    for ds in _read_by_table(rs, by, loose):
+        d, t = rs.datasets[ds], data.get(ds)
+        if t is None:
             continue
-        out += [(ds, f) for f, fd in fields.items() if fd.type == "money" and f not in names]
+        used = by.get(ds, set()) | loose
+        for f, fd in (d.fields or {}).items():
+            if f in used or f in (d.key, d.link) or fd.type not in ("text", "enum", "bool"):
+                continue
+            vals = list(dict.fromkeys(str(r.values.get(f)).strip() for r in t.rows if r.values.get(f) not in (None, "")))
+            if 2 <= len(vals) <= STATUS_VALUES and (_STATUS.search(_label(ds, f, fd, headers))
+                                                    or any(_STATUS.search(v) for v in vals)):
+                out.append((ds, f, vals))
+    return out
+
+
+def _no_period(rs: RuleSet, data: Datasets, headers: dict[str, str]) -> list[tuple[str, str, str]]:
+    """(数据表, 日期字段, 数据跨的月份)：本方案汇总了一张带日期的明细表，却没用任何日期或期间字段筛选，数据又跨了几个月。"""
+    by, loose = _table_names(rs)
+    out = []
+    for ds in _read_by_table(rs, by, loose):
+        d, t = rs.datasets[ds], data.get(ds)
+        if t is None or d.key:                      # 实体表（人员、项目）的日期多是入职、签约日，不是统计期间
+            continue
+        fields = d.fields or {}
+        used = by.get(ds, set()) | loose
+        dates = [f for f, fd in fields.items() if fd.type == "date"]
+        if not dates or any(f in used for f in dates) or \
+                any(f in used and _PERIOD.search(_label(ds, f, fd, headers)) for f, fd in fields.items()):
+            continue
+        months = sorted({str(v)[:7] for r in t.rows for f in dates if (v := r.values.get(f)) not in (None, "")})
+        if len(months) > 1:
+            out.append((ds, dates[0], f"{months[0]}～{months[-1]}"))
     return out
 
 
