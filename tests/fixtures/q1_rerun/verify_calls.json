@@ -1,0 +1,158 @@
+[
+ {
+  "round": 2,
+  "step": 15,
+  "args": {
+   "node": "部门:D01",
+   "scheme": "QUARTER",
+   "expr": "round((tier(q_sales_tier, sum(sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")) * lookup(region_coef, region) * if(contract_date >= \"2026-01-01\", 1.10, 0.95) * tier_rate(margin_coef, ratio(sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")) - sum(cost_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")), sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")), zero: 0)), of: \"项目\")) + max(sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")) - sum(cost_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")) - sum(expense_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")), 0) * 0.05) * tier_rate(completion_coef, ratio(sum(sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")), of: \"项目\"), sum(sales_target, of: \"目标值_部门\", where: period == \"Q3\"), zero: 0)), 2)",
+   "basis": "01_奖金制度.docx：有效销售额 = 期间销售额 × 区域系数 × 新老项目系数 × 毛利率系数；季度销售激励 = 部门全部有效销售额 × 命中档比例；季度利润激励 = MAX(部门净利润, 0) × 5%；季度奖金包 = ROUND((销售激励 + 利润激励) × 完成系数, 2)；完成率 = 部门实际销售额 ÷ 同周期部门目标"
+  }
+ },
+ {
+  "round": 2,
+  "step": 16,
+  "args": {
+   "basis": "01_奖金制度.docx：每个方案先在部门内分配至小组，再在小组内分配至个人。小组权重 = ROUND(同周期小组绩效评分 ÷ 100 × MIN(小组实际销售额 ÷ 小组目标, 1.20), 6)。上级总包统一为分位金额，按权重分配。",
+   "expr": "round(2152934.85 * round(96 / 100 * min(ratio(sum(sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")), of: \"项目\"), sum(sales_target, of: \"目标值_小组\", where: period == \"Q3\"), zero: 0), 1.2), 6) / (round(94 / 100 * min(ratio(sum(sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")), of: \"项目\", where: group_id == \"G01\"), sum(sales_target, of: \"目标值_小组\", where: period == \"Q3\" and group_id == \"G01\"), zero: 0), 1.2), 6) + round(96 / 100 * min(ratio(sum(sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")), of: \"项目\", where: group_id == \"G02\"), sum(sales_target, of: \"目标值_小组\", where: period == \"Q3\" and group_id == \"G02\"), zero: 0), 1.2), 6) + round(90 / 100 * min(ratio(sum(sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")), of: \"项目\", where: group_id == \"G03\"), sum(sales_target, of: \"目标值_小组\", where: period == \"Q3\" and group_id == \"G03\"), zero: 0), 1.2), 6)), 2)",
+   "node": "小组:G02",
+   "scheme": "QUARTER"
+  }
+ },
+ {
+  "round": 2,
+  "step": 17,
+  "args": {
+   "basis": "01_奖金制度.docx：季度奖金包 = ROUND((销售激励 + 利润激励) × 完成系数, 2)；每个方案先在部门内分配至小组；小组权重 = ROUND(同周期小组绩效评分 ÷ 100 × MIN(小组实际销售额 ÷ 小组目标, 1.20), 6)",
+   "expr": "round(v_dept_pool * v_gw / (sum(v_gw, of: \"小组\", where: dept_id == \"D01\")), 2)",
+   "helpers": {
+    "v_proj_eff": {
+     "expr": "sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")) * lookup(region_coef, region) * if(contract_date >= \"2026-01-01\", 1.10, 0.95) * tier_rate(margin_coef, ratio(sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")) - sum(cost_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")), sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")), zero: 0))",
+     "scope": "项目"
+    },
+    "v_dept_pool": {
+     "expr": "round((tier(q_sales_tier, sum(v_proj_eff, of: \"项目\")) + max(sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")) - sum(cost_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")) - sum(expense_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")), 0) * 0.05) * tier_rate(completion_coef, ratio(sum(sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")), of: \"项目\"), sum(sales_target, of: \"目标值_部门\", where: period == \"Q3\"), zero: 0)), 2)",
+     "scope": "部门"
+    },
+    "v_gw": {
+     "expr": "round(perf_q3 / 100 * min(ratio(sum(sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")), of: \"项目\"), sum(sales_target, of: \"目标值_小组\", where: period == \"Q3\"), zero: 0), 1.2), 6)",
+     "scope": "小组"
+    }
+   },
+   "node": "小组:G02",
+   "scheme": "QUARTER"
+  }
+ },
+ {
+  "round": 2,
+  "step": 18,
+  "args": {
+   "basis": "01_奖金制度.docx：季度奖金包 = ROUND((销售激励 + 利润激励) × 完成系数, 2)；每个方案先在部门内分配至小组；小组权重 = ROUND(同周期小组绩效评分 ÷ 100 × MIN(小组实际销售额 ÷ 小组目标, 1.20), 6)",
+   "expr": "round(v_dept_pool * share(v_gw), 2)",
+   "node": "小组:G02",
+   "scheme": "QUARTER"
+  }
+ },
+ {
+  "round": 2,
+  "step": 19,
+  "args": {
+   "basis": "01_奖金制度.docx：个人原始权重由下表各项归一化指标乘权重后求和，最后按四舍五入保留 6 位小数（工龄10%、贡献评分20%、项目难度15%、销售完成30%、项目数量10%、产出评分15%）；每个方案先在部门内分配至小组，再在小组内分配至个人",
+   "expr": "round(v_dept_pool * share(v_gw) * share(v_ew), 2)",
+   "helpers": {
+    "v_ew": {
+     "expr": "round(0.1 * min(years_between(join_date, \"2026-09-30\"), 5) / 5 + 0.2 * ratio(sum(contribution_score, of: \"绩效评分\", where: period == \"Q3\" and approved == true), 100, zero: 0) + 0.15 * ratio(sum(difficulty * share, of: \"项目参与\"), sum(share, of: \"项目参与\"), zero: 0) / 3 + 0.3 * min(ratio(sum(sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")), of: \"项目参与\"), sum(sales_target, of: \"目标值_个人\", where: period == \"Q3\"), zero: 0), 1.5) / 1.5 + 0.1 * min(count_distinct(project_id, of: \"项目参与\"), 8) / 8 + 0.15 * ratio(sum(output_score, of: \"绩效评分\", where: period == \"Q3\" and approved == true), 100, zero: 0), 6)",
+     "scope": "个人"
+    }
+   },
+   "node": "个人:E007",
+   "scheme": "QUARTER"
+  }
+ },
+ {
+  "round": 2,
+  "step": 20,
+  "args": {
+   "basis": "01_奖金制度.docx：个人归属销售额 = SUM(所参与项目销售额 × share)；个人原始权重由下表各项归一化指标乘权重后求和，最后按四舍五入保留 6 位小数（工龄10%、贡献评分20%、项目难度15%、销售完成30%、项目数量10%、产出评分15%）",
+   "expr": "round(v_dept_pool * share(v_gw) * share(v_ew), 2)",
+   "helpers": {
+    "v_ew": {
+     "expr": "round(0.1 * min(years_between(join_date, \"2026-09-30\"), 5) / 5 + 0.2 * ratio(sum(contribution_score, of: \"绩效评分\", where: period == \"Q3\" and approved == true), 100, zero: 0) + 0.15 * ratio(sum(difficulty * share, of: \"项目参与\"), sum(share, of: \"项目参与\"), zero: 0) / 3 + 0.3 * min(ratio(sum(v_proj_sales * share, of: \"项目参与\"), sum(sales_target, of: \"目标值_个人\", where: period == \"Q3\"), zero: 0), 1.5) / 1.5 + 0.1 * min(count_distinct(project_id, of: \"项目参与\"), 8) / 8 + 0.15 * ratio(sum(output_score, of: \"绩效评分\", where: period == \"Q3\" and approved == true), 100, zero: 0), 6)",
+     "scope": "个人"
+    },
+    "v_proj_sales": {
+     "expr": "sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\"))",
+     "scope": "项目"
+    }
+   },
+   "node": "个人:E007",
+   "scheme": "QUARTER"
+  }
+ },
+ {
+  "round": 2,
+  "step": 23,
+  "args": {
+   "basis": "01_奖金制度.docx：每个方案先在部门内分配至小组，再在小组内分配至个人；个人原始权重由下表各项归一化指标乘权重后求和，最后按四舍五入保留 6 位小数",
+   "expr": "round(v_dept_pool * share(v_gw) * share(v_ew), 2)",
+   "node": "个人:E007",
+   "scheme": "QUARTER"
+  }
+ },
+ {
+  "round": 3,
+  "step": 6,
+  "args": {
+   "node": "个人:E007",
+   "scheme": "QUARTER",
+   "expr": "round(v_dept_pool * share(v_gw) * share(v_ew), 2)",
+   "basis": "01_奖金制度.docx：每个方案先在部门内分配至小组，再在小组内分配至个人；小组权重=ROUND(同周期小组绩效评分÷100×MIN(小组实际销售额÷小组目标,1.20),6)；个人原始权重由下表各项归一化指标乘权重后求和，最后按四舍五入保留6位小数。",
+   "helpers": {
+    "v_gw": {
+     "scope": "小组",
+     "expr": "round(perf_q3 / 100 * min(ratio(sum(v_proj_sales, of: \"项目\"), sum(sales_target, of: \"目标值_小组\", where: period == \"Q3\"), zero: 0), 1.2), 6)"
+    },
+    "v_dept_pool": {
+     "scope": "部门",
+     "expr": "round((tier(q_sales_tier, sum(v_proj_eff, of: \"项目\")) + max(sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")) - sum(cost_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")) - sum(expense_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")), 0) * 0.05) * tier_rate(completion_coef, ratio(sum(v_proj_sales, of: \"项目\"), sum(sales_target, of: \"目标值_部门\", where: period == \"Q3\"), zero: 0)), 2)"
+    }
+   }
+  }
+ },
+ {
+  "round": 3,
+  "step": 9,
+  "args": {
+   "basis": "01_奖金制度.docx：每个方案先在部门内分配至小组，再在小组内分配至个人；小组权重=ROUND(同周期小组绩效评分÷100×MIN(小组实际销售额÷小组目标,1.20),6)；个人原始权重由下表各项归一化指标乘权重后求和，最后按四舍五入保留6位小数。",
+   "expr": "round(v_dept_pool * ratio(v_gw, sum(v_gw, of: \"小组\", where: dept_id == \"D01\"), zero: 0) * ratio(v_ew, sum(v_ew, of: \"员工\", where: group_id == \"G02\"), zero: 0), 2)",
+   "helpers": {
+    "v_gw": {
+     "expr": "round(perf_q3 / 100 * min(ratio(sum(v_proj_sales, of: \"项目\"), sum(sales_target, of: \"目标值_小组\", where: period == \"Q3\"), zero: 0), 1.2), 6)",
+     "scope": "小组"
+    }
+   },
+   "node": "个人:E007",
+   "scheme": "QUARTER"
+  }
+ },
+ {
+  "round": 3,
+  "step": 10,
+  "args": {
+   "basis": "01_奖金制度.docx：每个方案先在部门内分配至小组，再在小组内分配至个人；小组权重=ROUND(同周期小组绩效评分÷100×MIN(小组实际销售额÷小组目标,1.20),6)；个人原始权重由下表各项归一化指标乘权重后求和，最后按四舍五入保留6位小数。",
+   "expr": "round(v_dept_pool * v_gw_share * v_ew_share, 2)",
+   "helpers": {
+    "v_gw_share": {
+     "expr": "ratio(v_gw, sum(v_gw, of: \"小组\", where: dept_id == \"D01\"), zero: 0)",
+     "scope": "小组"
+    },
+    "v_ew_share": {
+     "expr": "ratio(v_ew, sum(v_ew, of: \"员工\", where: group_id == \"G02\"), zero: 0)",
+     "scope": "个人"
+    }
+   },
+   "node": "个人:E007",
+   "scheme": "QUARTER"
+  }
+ }
+]

@@ -65,3 +65,31 @@ def test_corrected_q55_matches_expected_file_to_the_cent(tmp_path):
         row = dict(zip(head, r))
         got[row["节点"].split(":")[1]] = {"应得": row["应得"], "预发": row["已发抵扣"], "实发": row["本次实发"], "超预发": row["超发待核对"]}
     assert got == q55.expected()
+
+
+@pytest.mark.verify
+def test_q1_rerun_verify_calls_now_agree_with_engine():
+    """Q1 新跑（最新代码三轮都停下）：用模型当时写的规则和全部 verify 调用回放。按财务理解写的同级合计、份额
+    （share(小组权重)、sum(小组权重, of: "小组", where: ...)）现在和引擎对到分；真错的两次仍拦下：
+    把中间结果直接写成数字的（第 2 轮第 16 步），以及个人权重里贡献评分漏了 /100 的（第 2 轮第 19 步）。"""
+    import json as _json
+    from bonus_agent import case as cs
+    from bonus_agent.agent import ToolError, Workspace
+    from bonus_agent.auto import build_inventory
+    from bonus_agent.llm import FakeLLM
+    fx = Path(__file__).parent / "fixtures" / "q1_rerun"
+    inp = Path(__file__).parent.parent / "evals" / "cases" / "syn_acceptance" / "inputs"
+    ws = Workspace(FakeLLM([]), build_inventory(sorted(inp.iterdir())))
+    cs.restore(ws, _json.loads((fx / "workspace.json").read_text(encoding="utf-8")))
+    ws.untested = set(ws.schemes)
+    ws.trial_run()
+    got = {}
+    for c in _json.loads((fx / "verify_calls.json").read_text(encoding="utf-8")):
+        try:
+            ws.verify(**c["args"])
+            got[(c["round"], c["step"])] = "通过"
+        except ToolError as e:
+            got[(c["round"], c["step"])] = str(e)[:60]
+    bad = {k: v for k, v in got.items() if v != "通过"}
+    assert set(bad) == {(2, 16), (2, 19)}, got
+    assert "在材料里找不到" in bad[(2, 16)] and "对不上" in bad[(2, 19)]

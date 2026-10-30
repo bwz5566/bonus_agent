@@ -1,0 +1,1142 @@
+{
+ "datasets": {
+  "部门": {
+   "key": "dept_id",
+   "fields": {
+    "dept_id": {
+     "type": "id",
+     "desc": "dept_id"
+    },
+    "dept_name": {
+     "type": "text",
+     "desc": "dept_name"
+    }
+   }
+  },
+  "小组": {
+   "key": "group_id",
+   "fields": {
+    "group_id": {
+     "type": "id",
+     "desc": "group_id"
+    },
+    "dept_id": {
+     "type": "id",
+     "desc": "dept_id"
+    },
+    "group_name": {
+     "type": "text",
+     "desc": "group_name"
+    },
+    "perf_q3": {
+     "type": "number",
+     "desc": "perf_q3"
+    },
+    "perf_fy": {
+     "type": "number",
+     "desc": "perf_fy"
+    }
+   }
+  },
+  "员工": {
+   "key": "employee_id",
+   "fields": {
+    "employee_id": {
+     "type": "id",
+     "desc": "employee_id"
+    },
+    "employee_name": {
+     "type": "text",
+     "desc": "employee_name"
+    },
+    "group_id": {
+     "type": "id",
+     "desc": "group_id"
+    },
+    "dept_id": {
+     "type": "id",
+     "desc": "dept_id"
+    },
+    "join_date": {
+     "type": "date",
+     "desc": "join_date"
+    }
+   }
+  },
+  "项目": {
+   "key": "project_id",
+   "fields": {
+    "project_id": {
+     "type": "id",
+     "desc": "project_id"
+    },
+    "project_name": {
+     "type": "text",
+     "desc": "project_name"
+    },
+    "dept_id": {
+     "type": "id",
+     "desc": "dept_id"
+    },
+    "group_id": {
+     "type": "id",
+     "desc": "group_id"
+    },
+    "region": {
+     "type": "text",
+     "desc": "region"
+    },
+    "contract_date": {
+     "type": "date",
+     "desc": "contract_date"
+    },
+    "difficulty": {
+     "type": "int",
+     "desc": "difficulty"
+    }
+   }
+  },
+  "销售明细": {
+   "key": "sales_id",
+   "fields": {
+    "sales_id": {
+     "type": "id",
+     "desc": "sales_id"
+    },
+    "project_id": {
+     "type": "id",
+     "desc": "project_id"
+    },
+    "recognition_date": {
+     "type": "date",
+     "desc": "recognition_date"
+    },
+    "sales_amount": {
+     "type": "money",
+     "desc": "sales_amount",
+     "unit": "元"
+    },
+    "cost_amount": {
+     "type": "money",
+     "desc": "cost_amount",
+     "unit": "元"
+    },
+    "expense_amount": {
+     "type": "money",
+     "desc": "expense_amount",
+     "unit": "元"
+    }
+   }
+  },
+  "回款明细": {
+   "key": "receipt_id",
+   "link": "sales_id",
+   "fields": {
+    "receipt_id": {
+     "type": "id",
+     "desc": "receipt_id"
+    },
+    "sales_id": {
+     "type": "id",
+     "desc": "sales_id"
+    },
+    "receipt_date": {
+     "type": "date",
+     "desc": "receipt_date"
+    },
+    "receipt_amount": {
+     "type": "money",
+     "desc": "receipt_amount",
+     "unit": "元"
+    }
+   }
+  },
+  "项目参与": {
+   "link": "employee_id",
+   "fields": {
+    "project_id": {
+     "type": "id",
+     "desc": "project_id"
+    },
+    "employee_id": {
+     "type": "id",
+     "desc": "employee_id"
+    },
+    "share": {
+     "type": "ratio",
+     "desc": "share"
+    }
+   }
+  },
+  "绩效评分": {
+   "link": "employee_id",
+   "fields": {
+    "period": {
+     "type": "text",
+     "desc": "period"
+    },
+    "employee_id": {
+     "type": "id",
+     "desc": "employee_id"
+    },
+    "contribution_score": {
+     "type": "number",
+     "desc": "contribution_score"
+    },
+    "output_score": {
+     "type": "number",
+     "desc": "output_score"
+    },
+    "score_source": {
+     "type": "text",
+     "desc": "score_source"
+    },
+    "ai_suggested_score": {
+     "type": "number",
+     "desc": "ai_suggested_score"
+    },
+    "approved": {
+     "type": "enum",
+     "desc": "approved",
+     "values": [
+      "True"
+     ]
+    },
+    "approved_by": {
+     "type": "text",
+     "desc": "approved_by"
+    },
+    "approved_at": {
+     "type": "date",
+     "desc": "approved_at"
+    }
+   }
+  },
+  "目标值_部门": {
+   "link": "dept_id",
+   "fields": {
+    "period": {
+     "type": "text",
+     "desc": "period"
+    },
+    "dept_id": {
+     "type": "id",
+     "desc": "entity_id"
+    },
+    "sales_target": {
+     "type": "money",
+     "desc": "sales_target",
+     "unit": "元"
+    }
+   }
+  },
+  "目标值_小组": {
+   "link": "group_id",
+   "fields": {
+    "period": {
+     "type": "text",
+     "desc": "period"
+    },
+    "group_id": {
+     "type": "id",
+     "desc": "entity_id"
+    },
+    "sales_target": {
+     "type": "money",
+     "desc": "sales_target",
+     "unit": "元"
+    }
+   }
+  },
+  "目标值_个人": {
+   "link": "employee_id",
+   "fields": {
+    "period": {
+     "type": "text",
+     "desc": "period"
+    },
+    "employee_id": {
+     "type": "id",
+     "desc": "entity_id"
+    },
+    "sales_target": {
+     "type": "money",
+     "desc": "sales_target",
+     "unit": "元"
+    }
+   }
+  },
+  "里程碑": {
+   "link": "project_id",
+   "fields": {
+    "milestone_id": {
+     "type": "id",
+     "desc": "milestone_id"
+    },
+    "project_id": {
+     "type": "id",
+     "desc": "project_id"
+    },
+    "milestone_name": {
+     "type": "text",
+     "desc": "milestone_name"
+    },
+    "acceptance_date": {
+     "type": "date",
+     "desc": "acceptance_date"
+    },
+    "status": {
+     "type": "text",
+     "desc": "status"
+    },
+    "base_bonus": {
+     "type": "money",
+     "desc": "base_bonus",
+     "unit": "元"
+    }
+   }
+  },
+  "历史已发": {
+   "link": "employee_id",
+   "fields": {
+    "payment_id": {
+     "type": "id",
+     "desc": "payment_id"
+    },
+    "employee_id": {
+     "type": "id",
+     "desc": "employee_id"
+    },
+    "annual_bonus_year": {
+     "type": "int",
+     "desc": "annual_bonus_year"
+    },
+    "payment_date": {
+     "type": "date",
+     "desc": "payment_date"
+    },
+    "bonus_item": {
+     "type": "text",
+     "desc": "bonus_item"
+    },
+    "paid_amount": {
+     "type": "money",
+     "desc": "paid_amount",
+     "unit": "元"
+    }
+   }
+  }
+ },
+ "mapping": {
+  "部门": {
+   "file": "03_业务输入.xlsx",
+   "sheet": "部门",
+   "columns": {
+    "dept_id": "dept_id",
+    "dept_name": "dept_name"
+   }
+  },
+  "小组": {
+   "file": "03_业务输入.xlsx",
+   "sheet": "小组",
+   "columns": {
+    "group_id": "group_id",
+    "dept_id": "dept_id",
+    "group_name": "group_name",
+    "perf_q3": "perf_q3",
+    "perf_fy": "perf_fy"
+   }
+  },
+  "员工": {
+   "file": "03_业务输入.xlsx",
+   "sheet": "员工",
+   "columns": {
+    "employee_id": "employee_id",
+    "employee_name": "employee_name",
+    "group_id": "group_id",
+    "dept_id": "dept_id",
+    "join_date": "join_date"
+   }
+  },
+  "项目": {
+   "file": "03_业务输入.xlsx",
+   "sheet": "项目",
+   "columns": {
+    "project_id": "project_id",
+    "project_name": "project_name",
+    "dept_id": "dept_id",
+    "group_id": "group_id",
+    "region": "region",
+    "contract_date": "contract_date",
+    "difficulty": "difficulty"
+   }
+  },
+  "销售明细": {
+   "file": "03_业务输入.xlsx",
+   "sheet": "销售明细",
+   "columns": {
+    "sales_id": "sales_id",
+    "project_id": "project_id",
+    "recognition_date": "recognition_date",
+    "sales_amount": "sales_amount",
+    "cost_amount": "cost_amount",
+    "expense_amount": "expense_amount"
+   }
+  },
+  "回款明细": {
+   "file": "03_业务输入.xlsx",
+   "sheet": "回款明细",
+   "columns": {
+    "receipt_id": "receipt_id",
+    "sales_id": "sales_id",
+    "receipt_date": "receipt_date",
+    "receipt_amount": "receipt_amount"
+   }
+  },
+  "项目参与": {
+   "file": "03_业务输入.xlsx",
+   "sheet": "项目参与",
+   "columns": {
+    "project_id": "project_id",
+    "employee_id": "employee_id",
+    "share": "share"
+   }
+  },
+  "绩效评分": {
+   "file": "03_业务输入.xlsx",
+   "sheet": "绩效评分",
+   "columns": {
+    "period": "period",
+    "employee_id": "employee_id",
+    "contribution_score": "contribution_score",
+    "output_score": "output_score",
+    "score_source": "score_source",
+    "ai_suggested_score": "ai_suggested_score",
+    "approved": "approved",
+    "approved_by": "approved_by",
+    "approved_at": "approved_at"
+   }
+  },
+  "目标值_部门": {
+   "file": "03_业务输入.xlsx",
+   "sheet": "目标值",
+   "columns": {
+    "period": "period",
+    "dept_id": "entity_id",
+    "sales_target": "sales_target"
+   },
+   "filter": {
+    "entity_type": "department"
+   }
+  },
+  "目标值_小组": {
+   "file": "03_业务输入.xlsx",
+   "sheet": "目标值",
+   "columns": {
+    "period": "period",
+    "group_id": "entity_id",
+    "sales_target": "sales_target"
+   },
+   "filter": {
+    "entity_type": "group"
+   }
+  },
+  "目标值_个人": {
+   "file": "03_业务输入.xlsx",
+   "sheet": "目标值",
+   "columns": {
+    "period": "period",
+    "employee_id": "entity_id",
+    "sales_target": "sales_target"
+   },
+   "filter": {
+    "entity_type": "employee"
+   }
+  },
+  "里程碑": {
+   "file": "03_业务输入.xlsx",
+   "sheet": "里程碑",
+   "columns": {
+    "milestone_id": "milestone_id",
+    "project_id": "project_id",
+    "milestone_name": "milestone_name",
+    "acceptance_date": "acceptance_date",
+    "status": "status",
+    "base_bonus": "base_bonus"
+   }
+  },
+  "历史已发": {
+   "file": "03_业务输入.xlsx",
+   "sheet": "历史已发",
+   "columns": {
+    "payment_id": "payment_id",
+    "employee_id": "employee_id",
+    "annual_bonus_year": "annual_bonus_year",
+    "payment_date": "payment_date",
+    "bonus_item": "bonus_item",
+    "paid_amount": "paid_amount"
+   }
+  }
+ },
+ "drafts": {
+  "共用": {
+   "tables": {
+    "region_coef": {
+     "kind": "lookup",
+     "mapping": {
+      "华东": 1.1,
+      "华南": 1.0,
+      "华北": 0.9,
+      "西部": 1.2
+     },
+     "desc": "区域系数，用于有效销售额与过程奖",
+     "sources": [
+      {
+       "doc": "02_规则补充.pptx",
+       "quote": "R_REGION　按项目所属区域查表，系数用于有效销售额和里程碑奖金"
+      }
+     ]
+    },
+    "margin_coef": {
+     "kind": "tier",
+     "mode": "whole",
+     "steps": [
+      [
+       0,
+       0
+      ],
+      [
+       0.15,
+       0.8
+      ],
+      [
+       0.25,
+       1.0
+      ],
+      [
+       0.35,
+       1.2
+      ]
+     ],
+     "lower_inclusive": true,
+     "desc": "毛利率系数（按项目期间毛利率）",
+     "sources": [
+      {
+       "doc": "02_规则补充.pptx",
+       "quote": "| 不足 15% | 0.00 | 不贡献有效销售额 |"
+      }
+     ]
+    },
+    "difficulty_coef": {
+     "kind": "tier",
+     "mode": "whole",
+     "steps": [
+      [
+       1,
+       1.0
+      ],
+      [
+       2,
+       1.1
+      ],
+      [
+       3,
+       1.25
+      ]
+     ],
+     "lower_inclusive": true,
+     "desc": "里程碑难度系数，仅用于过程奖",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "难度等级 1、2、3 对应系数 1.00、1.10、1.25。"
+      }
+     ]
+    },
+    "completion_coef": {
+     "kind": "tier",
+     "mode": "whole",
+     "steps": [
+      [
+       0,
+       0.8
+      ],
+      [
+       0.8,
+       1.0
+      ],
+      [
+       1.0,
+       1.1
+      ]
+     ],
+     "lower_inclusive": true,
+     "desc": "部门完成率系数",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "完成率不足 80% 时系数为 0.80，达到 80% 但不足 100% 时为 1.00，达到 100% 时为 1.10。"
+      }
+     ]
+    },
+    "q_sales_tier": {
+     "kind": "tier",
+     "mode": "whole",
+     "steps": [
+      [
+       0,
+       0.08
+      ],
+      [
+       10000000,
+       0.1
+      ],
+      [
+       20000000,
+       0.12
+      ]
+     ],
+     "lower_inclusive": true,
+     "desc": "季度全额阶梯",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "季度销售激励 = 部门全部有效销售额 × 命中档比例。"
+      }
+     ]
+    },
+    "a_sales_tier": {
+     "kind": "tier",
+     "mode": "excess",
+     "steps": [
+      [
+       0,
+       0.05
+      ],
+      [
+       10000000,
+       0.08
+      ],
+      [
+       20000000,
+       0.1
+      ]
+     ],
+     "lower_inclusive": true,
+     "desc": "年度分段阶梯",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "有效销售额前 1000 万元按 5%，超过 1000 万至 2000 万元的部分按 8%，超过 2000 万元的部分按 10%。"
+      }
+     ]
+    }
+   },
+   "variables": {
+    "new_coef": {
+     "scope": "项目",
+     "expr": "if(contract_date >= \"2026-01-01\", 1.10, 0.95)",
+     "desc": "新老项目系数",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "新项目：合同日期大于或等于 2026 年 1 月 1 日。老项目：合同日期早于该日期。新老系数分别为 1.10 和 0.95。"
+      }
+     ]
+    },
+    "group_weight": {
+     "scope": "小组",
+     "expr": "round(perf_q3 / 100 * min(ratio(sum(proj_sales_q3, of: \"项目\"), sum(sales_target, of: \"目标值_小组\", where: period == \"Q3\"), zero: 0), 1.2), 6)",
+     "desc": "小组权重（Q3 口径）：绩效评分/100 × MIN(小组实际销售额/小组目标,1.2)，保留6位",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "小组权重 = ROUND(同周期小组绩效评分 ÷ 100 × MIN(小组实际销售额 ÷ 小组目标, 1.20), 6)"
+      }
+     ]
+    },
+    "emp_weight": {
+     "scope": "个人",
+     "expr": "round(0.1 * min(years_between(join_date, \"2026-09-30\"), 5) / 5 + 0.2 * ratio(sum(contribution_score, of: \"绩效评分\", where: period == \"Q3\" and approved == true), 100, zero: 0) + 0.15 * ratio(sum(difficulty * share, of: \"项目参与\"), sum(share, of: \"项目参与\"), zero: 0) / 3 + 0.3 * min(ratio(sum(proj_sales_q3 * share, of: \"项目参与\"), sum(sales_target, of: \"目标值_个人\", where: period == \"Q3\"), zero: 0), 1.5) / 1.5 + 0.1 * min(count_distinct(project_id, of: \"项目参与\"), 8) / 8 + 0.15 * ratio(sum(output_score, of: \"绩效评分\", where: period == \"Q3\" and approved == true), 100, zero: 0), 6)",
+     "desc": "个人原始权重（Q3 口径），六项归一化指标乘权重求和，保留6位",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "个人原始权重由下表各项归一化指标乘权重后求和，最后按四舍五入保留 6 位小数。"
+      }
+     ]
+    },
+    "proj_sales_q3": {
+     "scope": "项目",
+     "expr": "sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\"))",
+     "desc": "项目 Q3 期间销售额（不含税）",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "销售额按销售明细的 recognition_date 归入期间。"
+      }
+     ]
+    },
+    "proj_sales_fy": {
+     "scope": "项目",
+     "expr": "sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-01-01\", \"2026-12-31\"))",
+     "desc": "项目全年销售额（不含税）",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "销售额按销售明细的 recognition_date 归入期间。"
+      }
+     ]
+    }
+   },
+   "allocation": [
+    {
+     "key": "dept_id",
+     "level": "部门",
+     "parent_key": null,
+     "weight": "1"
+    },
+    {
+     "key": "group_id",
+     "level": "小组",
+     "parent_key": "dept_id",
+     "weight": "group_weight"
+    },
+    {
+     "key": "employee_id",
+     "level": "个人",
+     "parent_key": "group_id",
+     "weight": "emp_weight"
+    }
+   ],
+   "checks": [
+    {
+     "expr": "abs(sum(share, of: \"项目参与\") - 1) < 0.000001",
+     "id": "share_sum_one",
+     "message": "项目参与比例合计须为1",
+     "scope": "项目"
+    },
+    {
+     "expr": "count(of: \"目标值_部门\", where: sales_target <= 0) == 0 and count(of: \"目标值_小组\", where: sales_target <= 0) == 0 and count(of: \"目标值_个人\", where: sales_target <= 0) == 0",
+     "id": "target_positive",
+     "message": "目标值必须大于零",
+     "scope": "global"
+    },
+    {
+     "expr": "count(of: \"绩效评分\", where: approved != true) == 0",
+     "id": "score_approved",
+     "message": "评分尚未人工确认",
+     "scope": "global"
+    },
+    {
+     "expr": "count(of: \"绩效评分\", where: contribution_score < 0 or contribution_score > 100 or output_score < 0 or output_score > 100) == 0",
+     "id": "score_range",
+     "message": "评分必须在0至100",
+     "scope": "global"
+    },
+    {
+     "expr": "count(of: \"回款明细\", where: receipt_amount < 0) == 0",
+     "id": "receipt_not_exceed_sales",
+     "message": "回款合计超过销售额或存在负回款",
+     "scope": "global"
+    }
+   ]
+  },
+  "QUARTER": {
+   "variables": {
+    "proj_margin_q3": {
+     "scope": "项目",
+     "expr": "ratio(sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")) - sum(cost_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")), sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")), zero: 0)",
+     "desc": "项目 Q3 毛利率 = 期间毛利/期间销售额",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "毛利率以项目在该统计期内的合计毛利除以合计销售额计算。"
+      }
+     ]
+    },
+    "proj_eff_sales_q3": {
+     "scope": "项目",
+     "expr": "proj_sales_q3 * lookup(region_coef, region) * new_coef * tier_rate(margin_coef, proj_margin_q3)",
+     "desc": "项目 Q3 有效销售额（不舍入）",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "有效销售额 = 期间销售额 × 区域系数 × 新老项目系数 × 毛利率系数。"
+      }
+     ]
+    },
+    "dept_eff_sales_q3": {
+     "scope": "部门",
+     "expr": "sum(proj_eff_sales_q3, of: \"项目\")",
+     "desc": "部门 Q3 有效销售额合计",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "中间有效销售额保留精度，部门汇总前不按项目舍入。"
+      }
+     ]
+    },
+    "dept_net_profit_q3": {
+     "scope": "部门",
+     "expr": "sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")) - sum(cost_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\")) - sum(expense_amount, of: \"销售明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\"))",
+     "desc": "部门 Q3 净利润（先汇总）",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "净利润等于销售额减成本再减费用。净利润以部门合计后取不小于零的数计算利润激励"
+      }
+     ]
+    },
+    "dept_actual_sales_q3": {
+     "scope": "部门",
+     "expr": "sum(proj_sales_q3, of: \"项目\")",
+     "desc": "部门 Q3 实际销售额（含低毛利项目）",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "实际销售额包含低毛利项目，不能用有效销售额替代。"
+      }
+     ]
+    },
+    "dept_completion_q3": {
+     "scope": "部门",
+     "expr": "ratio(dept_actual_sales_q3, sum(sales_target, of: \"目标值_部门\", where: period == \"Q3\"), zero: 0)",
+     "desc": "部门 Q3 完成率",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "完成率 = 部门实际销售额 ÷ 同周期部门目标。"
+      }
+     ]
+    },
+    "dept_completion_coef_q3": {
+     "scope": "部门",
+     "expr": "tier_rate(completion_coef, dept_completion_q3)",
+     "desc": "部门 Q3 完成系数",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "完成率不足 80% 时系数为 0.80，达到 80% 但不足 100% 时为 1.00，达到 100% 时为 1.10。"
+      }
+     ]
+    },
+    "emp_sales_q3": {
+     "desc": "个人 Q3 归属销售额 = SUM(所参与项目 Q3 销售额 × share)",
+     "expr": "sum(proj_sales_q3 * share, of: \"项目参与\")",
+     "scope": "个人",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "个人归属销售额 = SUM(所参与项目销售额 × share)。"
+      }
+     ]
+    },
+    "emp_receipt_q3": {
+     "desc": "个人 Q3 归属回款额：本期销售单截至 2026-09-30 到账金额按 share 归属",
+     "expr": "sum(proj_receipt_q3 * share, of: \"项目参与\")",
+     "scope": "个人",
+     "sources": [
+      {
+       "doc": "finance_answers.json",
+       "quote": "只选recognition_date在期间内的销售单，累计截至截止日到账金额。个人销售额和回款额均按share归属，先汇总再求比例"
+      }
+     ]
+    },
+    "proj_receipt_q3": {
+     "desc": "项目 Q3 销售单截至 2026-09-30 的到账金额",
+     "expr": "sum(receipt_amount, of: \"回款明细\", where: between(recognition_date, \"2026-07-01\", \"2026-09-30\") and receipt_date <= \"2026-09-30\")",
+     "scope": "项目",
+     "sources": [
+      {
+       "doc": "finance_answers.json",
+       "quote": "只选recognition_date在期间内的销售单，累计截至截止日到账金额。"
+      }
+     ]
+    },
+    "emp_cash_ratio_q3": {
+     "desc": "个人 Q3 回款比例，最高 100%，销售额为零则比例为零",
+     "expr": "min(ratio(emp_receipt_q3, emp_sales_q3, zero: 0), 1)",
+     "scope": "个人",
+     "sources": [
+      {
+       "doc": "finance_answers.json",
+       "quote": "个人销售额和回款额均按share归属，先汇总再求比例，最高100%，销售额为零则比例为零。"
+      }
+     ]
+    }
+   },
+   "pool": {
+    "expr": "round((tier(q_sales_tier, dept_eff_sales_q3) + max(dept_net_profit_q3, 0) * 0.05) * dept_completion_coef_q3, 2)",
+    "scope": "部门",
+    "desc": "季度奖金包 = ROUND((季度销售激励 + 季度利润激励) × 完成系数, 2)",
+    "sources": [
+     {
+      "doc": "01_奖金制度.docx",
+      "quote": "季度奖金包 = ROUND((销售激励 + 利润激励) × 完成系数, 2)。"
+     }
+    ]
+   },
+   "payout": [
+    {
+     "id": "cash",
+     "scope": "个人",
+     "pay_ratio": "emp_cash_ratio_q3",
+     "desc": "可发上限 = ROUND(应得 × 回款比例, 2)，暂缓 = 应得 − 可发上限",
+     "sources": [
+      {
+       "doc": "finance_answers.json",
+       "quote": "可发上限ROUND(应得乘比例,2)。季度和过程奖本次可发等于可发上限，暂缓等于应得减上限。"
+      }
+     ]
+    }
+   ],
+   "revisions": [
+    {
+     "name": "R1",
+     "adjust": [
+      {
+       "node": "小组:G01",
+       "amount": 900000,
+       "reason": "ADJ001 样例部门内小组奖金包调整"
+      }
+     ]
+    },
+    {
+     "name": "R2",
+     "adjust": [
+      {
+       "node": "小组:G01",
+       "amount": 900000,
+       "reason": "ADJ001 样例部门内小组奖金包调整"
+      },
+      {
+       "node": "个人:E001",
+       "amount": 150000,
+       "reason": "ADJ002 样例个人专项贡献调整"
+      }
+     ]
+    }
+   ]
+  },
+  "PROCESS": {
+   "pool": {
+    "desc": "部门过程奖金包 = 合格里程碑奖金合计（逐条 ROUND 到分）",
+    "expr": "sum(round(base_bonus * lookup(region_coef, region) * new_coef * tier_rate(difficulty_coef, difficulty), 2), of: \"里程碑\", where: status == \"已验收\" and between(acceptance_date, \"2026-07-01\", \"2026-09-30\"))",
+    "scope": "部门",
+    "sources": [
+     {
+      "doc": "01_奖金制度.docx",
+      "quote": "单条里程碑奖金 = ROUND(基础奖金 × 区域系数 × 新老系数 × 难度系数, 2)。部门过程奖金包为合格里程碑奖金合计。"
+     }
+    ]
+   }
+  },
+  "ANNUAL": {
+   "variables": {
+    "dept_actual_sales_fy": {
+     "desc": "部门全年实际销售额",
+     "expr": "sum(proj_sales_fy, of: \"项目\")",
+     "scope": "部门",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "实际销售额包含低毛利项目，不能用有效销售额替代。"
+      }
+     ]
+    },
+    "dept_completion_coef_fy": {
+     "desc": "部门全年完成系数",
+     "expr": "tier_rate(completion_coef, dept_completion_fy)",
+     "scope": "部门",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "完成率不足 80% 时系数为 0.80，达到 80% 但不足 100% 时为 1.00，达到 100% 时为 1.10。"
+      }
+     ]
+    },
+    "dept_completion_fy": {
+     "desc": "部门全年完成率",
+     "expr": "ratio(dept_actual_sales_fy, sum(sales_target, of: \"目标值_部门\", where: period == \"FY\"), zero: 0)",
+     "scope": "部门",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "完成率 = 部门实际销售额 ÷ 同周期部门目标。"
+      }
+     ]
+    },
+    "dept_eff_sales_fy": {
+     "desc": "部门全年有效销售额合计",
+     "expr": "sum(proj_eff_sales_fy, of: \"项目\")",
+     "scope": "部门",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "中间有效销售额保留精度，部门汇总前不按项目舍入。"
+      }
+     ]
+    },
+    "dept_net_profit_fy": {
+     "desc": "部门全年净利润（先汇总）",
+     "expr": "sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-01-01\", \"2026-12-31\")) - sum(cost_amount, of: \"销售明细\", where: between(recognition_date, \"2026-01-01\", \"2026-12-31\")) - sum(expense_amount, of: \"销售明细\", where: between(recognition_date, \"2026-01-01\", \"2026-12-31\"))",
+     "scope": "部门",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "净利润等于销售额减成本再减费用。净利润以部门合计后取不小于零的数计算利润激励"
+      }
+     ]
+    },
+    "proj_eff_sales_fy": {
+     "desc": "项目全年有效销售额（不舍入）",
+     "expr": "proj_sales_fy * lookup(region_coef, region) * new_coef * tier_rate(margin_coef, proj_margin_fy)",
+     "scope": "项目",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "有效销售额 = 期间销售额 × 区域系数 × 新老项目系数 × 毛利率系数。"
+      }
+     ]
+    },
+    "proj_margin_fy": {
+     "desc": "项目全年毛利率 = 全年毛利/全年销售额",
+     "expr": "ratio(sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-01-01\", \"2026-12-31\")) - sum(cost_amount, of: \"销售明细\", where: between(recognition_date, \"2026-01-01\", \"2026-12-31\")), sum(sales_amount, of: \"销售明细\", where: between(recognition_date, \"2026-01-01\", \"2026-12-31\")), zero: 0)",
+     "scope": "项目",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "毛利率以项目在该统计期内的合计毛利除以合计销售额计算。"
+      }
+     ]
+    },
+    "emp_cash_ratio_fy": {
+     "desc": "个人全年回款比例，最高100%，销售额为零则比例为零",
+     "expr": "min(ratio(emp_receipt_fy, emp_sales_fy, zero: 0), 1)",
+     "scope": "个人",
+     "sources": [
+      {
+       "doc": "finance_answers.json",
+       "quote": "个人销售额和回款额均按share归属，先汇总再求比例，最高100%，销售额为零则比例为零。"
+      }
+     ]
+    },
+    "emp_receipt_fy": {
+     "desc": "个人全年归属回款额：全年销售单截至 2026-12-31 到账金额按 share 归属",
+     "expr": "sum(proj_receipt_fy * share, of: \"项目参与\")",
+     "scope": "个人",
+     "sources": [
+      {
+       "doc": "finance_answers.json",
+       "quote": "年度使用全年销售单。"
+      }
+     ]
+    },
+    "emp_sales_fy": {
+     "desc": "个人全年归属销售额",
+     "expr": "sum(proj_sales_fy * share, of: \"项目参与\")",
+     "scope": "个人",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "个人归属销售额 = SUM(所参与项目销售额 × share)。"
+      }
+     ]
+    },
+    "proj_receipt_fy": {
+     "desc": "项目全年销售单截至 2026-12-31 的到账金额",
+     "expr": "sum(receipt_amount, of: \"回款明细\", where: between(recognition_date, \"2026-01-01\", \"2026-12-31\") and receipt_date <= \"2026-12-31\")",
+     "scope": "项目",
+     "sources": [
+      {
+       "doc": "finance_answers.json",
+       "quote": "只选recognition_date在期间内的销售单，累计截至截止日到账金额。"
+      }
+     ]
+    },
+    "group_weight_fy": {
+     "desc": "小组权重（全年口径）：perf_fy/100 × MIN(小组全年实际销售额/小组FY目标,1.2)，保留6位",
+     "expr": "round(perf_fy / 100 * min(ratio(sum(proj_sales_fy, of: \"项目\"), sum(sales_target, of: \"目标值_小组\", where: period == \"FY\"), zero: 0), 1.2), 6)",
+     "scope": "小组",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "小组权重 = ROUND(同周期小组绩效评分 ÷ 100 × MIN(小组实际销售额 ÷ 小组目标, 1.20), 6)。过程奖使用第三季度评分、销售额与目标。年度奖使用全年数据。"
+      }
+     ]
+    },
+    "emp_weight_fy": {
+     "desc": "个人原始权重（全年口径），六项归一化指标乘权重求和，保留6位",
+     "expr": "round(0.1 * min(years_between(join_date, \"2026-12-31\"), 5) / 5 + 0.2 * ratio(sum(contribution_score, of: \"绩效评分\", where: period == \"FY\" and approved == true), 100, zero: 0) + 0.15 * ratio(sum(difficulty * share, of: \"项目参与\"), sum(share, of: \"项目参与\"), zero: 0) / 3 + 0.3 * min(ratio(sum(proj_sales_fy * share, of: \"项目参与\"), sum(sales_target, of: \"目标值_个人\", where: period == \"FY\"), zero: 0), 1.5) / 1.5 + 0.1 * min(count_distinct(project_id, of: \"项目参与\"), 8) / 8 + 0.15 * ratio(sum(output_score, of: \"绩效评分\", where: period == \"FY\" and approved == true), 100, zero: 0), 6)",
+     "scope": "个人",
+     "sources": [
+      {
+       "doc": "01_奖金制度.docx",
+       "quote": "个人原始权重由下表各项归一化指标乘权重后求和，最后按四舍五入保留 6 位小数。"
+      }
+     ]
+    }
+   },
+   "pool": {
+    "desc": "年度应得总包 = ROUND((年度销售激励 + 年度利润激励) × 完成系数, 2)",
+    "expr": "round((tier(a_sales_tier, dept_eff_sales_fy) + max(dept_net_profit_fy, 0) * 0.05) * dept_completion_coef_fy, 2)",
+    "scope": "部门",
+    "sources": [
+     {
+      "doc": "01_奖金制度.docx",
+      "quote": "年度应得总包 = ROUND((年度销售激励 + 年度利润激励) × 完成系数, 2)。"
+     }
+    ]
+   },
+   "payout": [
+    {
+     "desc": "年度可发上限 = ROUND(年度应得 × 全年回款比例, 2)，年度暂缓 = 年度应得 − 年度可发上限",
+     "id": "cash",
+     "pay_ratio": "emp_cash_ratio_fy",
+     "scope": "个人",
+     "sources": [
+      {
+       "doc": "finance_answers.json",
+       "quote": "年度暂缓等于年度应得减年度可发上限。"
+      }
+     ]
+    }
+   ],
+   "offsets": [
+    {
+     "desc": "已发抵扣 = 本年度预付（prior_paid）+ 季度 R2 最终可发金额；R0、R1 不重复计入，过程奖独立",
+     "expr": "sum(paid_amount, of: \"历史已发\", where: annual_bonus_year == 2026) + scheme_paid(\"QUARTER\", \"R2\")",
+     "id": "prior",
+     "scope": "个人",
+     "sources": [
+      {
+       "doc": "finance_answers.json",
+       "quote": "年度在员工粒度抵扣prior_paid中的本年度预付与季度R2最终可发金额。"
+      }
+     ]
+    }
+   ],
+   "allocation": [
+    {
+     "key": "dept_id",
+     "level": "部门",
+     "parent_key": null,
+     "weight": "1"
+    },
+    {
+     "key": "group_id",
+     "level": "小组",
+     "parent_key": "dept_id",
+     "weight": "group_weight_fy"
+    },
+    {
+     "key": "employee_id",
+     "level": "个人",
+     "parent_key": "group_id",
+     "weight": "emp_weight_fy"
+    }
+   ]
+  }
+ }
+}
