@@ -371,3 +371,15 @@ def test_repeated_successful_write_is_not_kept_in_history():
     assert sum(1 for m in third if m["role"] == "assistant") == 1
     assert "没有任何变化" in third[-2]["content"] and "下一步（程序判断）" in third[-2]["content"]
     assert sum(1 for m in llm.calls[-1] if "没有任何变化" in str(m.get("content"))) == 2
+
+
+def test_same_mistake_on_different_tables_is_not_stuck():
+    """Q1：目标值表拆成部门、小组、个人三张，三张都错写了 key，各错一次，被当成“连续 3 次失败”停下。
+    原因相同还要是同一个对象才算原地打转；同一张表连错 3 次仍停下。"""
+    from bonus_agent.agent import run_agent
+    bad = lambda n: {"tool": "define_dataset", "args": {"name": n, "file": "无.xlsx", "sheet": "a",   # noqa: E731
+                                                        "fields": {"a": {"column": "b", "type": "id"}}}}
+    ar = run_agent(FakeLLM([bad("部门目标"), bad("小组目标"), bad("个人目标"), {"tool": "list_files"}]), [ANNUAL], max_steps=4)
+    assert len(ar.steps) == 4 and "卡住" not in (ar.error or "")
+    ar = run_agent(FakeLLM([bad("部门目标")] * 4), [ANNUAL], max_steps=6)
+    assert "卡住" in ar.error and len(ar.steps) == 3

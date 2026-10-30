@@ -1914,6 +1914,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 history.append({"role": "user", "content": "请调用工具继续工作；全部完成后调用 finish。"})
                 continue
         turn_start, skipped = len(history) - 1, 0     # 本轮 assistant 消息的位置；被拦下的重复调用数
+        failed_now: set[str] = set()                  # 这次回复里已经算过一次失败的工具
         said = "" if mode == "json" else (reply.get("content") or "").strip()     # 原生工具调用时模型写在正文里的思考
         for c in calls:
             args, note, dup = {}, "", False
@@ -1980,8 +1981,16 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                     step.result = result
                     skipped += 1
             # 同一工具因为同一个原因连续失败才算卡住；原因变了说明在往前改（如 finish 先后被不同的检查拦下）
-            why = re.sub(r"\d+", "", result.removeprefix("错误：").split("\n", 1)[0])[:15]
-            fails[c["name"]] = 0 if ok else (fails.get(c["name"], 0) + 1 if fail_why.get(c["name"]) == why else 1)
+            # 原因相同还要是同一个对象（如同一张表）：先后把三张表各写错一次是三个问题，不是在原地打转；
+            # 同一次回复里并排的几个调用，模型还没看到前一个的结果，只算一次
+            what = str((args or {}).get("name") or (args or {}).get("node") or (args or {}).get("scheme") or "") \
+                if isinstance(args, dict) else ""
+            why = re.sub(r"\d+", "", result.removeprefix("错误：").split("\n", 1)[0])[:15] + "|" + what
+            if ok:
+                fails[c["name"]] = 0
+            elif c["name"] not in failed_now:
+                fails[c["name"]] = fails.get(c["name"], 0) + 1 if fail_why.get(c["name"]) == why else 1
+                failed_now.add(c["name"])
             fail_why[c["name"]] = None if ok else why
             if ok and c["name"] in ("remove_dataset", "remove_facts"):     # 建了又删、删了又建：没有进展的来回改
                 what = str((args or {}).get("name", ""))
