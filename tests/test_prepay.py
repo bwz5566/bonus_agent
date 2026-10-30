@@ -66,3 +66,20 @@ def test_prepay_as_offset_fills_payout_columns_and_verifies_net_pay(tmp_path):
     assert "一致" in w.verify("个人:001", net, "本次实发 = max(应得提成 − 预发合计, 0)", amount="实发")
     assert "一致" in w.verify("个人:002", net, "本次实发 = max(应得提成 − 预发合计, 0)", amount="实发")
     assert not any("实发" in g for g in w._verify_gaps())
+
+
+def test_prepay_gate_cannot_be_ignored_or_asked_away(tmp_path):
+    """写进 ignored、或在问题里提到，都不能放过“预发扣在奖金池里”的检查；finish 必须拦下，直到改成 offsets。"""
+    w = case(tmp_path / "m")
+    w.set_rules(scheme="S", variables={**EARNED, "pay": {"scope": "个人", "expr": 'max(earned - sum(prepay_amount, of: "预发记录"), 0)'}},
+                pool={"expr": "pay", "scope": "个人"}, allocation=[{"level": "个人", "key": "emp_id"}])
+    w.trial_run()
+    w.ignored = [{"ref": "抵扣 pool", "reason": "实发已经正确"}, {"ref": "01_规则.md", "reason": "测试"}]
+    w.ask_question("pool 里直接扣预发可以吗？", ["可以", "不可以"])
+    w.questions[-1].answer = "可以"
+    assert any("直接扣减了已发" in g for g in w._open_gates(w.lint["S"]))
+    with pytest.raises(ToolError, match="直接扣减了已发"):
+        w.finish("x", ignored=[{"ref": "抵扣 pool", "reason": "实发已经正确"}], review=False)
+    w.set_rules(scheme="S", variables=EARNED, pool={"expr": "earned", "scope": "个人"}, offsets=OFFSET)
+    w.trial_run()
+    assert not w._open_gates(w.lint["S"])

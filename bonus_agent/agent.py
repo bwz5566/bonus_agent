@@ -49,6 +49,8 @@ MAX_STUCK = 3                  # 同一调用原样重复、或同一工具连�
 KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保留全文
 BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
 READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate"}
+NO_IGNORE = ("查找表 ", "抵扣 ")    # 程序检查里不能写进 ignored 放过的项
+MUST_FIX = ("抵扣 ",)              # 连提问也不能放过、只能改规则的项
 VERIFY_TOL = Decimal("0.005")   # 按份额分配时，独立算式和引擎未舍入的份额之差不超过半分，才算尾差
 WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", "remove_facts", "ask_question",
                "record_clauses", "cover_clauses",
@@ -1049,10 +1051,12 @@ class Workspace:
 
     def _open_gates(self, rep) -> list[str]:
         """还没处理的程序检查项：已写进 ignored，或已有问题提到这个取值 / 常数的，算处理过。
-        照抄数据表的查找表不能自己写进 ignored 了事（会让下一期悄悄算错），只能改规则或问财务。"""
-        skipped = {str(i.get("ref", "")) for i in self.ignored if not str(i.get("ref", "")).startswith("查找表 ")}
+        有两类不能由智能体自己放过：照抄数据表的查找表（下一期悄悄算错），只能改规则或问财务；
+        已发抵扣写进奖金池（发放表应得、抵扣、超发三列错），写进 ignored 或提问都不算，只能改成 offsets。"""
+        skipped = {str(i.get("ref", "")) for i in self.ignored if not str(i.get("ref", "")).startswith(NO_IGNORE)}
         asked = " ".join(f"{q.text} {q.answer or ''}" for q in self.questions)
-        return [g for g, k in zip(rep.gates, rep.keys) if k not in skipped and k.split(" ", 1)[1] not in asked]
+        return [g for g, k in zip(rep.gates, rep.keys)
+                if k.startswith(MUST_FIX) or (k not in skipped and k.split(" ", 1)[1] not in asked)]
 
     def _period_mismatch(self, name: str) -> str:
         """奖金池和分配权重用的统计期间（日期、period == "Q3" 这类取值）对不上时给出提示，常见于把按季度算的权重放在共用部分、
