@@ -2077,7 +2077,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         ar.outputs = write_agent_outputs(ar, out, answers)
         rnd["inputs"] = [str(f) for f in ws.data_files]
         rnd["outputs"] = {k: [p.name, cs.sha256(p)] for k, p in ar.outputs.items()
-                          if k == "mapping" or k == "rules" or k.startswith(("rules:", "adjust:"))}
+                          if k in ("mapping", "rules", "review") or k.startswith(("rules:", "adjust:"))}
         if message:
             rnd["message"] = {"by": ws.chat_by, "text": message}
         rnd.update(status=ar.status, error=error, pending=[q.id for q in ws.pending], summary=ws.summary,
@@ -2177,8 +2177,9 @@ def _lessons(error: str) -> list[str]:
 # ---------------- 输出 ----------------
 def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None = None) -> dict[str, Path]:
     out.mkdir(parents=True, exist_ok=True)
+    from bonus_agent import review as rv
     for old in [*out.glob("result*.xlsx"), *out.glob("rules*.yaml"), *out.glob("adjust_*.yaml"),
-                out / "待确认问题.xlsx", out / "expected_check.txt"]:
+                out / "待确认问题.xlsx", out / "expected_check.txt", out / rv.FILE]:
         old.unlink(missing_ok=True)       # 上一轮的输出已存档在 history/，不能留在顶层被误用
     ws, paths = ar.ws, {}
     if ws.mapping:
@@ -2224,6 +2225,7 @@ def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None =
             paths["pending"] = out / "待确认问题.xlsx"
             wb.save(paths["pending"])
         return paths
+    paths["review"] = rv.write(ws, out, ar.results)  # 口径单：财务逐条确认后才能确认结果（确认记录按内容保留，见 review.py）
     paths["results"] = out / "results.json"      # 全部金额的明细（应得、暂缓、抵扣、超发、实发），便于程序逐分核对
     paths["results"].write_text(json.dumps(_results_json(ar.results), ensure_ascii=False, indent=1), encoding="utf-8")
     ar.recheck = "；".join(_recheck(ar, paths, name, rev) for name, revs in ar.results.items() for rev in revs)
@@ -2365,6 +2367,9 @@ def _sheets(ar: AgentResult, qrows: list[dict]):
     if ar.compared:
         out.append(("与上一轮对比", ["方案", "修订", "对象", "名称", "上一轮应得", "本轮应得", "差额", "上一轮实发", "本轮实发"],
                     ar.diff_rows or [["（所有对象金额与上一轮相同）"]], {"对象": 16, "名称": 14}))
+    if ar.results:
+        from bonus_agent import review as rv
+        out.append(rv.sheet(rows=rv.build(ws, ar.results)))
     return out + [
             ("智能体规划", ["项目", "内容"], plan, {"项目": 22, "内容": 100}),
             ("智能体工作记录", ["步骤", "工具", "参数", "结果"], log, {"参数": 60, "结果": 90})]

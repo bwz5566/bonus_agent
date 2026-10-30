@@ -34,6 +34,7 @@ from urllib.parse import quote
 import yaml
 
 from bonus_agent import case as cs
+from bonus_agent import review as rv
 from bonus_agent.failure import explain as explain_failure, retryable, to_text
 from bonus_agent.parsing.docs import PARSERS
 
@@ -301,6 +302,10 @@ def output_kind(name: str) -> tuple[str, str]:
         return OUT_GROUPS[0], "奖金结果（有多个方案时是总览）"
     if name.startswith("result_") and name.endswith(".xlsx"):
         return OUT_GROUPS[0], f"方案 {name[7:-5]} 的逐人结果和计算过程"
+    if name == "口径单.json":
+        return OUT_GROUPS[0], "口径单：规则逐条翻译成大白话，在本页「口径单」里逐条确认"
+    if name == "口径确认.json":
+        return OUT_GROUPS[1], "口径单的确认记录（谁、何时、确认或有误）"
     if name.startswith("待确认问题"):
         return OUT_GROUPS[0], "需要你答复的问题"
     if name.startswith("rules"):
@@ -432,6 +437,47 @@ def files_table(base: Path, href: str, csrf: str | None = None, delete: str | No
         rows.append(f"<tr><td><a href='{e(href)}/{e(rel)}'>{e(rel)}</a></td><td class='mut'>{p.stat().st_size:,} 字节</td>"
                     f"<td class='mut'>{datetime.fromtimestamp(p.stat().st_mtime).strftime('%Y-%m-%d %H:%M')}</td><td>{act}</td></tr>")
     return "<div class='wrap'><table>" + "".join(rows) + "</table></div>"
+
+
+def review_section(cid: str, out: Path, csrf: str, can_mark: bool) -> str:
+    """口径单：按方案、类别分组，每行可确认或标有误；可疑的行（程序检查标出的）不随整节确认。"""
+    rows, marks = rv.load(out), rv.load_marks(out)
+    st = rv.status(out)
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for r in rows:
+        groups.setdefault((r["scheme"], r["section"]), []).append(r)
+    blocks = []
+    for (scheme, section), rs in groups.items():
+        items, todo = [], 0
+        for r in rs:
+            mk = marks.get(r["key"], {})
+            state = mk.get("status")
+            todo += state != rv.OK
+            badge = (f"<span class='ok'>已确认（{e(mk.get('by'))}）</span>" if state == rv.OK else
+                     f"<span class='bad'>有误：{e(mk.get('note'))}（{e(mk.get('by'))}）"
+                     + ("，已交给智能体" if mk.get("sent") else "") + "</span>" if state == rv.WRONG else
+                     "<span class='warn'>待确认</span>")
+            ctl = (f"<div><label class='opt'><input type='radio' name='st_{r['key']}' value='{rv.OK}'> 确认</label>"
+                   f"<label class='opt'><input type='radio' name='st_{r['key']}' value='{rv.WRONG}'> 有误</label>"
+                   f"<input type='text' name='note_{r['key']}' placeholder='有误时写明哪里不对'></div>") if can_mark else ""
+            items.append(f"<div class='q'><b>{e(r['id'])}</b> {e(r['item'])} {badge}"
+                         + (f"<div class='bad'>需要重点看：{e(r['flag'])}</div>" if r["flag"] else "")
+                         + f"<pre>{e(r['reading'])}</pre>"
+                         + (f"<div class='mut'>代入示例：{e(r['example'])}</div>" if r["example"] else "")
+                         + (f"<details><summary class='mut'>材料原文</summary><pre>{e(r['source'])}</pre></details>"
+                            if r["source"] else "<div class='mut'>没有对应的材料原文，请核对依据</div>")
+                         + ctl + "</div>")
+        bulk = (f"<p><button name='bulk' value='{e(scheme)}|{e(section)}'>本节其余全部确认</button> "
+                "<span class='mut'>标了“需要重点看”的行不会随整节确认</span></p>") if can_mark and todo else ""
+        blocks.append(f"<details{' open' if todo else ''}><summary>{e(scheme)} · {e(section)}（{len(rs)} 行，"
+                      f"{'待确认 ' + str(todo) + ' 行' if todo else '已全部确认'}）</summary>{''.join(items)}{bulk}</details>")
+    head = (f"<p>规则逐条翻译成的大白话（程序按规则机械翻译，和实际计算一致）。已确认 {st['confirmed']} / {st['total']} 行"
+            + (f"，<span class='bad'>{len(st['wrong'])} 行有误</span>" if st["wrong"] else "") + "。"
+            "看“程序的理解”是否符合制度；有误的写明哪里不对，点“运行下一轮”交给智能体改正。规则改动后，内容变了的行要重新确认。</p>")
+    body = "".join(blocks)
+    if can_mark:
+        body = form(f"/cases/{cid}/review", body + "<p><button>保存确认</button></p>", csrf)
+    return f"<section><h2>口径单</h2>{head}{body}</section>"
 
 
 def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_parallel: int = 2, model_name: str = "",
@@ -641,6 +687,9 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
                 body = form(f"/cases/{cid}/answers", body + "<p><button>保存答复</button> "
                                                            "<span class='mut'>保存后点“运行下一轮”</span></p>", csrf)
             parts.append(f"<section><h2>问题</h2>{body}</section>")
+        # 口径单
+        if (out / rv.FILE).exists():
+            parts.append(review_section(cid, out, csrf, approver and not busy))
         # 结果
         top = [p for p in sorted(out.glob("*")) if p.is_file() and p.name != cs.CASE_FILE]
         groups: dict[str, list[str]] = {}
@@ -664,7 +713,11 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         if approver and not busy and last.get("status") == "OK" and not last.get("confirmed"):
             cbody += form(f"/cases/{cid}/confirm", "<p><input type='text' name='note' placeholder='确认说明（可选）'></p>"
                                                    f"<p><button>确认第 {e(last['n'])} 轮结果并冻结为模板</button></p>", csrf)
-        cbody += "<p class='mut'>确认前会核对输出文件没被改过，并按模板复算、与该轮结果逐分一致。确认后每期换数据直接按模板计算，不再调用大模型。</p>"
+        if (out / rv.FILE).exists():
+            st = rv.status(out)
+            cbody += (f"<p class='{'ok' if not st['pending'] else 'warn'}'>口径单：已确认 {st['confirmed']} / {st['total']} 行"
+                      + (f"，{len(st['wrong'])} 行有误" if st["wrong"] else "") + "（全部确认后才能确认结果）</p>")
+        cbody += "<p class='mut'>确认前会核对口径单已逐条确认、输出文件没被改过，并按模板复算、与该轮结果逐分一致。确认后每期换数据直接按模板计算，不再调用大模型。</p>"
         parts.append(f"<section><h2>确认</h2>{cbody}</section>")
         if (out / "template" / "manifest.yaml").exists():
             tbody = form(f"/cases/{cid}/template", "<p><input type='file' name='files' multiple> <button>按模板计算</button></p>",
@@ -757,6 +810,31 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             store.audit(cid, u["display"], "答复问题", question=qid, answer=q["answer"])
         return back(cid, f"已保存 {len(done)} 个答复，点“运行下一轮”继续" if done else "没有新的答复")
 
+    @app.post("/cases/{cid}/review")
+    async def review_marks(cid: str, request: Request, u: dict = Depends(user)):
+        need(u, "approver")
+        d = case_dir(cid)
+        idle(cid)
+        f = await posted(request, u)
+        out = d / "out"
+        rows = rv.load(out)
+        decisions = {r["key"]: (str(f.get(f"st_{r['key']}")), str(f.get(f"note_{r['key']}", "")))
+                     for r in rows if f.get(f"st_{r['key']}") in (rv.OK, rv.WRONG)}
+        bulk = str(f.get("bulk", ""))
+        if bulk:                      # 整节确认：可疑的行（程序检查标出的）不随整节确认，要单独确认
+            marks = rv.load_marks(out)
+            for r in rows:
+                if f"{r['scheme']}|{r['section']}" == bulk and not r["flag"] and r["key"] not in decisions \
+                        and marks.get(r["key"], {}).get("status") != rv.WRONG:
+                    decisions[r["key"]] = (rv.OK, "")
+        errs = rv.mark(out, decisions, u["display"])
+        n_ok = sum(1 for st, _ in decisions.values() if st == rv.OK)
+        n_bad = sum(1 for st, _ in decisions.values() if st == rv.WRONG) - len(errs)
+        if decisions:
+            store.audit(cid, u["display"], "口径单确认", confirmed=n_ok, wrong=n_bad, section=bulk or "")
+        return back(cid, "；".join(errs) if errs else f"已记录：确认 {n_ok} 行" + (f"，有误 {n_bad} 行（点“运行下一轮”交给智能体改正）"
+                                                                            if n_bad else ""))
+
     @app.post("/cases/{cid}/run")
     async def run(cid: str, request: Request, u: dict = Depends(user)):
         need(u, "editor")
@@ -764,7 +842,13 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         f = await posted(request, u)
         if not any((d / "materials").iterdir()):
             return back(cid, "还没有材料，请先上传")
+        fix = rv.instruction(d / "out") if f.get("new") != "1" else ""
         try:
+            if fix:                   # 口径单上标了有误：作为修改要求交给智能体，改完重新试算
+                store.chat_add(cid, "user", u["display"], fix)
+                runner.start(cid, u["display"], message=fix)
+                rv.mark_sent(d / "out")
+                return back(cid)
             runner.start(cid, u["display"], new=f.get("new") == "1")
         except RuntimeError as err:
             raise HTTPException(409, str(err)) from None

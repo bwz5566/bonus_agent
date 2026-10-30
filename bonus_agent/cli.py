@@ -9,7 +9,7 @@
                                            --out 是案卷目录：有问题时本轮停下等答复；在 questions.yaml 填答复、
                                            补充材料后用同一个目录再运行，从上一轮接着做（--new 从头开始）
                                            （--pipeline 改用固定流程：规划 → 抽取 → 计算）
-  confirm --out 案卷目录 --by 确认人 [--note 说明] [数据文件...]
+  confirm --out 案卷目录 --by 确认人 [--note 说明] [--no-review] [数据文件...]
                                            财务确认最新一轮结果：复算核对后把规则、映射和调整冻结为 案卷目录/template/，
                                            以后每期用 bonus run-template 计算，不再调用大模型
   negcheck --out 案卷目录 --cases negative_cases.json [--sheet 表名=工作表 ...] 材料...
@@ -60,6 +60,7 @@ def main(argv=None) -> int:
     p.add_argument("--out", required=True, help="案卷目录")
     p.add_argument("--by", required=True, help="确认人")
     p.add_argument("--note", default="", help="确认说明")
+    p.add_argument("--no-review", action="store_true", help="口径单（口径单.json）已在线下逐条核对，不检查网页上的确认记录")
     p.add_argument("data", nargs="*", help="复算用的数据文件（默认用该轮的输入文件）")
     p = sub.add_parser("negcheck")
     p.add_argument("--out", required=True, help="案卷目录（读其中 case.json 的规则）")
@@ -196,7 +197,7 @@ def main(argv=None) -> int:
     if a.cmd == "confirm":
         from bonus_agent.case import ConfirmError, confirm
         try:
-            tpl = confirm(Path(a.out), a.by, a.note, [Path(x) for x in a.data] or None)
+            tpl = confirm(Path(a.out), a.by, a.note, [Path(x) for x in a.data] or None, review=not a.no_review)
         except ConfirmError as e:
             print(f"不能确认：{e}")
             return 1

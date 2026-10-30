@@ -89,8 +89,24 @@ def test_web_rounds_confirm_and_template(env):
     assert "已出结果" in job.message, job.message
     page = c.get(f"/cases/{cid}").text
     assert "result.xlsx" in page and "第 2 轮" in page
-    # 只有 approver 能确认
+    # 只有 approver 能确认；口径单逐条确认之前不能确认结果
     assert post(c, store, f"/cases/{cid}/confirm").status_code == 403
+    r = post(c, store, f"/cases/{cid}/confirm", {"note": "已核对"}, user="bob")
+    assert "口径单还有" in c.get(r.headers["location"]).text
+    from bonus_agent import review as rv
+    out = store.dir(cid) / "out"
+    rows = rv.load(out)
+    assert rows and "口径单" in c.get(f"/cases/{cid}").text
+    assert post(c, store, f"/cases/{cid}/review", {f"st_{rows[0]['key']}": rv.OK}).status_code == 403   # 只有 approver 能标
+    r = post(c, store, f"/cases/{cid}/review", {f"st_{rows[0]['key']}": rv.WRONG}, user="bob")
+    assert "请写明哪里不对" in c.get(r.headers["location"]).text and rv.status(out)["confirmed"] == 0
+    for sec in dict.fromkeys(f"{x['scheme']}|{x['section']}" for x in rows):       # 整节确认，可疑行单独确认
+        post(c, store, f"/cases/{cid}/review", {"bulk": sec}, user="bob")
+    flagged = [x for x in rows if x["flag"]]
+    assert rv.status(out)["confirmed"] == len(rows) - len(flagged)
+    post(c, store, f"/cases/{cid}/review", {f"st_{x['key']}": rv.OK for x in flagged}, user="bob")
+    assert rv.status(out)["pending"] == []
+    assert any(a["action"] == "口径单确认" for a in store.audit_log(cid))
     r = post(c, store, f"/cases/{cid}/confirm", {"note": "已核对"}, user="bob")
     assert "已确认" in c.get(r.headers["location"]).text
     assert (store.dir(cid) / "out" / "template" / "manifest.yaml").exists()

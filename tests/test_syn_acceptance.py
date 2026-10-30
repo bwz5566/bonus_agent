@@ -224,6 +224,10 @@ def test_confirm_freezes_template_and_runs_without_llm(tmp_path):
     with pytest.raises(ConfirmError, match="rules_ANNUAL.yaml"):
         confirm(out, "财务甲")
     rules.write_text(text, encoding="utf-8")
+    from bonus_agent import review as rv
+    with pytest.raises(ConfirmError, match="口径单还有"):          # 口径单逐条确认之前不能确认结果
+        confirm(out, "财务甲")
+    rv.mark(out, {r["key"]: (rv.OK, "") for r in rv.load(out)}, "财务甲")
     tpl = confirm(out, "财务甲", "Q3 验收")
     m = yaml.safe_load((tpl / "manifest.yaml").read_text(encoding="utf-8"))
     order = [s["name"] for s in m["schemes"]]

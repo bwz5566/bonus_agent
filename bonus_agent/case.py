@@ -190,10 +190,11 @@ class ConfirmError(ValueError):
     pass
 
 
-def confirm(out: Path, by: str, note: str = "", data: list[Path] | None = None) -> Path:
-    """财务确认最新一轮：核对输出文件没被改过、按这些文件复算与该轮结果逐分一致，然后冻结成 template/。
+def confirm(out: Path, by: str, note: str = "", data: list[Path] | None = None, review: bool = True) -> Path:
+    """财务确认最新一轮：核对口径单已逐条确认、输出文件没被改过、按这些文件复算与该轮结果逐分一致，然后冻结成 template/。
 
     只能确认最新的一轮，且该轮已出结果（状态 OK）。返回模板目录。
+    review=False：口径单已在线下核对（命令行确认时用 --no-review 明确说明）。
     """
     import yaml
 
@@ -214,6 +215,16 @@ def confirm(out: Path, by: str, note: str = "", data: list[Path] | None = None) 
     if changed:
         raise ConfirmError(f"这些文件在第 {rnd['n']} 轮输出之后被改过或删除：{'、'.join(changed)}。"
                            "改规则请走一轮智能体处理，不要直接改文件")
+    if review and "review" in outs:
+        from bonus_agent import review as rv
+        st = rv.status(out)
+        if st["wrong"]:
+            raise ConfirmError(f"口径单有 {len(st['wrong'])} 行标了有误（{'、'.join(r['id'] for r in st['wrong'][:10])}），"
+                               "先让智能体改正（运行下一轮），改完重新确认这些行")
+        if st["pending"]:
+            raise ConfirmError(f"口径单还有 {len(st['pending'])} / {st['total']} 行没确认"
+                               f"（{'、'.join(r['id'] for r in st['pending'][:10])}{'……' if len(st['pending']) > 10 else ''}），"
+                               "逐条确认后才能确认结果")
     # 方案、规则文件和修订
     rules = {k: v[0] for k, v in outs.items() if k == "rules" or k.startswith("rules:")}
     names = {("默认" if k == "rules" else k.split(":", 1)[1]): f for k, f in rules.items()}
