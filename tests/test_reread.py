@@ -53,6 +53,15 @@ def test_ambiguous_tier_is_not_compared():
     assert d == {}                      # 两张表都有 0.02、0.03 又都不完全一样：认不准，不比
 
 
+def test_partial_rate_overlap_is_not_compared():
+    """复读把另一个系数（如按耗时取的时效系数 1.10、0.80）写成分档，恰好和规则里某张表的几档比例相同：档数不同，不是同一张表。"""
+    drafts = json.loads(json.dumps(DRAFTS))
+    drafts["共用"]["tables"]["Q"] = {"kind": "tier", "steps": [[0, 0], [75, 0.8], [85, 1], [95, 1.1]]}
+    d = dict(rr.compare(_ws(drafts), {"items": [{"name": "时效系数", "tiers": [{"input": "耗时，分钟", "cutoffs": [0, 30],
+                                                                            "rates": [1.1, 0.8]}]}], "error": ""}))
+    assert d == {}
+
+
 def test_material_has_headers_not_rows(tmp_path):
     ws = _ws(DRAFTS, [(2, ["A1", 123456.78, 60, 10, "已审批", "2026-07-03"])])
     ws.read_document = lambda *a, **k: ""

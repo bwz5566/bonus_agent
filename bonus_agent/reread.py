@@ -269,13 +269,13 @@ def compare(ws, rr: dict) -> list[tuple[str, str]]:
             if not rates or not cuts:
                 continue
             mine = [r for r in rates if r != 0]
-            cand = {}
-            for tname, spec in rules.tiers.items():           # 各档比例对得上，才是同一张分档表
+            # 各档比例一一对得上（档数相同），才认定是同一张分档表。只对上其中几档时不比：
+            # 1.10、0.80 这类常见系数在不同的表里都会出现（如时效系数和质量系数），硬比只会误报
+            pick = []
+            for tname, spec in rules.tiers.items():
                 theirs = [r for r in (_dec(r) for _, r in spec.get("steps") or []) if r not in (None, 0)]
-                if len(mine) >= 2 and all(_near(r, theirs) for r in mine):
-                    cand[tname] = len(theirs) == len(mine)
-            exact = [n for n, same in cand.items() if same]
-            pick = exact or (list(cand) if len(cand) == 1 else [])      # 对得上好几张又都不完全一样：认不准是哪张，不比
+                if len(mine) >= 2 and len(theirs) == len(mine) and all(_near(r, theirs) for r in mine):
+                    pick.append(tname)
             for tname in pick:
                 steps = rules.tiers[tname].get("steps") or []
                 lows = sorted(x for x in (_dec(lo) for lo, _ in steps) if x is not None)
