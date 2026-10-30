@@ -84,6 +84,11 @@ def test_unused_money_field_and_tier_scale_are_gated(tmp_path):
     near = {"contrib_tier": {"n": 6, "min": Decimal("20000"), "max": Decimal("90000"), "bands": {0: 6}}}
     rep = lint.check(rs, data, "", tiers=near)
     assert not [g for g in rep.gates if "分档表" in g] and any("分档表 contrib_tier" in w for w in rep.warns)
+    # 传入很多个值、表有三档以上却全部落在同一档（Q1：毛利率写成成本率，216 个值全落在最高档）：要处理
+    many = {"contrib_tier": {"n": 30, "min": Decimal("20000"), "max": Decimal("90000"), "bands": {0: 30}}}
+    if len(rs.tables["contrib_tier"].steps) >= 3:
+        rep = lint.check(rs, data, "", tiers=many)
+        assert any("contrib_tier" in g and "传错了数" in g for g in rep.gates) and "分档 contrib_tier" in rep.keys
 
 
 def test_engine_records_tier_inputs(tmp_path):
