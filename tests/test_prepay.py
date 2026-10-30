@@ -63,7 +63,7 @@ def test_prepay_as_offset_fills_payout_columns_and_verifies_net_pay(tmp_path):
     net = 'max(round(sum(amount, of: "订单") * 10%, 2) - sum(prepay_amount, of: "预发记录"), 0)'
     with pytest.raises(ToolError, match="实发对不上") as e:
         w.verify("个人:001", 'round(sum(amount, of: "订单") * 10%, 2)', "本次实发 = max(应得提成 − 预发合计, 0)", amount="实发")
-    assert "引擎：应得 400，暂缓 0，可发上限 400，已发抵扣 150，实发 250" in str(e.value)     # 引擎一侧的数摆出来逐项对照
+    assert "引擎：应得 400，暂缓 0，可发上限 400，已发抵扣 150（实际抵扣 150，超发待核对 0），实发 250" in str(e.value)     # 引擎一侧的数摆出来逐项对照
     assert "一致" in w.verify("个人:001", net, "本次实发 = max(应得提成 − 预发合计, 0)", amount="实发")
     assert "一致" in w.verify("个人:002", net, "本次实发 = max(应得提成 − 预发合计, 0)", amount="实发")
     assert not any("实发" in g for g in w._verify_gaps())
@@ -106,4 +106,5 @@ def test_results_json_has_every_payout_column(tmp_path):
     w.trial_run()
     j = _results_json(w.results)["S"]["R0"]
     assert j["对象"]["个人:002"] == {"层级": "个人", "名称": j["对象"]["个人:002"]["名称"], "应得": "136.00", "暂缓": "0.00",
-                                   "可发上限": "136.00", "已发抵扣": "136.00", "超发待核对": "14.00", "实发": "0.00"}
+                                   "可发上限": "136.00", "已发抵扣": "150.00", "实际抵扣": "136.00", "超发待核对": "14.00",
+                                   "实发": "0.00"}

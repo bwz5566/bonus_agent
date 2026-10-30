@@ -66,7 +66,8 @@ def detect_sheet(ws, file: str) -> SheetTable | None:
     best, best_score = None, 0.0
     for i, row in enumerate(grid[:SCAN_ROWS]):
         n = _filled(row)
-        if n < 2:
+        # 合并单元格展开的标题行（如跨整表的表名、说明）所有格子是同一个值，不是表头
+        if n < 2 or len({str(v).strip() for v in row if v not in (None, "")}) < 2:
             continue
         text = sum(1 for v in row if _is_text(v)) / n
         nxt = next((r for r in grid[i + 1:i + 4] if _filled(r) >= 2), None)

@@ -98,6 +98,8 @@ class Evaluator:
         # 独立验算用：对本层或上层的实体表聚合（如在个人层对「员工」表、在小组层对「小组」表求和）时，按上一层的范围取同级，
         # 配合 where 就能算“同部门各小组合计”；share(上层变量) 按变量所在的层取同级。正式计算不开，规则语义不变
         self.peer_scope = False
+        # 分档表的实际取值分布：表名 -> {n, min, max, bands: {档位序号: 次数}}，程序检查用来发现传入值和分档点量纲不一致
+        self.tier_stats: dict[str, dict] = {}
         self.layout = Layout(rs)
         # 只能在聚合里使用的字段 -> 所在的明细表/公司级表（不含主键/关联键）
         self.detail_fields = self.layout.row_only
@@ -308,6 +310,7 @@ class Evaluator:
                 raise EvalError(f"{fn} 的第一个参数必须是阶梯表，得到 {t.text}", ctx.where)
             xv = self._num(x, ctx.where)
             r = tier_amount(t.v, xv) if fn == "tier" else tier_rate(t.v, xv)
+            self._tier_seen(c.args[0], t, xv)
             return Val(r, f"{fn}({t.text}, {x.text})", x.deps, x.rows)
         if fn == "lookup":
             t, k = self.ev(c.args[0], ctx), self.ev(c.args[1], ctx)
@@ -383,6 +386,14 @@ class Evaluator:
             return Val(r, f"{fn}({a.text})", a.deps, a.rows)
         raise EvalError(f"不支持的函数 {fn}", ctx.where)
 
+    def _tier_seen(self, arg, t: Val, x: Decimal) -> None:
+        name = getattr(arg, "id", None) or t.text
+        st = self.tier_stats.setdefault(name, {"n": 0, "min": x, "max": x, "bands": {}})
+        st["n"] += 1
+        st["min"], st["max"] = min(st["min"], x), max(st["max"], x)
+        b = tier_band(t.v, x)
+        st["bands"][b] = st["bands"].get(b, 0) + 1
+
     def _aggregate(self, c: Call, ctx: Ctx) -> Val:
         kw = c.kw()
         ds = self._agg_dataset(c, ctx)
@@ -399,7 +410,8 @@ class Evaluator:
             if aux:
                 return Ctx(self._row_node[id(r)], r, ctx.where)
             home = self._home.get(id(r))
-            return Ctx(home if home is not None and node in home.chain() else node, r, ctx.where)
+            # 在关联实体上（如人员）汇总分配层级的明细（如它参与的各项目分配记录）：行也在所属的层级对象上求值，才能用到层级变量
+            return Ctx(home if home is not None and (node.aux or node in home.chain()) else node, r, ctx.where)
         if "where" in kw:
             cond = kw["where"]
             rows = [r for r in rows if self._bool(self.ev(cond, rctx(r)), ctx)]
@@ -488,6 +500,15 @@ def _paren(ast, text: str, parent_op: str, right: bool) -> str:
     if c < p or (right and c == p and parent_op in "-/"):
         return f"({text})"
     return text
+
+
+def tier_band(t: TierTable, x: Decimal) -> int:
+    """x 落在第几档（从 0 起），低于第一档的下限为 -1。"""
+    band = -1
+    for i, (lo, _) in enumerate(t.steps):
+        if x > lo or (t.lower_inclusive and x == lo):
+            band = i
+    return band
 
 
 def tier_rate(t: TierTable, x: Decimal) -> Decimal:

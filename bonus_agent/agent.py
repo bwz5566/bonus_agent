@@ -1065,8 +1065,10 @@ class Workspace:
         if warns:
             lines.append("数据提示：\n" + "\n".join(f"- {w}" for w in warns[:8]))
         heads = {f"{n}.{f}": f"{m.sheet or ''} {c}" for n, m in self.mapping.items() for f, c in m.columns.items()}
+        others = {w for k, d in self.drafts.items() if k != name
+                  for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", json.dumps(d, ensure_ascii=False))}
         rep = self.lint[name] = lint.check(rs, data, self._rule_text(), base.traces, sourced=self._sources_readable(),
-                                           headers=heads)
+                                           headers=heads, tiers=base.tier_stats, used_elsewhere=others)
         if rep.warns:
             lines.append("程序检查提示：\n" + "\n".join(f"- {w}" for w in rep.warns[:8]))
         gates = self._open_gates(rep)
@@ -1158,12 +1160,16 @@ class Workspace:
         name = self._scheme(scheme) if self.schemes else self._scheme(None, for_write=True)
         if not self._merged(name).get("allocation"):
             raise ToolError("需要先用 set_rules 设定 allocation（pool 可以先写 0）")
-        v, rendered = self._probe(name, expr, node)
+        # 验算时定义过的辅助变量在 evaluate 里也能用（规则里同名的变量优先），按正式规则的语义计算
+        rule_vars = set((self._merged(name).get("variables") or {}))
+        extra = {k: v for k, v in _used_helpers(expr, self.check_vars).items() if k not in rule_vars}
+        v, rendered = self._probe(name, expr, node, extra=extra or None)
         return f"{expr} = {rendered} = {fmt(v)}"
 
-    def _probe(self, name: str, expr: str, node: str, helpers: dict | None = None):
+    def _probe(self, name: str, expr: str, node: str, helpers: dict | None = None, extra: dict | None = None):
         """在方案的数据上（已应用数据修订、带上引用的其他方案结果）对某个节点计算表达式，和正式计算用同样的数据。
-        helpers：独立验算自己定义的辅助变量 {名字: {scope, expr}}，给出时只认这些变量，不带规则里的变量。"""
+        helpers：独立验算自己定义的辅助变量 {名字: {scope, expr}}，给出时只认这些变量，不带规则里的变量。
+        extra：evaluate 用到的已保存辅助变量，加在规则变量旁边，语义和正式计算一样。"""
         key = id(self.results.get(name))           # 试算结果没变时规则和数据也没变，不必重读文件
         hit = self._probe_cache.get(name)
         if hit and hit[0] == key and name in self.results and name not in self.untested:
@@ -1180,6 +1186,13 @@ class Workspace:
                 raise ToolError(f"辅助变量写法不对：{e}") from None
             hv = {k: v.model_copy(update={"scope": _helper_scope(rs, k, v.scope)}) for k, v in hv.items()}
             rs = rs.model_copy(update={"variables": hv})
+        elif extra:
+            try:
+                ev_ = {k: Variable.model_validate(v) for k, v in extra.items()}
+                ev_ = {k: v.model_copy(update={"scope": _helper_scope(rs, k, v.scope)}) for k, v in ev_.items()}
+            except (ValueError, ToolError):
+                ev_ = {}
+            rs = rs.model_copy(update={"variables": {**rs.variables, **ev_}})
         root, by_level, issues = build_tree(rs, data)
         blocking = [i for i in patched + issues if i.severity == "blocking"]
         if blocking:
@@ -1310,7 +1323,8 @@ class Workspace:
             r = next((r for r in res.payout_rows() if r.node_id == node), None)
             if r is not None:
                 parts.append(f"引擎：应得 {fmt(Decimal(r.final))}，暂缓 {fmt(Decimal(r.held))}，可发上限 {fmt(Decimal(r.cap or r.final))}，"
-                             f"已发抵扣 {fmt(Decimal(r.deducted))}，实发 {fmt(Decimal(r.paid))}"
+                             f"已发抵扣 {fmt(Decimal(r.offset))}（实际抵扣 {fmt(Decimal(r.deducted))}，超发待核对 {fmt(Decimal(r.overpaid))}），"
+                             f"实发 {fmt(Decimal(r.paid))}"
                              "（实发对不上时先单独核对应得，再核对比例、暂缓和抵扣）")
         parts = [p for p in parts if p]
         return ("；".join(parts) + "。") if parts else ""
@@ -2233,7 +2247,8 @@ def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None =
 
 
 def _results_json(results: dict) -> dict:
-    """方案 -> 修订 -> {奖金池, 对象: {层级, 名称, 应得, [暂缓, 可发上限, 已发抵扣, 超发待核对, 实发]}}；有按人汇总的抵扣时实发取汇总行。"""
+    """方案 -> 修订 -> {奖金池, 对象: {层级, 名称, 应得, [暂缓, 可发上限, 已发抵扣, 实际抵扣, 超发待核对, 实发]}}；有按人汇总的抵扣时实发取汇总行。
+    已发抵扣是已发（预发）全额，和 Excel 发放表同一口径；实际抵扣 = MIN(可发上限, 已发抵扣)，超发待核对 = 已发抵扣 − 实际抵扣。"""
     out = {}
     for s, revs in results.items():
         for rev, r in revs.items():
@@ -2243,8 +2258,8 @@ def _results_json(results: dict) -> dict:
                     objs[nid] = {"层级": n.level, "名称": n.label, "应得": n.final}
             for nid, p in {**r.payouts, **r.rollups}.items():
                 objs.setdefault(nid, {"名称": getattr(p, "label", ""), "应得": p.final})
-                objs[nid].update({"暂缓": p.held, "可发上限": p.cap or p.final, "已发抵扣": p.deducted,
-                                  "超发待核对": p.overpaid, "实发": p.paid})
+                objs[nid].update({"暂缓": p.held, "可发上限": p.cap or p.final, "已发抵扣": p.offset,
+                                  "实际抵扣": p.deducted, "超发待核对": p.overpaid, "实发": p.paid})
             out.setdefault(s, {})[rev] = {"奖金池": r.pool, "对象": objs}
     return out
 

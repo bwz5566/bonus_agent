@@ -100,6 +100,7 @@ class Result:
     data_hash: str = ""         # 只含规则和数据；input_hash 另含人工调整和引用的其他方案结果
     rollups: dict[str, RollupResult] = field(default_factory=dict)
     inputs: dict[str, dict[str, object]] = field(default_factory=dict)   # 过程复核表的取数：节点 -> {字段或变量: 引擎值}
+    tier_stats: dict[str, dict] = field(default_factory=dict)            # 分档表实际取值分布（程序检查用，不进输出）
 
     def payout_rows(self) -> list:
         """发放的最终口径：有按实体汇总的抵扣时用汇总行，否则用最末层。"""
@@ -113,6 +114,7 @@ class Result:
 
     def to_dict(self) -> dict:
         d = asdict(self)
+        d.pop("tier_stats", None)
         return json.loads(json.dumps(d, default=str, ensure_ascii=False))
 
 
@@ -265,7 +267,7 @@ class Engine:
             input_hash=run_hash(self.hash, active, self.refs), data_hash=self.hash, pool_exact=str(self.pool_exact), pool=str(self.root.final),
             levels=[lv.level for lv in self.rs.allocation], nodes=nodes, payouts=payouts,
             traces=dict(self.ev.traces), adjustments=adjustments, issues=list(self.issues), rollups=rollups,
-            inputs=self._sheet_inputs(),
+            inputs=self._sheet_inputs(), tier_stats=dict(self.ev.tier_stats),
         )
 
     def _sheet_inputs(self) -> dict[str, dict[str, object]]:

@@ -5,6 +5,8 @@
 - 出处：规则里的每个常数（系数、比例、阈值、单价）都要在材料、财务的话或答复里找得到；
 - 取值：规则里和字段比较的文字（如 review == "通过"）要在数据或材料里出现，防止写错取值导致整批被筛掉；
 - 未提及的取值：数据里出现了材料和规则都没提到的取值（如工单状态“挂起”），规则会把它悄悄当成不满足条件，要问财务；
+- 漏用金额：规则读了某张数据表，却没用到表里的某个金额字段（如算利润只减了成本、漏了费用），要么接进计算，要么说明为什么不用；
+- 分档量纲：分档表的实际传入值全部落在同一档，而且和分档点差一个数量级以上（如传入比值、分档点却按分钟写），其他档从来用不上；
 - 结构提示：筛选后全部为 0、定义了却没用到的变量。
 
 gates 在 finish 时必须处理（改规则、问财务，或写进 ignored 说明原因）；warns 只附在试算结果里。
@@ -137,9 +139,10 @@ def _compared(rs: RuleSet, negated: set[str] | None = None) -> dict[str, dict[st
 
 
 def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, sourced: str = "",
-          headers: dict[str, str] | None = None) -> Report:
+          headers: dict[str, str] | None = None, tiers: dict | None = None, used_elsewhere: set[str] | None = None) -> Report:
     """text：规则材料原文（规则文档、财务的话和答复）。sourced 非空时（如有图片没转写）常数出处无法核对，只提示。
-    headers：字段 -> Excel 表头原文（含工作表名），判断字段含义时不只看智能体起的名字。"""
+    headers：字段 -> Excel 表头原文（含工作表名），判断字段含义时不只看智能体起的名字。
+    tiers：引擎记录的分档表实际取值分布；used_elsewhere：其他方案用到的名字（一个金额字段只要有方案用到就不算漏用）。"""
     rep = Report()
     norm = unicodedata.normalize("NFKC", text)
     nums = material_numbers(text)
@@ -195,6 +198,19 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
                 rep.gates.append(f"数据里「{fld}」有取值「{v}」（{cnt} 行），材料和规则都没提到，现在的规则会把它{how}。"
                                  "用 ask_question 问财务这类记录怎么处理（问题里写上这个取值）")
                 rep.keys.append(f"取值 {v}")
+    # 4. 读了数据表却漏用了表里的金额字段
+    for ds, fld in _unused_money(rs, used_elsewhere or set()):
+        head = (headers or {}).get(f"{ds}.{fld}", "").strip()
+        rep.gates.append(f"规则读了数据表「{ds}」，但没有用到它的金额字段 {fld}{f'（表头：{head}）' if head else ''}。"
+                         "核对材料：这个金额是否应该计入（如利润要扣的费用、要扣的成本或已发金额）；确实与本方案无关，写进 ignored 说明原因")
+        rep.keys.append(f"金额 {fld}")
+    # 5. 分档表的传入值和分档点量纲不一致
+    for name, msg, hard in _tier_scale(rs, tiers or {}):
+        if hard:
+            rep.gates.append(msg)
+            rep.keys.append(f"分档 {name}")
+        else:
+            rep.warns.append(msg)
     # 结构提示
     used = _reachable(rs)
     idle = [n for n in rs.variables if n not in used]
@@ -204,6 +220,50 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
     if traces:
         rep.warns += _all_zero(rs, traces)
     return rep
+
+
+def _names(rs: RuleSet) -> set[str]:
+    return {n.id for _, ast in _parsed(rs) for n in walk(ast) if isinstance(n, Name)}
+
+
+def _unused_money(rs: RuleSet, elsewhere: set[str]) -> list[tuple[str, str]]:
+    """(数据表, 金额字段)：表里有字段被规则用到，金额字段本身却哪个方案都没用到。"""
+    names = _names(rs) | elsewhere
+    out = []
+    for ds, d in rs.datasets.items():
+        fields = d.fields or {}
+        if not any(f in names for f in fields if f not in (d.key, d.link)) and f'"{ds}"' not in " ".join(e for _, e in _exprs(rs)):
+            continue
+        out += [(ds, f) for f, fd in fields.items() if fd.type == "money" and f not in names]
+    return out
+
+
+def _fmt(x) -> str:
+    return format(Decimal(str(x)).normalize(), "f")
+
+
+def _tier_scale(rs: RuleSet, tiers: dict) -> list[tuple[str, str, bool]]:
+    """(表名, 提示, 是否必须处理)。全部传入值落在同一档才看；和相邻分档点差 5 倍以上算量纲不一致（必须处理），否则只提示。"""
+    out = []
+    for name, st in tiers.items():
+        t = rs.tables.get(name)
+        if not isinstance(t, TierTable) or len(t.steps) < 2 or st.get("n", 0) < 3 or len(st.get("bands", {})) != 1:
+            continue
+        lo, hi = Decimal(str(st["min"])), Decimal(str(st["max"]))
+        cuts = [Decimal(a) for a, _ in t.steps]
+        band = next(iter(st["bands"]))
+        nxt = cuts[band + 1] if band + 1 < len(cuts) else None
+        cur = cuts[band] if band >= 0 else None
+        far = (nxt is not None and nxt > 0 and hi >= 0 and hi * 5 < nxt) or \
+              (cur is not None and cur > 0 and lo > cur * 5 and nxt is None)
+        msg = (f"分档表 {name} 的分档点是 {'、'.join(_fmt(c) for c in cuts)}，实际传入的 {st['n']} 个值在 {_fmt(lo)}～{_fmt(hi)} 之间，"
+               "全部落在同一档，其他档从来没用上。")
+        if far:
+            out.append((name, msg + "传入值和分档点差了一个数量级以上，量纲多半不一致（如一个是比值、一个是分钟数或百分数，"
+                              "一个是元、一个是万元）。核对传入的表达式和分档点是否同一单位；确实如此就写进 ignored 说明原因", True))
+        else:
+            out.append((name, msg + "如果数据本来就都在这一档可以不管，否则核对分档点和传入值", False))
+    return out
 
 
 _PAID = re.compile(r"预发|预付|预支|已发|已付|已支付|已领|prepa|paid|advance", re.I)
