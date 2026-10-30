@@ -332,3 +332,27 @@ def test_agent_stops_only_on_same_failure_reason():
     assert len(ar.steps) == 4 and "卡住" not in ar.error
     ar = run_agent(FakeLLM([{"tool": "finish", "args": {"summary": "x"}}] * 4), [ANNUAL], max_steps=6)
     assert "卡住" in ar.error and len(ar.steps) == 3
+
+
+def test_split_object_arguments_are_repaired_and_reported():
+    """Q1：模型把 variables 里的几项写成 {"a": {...}}, {"b": {...}}，程序合成一个对象并告诉模型；后面还有内容的不悄悄丢掉。"""
+    from bonus_agent.agent import _fix_arguments
+    bad = ('{"scheme": "Q", "variables": {"q_sales": {"scope": "项目", "expr": "sum(x, where: between(d, \\"2026-07-01\\", '
+           '\\"2026-09-30\\"))"}}, {"q_gm": {"scope": "项目", "expr": "1"}}, {"q3": {"scope": "项目", "expr": "2"}}}')
+    fixed = json.loads(_fix_arguments(bad))
+    assert list(fixed["variables"]) == ["q_sales", "q_gm", "q3"] and "自动修正" in fixed["_note"]
+    lost = json.loads(_fix_arguments('{"a": {"x": 1}}, {"b" 2}'))
+    assert "未执行" in lost["_invalid_json"] and "▲" in lost["_invalid_json"]
+
+
+def test_next_round_is_told_why_last_round_stopped(tmp_path):
+    from bonus_agent.agent import Workspace, _resume_task
+    from bonus_agent.auto import build_inventory, collect_files
+    from bonus_agent.failure import to_text
+    ws = Workspace(FakeLLM([]), build_inventory(collect_files([ANNUAL])))
+    ws.round = 2
+    err = "智能体卡住了，已停止以免继续消耗 tokens：set_rules 连续 3 次失败，最后一次：错误：参数不是合法 JSON（Expecting property name）"
+    task = _resume_task(ws, {"status": "FAILED", "error": err}, {}, [])
+    assert "上一轮没做完，停在这里" in task and "set_rules 分几次调用" in task
+    text = to_text(err)
+    assert "不需要你回答" in text and "点「重试」" in text and "想请你确认" not in text

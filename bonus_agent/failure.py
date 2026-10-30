@@ -32,6 +32,11 @@ def _explain(err: str) -> dict:
     m = re.search(r"：(\w+) 连续 (\d+) 次失败，最后一次：(.*)", err, re.S)
     if m:
         tool, n, last = TOOL_NAMES.get(m.group(1), m.group(1)), m.group(2), m.group(3)
+        if "参数不是合法 JSON" in last:      # 模型输出格式的问题，不是材料或规则的问题
+            return {"title": f"智能体在「{tool}」这一步连续 {n} 次写出的内容格式不对（通常是一次写得太长），已自动停下。"
+                             "这是模型输出格式的问题，不需要你回答。",
+                    "advice": f"{RETRY}；下一轮会告诉它上次错在哪、要分小段写。连续几轮都卡在这里，请把这条消息发给开发。",
+                    "where": ""}
         if "结束前自查" in last or "条款清单还有没落实" in last:     # 程序自己的核对没走完，不是要财务回答的问题
             return {"title": f"智能体在结束前的自查（规则逐条对照材料）连续 {n} 次没走完，已自动停下。"
                              "这是程序内部的核对，不需要你回答。",

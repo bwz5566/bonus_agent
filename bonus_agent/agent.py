@@ -215,8 +215,8 @@ def _split_thought(arguments: str) -> tuple[str, str]:
 
 
 def _fix_arguments(text: str) -> str:
-    """模型输出的参数不是合法 JSON 时尽量修复（后面多了内容就取第一个对象）；修不好就换成说明错误的合法 JSON。
-    历史里的参数必须是合法 JSON，否则服务端会拒绝之后的所有请求。"""
+    """模型输出的参数不是合法 JSON 时尽量修复；修不好就换成说明错误的合法 JSON。
+    历史里的参数必须是合法 JSON，否则服务端会拒绝之后的所有请求。修复过的参数带 _note，执行时告诉模型改了什么。"""
     try:
         json.loads(text or "{}")
         return text or "{}"
@@ -224,18 +224,48 @@ def _fix_arguments(text: str) -> str:
         pass
     raw = (text or "").strip()
     err, pos = "参数不是 JSON 对象", None
-    for cand in (raw, re.sub(r",\s*([}\]])", r"\1", raw)):        # 原样；去掉多余的结尾逗号
+    try:
+        json.loads(raw)
+    except json.JSONDecodeError as e:
+        err, pos = e.msg, e.pos
+    for cand, note in ((raw, "后面多出的内容已忽略"), (re.sub(r",\s*([}\]])", r"\1", raw), "多余的逗号已去掉"),
+                       *_split_objects(raw)):
         try:
-            obj, _ = json.JSONDecoder().raw_decode(cand)
-            if isinstance(obj, dict):
-                return json.dumps(obj, ensure_ascii=False)
-        except json.JSONDecodeError as e:
-            if cand is raw:
-                err, pos = e.msg, e.pos
-    near = f"，出错位置附近：…{raw[max(0, pos - 60):pos + 40]}…" if pos is not None else ""
-    return json.dumps({"_invalid_json": f"参数不是合法 JSON（{err}{near}），未执行。请重新调用：字符串用双引号，"
+            obj, end = json.JSONDecoder().raw_decode(cand)
+        except json.JSONDecodeError:
+            continue
+        if '"' in cand[end:]:          # 后面还有内容（多半是被截断或拆开的参数），不能悄悄丢掉
+            continue
+        if isinstance(obj, dict):
+            obj["_note"] = f"（参数格式有误，程序已自动修正：{note}。下次按正确格式写。）"
+            return json.dumps(obj, ensure_ascii=False)
+    near, hint = "", ""
+    if pos is not None:
+        near = f"，出错位置（▲处）：…{raw[max(0, pos - 80):pos]}▲{raw[pos:pos + 40]}…"
+        if raw[pos:pos + 1] == "{" and re.search(r"}\s*,\s*$", raw[:pos]):
+            hint = ("这里在一个对象里写了 }, { 把各项分成了几个对象。几项要写在同一个对象里："
+                    "{\"a\": {...}, \"b\": {...}}，不要写成 {\"a\": {...}}, {\"b\": {...}}。")
+    return json.dumps({"_invalid_json": f"参数不是合法 JSON（{err}{near}），未执行。{hint}请重新调用：字符串用双引号，"
                                         "表达式里的双引号要转义成 \\\"，不要有注释和多余的逗号；参数很长时分几次调用"
                                         "（如 set_rules 先写 variables，再写 allocation、pool），每次少写一些"}, ensure_ascii=False)
+
+
+def _split_objects(raw: str):
+    """常见写法错误：一个对象里的几项被 }, { 分成了几个对象（{"a": {...}}, {"b": {...}}）。
+    在解析出错的位置去掉多出的 } 和 {，合成一个对象；最多修 50 处，修完能解析才算数。"""
+    text, fixed = raw, 0
+    for _ in range(50):
+        try:
+            json.loads(text)
+            break
+        except json.JSONDecodeError as e:
+            m = re.search(r"}\s*,\s*$", text[:e.pos])
+            if not (e.msg.startswith("Expecting property name") and text[e.pos:e.pos + 1] == "{" and m):
+                return
+            text = text[:m.start()] + ", " + text[e.pos + 1:]
+            fixed += 1
+    if fixed:
+        yield text, f"把被 }}, {{ 分开的 {fixed + 1} 段合成了一个对象"
 
 
 def _coerce_args(tool: str, args: dict) -> dict:
@@ -1769,7 +1799,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         turn_start, skipped = len(history) - 1, 0     # 本轮 assistant 消息的位置；被拦下的重复调用数
         said = "" if mode == "json" else (reply.get("content") or "").strip()     # 原生工具调用时模型写在正文里的思考
         for c in calls:
-            args = {}
+            args, note = {}, ""
             thought, bare = _split_thought(c["arguments"])
             thought = thought or said
             sig = f"{c['name']}:{bare}"          # 思考不同、参数相同，仍是同一个调用
@@ -1794,10 +1824,11 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 if "_invalid_json" in args:
                     raise ToolError(args["_invalid_json"])
                 args.pop("thought", None)
+                note = args.pop("_note", "")
                 args = _coerce_args(c["name"], args)
                 if fn is None:
                     raise ToolError(f"没有工具 {c['name']}，可用：{list(handlers)}")
-                result, ok = str(fn(**args)), True
+                result, ok = str(fn(**args)) + (f"\n{note}" if note else ""), True
             except ToolError as e:
                 result, ok = f"错误：{e}", False
             except json.JSONDecodeError as e:
@@ -1960,6 +1991,9 @@ def _resume_task(ws: Workspace, last: dict | None, changes: dict | None, fresh: 
         lines.append("- 程序撤回的问题（冲突所依据的材料已修改，请按新内容重新登记参数）：" + "；".join(q.id for q in withdrawn))
     if not fresh and not any((changes or {}).values()):
         lines.append("- 没有新答复，也没有文件变化")
+    if last and last.get("status") == "FAILED" and last.get("error"):
+        lines += ["", "上一轮没做完，停在这里（这一轮先针对这个原因换做法，不要原样重复上一轮的写法）：",
+                  "  " + str(last["error"])[:600]] + [f"  · {t}" for t in _lessons(str(last["error"]))]
     if ws.pending:
         lines.append("- 仍在等待答复：" + "；".join(f"{q.id} {q.text}" for q in ws.pending))
     lines += ["", "请：",
@@ -1971,6 +2005,21 @@ def _resume_task(ws: Workspace, last: dict | None, changes: dict | None, fresh: 
               "4. 试算全部方案，确认结果合理后 finish。还有问题等答复时，做完不受影响的部分就 finish 结束本轮。",
               "", "当前文件清单：", ws.list_files()]
     return "\n".join(lines)
+
+
+def _lessons(error: str) -> list[str]:
+    """上一轮停下的原因 -> 这一轮该怎么换做法。"""
+    out = []
+    if "合法 JSON" in error:
+        out += ["上一轮是参数格式写错（多为一次写得太长，或把一个对象里的几项写成了 {\"a\": {...}}, {\"b\": {...}}）。"
+                "这一轮 set_rules 分几次调用：每次只写几个变量，再单独写 allocation、pool、payout；同一个对象里的几项用逗号隔开，不要多加 }{"]
+    if "同样的阻断问题" in error:
+        out += ["上一轮同一个阻断问题反复没改掉：先用 explain / evaluate 弄清原因，确实表达不了的用 ask_question 说明卡在哪里"]
+    if "反复" in error or "原样调用" in error:
+        out += ["上一轮在原地打转：这一轮先看工作区状态里程序判断的下一步，按它推进"]
+    if "连续" in error and "失败" in error and not out:
+        out += ["上一轮同一个工具因为同一个原因连续失败：先在思考里写清失败原因，换一种写法再调用"]
+    return out
 
 
 # ---------------- 输出 ----------------
