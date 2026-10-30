@@ -202,3 +202,46 @@ def test_helpers_are_kept_and_reused(tmp_path):
     with pytest.raises(ToolError, match="验算式写错了"):          # 写法错了的不留
         w.verify("个人:001", "v_bad", "x", helpers={"v_bad": {"scope": "个人", "expr": "sum((("}})
     assert "v_bad" not in w.check_vars
+
+
+def test_peer_sums_and_shares_in_verify_like_q1_third_run(tmp_path):
+    """Q1 第 3 次：模型在个人层写 share(小组权重) 和 sum(小组权重, of: "小组", where: ...)，按旧语义只取得到自己这一组或自己一个人，
+    算出 1 / 4 份或 0。验算里改为按上一层范围取同级：同级合计、份额都是财务理解的意思。正式规则的语义不变。"""
+    d = tmp_path / "m"
+    d.mkdir()
+    (d / "01_规则.md").write_text("奖金 900 元按小组人数分到小组，小组内平分。", encoding="utf-8")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "小组"
+    for r in (["组号"], ["G1"], ["G2"]):
+        ws.append(r)
+    t = wb.create_sheet("人员")
+    for r in (["工号", "组号"], ["E1", "G1"], ["E2", "G2"], ["E3", "G2"]):
+        t.append(r)
+    wb.save(d / "02_数据.xlsx")
+    w = Workspace(FakeLLM([]), build_inventory(sorted(d.iterdir())))
+    f = lambda c, t: {"column": c, "type": t}   # noqa: E731
+    w.define_dataset("小组", "02_数据.xlsx", "小组", {"group_id": f("组号", "id")}, header_rows=[1], key="group_id")
+    w.define_dataset("人员", "02_数据.xlsx", "人员", {"emp_id": f("工号", "id"), "group_id": f("组号", "id")},
+                     header_rows=[1], key="emp_id")
+    w.set_rules(scheme="S", pool={"expr": "900"},
+                allocation=[{"level": "小组", "key": "group_id", "weight": 'count(of: "人员")'},
+                            {"level": "个人", "key": "emp_id", "parent_key": "group_id", "weight": "1"}])
+    w.trial_run()
+    h = {"v_gw": {"scope": "小组", "expr": 'count(of: "人员")'}, "v_ew": {"scope": "个人", "expr": "1"}}
+    assert "一致" in w.verify("个人:E2", "round(900 * share(v_gw) * share(v_ew), 2)", "按人数平分", helpers=h)
+    explicit = ('round(900 * v_gw / sum(v_gw, of: "小组") * v_ew / sum(v_ew, of: "人员", where: group_id == "G2"), 2)')
+    assert "一致" in w.verify("个人:E3", explicit, "按人数平分", helpers=h)
+    assert w.evaluate('count(of: "人员")', "个人:E2") == 'count(of: "人员") = 1 = 1'     # 规则里的写法语义不变
+
+
+def test_shared_allocation_may_use_weights_defined_per_scheme(tmp_path):
+    """Q1 第 1 次：先写共用的分配层级（权重用各方案自己定义的 group_weight），还没有方案时校验把它当成“无法识别的名字”阻断，
+    模型连改 3 次被判卡住。只有共用部分时先记下，写入方案后合并校验；方案里也没定义才阻断。"""
+    w = case(tmp_path / "m")
+    out = w.set_rules(scheme="共用", allocation=[{"level": "个人", "key": "emp_id", "weight": "emp_weight"}])
+    assert "需要修正" not in out and "emp_weight 还没有定义" in out and not w.last_blocking
+    out = w.set_rules(scheme="月度", pool={"expr": "100"})
+    assert "无法识别的名字 emp_weight" in out                  # 方案里也没定义：合并后照样阻断
+    out = w.set_rules(scheme="月度", variables={"emp_weight": {"scope": "个人", "expr": "1"}})
+    assert "需要修正" not in out

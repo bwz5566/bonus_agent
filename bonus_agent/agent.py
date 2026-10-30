@@ -199,7 +199,9 @@ TOOLS: list[dict] = [
                                      "写法同规则的 variables，不能和规则变量同名、不能引用规则变量。跨表的中间数先在对应层算出来，"
                                      "如 {\"v_proj_sales\": {\"scope\": \"项目\", \"expr\": \"sum(sales_amount, of: \\\"销售明细\\\")\"}}，"
                                      "再在参与行上引用 v_proj_sales * share。定义过的辅助变量会留着（见工作区状态），"
-                                     "后面的 verify 直接引用，只写新的或要改的；scope 写层级名、关联实体表名或 global"}},
+                                     "后面的 verify 直接引用，只写新的或要改的；scope 写层级名、关联实体表名或 global。"
+                                     "验算里对本层或上层的实体表求和（如在个人层 sum(v_gw, of: \"小组\", where: dept_id == \"D01\")）"
+                                     "按上一层范围取同级再用 where 筛选；share(小组层的变量) 在个人层求值时取所在小组在同级小组里的份额"}},
                         ["node", "expr", "basis"])},
     {"name": "finish", "description": "完成。要求每个方案在最近一次修改之后都已成功试算，程序指定的对象都已独立验算通过。",
      "parameters": _obj({"summary": {**_S, "description": "两三句话说明：什么奖金、奖金池怎么来、怎么分、发放条件"},
@@ -868,6 +870,13 @@ class Workspace:
                 issues = [i for i in issues if i.code not in ("no_levels", "scope_bad")]
                 later = ("还没有分配层级（allocation）" + (f"，用到的层级 {'、'.join(wait)} 先记下" if wait else "")
                          + "；写好 allocation 后再完整校验。")
+            if t == SHARED:     # 只有共用部分时，引用的变量可能由各方案自己定义（如共用的分配层级用各方案的权重变量）：先记下，合并后再校验
+                names_later = sorted({m.group(1) for i in issues if i.code == "name_unknown"
+                                      for m in [re.search(r"无法识别的名字 (\S+)", i.message)] if m})
+                issues = [i for i in issues if i.code != "name_unknown"]
+                if names_later:
+                    later += (f"共用部分引用的 {'、'.join(names_later)} 还没有定义：如果由各方案自己定义，写入各方案后会合并校验；"
+                              "否则在共用部分的 variables 里补上。")
             blocking = [str(i) for i in issues if i.severity == "blocking"]
             warns = [str(i) for i in issues if i.severity == "warning"]
             head = f"「{t}」" + ("（尚未设定 pool）" if "pool" not in full else "")
@@ -1180,6 +1189,7 @@ class Workspace:
         if node not in nodes:
             raise ToolError(f"没有节点「{node}」，例：{list(nodes)[:5]}")
         ev = Evaluator(rs, root, by_level, self._refs(name))
+        ev.peer_scope = helpers is not None      # 独立验算：对本层或上层实体表求和按上一层范围取同级（见 Evaluator.peer_scope）
         try:
             v = ev.evaluate(expr, nodes[node], "probe", "probe")
         except (EvalError, ValueError) as e:

@@ -95,6 +95,9 @@ class Evaluator:
         self._values: dict[str, object] = {}
         self._cache: dict[tuple[str, str], Val] = {}
         self._busy: set[tuple[str, str]] = set()
+        # 独立验算用：对本层或上层的实体表聚合（如在个人层对「员工」表、在小组层对「小组」表求和）时，按上一层的范围取同级，
+        # 配合 where 就能算“同部门各小组合计”；share(上层变量) 按变量所在的层取同级。正式计算不开，规则语义不变
+        self.peer_scope = False
         self.layout = Layout(rs)
         # 只能在聚合里使用的字段 -> 所在的明细表/公司级表（不含主键/关联键）
         self.detail_fields = self.layout.row_only
@@ -383,14 +386,20 @@ class Evaluator:
     def _aggregate(self, c: Call, ctx: Ctx) -> Val:
         kw = c.kw()
         ds = self._agg_dataset(c, ctx)
-        rows = ctx.node.rows(ds)
+        node = ctx.node
+        if self.peer_scope and not node.aux:
+            d = self.rs.datasets.get(ds)
+            lvl = self.layout.key_level.get(d.key) if d is not None and d.key else None
+            if lvl is not None and lvl <= self.layout.index.get(node.level, -1):
+                node = self._above(node, lvl)
+        rows = node.rows(ds)
         aux = ds in self.layout.aux
 
         def rctx(r):   # 关联实体的行在它自己的节点上求值，才能用到该实体的变量；其他行在它所属的下级对象上求值
             if aux:
                 return Ctx(self._row_node[id(r)], r, ctx.where)
             home = self._home.get(id(r))
-            return Ctx(home if home is not None and ctx.node in home.chain() else ctx.node, r, ctx.where)
+            return Ctx(home if home is not None and node in home.chain() else node, r, ctx.where)
         if "where" in kw:
             cond = kw["where"]
             rows = [r for r in rows if self._bool(self.ev(cond, rctx(r)), ctx)]
@@ -425,8 +434,20 @@ class Evaluator:
             raise EvalError(err, ctx.where)
         return ds
 
+    def _above(self, node: Node, lvl: int) -> Node:
+        """node 的祖先里第一个层级在 lvl 之上的（没有就是根）。"""
+        for a in node.chain():
+            if self.layout.index.get(a.level, -1) < lvl:
+                return a
+        return self.root
+
     def _sibling(self, c: Call, ctx: Ctx) -> Val:
         node = ctx.node
+        if self.peer_scope and not node.aux:     # share(小组变量) 在个人层求值：取小组在同部门各小组里的份额
+            scopes = {self.rs.variables[n].scope for n in names(c.args[0]) if n in self.rs.variables}
+            lv = self.layout.index.get(next(iter(scopes)), None) if len(scopes) == 1 else None
+            if lv is not None and lv < self.layout.index.get(node.level, -1):
+                node = next(a for a in node.chain() if a.level == self.rs.allocation[lv].level)
         sibs = node.parent.children if node.parent else [node]
         vals = {}
         for s in sibs:
