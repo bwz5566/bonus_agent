@@ -1,4 +1,5 @@
 """内网网页服务：登录、角色、防伪码、上传、答复、多轮运行、确认、按模板计算、下载和操作记录。"""
+import json
 from pathlib import Path
 
 import pytest
@@ -216,9 +217,12 @@ def test_failure_explained_with_retry(env):
     assert "算不出来" in x["title"] and "没对上" not in x["title"] and "不需要你回答" in x["title"]   # 写法问题，不问财务
     cid = store.create("失败", "张会计")
     (store.dir(cid) / "materials" / "数据.xlsx").write_bytes((m / "数据.xlsx").read_bytes())
-    scripts.append([{"tool": "trial_run"}] * 3)          # 连续失败 3 次，自动停下
+    scripts.append([{"tool": "trial_run"}] * 3)          # 连续失败 3 次，自动停下；程序自动接着做 2 轮，仍卡住才交给财务
     post(c, store, f"/cases/{cid}/run")
     wait(app, cid)
+    acts = [json.loads(x)["action"] for x in (store.dir(cid) / "audit.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert acts.count("自动接续") == 2 and acts.count("本轮结束") == 3
+    assert sum("程序自动接着做" in m["text"] for m in store.chat(cid)) == 2
     page = c.get(f"/cases/{cid}").text
     assert "已自动停下" in page and ">重试<" in page and "详细信息" in page
     said = store.chat(cid)[-1]["text"]                 # 对话里先说原因，再说需要什么帮助、想了解什么

@@ -34,7 +34,7 @@ from urllib.parse import quote
 import yaml
 
 from bonus_agent import case as cs
-from bonus_agent.failure import explain as explain_failure, to_text
+from bonus_agent.failure import explain as explain_failure, retryable, to_text
 from bonus_agent.parsing.docs import PARSERS
 
 ROLES = {"editor": "传材料、答复问题、运行、按模板计算", "approver": "确认结果"}
@@ -202,8 +202,9 @@ class Runner:
     """每个案卷同时只跑一轮；全局最多同时跑 max_parallel 轮（大模型调用量大）。"""
 
     def __init__(self, store: Store, llm_factory: Callable[[], object], max_parallel: int = 2, max_steps: int = 150,
-                 max_tokens: int = 4_000_000):
+                 max_tokens: int = 4_000_000, auto_continue: int = 2):
         self.store, self.llm_factory = store, llm_factory
+        self.auto_continue = auto_continue      # 模型自己卡住时自动接着做的轮数上限（tokens 上限按这一次运行的合计算）
         self.jobs: dict[str, Job] = {}
         self.lock = threading.Lock()
         self.slots = threading.Semaphore(max_parallel)
@@ -251,6 +252,18 @@ class Runner:
                                chat=self.store.chat(job.cid)[:-1] if message else self.store.chat(job.cid),
                                on_step=lambda n, s: self._step(job, d / "out", n, s), should_stop=lambda: job.cancel,
                                instruction=instruction)
+                auto = 0
+                # 模型自己卡住（写法、原地打转等）而停下：程序自动接着做下一轮（带上停下的原因），有次数上限，不用财务手动点重试
+                while not message and not instruction and auto < self.auto_continue and retryable(ar.error) and not job.cancel:
+                    auto += 1
+                    self.store.audit(job.cid, job.by, "本轮结束", round=ar.round, status=ar.status, error=ar.error)
+                    self.store.chat_add(job.cid, "agent", "智能体",
+                                        f"第 {ar.round} 轮没做完（{to_text(ar.error).splitlines()[0]}），"
+                                        f"程序自动接着做第 {ar.round + 1} 轮（自动接续第 {auto} 次，最多 {self.auto_continue} 次）。")
+                    self.store.audit(job.cid, job.by, "自动接续", round=ar.round + 1)
+                    ar = run_agent(llm, [d / "materials"], d / "out", resume=True, max_steps=self.max_steps,
+                                   max_tokens=self.max_tokens, by=job.by, chat=self.store.chat(job.cid),
+                                   on_step=lambda n, s: self._step(job, d / "out", n, s), should_stop=lambda: job.cancel)
                 expected = sorted((d / "expected").glob("*.xlsx"))
                 if expected and ar.results:
                     from bonus_agent.compare import compare_expected, report

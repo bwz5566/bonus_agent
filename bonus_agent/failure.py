@@ -135,6 +135,14 @@ def _where(err: str) -> str:
     return s[:200] + ("……" if len(s) > 200 else "")
 
 
+def retryable(error: str | None) -> bool:
+    """停下的原因是模型自己卡住（写法不对、原地打转、步数用完），接着做一轮多半能过：可以自动接续。
+    tokens 用完、服务出错、程序出错、等财务答复都不自动接续。"""
+    if not error or _is_bug(error):
+        return False
+    return error.startswith("智能体卡住了") or error.startswith("达到最大步数")
+
+
 def to_text(error: str) -> str:
     """对话框里的说明：原因 → 卡在哪 → 想了解什么 → 怎么继续。每项一行。"""
     x = explain(error)

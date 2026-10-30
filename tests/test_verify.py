@@ -187,3 +187,18 @@ def test_tier_text_keeps_fractional_thresholds():
     t = _tier_text("margin_coef", {"steps": [[0, 0], [0.15, 0.8], [0.25, 1], [0.35, 1.2]]})
     assert "0 至 0.15时全部金额按 0%；0.15 至 0.25时全部金额按 80%" in t and "0.35 以上时全部金额按 120%" in t
     assert "10,000,000 至 20,000,000" in _tier_text("a", {"steps": [[0, 0.05], [10000000, 0.08], [20000000, 0.1]], "mode": "excess"})
+
+
+def test_helpers_are_kept_and_reused(tmp_path):
+    """验算定义过的辅助变量留着：后面的验算直接引用，不必每次重写一长串（Q11 里每次 verify 都重写十几个辅助变量，写错一处就失败）。
+    记录里存着用到的全部辅助变量，规则改了重新比对时不依赖当时的工作区。"""
+    w = case(tmp_path / "m")
+    rules(w, "amount * rate")
+    first = {"v_oc": {"scope": "订单", "expr": "round(amount * rate, 2)"}}
+    w.verify("个人:002", 'round(sum(v_oc, of: "订单") * coef, 2)', "个人提成 = 订单提成合计 × 计奖系数", helpers=first)
+    assert w.check_vars == first and "v_oc[订单] = round(amount * rate, 2)" in w.state()
+    assert "一致" in w.verify("个人:001", 'round(sum(v_oc, of: "订单") * coef, 2)', "个人提成 = 订单提成合计 × 计奖系数")
+    assert w.verified["月度|个人:001"]["helpers"] == first
+    with pytest.raises(ToolError, match="验算式写错了"):          # 写法错了的不留
+        w.verify("个人:001", "v_bad", "x", helpers={"v_bad": {"scope": "个人", "expr": "sum((("}})
+    assert "v_bad" not in w.check_vars

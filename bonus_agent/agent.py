@@ -46,6 +46,7 @@ MAX_RESULT_CHARS = 6000
 DEFAULT_SCHEME = "默认"        # 只有一个方案时的方案名
 SCHEME_REF = re.compile(r"""scheme_paid\(\s*["']([^"']+)["']\s*(?:,\s*["']([^"']+)["']\s*)?\)""")   # 规则里引用别的方案
 SHARED = "共用"                # 多个方案共用的部分（权重、校验、共用变量），合并进每个方案
+AGENT_TEMPERATURE = 0          # 工作循环用 0：同样的材料和状态尽量走同样的路，过程稳定、可复现
 MAX_STUCK = 3                  # 同一调用原样重复、或同一工具连续失败达到这个次数就停下，把卡住的原因报给财务
 KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保留全文
 BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
@@ -197,12 +198,27 @@ TOOLS: list[dict] = [
                          "helpers": {"type": "object", "description": "可选：验算自己定义的辅助变量 {名字: {scope, expr}}，"
                                      "写法同规则的 variables，不能和规则变量同名、不能引用规则变量。跨表的中间数先在对应层算出来，"
                                      "如 {\"v_proj_sales\": {\"scope\": \"项目\", \"expr\": \"sum(sales_amount, of: \\\"销售明细\\\")\"}}，"
-                                     "再在参与行上引用 v_proj_sales * share"}},
+                                     "再在参与行上引用 v_proj_sales * share。定义过的辅助变量会留着（见工作区状态），"
+                                     "后面的 verify 直接引用，只写新的或要改的；scope 写层级名、关联实体表名或 global"}},
                         ["node", "expr", "basis"])},
     {"name": "finish", "description": "完成。要求每个方案在最近一次修改之后都已成功试算，程序指定的对象都已独立验算通过。",
      "parameters": _obj({"summary": {**_S, "description": "两三句话说明：什么奖金、奖金池怎么来、怎么分、发放条件"},
                          "ignored": {"type": "array", "items": _obj({"ref": _S, "reason": _S})}}, ["summary"])},
 ]
+
+
+def _used_helpers(expr: str, pool: dict) -> dict:
+    """验算式（经辅助变量传递）用到的辅助变量。写错的式子原样带上，交给后面的检查报错。"""
+    out, todo = {}, [expr]
+    while todo:
+        try:
+            got = set(parse_names(parse(todo.pop())))
+        except ExprError:
+            continue
+        for n in sorted(got & set(pool) - set(out)):
+            out[n] = pool[n]
+            todo.append(str(pool[n].get("expr", "")))
+    return out
 
 
 def _helper_scope(rs: RuleSet, name: str, scope: str) -> str:
@@ -374,6 +390,7 @@ class Workspace:
     _verify_note: str = ""
     _probe_cache: dict = field(default_factory=dict)
     _gap_cache: tuple | None = None
+    check_vars: dict = field(default_factory=dict)          # 独立验算定义过的辅助变量 {名字: {scope, expr}}，后面的验算直接引用，不必重写
     verified: dict = field(default_factory=dict)            # "方案|对象" -> 独立验算记录 {expr, at, basis}，结束前按最新规则重新比对
     read_nums: dict = field(default_factory=dict)           # 方案 -> 规则读取的数据字段里出现的数（直接读表的参数算用上了）
     lint: dict = field(default_factory=dict)                # 方案 -> 程序检查结果（lint.Report），finish 前要处理其中的 gates
@@ -1183,9 +1200,12 @@ class Workspace:
             raise ToolError("basis 写依据的材料原文（条款号或原句）")
         if helpers is not None and not (isinstance(helpers, dict) and all(isinstance(v, dict) for v in helpers.values())):
             raise ToolError('helpers 写成 {"名字": {"scope": "项目", "expr": "..."}}')
+        used = _used_helpers(expr, {**self.check_vars, **(helpers or {})})     # 之前定义过的辅助变量直接可用；记录里存全，单独可复算
         rec = {"expr": expr, "at": at or node, "basis": basis.strip(), "amount": amount,
-               **({"helpers": helpers} if helpers else {})}
+               **({"helpers": used} if used else {})}
         bad = self._verify_mismatch(name, node, rec)
+        if helpers and not bad.startswith(("验算式写错了", "辅助变量", "验算式算不出来")):
+            self.check_vars.update(helpers)      # 写法没问题的辅助变量留着复用（金额对不上时也留着，改哪个就重写哪个）
         if bad:
             raise ToolError(bad)
         self.verified[_verify_key(name, node, amount)] = rec
@@ -1513,6 +1533,9 @@ class Workspace:
         if self.schemes and all(s not in self.untested and s in self.results for s in self.schemes):
             left = self._verify_gaps()
             lines.append("- 待独立验算（程序指定，全部通过才能 finish）：" + ("；".join(left[:12]) if left else "全部通过"))
+        if self.check_vars:
+            lines.append("- 验算辅助变量（已定义，verify 里直接引用，不必再写进 helpers；要改哪个就在 helpers 里重写哪个）：\n"
+                         + "\n".join(f"  · {k}[{v.get('scope', 'global')}] = {v.get('expr', '')}" for k, v in self.check_vars.items()))
         return "\n".join(lines)
 
 
@@ -1841,7 +1864,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         if mode == "json":
             msgs = [{"role": "system", "content": sys + JSON_PROTOCOL + json.dumps(TOOLS, ensure_ascii=False)}] + body + tail
             try:
-                text = llm.chat(msgs, json_out=True, temperature=0.1)
+                text = llm.chat(msgs, json_out=True, temperature=AGENT_TEMPERATURE)
             except LLMError as e:
                 error = str(e)
                 break
@@ -1861,7 +1884,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         else:
             msgs = [{"role": "system", "content": sys}] + body + tail
             try:
-                reply = llm.chat_tools(msgs, openai_tools())
+                reply = llm.chat_tools(msgs, openai_tools(), temperature=AGENT_TEMPERATURE)
             except LLMError as e:
                 if turn == 0:  # 模型或服务不支持原生工具调用，改用 JSON 协议
                     mode = "json"
