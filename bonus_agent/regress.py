@@ -252,6 +252,10 @@ def run_suite(scenarios: list[Scenario], out: Path, llm_factory: Callable[[], ob
     records: list[RunRecord] = []
     summary = summarize(records, meta)
     for sc in scenarios:
+        missing = [str(p) for p in sc.inputs if not p.exists()] + ([str(sc.expected)] if sc.expected and not sc.expected.exists() else [])
+        if missing:      # 放在仓库外的样例（如 ../../bonus_fixture_v6）本机没有：跳过，不算失败
+            log(f"{sc.name}：找不到 {'、'.join(missing)}，跳过")
+            continue
         for i in range(1, runs + 1):
             log(f"{sc.name} 第 {i}/{runs} 次 ...")
             rec = run_once(sc, i, out / sc.name / f"第{i}次", llm_factory, log=log, **kw)

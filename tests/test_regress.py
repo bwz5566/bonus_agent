@@ -78,5 +78,14 @@ def test_cause_and_answer_text(tmp_path):
 
 def test_default_suite_files_exist():
     for sc in rg.load_suite(CASE.parent.parent / "regress.yaml"):
+        if "bonus_fixture_v" in str(sc.inputs[0]) and "examples" not in str(sc.inputs[0]):
+            continue                    # 放在仓库外的样例（Q6、Q7），本机可能没有
         assert sc.expected.exists() and sc.materials(), sc.name
         assert not any(f.name.startswith("negative_cases") for f in sc.materials())
+
+
+def test_scenario_outside_repo_is_skipped_when_missing(tmp_path):
+    sc = rg.Scenario(name="X", inputs=[tmp_path / "nope"], expected=tmp_path / "nope.xlsx")
+    logs = []
+    summary = rg.run_suite([sc], tmp_path / "out", lambda: FakeLLM([]), runs=1, log=logs.append)
+    assert summary["总计"]["次数"] == 0 and any("跳过" in x for x in logs)
