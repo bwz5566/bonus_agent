@@ -183,7 +183,7 @@ def test_independent_formula_needs_two_consistent_samples(tmp_path):
     ar = run_agent(llm, [run_case.XLSX], tmp_path / "a")
     assert ar.status == "OK", ar.error
     assert ar.ws.reread["calc"]["unsettled"] == {"PROCESS": ["奖金池"]}
-    assert any(r["item"] == "独立算式没有定论：PROCESS" for r in rv.load(tmp_path / "a"))
+    assert any(r["item"] == "独立算式没有定论：PROCESS" and r["flag"] for r in rv.load(tmp_path / "a"))
     llm = FakeLLM(_script())
     llm.calc = [a] * 3 + [b, a]
     ar = run_agent(llm, [run_case.XLSX], tmp_path / "b")
