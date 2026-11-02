@@ -29,6 +29,7 @@ from bonus_agent.llm import LLMError, parse_json
 
 MARK = "【独立复读】"            # 系统提示的开头；测试用的 FakeLLM 靠它认出复读调用
 CALC_MARK = "【独立算式】"
+EXTRA_SAMPLES = 2                # 独立算式和规则对不上时，最多再独立写几次（两次彼此一致才算数，否则多数说了算）
 CALC_TRIES = 3                   # 独立算式写不对时，带着报错让它自己改，最多试这么多次
 CALC_SHOW = 3                    # 奖金池对不上时，列出几个对象的两边金额
 PARAM_ROWS = 80                  # 没定义成数据表、不超过这么多行的工作表当作参数表，整表给复读
@@ -196,8 +197,8 @@ def calc(ws, rr: dict) -> dict:
     """让复读按材料写出每个方案的奖金池算式，写不对就带着报错让它改。结果存在 rr["calc"]：
     {"sig", "schemes": {方案: {"tables", "helpers", "pool"}}, "unclear", "error", "second"}。
     材料、数据字典、方案结构没变时用上次的。
-    和规则算出的数对不上的方案，再独立写一次（新开对话）：第二次和规则一致，就当是第一次写错了，用第二次的；
-    两次都和规则不一致、而且两次彼此一致，才交给智能体核对；两次彼此也不一致的记在 unsettled（不拦，口径单注明）。
+    和规则算出的数对不上的方案，再独立写（新开对话，最多 EXTRA_SAMPLES 次）：有一次和规则一致，就当是第一次写错了，用那一次的；
+    有两次都和规则不一致、而且彼此一致，才交给智能体核对；始终凑不出两次一致的记在 unsettled（不拦，口径单注明）。
     这样复读自己偶尔理解错，不会把对的规则带偏。"""
     names = schemes(ws)
     if not names:
@@ -215,21 +216,37 @@ def calc(ws, rr: dict) -> dict:
             {"role": "user", "content": text}]
     out = {"sig": sig, **_sample(ws, base, names), "second": [], "unsettled": {}}
     for n in [n for n in out["schemes"] if _disagree(ws, n, out["schemes"][n])]:
-        again = _sample(ws, base, [n])
-        out["second"].append(n)
-        first, second = out["schemes"][n], again["schemes"].get(n)
-        # 第二次要覆盖第一次写了的各项（第一次写了可发比例、第二次没写，不能算“一致”）
-        if second and not (first.get("pay_ratio") and not second.get("pay_ratio")) and not _disagree(ws, n, second):
-            out["schemes"][n] = second
-            continue
-        # 两次都和规则对不上：两次自己也一致，才是一份站得住的独立理解，交给智能体核对；
-        # 两次各算各的（复读自己都没读准），不拦，口径单上注明
+        first = out["schemes"][n]
         kinds = sorted({b[0] for b in _disagree(ws, n, first)})
-        shaky = [k for k in kinds if not second or not _same(ws, n, k, first, second)]
-        if shaky:
+        kept, shaky = [first], kinds
+        out["second"].append(n)
+        for _ in range(EXTRA_SAMPLES):
+            got = _sample(ws, base, [n])["schemes"].get(n)
+            # 第二次要覆盖第一次写了的各项（第一次写了可发比例、这次没写，不能算数）
+            if not got or (first.get("pay_ratio") and not got.get("pay_ratio")):
+                continue
+            if not _disagree(ws, n, got):          # 有一次和规则一致：当是前面写错了，用这一次的
+                out["schemes"][n], shaky = got, []
+                break
+            kept.append(got)
+            pair = {k: _pair(ws, n, k, kept) for k in kinds}
+            shaky = [k for k, p in pair.items() if p is None]
+            if not shaky:                          # 有两次彼此一致、又都和规则对不上：一份站得住的独立理解，交给智能体核对
+                out["schemes"][n] = pair[kinds[0]]
+                break
+        if shaky:                                  # 几次各算各的（复读自己都没读准）：不拦，口径单注明
             out["unsettled"][n] = shaky
     rr["calc"] = out
     return out
+
+
+def _pair(ws, name: str, kind: str, kept: list[dict]) -> dict | None:
+    """几次独立算式里，有两次在这一项上都和规则对不上、而且彼此一致：返回其中一次。"""
+    off = [k for k in kept if any(b[0] == kind for b in _disagree(ws, name, k))]
+    for i, a in enumerate(off):
+        if any(_same(ws, name, kind, a, b) for b in off[i + 1:]):
+            return a
+    return None
 
 
 def _values(ws, name: str, kind: str, spec: dict) -> dict[str, Decimal]:

@@ -169,18 +169,27 @@ def test_independent_pay_ratio_compared_on_data(tmp_path):
 
 
 def test_independent_formula_needs_two_consistent_samples(tmp_path):
-    """两次独立写的都和规则对不上、但两次彼此也不一致（复读自己没读准）：不拦，口径单注明没有定论。"""
+    """几次独立写的都和规则对不上、但凑不出两次彼此一致（复读自己没读准）：不拦，口径单注明没有定论；
+    第三次和第一次一致（多数说了算）：拦下交给智能体核对。"""
     from bonus_agent import review as rv
     from bonus_agent.agent import run_agent
     from bonus_agent.llm import FakeLLM
     from tests.test_syn_acceptance import _script, run_case
     llm = FakeLLM(_script())
     # 第一次（其他方案没写，带着报错重试 3 次）都是 A，第二次独立写是 B
-    llm.calc = [_calc(PROCESS_OK.replace(" * lookup(d, difficulty)", ""))] * 3 + [_calc(PROCESS_OK.replace("1.10, 0.95", "1.2, 0.9"))]
+    a = _calc(PROCESS_OK.replace(" * lookup(d, difficulty)", ""))
+    b, c = _calc(PROCESS_OK.replace("1.10, 0.95", "1.2, 0.9")), _calc(PROCESS_OK.replace("1.10, 0.95", "1.3, 0.8"))
+    llm.calc = [a] * 3 + [b, c]
     ar = run_agent(llm, [run_case.XLSX], tmp_path / "a")
     assert ar.status == "OK", ar.error
     assert ar.ws.reread["calc"]["unsettled"] == {"PROCESS": ["奖金池"]}
     assert any(r["item"] == "独立算式没有定论：PROCESS" for r in rv.load(tmp_path / "a"))
+    llm = FakeLLM(_script())
+    llm.calc = [a] * 3 + [b, a]
+    ar = run_agent(llm, [run_case.XLSX], tmp_path / "b")
+    blocked = [st for st in ar.steps if st.tool == "finish" and not st.ok]
+    assert ar.status != "OK" and blocked and "复读 奖金池 PROCESS" in blocked[0].result
+    assert not ar.ws.reread["calc"]["unsettled"]
 
 
 def test_cross_check_uses_another_model_and_falls_back():
