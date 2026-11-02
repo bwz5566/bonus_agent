@@ -112,14 +112,14 @@ models:
   # ---- 内网自建 Qwen（2026-11-02 起默认用 A）----
   # 深度思考默认关（和 deepseek-flash 一致，Q1–Q7 都是在不思考下算对的）；要试思考时把 tools_extra_body 打开、timeout 改 600，
   # 只对智能体每一步生效，抽取、复读等要 JSON 的调用仍然不思考
-  qwen-a:                       # 服务 A，上下文 1M
+  qwen-a:                       # 服务 A：Qwen3.8-27B-FP8，上下文 1M
     provider: local_qwen
     model: qwen-chat
     json_mode: json_object
     timeout: 300
     extra_body: {chat_template_kwargs: {enable_thinking: false}}
     # tools_extra_body: {chat_template_kwargs: {enable_thinking: true}}
-  qwen-b:                       # 服务 B（qwen38-int4）。上下文要调到 65536 以上才能用，程序开始前会检查
+  qwen-b:                       # 服务 B：同为 27B（64 层），INT4（W4A16，group 128）单卡 4090，上下文 65536（至少要这么多，开始前会检查）
     provider: local_qwen_b
     model: qwen38-int4
     json_mode: json_object
