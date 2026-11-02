@@ -15,7 +15,7 @@
   negcheck --out 案卷目录 --cases negative_cases.json [--sheet 表名=工作表 ...] 材料...
                                            坏数据回归：用该案卷的规则（不调用大模型）在逐个改坏的数据上重算，
                                            列出每种坏数据有没有被拦住
-  regress [--suite 场景.yaml] [--runs 3] [--model M] [--checker M2] [--only Q1,Q3] --out 目录
+  regress [--suite 场景.yaml] [--runs 3] [--model M] [--checker M2] [--only Q1,Q3] [--max-minutes 120] [--resume] --out 目录
                                            固定回归：每个场景跑 N 次（默认 3），和期望结果逐分比对，
                                            汇总写入 目录/summary.json（完成率、正确率、算错没拦住、卡住原因）
   serve --data 数据目录 [--host 127.0.0.1] [--port 8080] [--model M] [--checker M2]
@@ -81,6 +81,9 @@ def main(argv=None) -> int:
     p.add_argument("--out", required=True, help="输出目录：每次运行的案卷和 summary.json")
     p.add_argument("--max-steps", type=int, default=150)
     p.add_argument("--max-tokens", type=int, default=4_000_000)
+    p.add_argument("--max-minutes", type=float, default=0, help="单次运行（含自动接续）最多多少分钟，超过就跳过这一次接着跑下一个；0 表示不限")
+    p.add_argument("--resume", action="store_true", help="接着上次没跑完的跑：同一个 --out 里已跑完的不再跑")
+    p.add_argument("--check-only", action="store_true", help="只检查模型能不能调用（主模型和交叉验证模型），不开跑")
     p = sub.add_parser("serve")
     p.add_argument("--data", required=True, help="数据目录：用户、案卷、材料和结果都在这里")
     p.add_argument("--host", default="127.0.0.1", help="默认只监听本机；内网访问请放在 HTTPS 反向代理后面")
@@ -139,14 +142,23 @@ def main(argv=None) -> int:
         scenarios = [s for s in scenarios if not only or s.name in only]
         missing = [f"{s.name}：{p}" for s in scenarios for p in s.inputs + [s.expected, s.answers] if p and not p.exists()]
         if missing:
-            print("找不到这些文件：\n  " + "\n  ".join(missing))
-            return 1
+            print("找不到这些文件，对应场景会跳过：\n  " + "\n  ".join(missing))
+            if len({m.split("：", 1)[0] for m in missing}) == len(scenarios):
+                return 1
         cfg = load_config()
         name = a.model or cfg["default"]
         hist = cfg["models"].get(name, {}).get("max_history_chars", 40000)
+        ok, checks = rg.preflight(LLM.from_config(a.model, cfg, a.checker))
+        print("模型检查：\n  " + "\n  ".join(checks), flush=True)
+        if not ok:
+            print("主模型调不通，没有开跑。请先确认模型服务已启动、地址和 key 正确。")
+            return 1
+        if a.check_only:
+            return 0
         summary = rg.run_suite(scenarios, Path(a.out), lambda: LLM.from_config(a.model, cfg, a.checker), runs=a.runs,
                                meta={"模型": name, "交叉验证模型": a.checker or "", "场景配置": str(a.suite)}, max_steps=a.max_steps,
-                               max_tokens=a.max_tokens, max_history_chars=hist)
+                               max_tokens=a.max_tokens, max_history_chars=hist,
+                               max_minutes=a.max_minutes, resume=a.resume)
         print("\n" + "\n".join(rg.lines(summary)))
         print(f"\n汇总已写入 {Path(a.out) / rg.SUMMARY}")
         return 0 if summary["总计"]["算错没拦住"] == 0 else 2

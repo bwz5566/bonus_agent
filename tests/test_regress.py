@@ -89,3 +89,45 @@ def test_scenario_outside_repo_is_skipped_when_missing(tmp_path):
     logs = []
     summary = rg.run_suite([sc], tmp_path / "out", lambda: FakeLLM([]), runs=1, log=logs.append)
     assert summary["总计"]["次数"] == 0 and any("跳过" in x for x in logs)
+
+
+def test_long_run_skips_failures_and_resumes(tmp_path, monkeypatch):
+    """跑几小时的回归：一次超时、一次出错都只记在那一次，接着跑下一个；中途断了用 resume 接着跑，已跑完的不重跑。"""
+    sc = _suite(tmp_path)
+    clock = iter(range(0, 10 ** 6, 600))                 # 每看一次表过 10 分钟：第一次就超过 5 分钟上限
+    with monkeypatch.context() as m:
+        m.setattr(rg.time, "time", lambda: next(clock))
+        s = rg.run_suite(sc, tmp_path / "out", lambda: FakeLLM(_script()), runs=1, log=lambda _: None, max_minutes=5)
+    r = s["明细"][0]
+    assert r["status"] == "FAILED" and r["cause"] == "超时跳过" and "超过 5 分钟" in r["error"]
+
+    def broken():
+        raise RuntimeError("模型配置坏了")
+    s = rg.run_suite(sc, tmp_path / "out2", broken, runs=2, log=lambda _: None)
+    assert [r["status"] for r in s["明细"]] == ["ERROR", "ERROR"]          # 出错照样跑完两次、写进汇总
+    # 第 1 次跑完后中断：续跑只跑第 2 次，汇总里两次都在
+    rg.run_suite(sc, tmp_path / "out3", lambda: FakeLLM(_script()), runs=1, log=lambda _: None)
+    seen = []
+    s = rg.run_suite(sc, tmp_path / "out3", lambda: FakeLLM(_script()), runs=2, log=seen.append, resume=True)
+    assert [r["run"] for r in s["明细"]] == [1, 2] and s["总计"]["金额正确"] == 2
+    assert any("上次已跑完，跳过" in x for x in seen)
+
+
+def test_preflight_checks_main_and_checker_models():
+    """开跑前确认模型能调度：主模型不通就不开跑；交叉验证模型不通只提示（会退回主模型）；上下文太小也算不通。"""
+    from bonus_agent.llm import LLMError
+    good = FakeLLM(lambda m: '{"ok": true}', name="qwen-b")
+    ok, lines = rg.preflight(good)
+    assert ok and "主模型 qwen-b：可以调用" in lines[0]
+
+    def down(m):
+        raise LLMError("Connection error.")
+    good.checker_llm = FakeLLM(down, name="qwen-a")
+    ok, lines = rg.preflight(good)
+    assert ok and "交叉验证模型 qwen-a：调用失败" in lines[1] and "退回主模型" in lines[1]
+    small = FakeLLM(lambda m: '{"ok": true}', name="tiny")
+    small.ctx = 4096
+    ok, lines = rg.preflight(small)
+    assert not ok and "4096" in lines[0]
+    ok, _ = rg.preflight(FakeLLM(lambda m: "好的", name="chatty"))
+    assert not ok

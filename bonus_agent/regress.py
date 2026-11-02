@@ -12,7 +12,7 @@ import json
 import re
 import shutil
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -31,6 +31,7 @@ CAUSES = (
     ("程序检查没处理完", r"程序检查还有没处理的"),
     ("同一阻断改不掉", r"保存后仍有同样的阻断问题"),
     ("原地打转", r"反复重复相同的调用|原样调用|反复调用|反复提交相同|反复建了又删"),
+    ("超时跳过", r"单次运行超过"),
     ("tokens 用完", r"tokens 用量"),
     ("步数用完", r"达到最大步数"),
     ("模型服务出错", r"(?i)timeout|timed out|connection|401|403|402|429|5\d\d|api key|quota|余额|欠费"),
@@ -145,10 +146,10 @@ class RunRecord:
 
 def run_once(sc: Scenario, i: int, out: Path, llm_factory: Callable[[], object], *, auto_continue: int = 2,
              max_steps: int = 150, max_tokens: int = 4_000_000, max_history_chars: int = 40000,
-             log: Callable[[str], None] = print) -> RunRecord:
-    from bonus_agent import review as rv
+             max_minutes: float = 0, log: Callable[[str], None] = print) -> RunRecord:
+    """跑一次场景。max_minutes>0 时整次（含自动接续）超过这么多分钟就在当前这一步做完后停下，记为超时跳过。
+    任何一步出错（模型服务、程序、核对期望结果）都只记在这一次的记录里，不影响其他场景。"""
     from bonus_agent.agent import run_agent
-    from bonus_agent.compare import compare_expected, report
     rec = RunRecord(sc.name, i, out=str(out))
     if out.exists():
         shutil.rmtree(out)
@@ -158,18 +159,21 @@ def run_once(sc: Scenario, i: int, out: Path, llm_factory: Callable[[], object],
     t0 = time.time()
     steps = 0
     ar = None
+    late = (lambda: time.time() - t0 > max_minutes * 60) if max_minutes else (lambda: False)
     try:
         new, auto, answered = True, 0, 0
         while True:
             ar = run_agent(llm, files, out, resume=not new, max_steps=max_steps, max_tokens=max_tokens,
-                           max_history_chars=max_history_chars)
+                           max_history_chars=max_history_chars, should_stop=late)
+            if late() and ar.status == "FAILED":
+                ar.error = f"单次运行超过 {max_minutes:g} 分钟，已跳过（{ar.error[:80]}）"
             new = False
             steps += len(ar.steps)
             rec.reflections += sum(1 for s in ar.steps if s.tool == "（反思）")
             rec.rounds += 1
             log(f"  {sc.name} 第 {i} 次 · 第 {ar.round} 轮：{ar.status}" + (f"（{ar.error[:80]}）" if ar.error else ""))
             rec.questions += [q.text for q in ar.ws.pending if q.text not in rec.questions]
-            if ar.status == "FAILED" and retryable(ar.error) and auto < auto_continue:
+            if ar.status == "FAILED" and retryable(ar.error) and auto < auto_continue and not late():
                 auto += 1
                 continue
             if ar.status == "NEEDS_CONFIRMATION" and sc.answers and answered < sc.max_answer_rounds \
@@ -191,6 +195,16 @@ def run_once(sc: Scenario, i: int, out: Path, llm_factory: Callable[[], object],
     if u is not None:
         rec.calls, rec.prompt_tokens, rec.completion_tokens = u.calls, u.prompt_tokens, u.completion_tokens
     rec.steps = steps
+    try:
+        _score(rec, ar, sc, out)
+    except Exception as e:  # 核对期望结果出错也只记在这一次
+        rec.error = (rec.error + "；" if rec.error else "") + f"核对期望结果出错：{type(e).__name__}: {e}"
+    return rec
+
+
+def _score(rec: RunRecord, ar, sc: Scenario, out: Path) -> None:
+    from bonus_agent import review as rv
+    from bonus_agent.compare import compare_expected, report
     if ar is not None:
         rec.reread_ignored = sum(1 for i in ar.ws.ignored if str(i.get("ref", "")).startswith("复读 "))
         rec.reread_error = (ar.ws.reread or {}).get("error", "")
@@ -206,7 +220,39 @@ def run_once(sc: Scenario, i: int, out: Path, llm_factory: Callable[[], object],
                 all(m.total or m.ambiguous for m in ms if m.metric == "应得")
             rec.missed = not rec.correct
             (out / "expected_check.txt").write_text("\n".join(rec.check) + "\n", encoding="utf-8")
-    return rec
+
+
+def preflight(llm) -> tuple[bool, list[str]]:
+    """开跑前确认模型能调度：查上下文长度，发一个很小的请求要它回 JSON。主模型不行就不开跑；
+    交叉验证模型不行只提示（跑的时候会退回主模型验证）。"""
+    from bonus_agent.agent import MIN_CONTEXT
+    from bonus_agent.failure import explain
+    from bonus_agent.llm import LLMError, parse_json
+    ok, lines = True, []
+    for role, m in (("主模型", llm), ("交叉验证模型", getattr(llm, "checker_llm", None))):
+        if m is None:
+            continue
+        t0 = time.time()
+        try:
+            ctx = m.context_window()
+            if ctx is not None and ctx < MIN_CONTEXT:
+                raise LLMError(f"上下文长度只有 {ctx} tokens，至少要 {MIN_CONTEXT}（vLLM 的 --max-model-len）")
+            raw = m.chat([{"role": "user", "content": '只输出这个 JSON，不要别的文字：{"ok": true}'}],
+                         json_out=True, temperature=0, max_tokens=64)
+            if not isinstance(parse_json(raw), dict):
+                raise LLMError(f"能连上，但没有按要求回 JSON：{raw[:80]}")
+            lines.append(f"{role} {m.name}：可以调用（上下文 {ctx or '未知'} tokens，响应 {time.time() - t0:.1f} 秒）")
+        except Exception as e:
+            why = str(e)[:200]
+            try:
+                d = explain(why)
+                why = f"{d.get('title', '')}{('；' + d['advice']) if d.get('advice') else ''}（原始信息：{why[:120]}）"
+            except Exception:
+                pass
+            lines.append(f"{role} {m.name}：调用失败 —— {why}"
+                         + ("" if role == "主模型" else "（运行时会退回主模型做验证）"))
+            ok = ok and role != "主模型"
+    return ok, lines
 
 
 def summarize(records: list[RunRecord], meta: dict) -> dict:
@@ -244,12 +290,19 @@ def lines(summary: dict) -> list[str]:
 
 
 def run_suite(scenarios: list[Scenario], out: Path, llm_factory: Callable[[], object], *, runs: int = 3,
-              meta: dict | None = None, log: Callable[[str], None] = print, **kw) -> dict:
-    """每个场景跑 runs 次；每跑完一次就更新 summary.json（中途停掉也有已跑完的部分）。"""
+              meta: dict | None = None, log: Callable[[str], None] = print, resume: bool = False, **kw) -> dict:
+    """每个场景跑 runs 次；每跑完一次就更新 summary.json（中途停掉也有已跑完的部分）。
+    resume：同一个输出目录里 summary.json 已记下的（场景, 第几次）不再跑，接着跑没跑的（电脑重启、窗口关掉后续跑）。"""
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     meta = {"开始": datetime.now().isoformat(timespec="seconds"), "每个场景次数": runs, **(meta or {})}
     records: list[RunRecord] = []
+    if resume and (out / SUMMARY).exists():
+        old = json.loads((out / SUMMARY).read_text(encoding="utf-8"))
+        names = {f.name for f in fields(RunRecord)}
+        records = [RunRecord(**{k: v for k, v in r.items() if k in names}) for r in old.get("明细", [])]
+        meta = {**old.get("meta", {}), **{k: v for k, v in meta.items() if k != "开始"}, "续跑": meta["开始"]}
+    done = {(r.scenario, r.run) for r in records}
     summary = summarize(records, meta)
     for sc in scenarios:
         missing = [str(p) for p in sc.inputs if not p.exists()] + ([str(sc.expected)] if sc.expected and not sc.expected.exists() else [])
@@ -257,8 +310,15 @@ def run_suite(scenarios: list[Scenario], out: Path, llm_factory: Callable[[], ob
             log(f"{sc.name}：找不到 {'、'.join(missing)}，跳过")
             continue
         for i in range(1, runs + 1):
+            if (sc.name, i) in done:
+                log(f"{sc.name} 第 {i}/{runs} 次：上次已跑完，跳过")
+                continue
             log(f"{sc.name} 第 {i}/{runs} 次 ...")
-            rec = run_once(sc, i, out / sc.name / f"第{i}次", llm_factory, log=log, **kw)
+            try:
+                rec = run_once(sc, i, out / sc.name / f"第{i}次", llm_factory, log=log, **kw)
+            except Exception as e:      # 连准备都出错（如目录被占用）：记下来，接着跑下一个
+                rec = RunRecord(sc.name, i, status="ERROR", error=f"{type(e).__name__}: {e}",
+                                cause=cause(f"{type(e).__name__}: {e}"), out=str(out / sc.name / f"第{i}次"))
             records.append(rec)
             verdict = ("金额全部正确" if rec.correct else f"算错没拦住（{rec.wrong}/{rec.checked} 个金额不一致）"
                        if rec.missed else "已出结果（没有期望结果，未核对）" if rec.status == "OK" else f"没出结果：{rec.cause}")
