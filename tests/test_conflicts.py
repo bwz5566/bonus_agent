@@ -120,7 +120,7 @@ def test_finish_requires_facts_and_uses_them(tmp_path):
     with pytest.raises(ToolError, match="variables.rate 不存在"):
         ws.cover_clauses({"C1": "variables.rate"})
     ws.cover_clauses({"C1": "pool"})
-    assert "C1 [方案.docx] 按销售额 5% 计提 → pool" in ws.state()
+    assert "C1 按销售额 5% 计提 → pool" in ws.state()
     try:
         ws.finish("x")
         raise AssertionError("登记的 5% 没用到也能完成")

@@ -339,3 +339,13 @@ def test_rejected_upload_keeps_existing_files(env, monkeypatch):
     assert [p.name for p in (store.dir(cid) / "expected").iterdir()] == ["期望.xlsx"]
     r = post(c, store, f"/cases/{cid}/materials", files=[("files", ("a.xlsx", b"ok")), ("files", ("b.xlsx", b"x" * 20))])
     assert r.status_code == 413 and not list((store.dir(cid) / "materials").glob("*.xlsx"))
+
+
+def test_long_thought_is_shortened_in_history_only():
+    """思考太长时，记进历史（之后每步都要重发）的只留开头；短的、不是 JSON 的原样保留。"""
+    from bonus_agent.agent import HISTORY_THOUGHT_CHARS, _short_thought
+    long = json.dumps({"thought": "想" * 1000, "tool": "trial_run", "args": {}}, ensure_ascii=False)
+    got = json.loads(_short_thought(long))
+    assert len(got["thought"]) < HISTORY_THOUGHT_CHARS + 20 and got["tool"] == "trial_run"
+    short = json.dumps({"thought": "试算", "tool": "trial_run"}, ensure_ascii=False)
+    assert _short_thought(short) == short and _short_thought("不是 JSON") == "不是 JSON"

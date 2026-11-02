@@ -401,6 +401,25 @@ def _repair_json(text: str, close: bool = True):
     return None
 
 
+HISTORY_THOUGHT_CHARS = 300     # 历史里保留的思考长度：之后每一步都要重发，太长的只留开头
+
+
+def _short_thought(text: str) -> str:
+    """回复（JSON）里的 thought 太长时，记进历史的只留开头；执行和运行步骤里用的仍是原文。"""
+    try:
+        obj = json.loads(text)
+    except ValueError:
+        return text
+    t = obj.get("thought") if isinstance(obj, dict) else None
+    if not isinstance(t, str) or len(t) <= HISTORY_THOUGHT_CHARS:
+        return text
+    return json.dumps({**obj, "thought": t[:HISTORY_THOUGHT_CHARS] + "…（思考较长，已省略）"}, ensure_ascii=False)
+
+
+def _clip(text: str, n: int) -> str:
+    return text if len(text) <= n else text[:n] + "…"
+
+
 def _close_json(text: str) -> str | None:
     """JSON 只是结尾少了 } 或 ]（模型常见的漏写）：补上。不在字符串中间、括号配得上时才补。"""
     stack, in_str, esc = [], False, False
@@ -432,7 +451,7 @@ def _list_to_obj(items: list[dict]):
     return items
 
 
-THOUGHT = {"type": "string", "description": "思考（必填）：上一步观察到了什么、为什么做这一步、预期看到什么；上一步出错时先说明原因"}
+THOUGHT = {"type": "string", "description": "思考（必填，1～3 句、不超过 150 字）：上一步观察到了什么、为什么做这一步、预期看到什么；上一步出错时先说明原因。不要复述结果、原文和规则"}
 for _t in TOOLS:          # 思考-行动-观察：每次行动都带上思考，记进运行步骤
     _p = _t["parameters"]
     _p["properties"] = {"thought": THOUGHT, **_p.get("properties", {})}
@@ -773,12 +792,12 @@ class Workspace:
     def _clause_sig(self, c, texts: dict[str, list[str]]) -> str:
         return "\n".join(t for r in cl.refs(c.where) for t in texts.get(r, []))
 
-    def _side_by_side(self, clauses: list, limit: int = 9000) -> str:
+    def _side_by_side(self, clauses: list, limit: int = 6000) -> str:
         """条款原文和它落到的规则并排列出，让模型逐条核对；列出过的记下当时的规则内容。"""
         texts, lines = self._element_texts(), []
         for c in clauses:
             sig = self._clause_sig(c, texts)
-            body = "\n".join(f"      {t[:300]}" for t in sig.splitlines()) or f"      {c.where}"
+            body = "\n".join(f"      {t[:200]}" for t in sig.splitlines()) or f"      {c.where}"
             lines.append(f"- {c.id} 原文（{c.file}）：{c.quote[:160]}\n    要点：{c.point}\n    规则：\n{body}")
             c.checked = sig
         text = "\n".join(lines)
@@ -1729,7 +1748,14 @@ class Workspace:
         if self.clauses:
             left = sum(1 for c in self.clauses if not c.where)
             lines.append(f"- 条款清单 {len(self.clauses)} 条" + (f"（{left} 条还没落实）" if left else "") + "，逐条对照，不要遗漏：")
-            lines += [f"  · {c.id} [{c.file}] {c.point} → {c.where or '未落实'}" for c in self.clauses]
+            done = [c for c in self.clauses if c.where]
+            if left and done:      # 已落实的只列位置（原文和要点在 cover_clauses 的核对结果里看过），没落实的列全
+                lines.append("  已落实：" + "；".join(f"{c.id}→{c.where[:40]}" for c in done))
+                lines += [f"  · {c.id} [{c.file}] {c.point} → 未落实" for c in self.clauses if not c.where]
+            elif left:
+                lines += [f"  · {c.id} [{c.file}] {c.point} → 未落实" for c in self.clauses]
+            else:
+                lines += [f"  · {c.id} {c.point[:40]} → {c.where[:40]}" for c in self.clauses]
         else:
             lines.append("- 条款清单：还没有。读完每份规则文档就用 record_clauses 逐条摘出计算条款")
         if self.questions:
@@ -1747,8 +1773,11 @@ class Workspace:
             left = self._verify_gaps()
             lines.append("- 待独立验算（程序指定，全部通过才能 finish）：" + ("；".join(left[:12]) if left else "全部通过"))
         if self.check_vars:
-            lines.append("- 验算辅助变量（已定义，verify 里直接引用，不必再写进 helpers；要改哪个就在 helpers 里重写哪个）：\n"
-                         + "\n".join(f"  · {k}[{v.get('scope', 'global')}] = {v.get('expr', '')}" for k, v in self.check_vars.items()))
+            pending = bool(self.schemes) and bool(self._verify_gaps())
+            lines.append("- 验算辅助变量（已定义，verify 里直接引用，不必再写进 helpers；要改哪个就在 helpers 里重写哪个）："
+                         + ("\n" + "\n".join(f"  · {k}[{v.get('scope', 'global')}] = {_clip(v.get('expr', ''), 160)}"
+                                              for k, v in self.check_vars.items()) if pending
+                            else "、".join(self.check_vars)))
         return "\n".join(lines)
 
 
@@ -1887,7 +1916,7 @@ def system_prompt() -> str:
 
 JSON_PROTOCOL = """
 # 回复格式（本模型不使用原生工具调用）
-每次只输出一个 JSON 对象，不要输出其他文字：{"thought": "简短的思考", "tool": "工具名", "args": {参数}}
+每次只输出一个 JSON 对象，不要输出其他文字：{"thought": "简短的思考（1～3 句）", "tool": "工具名", "args": {参数}}
 可用工具（JSON Schema）：
 """
 
@@ -2089,7 +2118,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             except LLMError as e:
                 error = str(e)
                 break
-            history.append({"role": "assistant", "content": text})
+            history.append({"role": "assistant", "content": _short_thought(text)})
             try:
                 act = parse_json(text)
                 a = act.get("args") or {}
@@ -2115,7 +2144,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             calls = [{**c, "raw": c["arguments"], "arguments": _fix_arguments(c["arguments"])} for c in reply["tool_calls"]]
             history.append({"role": "assistant", "content": reply["content"],
                             **({"tool_calls": [{"id": c["id"], "type": "function",
-                                                "function": {"name": c["name"], "arguments": c["arguments"]}}
+                                                "function": {"name": c["name"], "arguments": _short_thought(c["arguments"])}}
                                                for c in calls]} if calls else {})})
             if not calls:
                 nudges += 1
