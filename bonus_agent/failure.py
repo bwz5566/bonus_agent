@@ -81,6 +81,10 @@ def _explain(err: str) -> dict:
                 "advice": "请管理员检查 API Key 配置，改好后点「重试」。", "where": ""}
     if any(k in low for k in ("arrearage", "insufficient", "402", "欠费", "余额", "quota")):
         return {"title": "模型服务欠费或额度用完。", "advice": "请管理员充值或换一个模型，然后点「重试」。", "where": ""}
+    if "max_model_len" in low or "max-model-len" in low or "maximum context length" in low or "上下文长度" in err:
+        return {"title": "模型服务的上下文长度不够，放不下智能体每一步的输入。",
+                "advice": "请管理员把模型服务的上下文长度调到至少 65536（建议 131072，vLLM 启动参数 --max-model-len），然后点「重试」。",
+                "where": ""}
     if any(k in low for k in ("timeout", "timed out", "connection", "连接", "无法连接", "name resolution", "502", "503", "504")):
         return {"title": "连不上模型服务（网络或服务暂时不可用）。",
                 "advice": "稍后点「重试」；一直连不上请管理员检查网络和服务地址。", "where": ""}

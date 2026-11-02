@@ -225,6 +225,19 @@ class LLM:
     def _client(self):
         return openai_client(self.base_url, self.api_key, self.timeout)
 
+    def context_window(self) -> int | None:
+        """模型服务的上下文长度（vLLM 在 /models 里返回 max_model_len）；查不到返回 None，不影响调用。"""
+        if not hasattr(self, "_ctx"):
+            self._ctx = None
+            try:
+                for m in openai_client(self.base_url, self.api_key, 20).models.list():
+                    if m.id == self.model:
+                        n = getattr(m, "max_model_len", None) or (getattr(m, "model_extra", None) or {}).get("max_model_len")
+                        self._ctx = int(n) if n else None
+            except Exception:
+                pass
+        return self._ctx
+
     def chat(self, messages: list[dict], *, schema: dict | None = None, json_out: bool = False,
              temperature: float = 0.1, max_tokens: int = 8192) -> str:
         kwargs = dict(model=self.model, messages=self._prepare(messages), temperature=temperature, max_tokens=max_tokens)
@@ -268,6 +281,9 @@ class LLM:
 
 class FakeLLM(LLM):
     """测试和演练用：按调用顺序返回预设回答，或由函数根据消息生成回答。"""
+
+    def context_window(self) -> int | None:
+        return getattr(self, "ctx", None)        # 测试里设 ctx 模拟模型服务的上下文长度
 
     def __init__(self, responder: Callable[[list[dict]], str] | list[str], name: str = "fake"):
         super().__init__(name, name, "", "")

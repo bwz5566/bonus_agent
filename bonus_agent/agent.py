@@ -48,6 +48,7 @@ SCHEME_REF = re.compile(r"""scheme_paid\(\s*["']([^"']+)["']\s*(?:,\s*["']([^"']
 SHARED = "共用"                # 多个方案共用的部分（权重、校验、共用变量），合并进每个方案
 AGENT_TEMPERATURE = 0          # 工作循环用 0：同样的材料和状态尽量走同样的路，过程稳定、可复现
 MAX_STUCK = 3                  # 同一调用原样重复、或同一工具连续失败达到这个次数就算卡住
+MIN_CONTEXT = 65536            # 模型服务上下文长度的下限：智能体每步输入约 4～5 万 tokens（材料包、工作区状态、对话历史），再加输出
 MAX_REFLECT = 2                # 卡住时先让智能体停下来反思、换做法接着做，最多这么多次；再卡住才停下，把原因报给财务
 KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保留全文
 BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
@@ -1915,6 +1916,11 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         raise ToolError(str(e)) from None
     if not files:
         raise ToolError("没有找到可处理的文件（支持 .docx .pptx .pdf .xlsx .xlsm .png .jpg .txt .md .json .csv）")
+    ctx = llm.context_window()
+    if ctx is not None and ctx < MIN_CONTEXT:
+        raise ToolError(f"模型服务的上下文长度只有 {ctx} tokens（max_model_len），智能体每一步的输入就有约 4～5 万 tokens，"
+                        f"至少要 {MIN_CONTEXT}，建议 131072。请管理员调大模型服务的上下文长度（vLLM 启动参数 --max-model-len；"
+                        "超过模型原生长度的要同时开 YaRN），再重试")
     ws = Workspace(llm, build_inventory(files))
     out = Path(out_dir) if out_dir is not None else None
     case = cs.load_case(out) if out is not None else None      # --new 也保留历次记录，只是不接着上一轮的工作区

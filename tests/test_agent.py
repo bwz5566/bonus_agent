@@ -392,3 +392,16 @@ def test_lan_model_service_bypasses_system_proxy():
     assert not direct("https://api.deepseek.com/v1")
     assert openai_client("http://10.0.0.5:8000/v1", "k", 5)._client._trust_env is False
     assert openai_client("https://api.deepseek.com/v1", "k", 5)._client._trust_env is True
+
+
+def test_small_context_window_is_reported_before_running():
+    """模型服务上下文太小（如 vLLM 的 max_model_len 只有几千）：开始前就说清楚要调多大，不在第一步报一句 400。"""
+    from bonus_agent.agent import ToolError, run_agent
+    llm = FakeLLM([{"tool": "finish", "args": {"summary": "x"}}])
+    llm.ctx = 8000
+    try:
+        run_agent(llm, [ANNUAL])
+        raise AssertionError("应当报错")
+    except ToolError as e:
+        assert "8000" in str(e) and "max-model-len" in str(e)
+    assert not llm.calls
