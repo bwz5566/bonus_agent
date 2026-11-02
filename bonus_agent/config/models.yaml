@@ -16,14 +16,15 @@ providers:
   local_vllm:       # 自建 vLLM，部署后使用
     base_url: http://127.0.0.1:8000/v1
     api_key_env: VLLM_API_KEY
-  local_qwen:       # 内网 Qwen 服务（vLLM，OpenAI 兼容，max-model-len 1M）。Key 写在 secrets.yaml 或环境变量 LOCAL_QWEN_API_KEY
-    base_url: http://192.168.81.98:9705/v1
+  local_qwen:       # 自建 Qwen 服务（OpenAI 兼容）。Key 写在 secrets.yaml 或环境变量 LOCAL_QWEN_API_KEY；内网地址程序自动直连、不走代理
+    base_url: http://192.168.81.155:8000/v1
     api_key_env: LOCAL_QWEN_API_KEY
 
 default: qwen-local
 
 # 智能体相关的可选项（写在每个模型下）：
 #   tool_mode: native | json      native 为原生工具调用（默认）；服务不支持时会自动改用 json
+#   timeout: 300                  单次请求的超时（秒），默认 300；本地模型打开思考时可加大到 600
 #   max_history_chars: 24000      智能体对话历史的上限（字符）。超过时整理一次，压到一半；加大会让每步输入变多
 #   cache: explicit               百炼显式缓存（命中部分按输入价 10% 计费，5 分钟有效）。只对支持的模型开启，
 #                                 目前候选开源模型都不支持；私有化 vLLM 自带前缀缓存，无需配置
@@ -110,7 +111,8 @@ models:
   # 只对智能体每一步生效，抽取、复读等要 JSON 的调用仍然不思考
   qwen-local:
     provider: local_qwen
-    model: qwen-chat
+    model: qwen38-int4
+    timeout: 300                # 单次请求超时（秒）；打开思考时建议 600
     json_mode: json_object
     extra_body: {chat_template_kwargs: {enable_thinking: false}}
     # tools_extra_body: {chat_template_kwargs: {enable_thinking: true}}

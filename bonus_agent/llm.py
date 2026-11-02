@@ -185,7 +185,7 @@ class LLM:
         prov = cfg["providers"][m["provider"]]
         llm = cls(name, m["model"], prov["base_url"], provider_key(prov), m.get("json_mode", "json_object"),
                   m.get("extra_body"), m.get("tool_mode", "native"), cache=m.get("cache"),
-                  tools_extra_body=m.get("tools_extra_body"))
+                  tools_extra_body=m.get("tools_extra_body"), timeout=float(m.get("timeout", 300)))
         v = m.get("vision", True)       # true：自己看图；false：不能看图；模型名：用那个模型转写图片
         if isinstance(v, str):
             if v == name or cfg["models"].get(v, {}).get("vision", True) is not True:
