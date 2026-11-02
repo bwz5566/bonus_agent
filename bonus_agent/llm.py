@@ -173,10 +173,12 @@ class LLM:
     tools_extra_body: dict | None = None   # 智能体工具调用时覆盖 extra_body（如打开思考模式），抽取等其他调用不受影响
     vision: bool = True               # 能否看图；不能看图时由 vision_llm 转写图片（没配置就不转写）
     vision_llm: "LLM | None" = None
+    checker_llm: "LLM | None" = None  # 交叉验证（独立复读、独立算式）用的另一个模型；没配置就用自己
     usage: Usage = field(default_factory=Usage)
 
     @classmethod
-    def from_config(cls, name: str | None = None, config: dict | None = None) -> "LLM":
+    def from_config(cls, name: str | None = None, config: dict | None = None, checker: str | None = None) -> "LLM":
+        """checker：交叉验证用的模型名（不写就看 models.yaml 里这个模型的 checker 项，都没有就自己验证）。"""
         cfg = config or load_config()
         name = name or cfg["default"]
         if name not in cfg["models"]:
@@ -194,6 +196,12 @@ class LLM:
             llm.vision_llm.usage = llm.usage          # 看图的用量记在同一处
         else:
             llm.vision = bool(v)
+        c = checker or m.get("checker")
+        if c and c != name:
+            if c not in cfg["models"]:
+                raise LLMError(f"交叉验证模型 {c} 没有配置，可选：{', '.join(cfg['models'])}")
+            llm.checker_llm = cls.from_config(c, cfg)
+            llm.checker_llm.usage = llm.usage          # 用量记在同一处
         return llm
 
     @property

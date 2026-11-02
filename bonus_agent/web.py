@@ -963,16 +963,18 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
     return app
 
 
-def serve(root: str, host: str = "127.0.0.1", port: int = 8080, model: str | None = None, **kw) -> None:
+def serve(root: str, host: str = "127.0.0.1", port: int = 8080, model: str | None = None, checker: str | None = None,
+          **kw) -> None:
     import uvicorn
 
     from bonus_agent.llm import LLM, load_config
     cfg = load_config()
-    name = LLM.from_config(model, cfg).name          # 启动时就核对模型配置
+    llm = LLM.from_config(model, cfg, checker)       # 启动时就核对模型配置
+    name = llm.name + (f"（交叉验证：{llm.checker_llm.name}）" if llm.checker_llm else "")
     users = Store(Path(root)).users.load()
     if not users:
         raise SystemExit(f"还没有用户，先运行：bonus-agent user add --data {root} 用户名 --roles editor,approver")
     print(f"数据目录：{Path(root).resolve()}；用户：{'、'.join(users)}；模型：{name}；浏览器打开 http://{host}:{port}",
           flush=True)
-    app = create_app(root, lambda: LLM.from_config(model, cfg), model_name=name, **kw)
+    app = create_app(root, lambda: LLM.from_config(model, cfg, checker), model_name=name, **kw)
     uvicorn.run(app, host=host, port=port)

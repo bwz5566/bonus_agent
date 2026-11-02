@@ -425,6 +425,7 @@ class Workspace:
     changed: bool = False                                   # 对话里改过规则、数据表、台账或问题
     reply_text: str = ""
     budget: str = ""
+    checker_down: str = ""                                  # 交叉验证模型调用失败、改用主模型时的说明
     round: int = 1                                          # 第几轮（同一案卷和财务来回的次数）
     facts: list[fx.Fact] = field(default_factory=list)      # 参数台账：从材料里登记的参数和口径
     clauses: list[cl.Clause] = field(default_factory=list)  # 条款清单：每份规则文档的计算条款，及落在规则的哪里

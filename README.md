@@ -244,6 +244,8 @@ bonus-agent serve --data /srv/bonus --host 127.0.0.1 --port 8080 [--model local]
 
 现在默认用内网自建 Qwen 服务 A（`models.yaml` 里的 `qwen-a`，地址在 `local_qwen`）；服务 B 是 `qwen-b`（地址在 `local_qwen_b`），用 `--model qwen-b`。Key 写进 `config/secrets.yaml` 的 `local_qwen` / `local_qwen_b`，或环境变量 `LOCAL_QWEN_API_KEY` / `LOCAL_QWEN_B_API_KEY`；要换回 DeepSeek 用 `--model deepseek-flash`。
 
+交叉验证：`--checker qwen-a`（regress、serve、auto 都可以加）让独立复读和独立算式改用另一个模型，主流程仍用 `--model` 的模型。两个模型错法不同，验得更真；另一个模型连不上时自动退回主模型，并在复读记录里写明。也可以在 `models.yaml` 的模型下写 `checker: qwen-a` 作为默认。
+
 已配好两个本地模型（`models.yaml` 里的 `local`、`local-deepseek`），用 vLLM 启动后 `--model local` 即可。下面是参考命令，
 工具调用解析器（`--tool-call-parser`）和显存参数以模型卡说明和实际显卡为准：
 

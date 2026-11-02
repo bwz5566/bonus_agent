@@ -93,6 +93,18 @@ def signature(text: str) -> str:
     return hashlib.sha1(text.encode()).hexdigest()[:16]
 
 
+def _ask(ws, msgs: list[dict]) -> str:
+    """交叉验证：配置了另一个模型就让它来复读、写独立算式（和主流程的模型错法不同，验得更真）；
+    它调用失败时退回主模型，并记下来，不让整轮失败。"""
+    other = getattr(ws.llm, "checker_llm", None)
+    if other is not None and not getattr(ws, "checker_down", ""):
+        try:
+            return other.chat(msgs, json_out=True, temperature=0, max_tokens=8192)
+        except LLMError as e:
+            ws.checker_down = f"交叉验证模型 {other.name} 调用失败（{str(e)[:120]}），改用主模型 {ws.llm.name} 验证"
+    return ws.llm.chat(msgs, json_out=True, temperature=0, max_tokens=8192)
+
+
 def run(ws) -> dict:
     """调用模型复读；材料没变时用上次的结果。返回 {"sig", "items", "unclear", "error"}。"""
     text = material(ws)
@@ -105,7 +117,7 @@ def run(ws) -> dict:
     out = {"sig": sig, "items": [], "unclear": [], "error": "", "calc": old.get("calc") or {}}
     for attempt in range(2):
         try:
-            raw = ws.llm.chat(msgs, json_out=True, temperature=0, max_tokens=8192)
+            raw = _ask(ws, msgs)
             data = parse_json(raw)
             items = data.get("items") if isinstance(data, dict) else None
             if not isinstance(items, list):
@@ -121,6 +133,8 @@ def run(ws) -> dict:
     ws.reread = out
     if not out["error"]:
         calc(ws, out)
+    other = getattr(ws.llm, "checker_llm", None)
+    out["by"] = ws.checker_down or (other.name if other is not None else getattr(ws.llm, "name", ""))
     return out
 
 
@@ -237,7 +251,7 @@ def _sample(ws, base: list[dict], names: list[str]) -> dict:
     msgs, out = list(base), {"schemes": {}, "unclear": [], "error": ""}
     for attempt in range(CALC_TRIES):
         try:
-            raw = ws.llm.chat(msgs, json_out=True, temperature=0, max_tokens=8192)
+            raw = _ask(ws, msgs)
             data = parse_json(raw)
             got = data.get("schemes") if isinstance(data, dict) else None
             if not isinstance(got, dict):

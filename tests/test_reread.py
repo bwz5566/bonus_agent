@@ -181,3 +181,22 @@ def test_independent_formula_needs_two_consistent_samples(tmp_path):
     assert ar.status == "OK", ar.error
     assert ar.ws.reread["calc"]["unsettled"] == {"PROCESS": ["奖金池"]}
     assert any(r["item"] == "独立算式没有定论：PROCESS" for r in rv.load(tmp_path / "a"))
+
+
+def test_cross_check_uses_another_model_and_falls_back():
+    """配置了交叉验证模型：复读、独立算式交给它；它调用失败时退回主模型，记下原因，不让整轮失败。"""
+    from bonus_agent.llm import LLM, FakeLLM, LLMError, load_config
+    cfg = load_config()
+    llm = LLM.from_config("qwen-b", cfg, "qwen-a")
+    assert llm.checker_llm.name == "qwen-a" and llm.checker_llm.usage is llm.usage
+    assert LLM.from_config("qwen-b", cfg).checker_llm is None and LLM.from_config("qwen-a", cfg, "qwen-a").checker_llm is None
+    main, other = FakeLLM(lambda m: "主"), FakeLLM(lambda m: "副", name="other")
+    main.checker_llm = other
+    ws = NS(llm=main, checker_down="")
+    assert rr._ask(ws, [{"role": "user", "content": "x"}]) == "副" and not ws.checker_down
+
+    def down(m):
+        raise LLMError("Connection error.")
+    main.checker_llm = FakeLLM(down, name="other")
+    assert rr._ask(ws, [{"role": "user", "content": "x"}]) == "主" and "other 调用失败" in ws.checker_down
+    assert rr._ask(ws, [{"role": "user", "content": "x"}]) == "主"          # 失败过一次就不再反复等它超时

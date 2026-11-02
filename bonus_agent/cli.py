@@ -15,10 +15,11 @@
   negcheck --out 案卷目录 --cases negative_cases.json [--sheet 表名=工作表 ...] 材料...
                                            坏数据回归：用该案卷的规则（不调用大模型）在逐个改坏的数据上重算，
                                            列出每种坏数据有没有被拦住
-  regress [--suite 场景.yaml] [--runs 3] [--model M] [--only Q1,Q3] --out 目录
+  regress [--suite 场景.yaml] [--runs 3] [--model M] [--checker M2] [--only Q1,Q3] --out 目录
                                            固定回归：每个场景跑 N 次（默认 3），和期望结果逐分比对，
                                            汇总写入 目录/summary.json（完成率、正确率、算错没拦住、卡住原因）
-  serve --data 数据目录 [--host 127.0.0.1] [--port 8080] [--model M]
+  serve --data 数据目录 [--host 127.0.0.1] [--port 8080] [--model M] [--checker M2]
+                                           --checker：独立复读、独立算式改用另一个模型交叉验证（连不上时退回主模型）
                                            内网网页服务：看问题、填答复、传材料、运行下一轮、确认、按模板计算
   user add --data 数据目录 用户名 --roles editor,approver [--display 姓名]
                                            添加或修改网页用户（口令从终端输入，只存哈希）
@@ -75,6 +76,7 @@ def main(argv=None) -> int:
                    help="场景配置 YAML（默认 evals/regress.yaml）")
     p.add_argument("--runs", type=int, default=3, help="每个场景跑几次，默认 3")
     p.add_argument("--model")
+    p.add_argument("--checker", help="交叉验证（独立复读、独立算式）用的另一个模型，如 qwen-a；不写就用主模型自己验证")
     p.add_argument("--only", default="", help="只跑这些场景，逗号分隔")
     p.add_argument("--out", required=True, help="输出目录：每次运行的案卷和 summary.json")
     p.add_argument("--max-steps", type=int, default=150)
@@ -84,6 +86,7 @@ def main(argv=None) -> int:
     p.add_argument("--host", default="127.0.0.1", help="默认只监听本机；内网访问请放在 HTTPS 反向代理后面")
     p.add_argument("--port", type=int, default=8080, help="默认 8080（8000 留给本地 vLLM）")
     p.add_argument("--model")
+    p.add_argument("--checker", help="交叉验证（独立复读、独立算式）用的另一个模型，如 qwen-a；不写就用主模型自己验证")
     p.add_argument("--max-parallel", type=int, default=2, help="同时最多运行几个案卷")
     p = sub.add_parser("user")
     p.add_argument("action", choices=["add"])
@@ -94,6 +97,7 @@ def main(argv=None) -> int:
     p.add_argument("--password-stdin", action="store_true", help="从标准输入读口令（脚本用）")
     p = sub.add_parser("auto")
     p.add_argument("--model")
+    p.add_argument("--checker", help="交叉验证（独立复读、独立算式）用的另一个模型，如 qwen-a；不写就用主模型自己验证")
     p.add_argument("--answers", help="财务答复文件（默认读案卷目录里的 questions.yaml）")
     p.add_argument("--out", required=True, help="案卷目录：每轮的输出、问题和工作区都在这里，下一轮接着用")
     p.add_argument("--new", action="store_true", help="忽略案卷目录里上一轮的工作，从头开始")
@@ -140,8 +144,8 @@ def main(argv=None) -> int:
         cfg = load_config()
         name = a.model or cfg["default"]
         hist = cfg["models"].get(name, {}).get("max_history_chars", 40000)
-        summary = rg.run_suite(scenarios, Path(a.out), lambda: LLM.from_config(a.model, cfg), runs=a.runs,
-                               meta={"模型": name, "场景配置": str(a.suite)}, max_steps=a.max_steps,
+        summary = rg.run_suite(scenarios, Path(a.out), lambda: LLM.from_config(a.model, cfg, a.checker), runs=a.runs,
+                               meta={"模型": name, "交叉验证模型": a.checker or "", "场景配置": str(a.suite)}, max_steps=a.max_steps,
                                max_tokens=a.max_tokens, max_history_chars=hist)
         print("\n" + "\n".join(rg.lines(summary)))
         print(f"\n汇总已写入 {Path(a.out) / rg.SUMMARY}")
@@ -164,7 +168,7 @@ def main(argv=None) -> int:
         return 0 if all(r.blocked for r in res) else 3
     if a.cmd == "serve":
         from bonus_agent.web import serve
-        serve(a.data, a.host, a.port, a.model, max_parallel=a.max_parallel)
+        serve(a.data, a.host, a.port, a.model, max_parallel=a.max_parallel, checker=a.checker)
         return 0
     cfg = load_config()
     if a.cmd == "models":
@@ -243,7 +247,7 @@ def main(argv=None) -> int:
     if a.cmd == "auto":
         from bonus_agent.auto import run_auto
         answers = yaml.safe_load(Path(a.answers).read_text(encoding="utf-8")) if a.answers else None
-        llm = LLM.from_config(a.model, cfg)
+        llm = LLM.from_config(a.model, cfg, a.checker)
         print(f"使用模型 {llm.name}（固定流程）", flush=True)
 
         def show(files):
@@ -284,7 +288,7 @@ def main(argv=None) -> int:
 def _agent(a, cfg) -> int:
     from bonus_agent.agent import ToolError, run_agent
     answers = yaml.safe_load(Path(a.answers).read_text(encoding="utf-8")) if a.answers else None
-    llm = LLM.from_config(a.model, cfg)
+    llm = LLM.from_config(a.model, cfg, a.checker)
     hist = cfg["models"][llm.name].get("max_history_chars", 40000)
     print(f"使用模型 {llm.name}，智能体开始工作 ...", flush=True)
 
