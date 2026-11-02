@@ -92,16 +92,30 @@ def _parsed(rs: RuleSet):
 
 
 def constants(rs: RuleSet) -> list[tuple[Decimal, str]]:
-    """规则里写死的数和位置。round 的位数不算。"""
+    """规则里写死的数和位置。round 的位数不算；校验里 abs(…) < 0.0001 这类比较容差也不算（只影响校验，不影响金额）。"""
     out = []
     for where, ast in _parsed(rs):
         skip = {id(c.args[1]) for c in walk(ast) if isinstance(c, Call) and c.fn == "round" and len(c.args) > 1}
+        if where.startswith("checks."):
+            skip |= _tolerances(ast)
         out += [(n.value, where) for n in walk(ast) if isinstance(n, Num) and id(n) not in skip]
     for name, t in rs.tables.items():
         if isinstance(t, TierTable):
             out += [(x, f"tables.{name}") for step in t.steps for x in step]
         elif isinstance(t, LookupTable):
             out += [(x, f"tables.{name}") for x in list(t.mapping.values()) + ([t.default] if t.default is not None else [])]
+    return out
+
+
+def _tolerances(ast) -> set[int]:
+    """abs(x) < c、abs(x) <= c（或反过来写）里很小的 c：浮点比较容差。"""
+    out = set()
+    for c in walk(ast):
+        if not isinstance(c, Cmp):
+            continue
+        for a, b, ops in ((c.left, c.right, ("<", "<=")), (c.right, c.left, (">", ">="))):
+            if c.op in ops and isinstance(a, Call) and a.fn == "abs" and isinstance(b, Num) and 0 < b.value <= Decimal("0.01"):
+                out.add(id(b))
     return out
 
 

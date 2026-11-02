@@ -94,3 +94,19 @@ def test_structure_hints(tmp_path):
     w = case(tmp_path / "m")
     out = rules(w, 'count(of: "工单", where: review == "有效")', {"spare": {"scope": "个人", "expr": "n * 2"}})
     assert "变量 spare 定义了，但" in out
+
+
+def test_tolerance_in_check_needs_no_source():
+    """校验里 abs(…) < 0.0001 这类浮点比较容差不影响金额，不要求材料出处；金额表达式里的同一个数照样要出处。"""
+    from bonus_agent.lint import constants
+    from bonus_core.dsl.models import RuleSet
+    base = {"version": "t", "name": "s", "datasets": {}, "allocation": [{"level": "个人", "key": "emp_id"}],
+            "pool": {"expr": "1", "scope": "个人"}}
+    rs = RuleSet.model_validate({**base, "checks": [
+        {"id": "share_sum", "scope": "个人", "expr": "abs(share - 1) < 0.0001"},
+        {"id": "rev", "scope": "个人", "expr": "0.001 >= abs(share - 1)"},
+        {"id": "big", "scope": "个人", "expr": "abs(share - 1) < 5"}],
+        "variables": {"v": {"scope": "个人", "expr": "share * 0.0001"}}})
+    got = {(str(n), w) for n, w in constants(rs)}
+    assert ("0.0001", "variables.v") in got and ("5", "checks.big") in got
+    assert not any(n != "1" and w in ("checks.share_sum", "checks.rev") for n, w in got)

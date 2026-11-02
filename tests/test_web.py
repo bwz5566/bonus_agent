@@ -308,6 +308,18 @@ def test_list_where_object_expected_is_tolerated(tmp_path):
     assert v == {"n": {"expr": "1", "scope": "个人"}}
 
 
+def test_stringified_json_missing_closing_brace_is_repaired():
+    """本地模型常把对象写成 JSON 字符串，还漏掉结尾的 }：补上并提示核对；补不好的说清是哪个参数、怎么改。"""
+    from bonus_agent.agent import ToolError, _coerce_args, _missing_args
+    out = _coerce_args("set_rules", {"variables": '{"a": {"scope": "个人", "expr": "f(\\"x}\\")"}, "b": {"expr": "[1"}'})
+    assert out["variables"] == {"a": {"scope": "个人", "expr": 'f("x}")'}, "b": {"expr": "[1"}}
+    assert "结尾少了 }" in out["_fixed"]
+    with pytest.raises(ToolError, match="参数 variables 写成了 JSON 字符串"):
+        _coerce_args("set_rules", {"variables": '{"a": {"expr": "1"} "b": 2}'})
+    msg = _missing_args("define_dataset", TypeError("Workspace.define_dataset() missing 1 required positional argument: 'sheet'"))
+    assert msg.startswith("缺少必填参数 sheet")
+
+
 def test_rejected_upload_keeps_existing_files(env, monkeypatch):
     """#8 新文件被拒（太大）时：原来的期望结果还在；一批材料里有一个被拒，整批都不写入。"""
     import bonus_agent.web as web

@@ -321,8 +321,18 @@ def _coerce_args(tool: str, args: dict) -> dict:
         if isinstance(v, str) and props.get(k, {}).get("type") in ("array", "object") and v.strip()[:1] in "[{":
             try:
                 out[k] = json.loads(v)
+                continue
+            except ValueError as e:
+                err = e
+            closed = _close_json(v)
+            try:
+                out[k] = json.loads(closed or "")
+                out["_fixed"] = (out.get("_fixed", "") + f"（参数 {k} 写成了字符串，结尾少了 {closed[len(v.rstrip()):]}，"
+                                 "程序已补上；请核对内容是否完整）")
             except ValueError:
-                pass
+                raise ToolError(f"参数 {k} 写成了 JSON 字符串，而且这段 JSON 本身有错（{err}）。"
+                                f"{k} 直接写成{'对象 {...}' if props[k]['type'] == 'object' else '列表 [...]'}，不要外面套引号；"
+                                "内容很长时分几次提交")
     for k, v in list(out.items()):         # 对象写成了列表：[{"x": {...}}, ...] 或 [{"name"/"id": "x", ...}, ...]
         if props.get(k, {}).get("type") == "object" and isinstance(v, list) and v and all(isinstance(i, dict) for i in v):
             out[k] = _list_to_obj(v)
@@ -333,6 +343,33 @@ def _coerce_args(tool: str, args: dict) -> dict:
                 item = {a: b for a, b in v.items() if a != "name"}
                 out[k] = {v["name"]: item}
     return out
+
+
+def _missing_args(tool: str, e: TypeError) -> str:
+    """Python 的 “missing 1 required positional argument: 'sheet'” 换成能照着改的话：缺哪个参数、它是什么。"""
+    names = re.findall(r"'(\w+)'", str(e)) if "required" in str(e) and "missing" in str(e) else []
+    if not names:
+        return str(e)
+    props = next((t["parameters"]["properties"] for t in TOOLS if t["name"] == tool), {})
+    return "缺少必填参数 " + "；".join(f"{n}（{props.get(n, {}).get('description', '')}）".replace("（）", "") for n in names)
+
+
+def _close_json(text: str) -> str | None:
+    """JSON 只是结尾少了 } 或 ]（模型常见的漏写）：补上。不在字符串中间、括号配得上时才补。"""
+    stack, in_str, esc = [], False, False
+    for ch in text:
+        if in_str:
+            esc, in_str = (False, True) if esc else (ch == "\\", ch != '"')
+        elif ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if not stack or stack.pop() != ch:
+                return None
+    if in_str or not stack:
+        return None
+    return text.rstrip() + "".join(reversed(stack))
 
 
 def _list_to_obj(items: list[dict]):
@@ -2068,6 +2105,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 args.pop("thought", None)
                 note = args.pop("_note", "")
                 args = _coerce_args(c["name"], args)
+                note = "\n".join(x for x in (note, args.pop("_fixed", "")) if x)
                 if fn is None:
                     raise ToolError(f"没有工具 {c['name']}，可用：{list(handlers)}")
                 result, ok = str(fn(**args)) + (f"\n{note}" if note else ""), True
@@ -2076,7 +2114,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             except json.JSONDecodeError as e:
                 result, ok = f"错误：参数不是合法 JSON：{e}", False
             except TypeError as e:
-                result, ok = f"错误：参数不对：{e}", False
+                result, ok = f"错误：参数不对：{_missing_args(c['name'], e)}", False
             except (AttributeError, KeyError, IndexError, ValueError) as e:     # 参数结构和工具说明不一致（如对象写成了列表）
                 result, ok = (f"错误：参数结构不对（{type(e).__name__}: {e}）。请按工具说明的格式重写："
                               "要求对象 {...} 的地方不要写成列表 [...]，反之亦然"), False
