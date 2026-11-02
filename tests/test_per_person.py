@@ -62,6 +62,18 @@ def test_where_ignores_notes_in_brackets():
     assert check_where("pool（仅求和、无 payout/offsets）", {"pool"}, set()) is None
 
 
+def test_where_mixes_rule_places_with_builtin_note():
+    """规则位置后面接“引擎自带 / 不适用 / 已提问”的说明也算落实；位置写错的照样报，并告诉怎么写不落在规则里的条款。"""
+    k = {"checks.c_share", "checks.c_range"}
+    assert check_where("checks.c_share、checks.c_range、引擎自带：主键重复、关联编号不存在", k, set()) is None
+    assert check_where("checks.c_share；主键、关联编号、非零目标由引擎自带校验", k, set()) is None
+    assert check_where("checks.c_share、不适用：本批没有外包人员", k, set()) is None
+    assert check_where("checks.c_share、已提问 q1", k, {"q1"}) is None
+    assert check_where("checks.c_typo、引擎自带：x", k, set()).startswith("checks.c_typo 不存在")
+    msg = check_where("checks.c_share、随便写的", k, set())
+    assert msg.startswith("随便写的 不存在") and "引擎自带：说明" in msg
+
+
 @pytest.mark.verify
 def test_per_person_end_to_end_with_independent_verification(tmp_path):
     """完整流程：finish 先被拦下要求验算；按材料原文从字段独立重算 E1（最高）、E3（最低非零）、E2（为 0）后才出结果。"""

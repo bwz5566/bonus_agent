@@ -272,6 +272,10 @@ def _fix_arguments(text: str) -> str:
         json.loads(raw)
     except json.JSONDecodeError as e:
         err, pos = e.msg, e.pos
+    fixed = _repair_json(raw, close=False)
+    if fixed is not None and isinstance(fixed[0], dict):
+        fixed[0]["_note"] = f"（参数格式有误，程序已自动修正：{fixed[1]}。下次按正确格式写。）"
+        return json.dumps(fixed[0], ensure_ascii=False)
     for cand, note in ((raw, "后面多出的内容已忽略"), (re.sub(r",\s*([}\]])", r"\1", raw), "多余的逗号已去掉"),
                        *_split_objects(raw)):
         try:
@@ -324,12 +328,12 @@ def _coerce_args(tool: str, args: dict) -> dict:
                 continue
             except ValueError as e:
                 err = e
-            closed = _close_json(v)
-            try:
-                out[k] = json.loads(closed or "")
-                out["_fixed"] = (out.get("_fixed", "") + f"（参数 {k} 写成了字符串，结尾少了 {closed[len(v.rstrip()):]}，"
-                                 "程序已补上；请核对内容是否完整）")
-            except ValueError:
+            got = _repair_json(v)
+            if got is not None:
+                out[k] = got[0]
+                out["_fixed"] = (out.get("_fixed", "") + f"（参数 {k} 写成了字符串，JSON 也有错，程序已修正：{got[1]}；"
+                                 "请核对内容是否完整。下次直接写对象，不要套引号）")
+            else:
                 raise ToolError(f"参数 {k} 写成了 JSON 字符串，而且这段 JSON 本身有错（{err}）。"
                                 f"{k} 直接写成{'对象 {...}' if props[k]['type'] == 'object' else '列表 [...]'}，不要外面套引号；"
                                 "内容很长时分几次提交")
@@ -352,6 +356,49 @@ def _missing_args(tool: str, e: TypeError) -> str:
         return str(e)
     props = next((t["parameters"]["properties"] for t in TOOLS if t["name"] == tool), {})
     return "缺少必填参数 " + "；".join(f"{n}（{props.get(n, {}).get('description', '')}）".replace("（）", "") for n in names)
+
+
+_BARE_KEY = re.compile(r"([{,]\s*)(-?[A-Za-z0-9_.\u4e00-\u9fff]+)(\s*:)")
+
+
+def _quote_keys(text: str) -> str:
+    """对象的键没加引号（{1: 1.0}、{a: 1}，模型常见写法）：字符串外面的才补双引号。"""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        if text[i] == '"':                       # 跳过整个字符串
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            out.append(text[i:j + 1])
+            i = j + 1
+            continue
+        m = _BARE_KEY.match(text, i) if text[i] in "{," else None
+        if m and m.group(2) not in ("true", "false", "null"):
+            out.append(f'{m.group(1)}"{m.group(2)}"{m.group(3)}')
+            i = m.end()
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def _repair_json(text: str, close: bool = True):
+    """依次尝试几种常见修法，返回 (能解析的对象, 改了什么) 或 None。close=False 时不补结尾括号
+    （整段参数被截断时不能当成写完了）。"""
+    cands, t = [], text
+    fixes = [(_quote_keys, "键补了双引号"), (lambda x: re.sub(r",\s*([}\]])", r"\1", x), "去掉了多余的逗号")]
+    if close:
+        fixes.append((lambda x: _close_json(x) or x, "补上了结尾的括号"))
+    for fix, note in fixes:
+        u = fix(t)
+        if u != t:
+            cands.append(note)
+            t = u
+            try:
+                return json.loads(t), "、".join(cands)
+            except ValueError:
+                continue
+    return None
 
 
 def _close_json(text: str) -> str | None:
@@ -1635,7 +1682,9 @@ class Workspace:
         if not self.datasets:
             step = f"用 define_dataset 定义数据表（数据文件：{'、'.join(f.name for f in self.data_files) or '无'}）"
         elif not self.schemes:
-            step = "用 set_rules 写入规则（笔记和参数台账里已有的内容不必重读）"
+            step = ("共用部分已保存，接着用 set_rules(scheme=方案名) 写每个方案自己的 pool（和需要的 allocation、payout），"
+                    "不要再重复提交共用部分" if SHARED in self.drafts else
+                    "用 set_rules 写入规则（笔记和参数台账里已有的内容不必重读）")
         elif any(s in self.untested or s not in self.results for s in self.schemes):
             step = "用 trial_run 试算"
         elif bare:

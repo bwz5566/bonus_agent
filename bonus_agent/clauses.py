@@ -47,6 +47,9 @@ def refs(where: str) -> list[str]:
     return [x.strip() for x in re.split(r"[、,，;；]\s*", w) if x.strip()]
 
 
+_ELEMENT = re.compile(r"^(pool$|(variables|tables|checks|datasets|payout|offsets|allocation|revisions)\.)")
+
+
 def check_where(where: str, known: set[str], questions: set[str]) -> str | None:
     """where 里每一项都要指向现有的规则元素，或写明 引擎自带 / 不适用（带原因）/ 已提问 q?。返回错误原因。"""
     w = (where or "").strip()
@@ -59,10 +62,25 @@ def check_where(where: str, known: set[str], questions: set[str]) -> str | None:
     if w.startswith(ASKED):
         ids = re.findall(r"q\d+", w)
         return None if ids and all(i in questions for i in ids) else f"「{w}」里的问题编号不存在"
-    bad = [r for r in refs(w) if r not in known]
+    items = refs(w)
+    bad = [r for r in items if r not in known]
+    late = [r for r in bad if _ELEMENT.match(r)]
+    if bad and not late:
+        # 前面是规则位置，后面是说明（如 checks.a、checks.b；其余由引擎自带校验）：说明里要有标记
+        rest = w[w.find(bad[0]):]
+        if BUILTIN in rest:
+            return None
+        if NOT_APPLY in rest and len(rest) > len(NOT_APPLY) + 3:
+            return None
+        if ASKED in rest:
+            ids = re.findall(r"q\d+", rest)
+            return None if ids and all(i in questions for i in ids) else f"「{rest}」里的问题编号不存在"
+    bad = late or bad
     if bad:
         return (f"{'、'.join(bad)} 不存在。写规则元素的位置，如 variables.net_receipt、checks.grade_known、pool、"
-                "allocation.参与分配、payout.warranty、offsets.prepaid、tables.margin_tier、datasets.成本费用")
+                "allocation.参与分配、payout.warranty、offsets.prepaid、tables.margin_tier、datasets.成本费用；"
+                f"不落在规则里的写「{BUILTIN}：说明」（程序本身就会做的检查或处理）、「{NOT_APPLY}：原因」"
+                f"或「{ASKED} q1」，可以和规则位置写在一起，如 checks.share_sum、{BUILTIN}：编号重复由程序检查")
     return None
 
 

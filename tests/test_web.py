@@ -313,9 +313,16 @@ def test_stringified_json_missing_closing_brace_is_repaired():
     from bonus_agent.agent import ToolError, _coerce_args, _missing_args
     out = _coerce_args("set_rules", {"variables": '{"a": {"scope": "个人", "expr": "f(\\"x}\\")"}, "b": {"expr": "[1"}'})
     assert out["variables"] == {"a": {"scope": "个人", "expr": 'f("x}")'}, "b": {"expr": "[1"}}
-    assert "结尾少了 }" in out["_fixed"]
+    assert "补上了结尾的括号" in out["_fixed"]
     with pytest.raises(ToolError, match="参数 variables 写成了 JSON 字符串"):
         _coerce_args("set_rules", {"variables": '{"a": {"expr": "1"} "b": 2}'})
+    # 键没加引号（{1: 1.0}）、多余逗号：字符串里、整段参数里都能修；整段参数被截断的不补括号（不能当成写完了）
+    from bonus_agent.agent import _fix_arguments
+    out = _coerce_args("set_rules", {"tables": '{"d": {"kind": "lookup", "mapping": {1: 1.0, 2: 1.1,}, "desc": "x {3: 4}"}}'})
+    assert out["tables"] == {"d": {"kind": "lookup", "mapping": {"1": 1.0, "2": 1.1}, "desc": "x {3: 4}"}}
+    fixed = json.loads(_fix_arguments('{"tables": {"d": {"mapping": {1: 2}}}, a: true}'))
+    assert fixed["tables"] == {"d": {"mapping": {"1": 2}}} and fixed["a"] is True and "键补了双引号" in fixed["_note"]
+    assert "_invalid_json" in json.loads(_fix_arguments('{"tables": {"d": {"mapping": {1: 2}}'))
     msg = _missing_args("define_dataset", TypeError("Workspace.define_dataset() missing 1 required positional argument: 'sheet'"))
     assert msg.startswith("缺少必填参数 sheet")
 
