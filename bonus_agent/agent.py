@@ -350,6 +350,12 @@ def _coerce_args(tool: str, args: dict) -> dict:
             except ValueError as e:
                 err = e
             got = _repair_json(v)
+            extra = _sibling_args(v, props, args) if got is None else None
+            if extra is not None:
+                out.update(extra)
+                out["_fixed"] = (out.get("_fixed", "") + f"（参数 {k} 的字符串后面接着写了 {'、'.join(x for x in extra if x != k)}，"
+                                 "程序已拆成单独的参数。下次每个参数分开写，直接写对象、不要套引号）")
+                continue
             if got is not None:
                 out[k] = got[0]
                 out["_fixed"] = (out.get("_fixed", "") + f"（参数 {k} 写成了字符串，JSON 也有错，程序已修正：{got[1]}；"
@@ -367,15 +373,54 @@ def _coerce_args(tool: str, args: dict) -> dict:
             if isinstance(v, dict) and isinstance(v.get("name"), str) and ("expr" in v or "kind" in v):
                 item = {a: b for a, b in v.items() if a != "name"}
                 out[k] = {v["name"]: item}
+            v = out.get(k)
+            # 别的参数（checks、payout…）写进了 variables / tables 里面：不像一个变量或表（没有 expr / kind），就挪出来
+            moved = [a for a, b in (v.items() if isinstance(v, dict) else [])
+                     if a in props and a not in ("thought", "scheme", k) and a not in args
+                     and not (isinstance(b, dict) and ("expr" in b or "kind" in b))]
+            for a in moved:
+                out[a] = v.pop(a)
+            if moved:
+                out["_fixed"] = (out.get("_fixed", "") + f"（{'、'.join(moved)} 是 set_rules 的参数，写进了 {k} 里面，"
+                                 f"程序已挪到外面。下次和 {k} 并列写）")
     return out
+
+
+def _sibling_args(text: str, props: dict, args: dict) -> dict | None:
+    """一个参数的 JSON 字符串后面接着写了别的参数：'{"x": {...}}, "checks": [...]'。
+    拆成 {参数: 前一段, checks: [...]}；后面的键都是这个工具的其他参数、而且调用里没写过时才拆。"""
+    key = next((k for k, v in args.items() if v is text), None)
+    try:
+        first, end = json.JSONDecoder().raw_decode(text.strip())
+    except ValueError:
+        return None
+    rest = text.strip()[end:].strip()
+    if not rest.startswith(","):
+        return None
+    body = "{" + rest[1:].strip() + "}"
+    try:
+        more = json.loads(body)
+    except ValueError:
+        more = (_repair_json(body) or [None])[0]
+    if not isinstance(more, dict) or not more or not all(m in props and m not in args and m != key for m in more):
+        return None
+    if props.get(key, {}).get("type") == "object" and not isinstance(first, dict):
+        return None
+    return {key: first, **more}
 
 
 def _missing_args(tool: str, e: TypeError) -> str:
     """Python 的 “missing 1 required positional argument: 'sheet'” 换成能照着改的话：缺哪个参数、它是什么。"""
+    props = next((t["parameters"]["properties"] for t in TOOLS if t["name"] == tool), {})
+    bad = re.findall(r"unexpected keyword argument '(\w+)'", str(e))
+    if bad:       # 参数写成了别的工具的（如 record_facts 写了 note 的 topic / text）
+        own = [k for k in props if k != "thought"]
+        other = [t["name"] for t in TOOLS if t["name"] != tool and set(bad) <= set(t["parameters"]["properties"])]
+        return (f"{tool} 没有参数 {'、'.join(bad)}，它的参数是 {'、'.join(own)}"
+                + (f"；{'、'.join(bad)} 是 {'、'.join(other[:3])} 的参数，是不是想调用那个工具" if other else ""))
     names = re.findall(r"'(\w+)'", str(e)) if "required" in str(e) and "missing" in str(e) else []
     if not names:
         return str(e)
-    props = next((t["parameters"]["properties"] for t in TOOLS if t["name"] == tool), {})
     return "缺少必填参数 " + "；".join(f"{n}（{props.get(n, {}).get('description', '')}）".replace("（）", "") for n in names)
 
 
@@ -403,9 +448,42 @@ def _quote_keys(text: str) -> str:
     return "".join(out)
 
 
+def _escape_quotes(text: str) -> str:
+    """字符串里的英文双引号没转义（原文写的是 "已确认"，抄进 quote 时没加 \\）：字符串在这个引号处提前结束，
+    后面紧跟的不是 , } ] 而是文字，JSON 报 “Expecting ',' delimiter”。把这个引号转义，接着找下一处，最多 100 处。
+    只修“引号后面紧跟文字”的位置；漏写逗号（"a" "b"）等其他错误不动。"""
+    t = text
+    for _ in range(100):
+        try:
+            json.loads(t)
+            break
+        except json.JSONDecodeError as e:
+            if not e.msg.startswith("Expecting ',' delimiter") or e.pos >= len(t) or t[e.pos] in "\"{}[],:":
+                break
+            j = e.pos - 1
+            while j >= 0 and t[j] in " \t\r\n":
+                j -= 1
+            if j < 0 or t[j] != '"' or (j > 0 and t[j - 1] == "\\"):
+                break
+            t = t[:j] + '\\"' + t[j + 1:]
+    return t
+
+
 def _repair_json(text: str, close: bool = True):
     """依次尝试几种常见修法，返回 (能解析的对象, 改了什么) 或 None。close=False 时不补结尾括号
     （整段参数被截断时不能当成写完了）。"""
+    got = _repair_steps(text, close)
+    if got is None and (esc := _escape_quotes(text)) != text:
+        note = "字符串里没转义的双引号已转义"
+        try:
+            return json.loads(esc), note
+        except ValueError:
+            got = _repair_steps(esc, close)
+            return (got[0], f"{note}、{got[1]}") if got else None
+    return got
+
+
+def _repair_steps(text: str, close: bool):
     cands, t = [], text
     fixes = [(_quote_keys, "键补了双引号"), (lambda x: re.sub(r",\s*([}\]])", r"\1", x), "去掉了多余的逗号")]
     if close:
@@ -577,8 +655,8 @@ class Workspace:
                 d = next(d for d in self.inv.docs if d.name == f.name)
                 imgs = sum(1 for b in d.blocks if b.kind == "image")
                 lines.append(f"- {f.name}（{f.suffix[1:]}，约 {len(d.full_text())} 字" + (f"，{imgs} 张图片" if imgs else "") + "）")
-        if self.said:
-            lines.append(f"- {CHAT_SOURCE}（财务在对话里发的文字，约 {len(self.said)} 字；里面的规则和参数与材料同样有效，"
+        if self._chat_text():
+            lines.append(f"- {CHAT_SOURCE}（财务在对话里发的文字和问题答复，约 {len(self._chat_text())} 字；里面的规则和参数与材料同样有效，"
                          f"record_facts / record_clauses 引用时 file 写「{CHAT_SOURCE}」）")
         return "\n".join(lines)
 
@@ -691,8 +769,8 @@ class Workspace:
                 else:
                     parts.append(f"## 工作表 {ref}（数据表，只附前 5 行；define_dataset 会读取全部行）\n"
                                  + self.read_sheet(f.name, sheet, 1, 6))
-        if self.said:
-            parts.append(f"## {CHAT_SOURCE}（财务在对话里发的文字，全文；引用时 file 写「{CHAT_SOURCE}」）\n{self.said}")
+        if self._chat_text():
+            parts.append(f"## {CHAT_SOURCE}（财务在对话里发的文字和问题答复，全文；引用时 file 写「{CHAT_SOURCE}」）\n{self._chat_text()}")
         return "\n\n".join(parts)
 
     def note(self, topic: str, text: str) -> str:
@@ -703,10 +781,17 @@ class Workspace:
         return f"已记录「{topic}」（共 {len(self.notes)} 条笔记，每轮都会附在工作区状态里）"
 
     # ---- 参数台账 ----
+    def _chat_text(self) -> str:
+        """来源「财务对话」的全文：财务在对话里发的文字，加上问题的答复（问题表里答的和对话里答的都算），
+        这样按答复登记参数时也能引用原话核对。"""
+        answered = [f"{q.id} {q.text} → {q.answer}" for q in self.questions     # 和任务里列答复的写法一样，照抄就能核对
+                    if q.answer not in (None, "") and not getattr(q, "withdrawn", "")]
+        return "\n\n".join([t for t in [self.said] if t] + answered)
+
     def _lines(self, name: str) -> list[str]:
         """文件的原文，按行：文档文字、图片转写、Excel 每行单元格。"""
         if name == CHAT_SOURCE:
-            return self.said.splitlines()
+            return self._chat_text().splitlines()
         f = self._file(name)
         if f.suffix.lower() in DATA_SUFFIXES:
             if f.name not in self._sheet_corpus:
@@ -723,7 +808,7 @@ class Workspace:
     def _corpus(self) -> dict[str, str]:
         """每个文件规范化后的全文，用来核对引用。"""
         out = {f.name: fx.norm("".join(self._lines(f.name))) for f in self.inv.files}
-        if self.said:
+        if self._chat_text():
             out[CHAT_SOURCE] = fx.norm("".join(self._lines(CHAT_SOURCE)))
         return out
 
@@ -1007,7 +1092,7 @@ class Workspace:
             if isinstance(lv, dict) and lv.get("weight") is None:
                 lv["weight"] = ""
         try:
-            _revisions(draft.get("revisions"))
+            _revisions(draft.get("revisions"), strict=True)
             targets = (self.schemes or [SHARED]) if name == SHARED else [name]   # 还没有方案时也先校验共用部分的格式
             rss = {t: self._ruleset(t, {**self.drafts, name: draft}) for t in targets}
         except (ValidationError, ValueError) as e:
@@ -1985,15 +2070,21 @@ def _json_data_summary(path: Path) -> str:
     return "\n".join(lines)
 
 
-def _revisions(revs) -> list[dict]:
+def _revisions(revs, strict: bool = False) -> list[dict]:
     """修订版本：[{"name": "R1", "adjust": [{"node": "团队:T01", "amount": 900000, "reason": ...}]}, ...]。
-    后一个修订包含前面所有修订的调整（逐步累加），R0 是不做调整的基准。"""
+    后一个修订包含前面所有修订的调整（逐步累加），R0 是不做调整的基准。
+    没有调整的修订和 R0 一样：strict（set_rules 校验）时报错，否则（旧案卷里存的）直接跳过。"""
     out = []
     for r in revs or []:
         if not isinstance(r, dict) or not r.get("name") or not isinstance(r.get("adjust"), list):
             raise ValueError('revisions 的每一项应为 {"name": "R1", "adjust": [{"node": "团队:T01", "amount": 900000}]}')
         if r["name"] == "R0":
             raise ValueError("R0 是不做调整的基准结果，修订从 R1 开始命名")
+        if not r["adjust"]:
+            if not strict:
+                continue
+            raise ValueError(f"修订 {r['name']} 没有任何调整，和 R0 完全一样。只有材料里写了签批调整（某个节点改成多少）"
+                             "才建修订；没有调整就不要传 revisions，结果就是 R0")
         for a in r["adjust"]:
             if not isinstance(a, dict) or "node" not in a or "amount" not in a:
                 raise ValueError(f"修订 {r['name']} 的调整项应为 {{\"node\": 节点 id, \"amount\": 金额}}，得到 {a}")

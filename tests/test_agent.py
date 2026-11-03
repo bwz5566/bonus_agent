@@ -499,6 +499,59 @@ def test_answer_question_on_already_answered_question(tmp_path):
         ws.answer_question(id="q10", answer="2")
 
 
+def test_answer_from_question_table_is_citable(tmp_path):
+    """网页 Q6 第 2 轮：财务在“问题”里答了系数 1.0，模型按答复 record_facts（file 写「财务对话」），
+    却报原文里找不到——问题表的答复不在可引用的来源里。现在答复和对话文字一样可以引用。"""
+    from bonus_agent.agent import CHAT_SOURCE, run_agent
+    from bonus_agent.extract_rules import Question
+    case, script = _agent_case()
+    llm = FakeLLM(script)
+    llm.images = GRADE_IMG
+    ws = run_agent(llm, [ANNUAL], tmp_path).ws
+    ws.questions.append(Question(id="q9", text="操作岗的岗位系数是空的，取多少？", answer="1.0", answered_by="张会计"))
+    out = ws.record_facts([{"name": "操作岗系数", "value": "1.0", "file": CHAT_SOURCE,
+                            "quote": "q9 操作岗的岗位系数是空的，取多少？ → 1.0"}])    # 照抄任务里列答复的那一行
+    assert out.startswith("已登记 1 条"), out
+    assert CHAT_SOURCE in ws.list_files()
+
+
+def test_revision_without_adjustment_is_rejected():
+    """网页 Q6 第 3 轮：没有签批调整材料，模型仍建了 {"name": "R1", "adjust": []}，
+    结果和 R0 一样，总结里还写“R1 为签批后最终核算”。set_rules 拒绝空修订，旧案卷里的空修订直接跳过。"""
+    from bonus_agent.agent import _revisions
+    with pytest.raises(ValueError, match="没有任何调整"):
+        _revisions([{"name": "R1", "adjust": []}], strict=True)
+    assert _revisions([{"name": "R1", "adjust": []}]) == []
+    ok = [{"name": "R1", "adjust": [{"node": "团队:T01", "amount": 900000}]}]
+    assert _revisions(ok, strict=True) == ok
+
+
+def test_stray_quotes_and_misplaced_params_are_repaired():
+    """网页 Q6：原文里的英文双引号（审批状态为 "已确认"）抄进 quote 时没转义，record_clauses / set_rules 连续失败；
+    checks 写进了 variables 的字符串后面、或写进了 variables 对象里面。这几种都由程序修正并告诉模型。"""
+    from bonus_agent.agent import _coerce_args, _fix_arguments, _missing_args
+    clauses = '[{"point": "只算已确认", "file": "规则.docx", "quote": "审批状态为"已确认"的记录才计提"}, {"point": "b", "file": "规则.docx", "quote": "c"}]'
+    out = _coerce_args("record_clauses", {"clauses": clauses})
+    assert out["clauses"][0]["quote"] == '审批状态为"已确认"的记录才计提' and len(out["clauses"]) == 2
+    assert "双引号已转义" in out["_fixed"]
+    whole = json.loads(_fix_arguments('{"facts": [{"name": "a", "value": "1", "file": "f", "quote": "为"否"的班组"}]}'))
+    assert whole["facts"][0]["quote"] == '为"否"的班组'
+    assert "_invalid_json" in json.loads(_fix_arguments('{"a": "x" "b": 1}'))     # 漏写逗号不当成引号问题
+    v = '{"x": {"scope": "global", "expr": "1"}}, "checks": [{"id": "c1", "scope": "global", "expr": "x > 0"}]'
+    out = _coerce_args("set_rules", {"variables": v})
+    assert out["variables"] == {"x": {"scope": "global", "expr": "1"}} and out["checks"][0]["id"] == "c1"
+    out = _coerce_args("set_rules", {"variables": {"x": {"expr": "1"}, "checks": [{"id": "c1", "expr": "x > 0"}]}})
+    assert list(out["variables"]) == ["x"] and out["checks"][0]["id"] == "c1" and "挪到外面" in out["_fixed"]
+    out = _coerce_args("set_rules", {"variables": {"pool": {"scope": "global", "expr": "1"}}})   # 真叫 pool 的变量不动
+    assert "pool" in out["variables"] and "pool" not in out
+
+    def record_facts(facts):
+        pass
+    with pytest.raises(TypeError) as e:
+        record_facts(topic="a", text="b")
+    assert "note" in _missing_args("record_facts", e.value)
+
+
 def test_redefine_dataset_without_fields_and_evaluate_text(tmp_path):
     """Q3 网页运行：模型只想把表改成明细表（改 key / link），没写 fields，连续 3 次因缺参数失败；
     又想用 evaluate 看一行的编号，返回“需要数字”连续 3 次。现在重新定义可以沿用上次的字段，evaluate 能看文字取值。"""
