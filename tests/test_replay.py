@@ -58,6 +58,14 @@ def corrected_steps() -> list[dict]:
 def test_corrected_q55_matches_expected_file_to_the_cent(tmp_path):
     ar = run_agent(FakeLLM(corrected_steps()), [q55.make(tmp_path / "m")], tmp_path / "out", max_steps=30)
     assert ar.status == "OK", (ar.error, [(s.tool, s.result[:300]) for s in ar.steps if not s.ok])
+    # 每次“验算通过”写的是这个对象自己的金额（以前会被重新比对别的对象时的说明覆盖，Q33 显示成“引擎 0 元”）
+    from bonus_agent.agent import fmt
+    for s in (s for s in ar.steps if s.tool == "verify" and s.ok):
+        amt = ar.ws._amounts("默认", s.args["amount"])[s.args["node"]][0]
+        assert f"引擎 {fmt(amt)} 元" in s.result, (s.args["node"], s.result[:120])
+    first = next(s for s in ar.steps if s.tool == "verify" and s.ok)       # 已有多条验算记录时再验第一个：说明不能是别人的
+    again = ar.ws.verify(**{**first.args, "expr": f"({first.args['expr']})"})
+    assert f"引擎 {fmt(ar.ws._amounts('默认', first.args['amount'])[first.args['node']][0])} 元" in again, again[:120]
     ws = openpyxl.load_workbook(tmp_path / "out" / "result.xlsx", data_only=True)["个人发放"]
     head = [c.value for c in ws[1]]
     got = {}

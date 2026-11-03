@@ -442,3 +442,23 @@ def test_query_only_loop_is_nudged_then_stopped(tmp_path):
     ev = [s for s in ar.steps if s.tool == "evaluate"]
     assert "已经连续 6 次只查询" in ev[IDLE_WARN - 1].result and "已经连续" not in ev[IDLE_WARN - 2].result
     assert ar.status == "FAILED" and "只用 evaluate / explain 查询" in ar.error, ar.error
+
+
+def test_redefine_dataset_without_fields_and_evaluate_text(tmp_path):
+    """Q3 网页运行：模型只想把表改成明细表（改 key / link），没写 fields，连续 3 次因缺参数失败；
+    又想用 evaluate 看一行的编号，返回“需要数字”连续 3 次。现在重新定义可以沿用上次的字段，evaluate 能看文字取值。"""
+    from bonus_agent.agent import run_agent
+    case, script = _agent_case()
+    llm = FakeLLM(script)
+    llm.images = GRADE_IMG
+    ar = run_agent(llm, [ANNUAL], tmp_path)
+    ws = ar.ws
+    d = next(s["args"] for s in script if s["tool"] == "define_dataset")
+    out = ws.define_dataset(name=d["name"], file=d["file"], sheet=d["sheet"], key=d.get("key"), link=d.get("link"))
+    assert "沿用上一次" in out and set(ws.datasets[d["name"]].fields) == set(d["fields"])
+    with pytest.raises(Exception, match="之前没有定义成功过"):
+        ws.define_dataset(name="新表", file=d["file"], sheet=d["sheet"])
+    level = next(n for n, x in ws.datasets.items() if x.key)
+    node = next(k for k in ws.results[ws.schemes[0]]["R0"].nodes if k.startswith(level + ":"))
+    key = ws.datasets[level].key
+    assert node.split(":", 1)[1] in ws.evaluate(key, node=node)

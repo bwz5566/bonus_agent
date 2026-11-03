@@ -339,3 +339,21 @@ def test_nested_aggregation_in_row_uses_the_rows_object():
                          'of: "项目参与")', p, "t/nested", "t")
     via_var = ev.evaluate('sum(q_sales * share, of: "项目参与")', p, "t/var", "t")
     assert nested == via_var and nested > 0
+
+
+def test_nested_aggregation_over_unrelated_table_is_an_error():
+    """Q3 网页运行：逐张工单筛选时在条件里写 sum(paid_days, of: "出勤确认") > 0（出勤确认挂在员工上，和工单没有关联），
+    每张工单都取不到出勤行，以前悄悄算成 0（条件永远不成立，有效单量变 0）。现在报错，提示把条件移到外面。"""
+    from bonus_core.engine.evaluator import Evaluator
+    from bonus_core.engine.evaluator import EvalError
+    from bonus_core.engine.tree import build_tree
+    rs, _ = run("quarter")
+    data, _ = apply_mapping(rs, [XLSX], load_mapping(CASE / "mapping.yaml"))
+    root, by_level, _ = build_tree(rs, data)
+    ev = Evaluator(rs, root, by_level)
+    g = by_level["小组"][0]
+    assert ev.evaluate('count(of: "项目")', g, "t/all", "t") > 0
+    with pytest.raises(EvalError, match="没有关联"):
+        ev.evaluate('count(of: "项目", where: sum(contribution_score, of: "绩效评分") > 0)', g, "t/bad", "t")
+    # 有关联的嵌套照常：项目行里汇总这个项目的销售明细
+    assert ev.evaluate('sum(sum(sales_amount, of: "销售明细"), of: "项目")', g, "t/ok", "t") > 0

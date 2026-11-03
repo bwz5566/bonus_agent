@@ -448,6 +448,12 @@ class Evaluator:
             if owners and not any(a.level in owners for a in node.chain()):
                 node = next((a for o in owners for ref in self._refs(ctx.row) for a in ref.chain() if a.level == o), node)
         rows = node.rows(ds)
+        if not rows and ctx.row is not None and node.aux and not self._linked(ds, node.level):
+            # 在关联实体的行里（如逐张工单筛选时）对一张和它没有关联的表聚合（如员工的出勤确认）：这一行取不到那张表的任何行，
+            # 原来会悄悄算成 0（条件永远不成立、金额少算），改成报错让写法改正
+            raise EvalError(f"在「{node.level}」的每一行里对「{ds}」聚合，但「{ds}」和「{node.level}」没有关联，这一行取不到任何「{ds}」的行"
+                            f"（会悄悄算成 0）。把这个条件或数移到外层聚合的外面，如 if(sum(…, of: \"{ds}\") > 0, sum(…, of: \"{node.level}\", where: …), 0)，"
+                            f"或先在上一层定义变量再引用", ctx.where)
         aux = ds in self.layout.aux
 
         def rctx(r):   # 关联实体的行在它自己的节点上求值，才能用到该实体的变量；其他行在它所属的下级对象上求值
@@ -487,6 +493,19 @@ class Evaluator:
                 else:
                     r = min(nums) if c.fn == "min" else max(nums)
         return Val(r, fmt(r), frozenset(deps), tuple(rows))
+
+    def _linked(self, ds: str, ent: str) -> bool:
+        """表 ds 的行能不能挂到关联实体 ent 上：ds 就是 ent、带 ent 的编号字段，或沿关联逐级往上能到 ent。"""
+        key = self.rs.datasets[ent].key if ent in self.rs.datasets else None
+        t, seen = ds, set()
+        while t and t not in seen:
+            seen.add(t)
+            d = self.rs.datasets.get(t)
+            if t == ent or (key and d is not None and key in d.fields):
+                return True
+            kind, owner, _ = self.layout.parent.get(t, (None, None, None))
+            t = owner if kind == "aux" and isinstance(owner, str) else None
+        return False
 
     def _agg_dataset(self, c: Call, ctx: Ctx) -> str:
         ds, err = self.layout.agg_dataset(c)

@@ -150,8 +150,8 @@ TOOLS: list[dict] = [
                          "key": _S, "link": _S, "desc": _S,
                          "filter": {"type": "object", "description": '可选：只取这些行，{"列名": "取值"} 或 {"列名": ["取值1", "取值2"]}'},
                          "fields": {"type": "object", "additionalProperties": FIELD_SCHEMA,
-                                    "description": "字段名（英文小写加下划线） -> 定义"}},
-                        ["name", "file", "sheet", "fields"])},
+                                    "description": "字段名（英文小写加下划线） -> 定义。重新定义同一张表、字段不变时可以不写（沿用上一次的）"}},
+                        ["name", "file", "sheet"])},
     {"name": "remove_dataset", "description": "删除一张已定义的数据表。", "parameters": _obj({"name": _S}, ["name"])},
     {"name": "set_rules",
      "description": "写入或修改计算规则。只给出要改的部分：tables / variables 按名字合并（值为 null 表示删除），"
@@ -528,6 +528,7 @@ class Workspace:
     pinned: set[str] = field(default_factory=set)           # 全文已附在材料包里的文件 / 工作表
     _verify_note: str = ""
     _probe_cache: dict = field(default_factory=dict)
+    _prev_fields: dict = field(default_factory=dict)        # 每张表上一次定义成功的 fields：只改 key / link / filter 重新定义时沿用
     _gap_cache: tuple | None = None
     reread: dict = field(default_factory=dict)              # 独立复读的结果（见 reread.py），材料没变时复用
     check_vars: dict = field(default_factory=dict)          # 独立验算定义过的辅助变量 {名字: {scope, expr}}，后面的验算直接引用，不必重写
@@ -848,9 +849,22 @@ class Workspace:
         return out
 
     # ---- 数据表 ----
-    def define_dataset(self, name: str, file: str, sheet: str, fields: dict, key: str | None = None,
+    def define_dataset(self, name: str, file: str, sheet: str, fields: dict | None = None, key: str | None = None,
                        link: str | None = None, desc: str = "", header_rows: list[int] | None = None,
                        filter: dict | None = None) -> str:
+        reuse = ""
+        if not fields:      # 重新定义时只改 key / link / filter：沿用上一次的字段（模型常只写要改的部分，反复因缺 fields 失败）
+            fields = self._prev_fields.get(name)
+            if not fields:
+                raise ToolError(f"缺少 fields（字段名 -> {{column, type}}）。「{name}」之前没有定义成功过，要写全字段")
+            reuse = f"没写 fields，沿用上一次定义「{name}」时的 {len(fields)} 个字段"
+        out = self._define_dataset(name, file, sheet, fields, key, link, desc, header_rows, filter)
+        self._prev_fields[name] = fields
+        return out + (f"\n{reuse}" if reuse else "")
+
+    def _define_dataset(self, name: str, file: str, sheet: str, fields: dict, key: str | None = None,
+                        link: str | None = None, desc: str = "", header_rows: list[int] | None = None,
+                        filter: dict | None = None) -> str:
         f = self._file(file)
         try:
             st = table_at(f, sheet, header_rows) if header_rows else self.inv.sheet(f"{f.name}/{sheet}")
@@ -1370,7 +1384,7 @@ class Workspace:
         ev = Evaluator(rs, root, by_level, self._refs(name))
         ev.peer_scope = helpers is not None      # 独立验算：对本层或上层实体表求和按上一层范围取同级（见 Evaluator.peer_scope）
         try:
-            v = ev.evaluate(expr, nodes[node], "probe", "probe")
+            v = ev._eval_traced(expr, nodes[node], "probe", "probe").v     # evaluate 也能看文字取值（如编号、状态）
         except (EvalError, ValueError) as e:
             raise ToolError(f"计算失败：{e}") from None
         return v, ev.traces["probe"].rendered
@@ -1464,8 +1478,9 @@ class Workspace:
         if bad:
             raise ToolError(bad)
         self.verified[_verify_key(name, node, amount)] = rec
+        note = self._verify_note          # 下面重新比对别的对象会覆盖它，先取出来
         left = self._verify_gaps()
-        return (f"验算通过：{node} 的{amount} {self._verify_note}。"
+        return (f"验算通过：{node} 的{amount} {note}。"
                 + (f"还要验算：{'；'.join(left[:6])}" if left else "程序指定的对象都已验算通过"))
 
     def _amounts(self, name: str, kind: str) -> dict[str, tuple[Decimal, bool]]:
