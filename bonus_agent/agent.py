@@ -49,6 +49,16 @@ SHARED = "共用"                # 多个方案共用的部分（权重、校验
 AGENT_TEMPERATURE = 0          # 工作循环用 0：同样的材料和状态尽量走同样的路，过程稳定、可复现
 MAX_STUCK = 3                  # 同一调用原样重复、或同一工具连续失败达到这个次数就算卡住
 MIN_CONTEXT = 65536            # 模型服务上下文长度的下限：智能体每步输入约 4～5 万 tokens（材料包、工作区状态、对话历史），再加输出
+PHASES = (     # 工作分阶段：每个阶段的产出都存在工作区里（结构化），进入下一阶段时清空对话历史，只带工作区和材料包往下走
+    ("读懂材料", "逐份读规则文档：record_facts 登记参数，record_clauses 摘出计算条款（这两样是后面写规则和验算的依据）",
+     "每份规则文档都登记了参数、摘出了条款"),
+    ("写规则并试算", "define_dataset 定义数据表，set_rules 写规则，cover_clauses 标注每条条款落在哪，trial_run 试算并抽查",
+     "每个方案都已试算，条款全部落实"),
+    ("独立验算", "对“待独立验算”里的每个对象用 verify 按材料原文另写算式，和试算结果对到分；对不上就用 explain 找出哪一步不同，改错的那一边",
+     "待独立验算全部通过"),
+    ("核对并结束", "调用 finish；被拦下的逐条处理：规则错了就改，需要财务定的用 ask_question，数字对不上的不能自己放过",
+     "finish 成功"),
+)
 MAX_REFLECT = 2                # 卡住时先让智能体停下来反思、换做法接着做，最多这么多次；再卡住才停下，把原因报给财务
 KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保留全文
 BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
@@ -1730,6 +1740,16 @@ class Workspace:
         q.answered_at = datetime.now().isoformat(timespec="seconds")
         return f"已记录 {id} 的答复：{q.answer}。请按答复修改规则"
 
+    def phase(self) -> int:
+        """程序按工作区判断现在处在第几个阶段（0 起，见 PHASES）。规则改动后会退回前面的阶段。"""
+        skipped = {str(i.get("ref", "")) for i in self.ignored}
+        if self.schemes and not self.dirty and not self._clause_gaps(skipped):
+            return 2 if self._verify_gaps() else 3
+        docs = [f.name for f in self.inv.files if f.suffix.lower() in RULE_SUFFIXES and f.name not in skipped]
+        read = all(any(f.file == d for f in self.facts) and any(c.file == d for c in self.clauses) for d in docs) \
+            if docs else bool(self.clauses or self.datasets or self.drafts)
+        return 1 if read else 0
+
     def next_hint(self) -> str:
         """程序根据工作区判断的下一步（模型原地打转或步数用得多时提示）。"""
         docs = [f.name for f in self.inv.files if f.suffix.lower() in RULE_SUFFIXES]
@@ -1756,6 +1776,8 @@ class Workspace:
     def state(self) -> str:
         """每轮附在请求末尾的工作区摘要。"""
         lines = ["【当前工作区状态】" + (f"（{self.budget}）" if self.budget else "")]
+        k = self.phase()
+        lines.append(f"- 当前阶段 {k + 1}/{len(PHASES)}：{PHASES[k][0]}。要做：{PHASES[k][1]}。完成标准：{PHASES[k][2]}")
         used, limit = self.progress
         if limit and used >= limit * 0.3:
             lines.append(f"- 已用 {used}/{limit} 步，下一步（程序判断）：{self.next_hint()}")
@@ -2132,6 +2154,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     undo: dict[tuple[str, str], int] = {}
     same_block, prev_full, long_block, prev_block = 0, set(), 0, set()
     reflected = 0
+    reached = ws.phase()               # 本轮到过的最远阶段：往前推进到新阶段时清空对话历史；改规则退回前面的阶段再回来不清
     for turn in range(max_steps):
         if should_stop and should_stop():
             error = f"已手动停止（第 {len(steps)} 步）"
@@ -2312,6 +2335,24 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                                                        f"不要再重复；下一步（程序判断）：{ws.next_hint()}）"})
         if ws.done:
             break
+        now = ws.phase() if not message else reached
+        if now > reached:
+            # 进入新阶段：上一阶段的结论都已存进工作区（台账、条款、规则、试算、验算），对话历史里的读数、试错不再需要，
+            # 清掉腾出上下文，让模型只看材料包和工作区状态专心做这一阶段（小上下文的模型尤其需要）
+            reached = now
+            note = _phase_note(ws, now)
+            at = max((i for i, m in enumerate(history) if m["role"] == "assistant"), default=len(history))
+            keep = history[at:]          # 刚完成的这一步（如试算结果和抽查）留着，接下来要看
+            history.clear()
+            history += [{"role": "user", "content": note}] + keep
+            repeats, last_write, stuck = 0, None, ""
+            for d in (fails, fail_why, seen, undo):
+                d.clear()
+            same_block, prev_full, long_block, prev_block = 0, set(), 0, set()
+            steps.append(Step("（进入新阶段）", {}, note, True))
+            if on_step:
+                on_step(len(steps), steps[-1])
+            continue
         if (repeats >= MAX_STUCK or any(n >= MAX_STUCK for n in fails.values())) and reflected < reflect:
             # 卡住了先不停：清掉原地打转的对话历史（小模型会照着历史接着重复，也白占上下文），
             # 只留卡在哪、试过什么、程序的判断，让智能体回到材料和数据重新想、换一种做法。工作区（数据表、规则、台账）都保留
@@ -2439,6 +2480,14 @@ def _resume_task(ws: Workspace, last: dict | None, changes: dict | None, fresh: 
               "4. 试算全部方案，确认结果合理后 finish。还有问题等答复时，做完不受影响的部分就 finish 结束本轮。",
               "", "当前文件清单：", ws.list_files()]
     return "\n".join(lines)
+
+
+def _phase_note(ws: Workspace, k: int) -> str:
+    done = "；".join(f"{PHASES[i][0]}（{PHASES[i][2]}）" for i in range(k))
+    return (f"【进入第 {k + 1}/{len(PHASES)} 阶段：{PHASES[k][0]}】已完成：{done}。\n"
+            "为了腾出上下文，之前的对话已清空（只留下刚完成的最后一步）。材料包仍在任务里；读过的结论在参数台账、条款清单、笔记和规则摘要里（见工作区状态），"
+            "直接用，不要从头重读材料。\n"
+            f"这一阶段要做：{PHASES[k][1]}。\n完成标准：{PHASES[k][2]}。")
 
 
 def _reflection(ws: Workspace, stuck: str, steps: list[Step], n: int, limit: int) -> str:

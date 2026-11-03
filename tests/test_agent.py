@@ -405,3 +405,25 @@ def test_small_context_window_is_reported_before_running():
     except ToolError as e:
         assert "8000" in str(e) and "max-model-len" in str(e)
     assert not llm.calls
+
+
+def test_phases_clear_history_but_keep_last_step(tmp_path):
+    """分阶段：读懂材料 → 写规则并试算 → 独立验算 → 核对并结束。进入新阶段时清掉之前的对话（结论都在工作区里），
+    只留刚完成的那一步（如试算结果要接着看）；状态里写明当前阶段和完成标准。"""
+    from bonus_agent.agent import run_agent
+    case, script = _agent_case()
+    llm = FakeLLM(script)
+    llm.images = GRADE_IMG
+    ar = run_agent(llm, [ANNUAL], tmp_path)
+    tools = [s.tool for s in ar.steps]
+    marks = [s for s in ar.steps if s.tool == "（进入新阶段）"]
+    assert len(marks) == 2 and "第 2/4 阶段：写规则并试算" in marks[0].result and "第 4/4 阶段" in marks[1].result
+    assert tools.index("（进入新阶段）") == tools.index("record_clauses") + 1
+    after = next(c for c in llm.calls if "进入第 2/4 阶段" in json.dumps(c, ensure_ascii=False))
+    text = json.dumps(after, ensure_ascii=False)
+    assert "record_clauses" in text                                                   # 刚完成的一步留着
+    hist = json.dumps(after[2:-1], ensure_ascii=False)                                # 系统提示、任务之后，状态之前
+    assert "read_document" not in hist and "record_facts" not in hist                # 之前读材料的对话清掉了
+    assert "当前阶段 2/4：写规则并试算" in after[-1]["content"]
+    first = next(c for c in llm.calls if "材料包" in json.dumps(c, ensure_ascii=False))
+    assert "当前阶段 1/4：读懂材料" in first[-1]["content"]
