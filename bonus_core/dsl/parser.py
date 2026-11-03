@@ -9,7 +9,7 @@ from decimal import Decimal
 from functools import lru_cache
 
 from lark import Lark, Transformer, v_args
-from lark.exceptions import LarkError
+from lark.exceptions import LarkError, VisitError
 
 GRAMMAR = r"""
 ?start: expr
@@ -148,6 +148,10 @@ class _ToAst(Transformer):
         return BinOp(str(op), l, r)
 
     def cmp_op(self, l, op, r):
+        if isinstance(l, Name) and l == r:      # 常见于想按“当前对象”筛选：where: id == id 对每一行都成立
+            raise ExprError(f"{l.id} {op} {r.id} 两边是同一个字段，对每一行结果都一样，起不到筛选作用。"
+                            f"想只取当前对象自己的行时不用写这个条件：在某一层（或关联实体）上汇总，"
+                            f"引擎只取这个对象关联的行；要按别的对象筛选，右边写具体的值")
         return Cmp(str(op), l, r)
 
     def and_op(self, l, r):
@@ -170,8 +174,70 @@ _parser = Lark(GRAMMAR, parser="lalr", maybe_placeholders=False)
 def parse(src: str):
     try:
         return _ToAst().transform(_parser.parse(src))
+    except VisitError as e:          # 转换语法树时发现的写法问题（如位置参数写在命名参数后面）
+        if isinstance(e.orig_exc, ExprError):
+            raise ExprError(f"表达式写法不对：{e.orig_exc}") from None
+        raise ExprError(f"表达式无法解析：{e.orig_exc}") from None
     except LarkError as e:
-        raise ExprError(f"表达式无法解析: {src!r}\n{e}") from None
+        raise ExprError(f"表达式无法解析：{_why(src, e)}") from None
+
+
+def _parens(src: str, upto: int) -> tuple[list[tuple[int, bool]], int, int]:
+    """扫描到 upto 为止（跳过字符串）：(还没闭合的左括号 [(位置, 是不是函数调用)], 第一处多出右括号的位置或 -1, 整式左右括号差)。"""
+    stack: list[tuple[int, bool]] = []
+    extra, depth, quote = -1, 0, ""
+    for i, ch in enumerate(src):
+        if quote:
+            quote = "" if ch == quote else quote
+            continue
+        if ch in "\"'":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+            if i < upto:
+                j = i - 1
+                while j >= 0 and src[j] == " ":
+                    j -= 1
+                stack.append((i, j >= 0 and (src[j].isalnum() or src[j] == "_")))
+        elif ch == ")":
+            depth -= 1
+            if i < upto:
+                if stack:
+                    stack.pop()
+                elif extra < 0:
+                    extra = i
+    return stack, extra, depth
+
+
+def _why(src: str, e: Exception) -> str:
+    """把语法分析器的报错换成能照着改的话：出错位置（▲）、括号配没配对、常见的不支持写法。
+    长表达式不再整段回显，只给出错位置前后一段。"""
+    pos = getattr(e, "pos_in_stream", None)
+    if pos is None and getattr(e, "column", None):
+        pos = sum(len(l) + 1 for l in src.split("\n")[:max(getattr(e, "line", 1), 1) - 1]) + e.column - 1
+    pos = min(max(pos or 0, 0), len(src))
+    tok = getattr(e, "token", None)
+    tok = str(tok) if tok is not None else src[pos:pos + 1]
+    near = f"…{src[max(0, pos - 60):pos]}▲{src[pos:pos + 30]}…"
+    stack, extra, depth = _parens(src, pos)
+    total = f"整个式子左括号比右括号{'多' if depth > 0 else '少'} {abs(depth)} 个。" if depth else ""
+    if tok == "in" or src[pos:pos + 3] == "in ":
+        why = "不支持 in (…)，写成 x == \"a\" or x == \"b\""
+    elif tok.startswith("{") or src.lstrip().startswith("{"):
+        why = "表达式只能是一个算式，不能写成 {名字: 算式, …} 这样的对象；几个数分几次算"
+    elif tok == "," and not stack:
+        why = "到▲处括号已经全部闭合、式子已经结束，后面却还有逗号：前面多写了右括号，或少写了左括号"
+    elif tok == "," and not stack[-1][1]:
+        k = stack[-1][0]
+        why = (f"▲处的逗号在一个普通括号里（从「{src[max(0, k - 20):k + 1]}」这个左括号开始，它不是函数调用）："
+               "这个括号多半少写了右括号，没在逗号前闭合")
+    elif tok == ")" or extra >= 0:
+        why = "右括号多了，没有对应的左括号"
+    elif pos >= len(src) or tok in ("", "$END"):
+        why = "式子没写完" + ("：少了右括号" if depth > 0 else "")
+    else:
+        why = f"▲处的「{tok}」写法不对"
+    return f"{why}。{total}出错位置（▲处）：{near}"
 
 
 def walk(node):

@@ -237,3 +237,34 @@ def test_company_table_and_entity_aggregate_scope():
     # 公司级表字段不聚合直接用
     data["allocation"][1]["weight"] = "net_profit"
     assert any(i.code == "detail_outside_agg" for i in validate(RuleSet.model_validate(data)))
+
+
+def test_parse_errors_point_at_the_mistake():
+    """1103 回归：表达式写错时只回显整段式子和“column 1682”，模型数不出位置，同一个式子原样重试 3 次。
+    现在说清是哪种错（括号提前闭合、普通括号里出现逗号、不支持 in、写成对象），并用 ▲ 标出位置。"""
+    from bonus_core.dsl.parser import ExprError, parse
+
+    def err(src):
+        with pytest.raises(ExprError) as e:
+            parse(src)
+        return str(e.value)
+
+    e = err("round(min(a, 1), b), 2)")
+    assert "括号已经全部闭合" in e and "少 1 个" in e and "round(min(a, 1), b)▲, 2)" in e
+    e = err('sum(x * (if(p == "a", 1, 2), of: "t")')
+    assert "普通括号" in e and "▲, of:" in e
+    assert "不支持 in" in err('sum(x, of: "t", where: k in ("a", "b"))')
+    assert "不能写成" in err("{a: a, b: b}")
+    assert "式子没写完" in err("round(a, 2")
+    assert "位置参数不能写在命名参数之后" in err("f(a: 1, 2)")
+    long = "a + " * 400 + "round(b, 2), 0)"
+    assert len(err(long)) < 400                     # 长式子不整段回显
+
+
+def test_comparing_a_field_with_itself_is_rejected():
+    """1103 回归 Q2：辅助变量写了 where: project_id == project_id，想取“这一行所属的项目”，
+    结果对每一行都成立、把所有项目都加进来，同一个验算对不上重试了 8 次。"""
+    from bonus_core.dsl.parser import ExprError, parse
+    with pytest.raises(ExprError, match="两边是同一个字段"):
+        parse('sum(v, of: "项目", where: project_id == project_id)')
+    parse('sum(v, of: "项目", where: project_id == "P01")')
