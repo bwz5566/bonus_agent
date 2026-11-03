@@ -59,6 +59,8 @@ PHASES = (     # 工作分阶段：每个阶段的产出都存在工作区里（
     ("核对并结束", "调用 finish；被拦下的逐条处理：规则错了就改，需要财务定的用 ask_question，数字对不上的不能自己放过",
      "finish 成功"),
 )
+IDLE_WARN = 6                  # 连续这么多次只查询（evaluate / explain）、没有任何改动：提醒根据已查到的做决定；两倍就算卡住
+QUERY_TOOLS = {"evaluate", "explain"}
 MAX_REFLECT = 2                # 卡住时先让智能体停下来反思、换做法接着做，最多这么多次；再卡住才停下，把原因报给财务
 KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保留全文
 BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
@@ -2154,6 +2156,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     undo: dict[tuple[str, str], int] = {}
     same_block, prev_full, long_block, prev_block = 0, set(), 0, set()
     reflected = 0
+    idle = 0                           # 连续只查询、没有改动工作区的次数（参数每次不同，上面的重复检测发现不了）
     reached = ws.phase()               # 本轮到过的最远阶段：往前推进到新阶段时清空对话历史；改规则退回前面的阶段再回来不清
     for turn in range(max_steps):
         if should_stop and should_stop():
@@ -2321,6 +2324,18 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                     step.result = result
             if fails[c["name"]] >= MAX_STUCK:
                 stuck = f"{c['name']} 连续 {fails[c['name']]} 次失败，最后一次：{result[:300]}"
+            if c["name"] in QUERY_TOOLS:
+                idle += 1
+                if idle >= 2 * IDLE_WARN:
+                    repeats = MAX_STUCK
+                    stuck = f"连续 {idle} 次只用 evaluate / explain 查询，没有改规则、验算或提问，工作区没有进展"
+                elif idle == IDLE_WARN:
+                    result += (f"\n注意：已经连续 {idle} 次只查询、没有任何改动。根据已查到的信息做决定："
+                               "规则错了就 set_rules 改，验算式错了就重写 verify，两边都拿不准就 ask_question 把差异写给财务。"
+                               f"再查 {IDLE_WARN} 次仍没有改动就算卡住。下一步（程序判断）：{ws.next_hint()}")
+                    step.result = result
+            elif c["name"] not in READ_ONLY and ok:
+                idle = 0
             steps.append(step)
             if on_step:
                 on_step(len(steps), step)
@@ -2345,7 +2360,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             keep = history[at:]          # 刚完成的这一步（如试算结果和抽查）留着，接下来要看
             history.clear()
             history += [{"role": "user", "content": note}] + keep
-            repeats, last_write, stuck = 0, None, ""
+            repeats, last_write, stuck, idle = 0, None, "", 0
             for d in (fails, fail_why, seen, undo):
                 d.clear()
             same_block, prev_full, long_block, prev_block = 0, set(), 0, set()
@@ -2360,7 +2375,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             note = _reflection(ws, stuck, steps, reflected, reflect)
             history.clear()
             history.append({"role": "user", "content": note})
-            repeats, last_write, stuck = 0, None, ""
+            repeats, last_write, stuck, idle = 0, None, "", 0
             for d in (fails, fail_why, seen, undo):
                 d.clear()
             same_block, prev_full, long_block, prev_block = 0, set(), 0, set()

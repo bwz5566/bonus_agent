@@ -427,3 +427,18 @@ def test_phases_clear_history_but_keep_last_step(tmp_path):
     assert "当前阶段 2/4：写规则并试算" in after[-1]["content"]
     first = next(c for c in llm.calls if "材料包" in json.dumps(c, ensure_ascii=False))
     assert "当前阶段 1/4：读懂材料" in first[-1]["content"]
+
+
+def test_query_only_loop_is_nudged_then_stopped(tmp_path):
+    """Q2：模型反复 evaluate / explain，每次参数不同（重复检测发现不了），工作区一直没有进展。
+    连续 6 次只查询先提醒做决定，12 次算卡住（反思用完就停下报原因）。"""
+    from bonus_agent.agent import run_agent, IDLE_WARN
+    case, script = _agent_case()
+    j = next(k for k, s in enumerate(script) if s["tool"] == "trial_run")
+    probes = [{"tool": "evaluate", "args": {"expr": f"sum(net_profit) + {n}"}} for n in range(2 * IDLE_WARN)]
+    llm = FakeLLM(script[:j + 1] + probes + script[j + 1:])
+    llm.images = GRADE_IMG
+    ar = run_agent(llm, [ANNUAL], tmp_path, reflect=0)
+    ev = [s for s in ar.steps if s.tool == "evaluate"]
+    assert "已经连续 6 次只查询" in ev[IDLE_WARN - 1].result and "已经连续" not in ev[IDLE_WARN - 2].result
+    assert ar.status == "FAILED" and "只用 evaluate / explain 查询" in ar.error, ar.error

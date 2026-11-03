@@ -131,3 +131,24 @@ def test_preflight_checks_main_and_checker_models():
     assert not ok and "4096" in lines[0]
     ok, _ = rg.preflight(FakeLLM(lambda m: "好的", name="chatty"))
     assert not ok
+
+
+def test_compare_flags_scenarios_that_got_worse(tmp_path):
+    # 每次修复后和上一次回归对比：修好一个场景、弄坏另一个，要能一眼看出来
+    import json
+    from bonus_agent.regress import RunRecord, summarize, compare, load_summary
+    from bonus_agent.cli import main
+    old = summarize([RunRecord("Q1", 1, status="OK", correct=False, missed=True, wrong=3),
+                     RunRecord("Q2", 1, status="OK", correct=True)], {})
+    new = summarize([RunRecord("Q1", 1, status="OK", correct=True),
+                     RunRecord("Q2", 1, status="FAILED", cause="卡住"),
+                     RunRecord("Q3", 1, status="OK", correct=True)], {})
+    text = "\n".join(compare(new, old))
+    q1, q2, q3 = (next(l for l in text.splitlines() if l.startswith(q)) for q in ("Q1", "Q2", "Q3"))
+    assert "变好" in q1 and "变差：正确率下降、完成率下降" in q2 and "上次没跑" in q3
+    assert "共 1 个场景变差" in text and "--runs 3" in text
+    (tmp_path / "a").mkdir()
+    (tmp_path / "a" / "summary.json").write_text(json.dumps(old, ensure_ascii=False), encoding="utf-8")
+    (tmp_path / "b.json").write_text(json.dumps(new, ensure_ascii=False), encoding="utf-8")
+    assert load_summary(tmp_path / "a")["场景"]["Q1"]["不一致金额"] == 3
+    assert main(["regress-compare", str(tmp_path / "a"), str(tmp_path / "b.json")]) == 0

@@ -274,6 +274,8 @@ def summarize(records: list[RunRecord], meta: dict) -> dict:
                 "完成率": round(len(done) / n, 3) if n else 0,
                 "正确率": round(sum(1 for r in rs if r.correct) / n, 3) if n else 0,
                 "卡住原因": causes,
+                "不一致金额": sum(r.wrong for r in rs),
+                "平均步数": round(sum(r.steps for r in rs) / n, 1) if n else 0,
                 "平均耗时秒": round(sum(r.seconds for r in rs) / n, 1) if n else 0,
                 "平均输入tokens": sum(r.prompt_tokens for r in rs) // n if n else 0}
 
@@ -286,6 +288,40 @@ def lines(summary: dict) -> list[str]:
     for name, s in list(summary["场景"].items()) + [("总计", summary["总计"])]:
         why = "、".join(f"{k} {v}" for k, v in s["卡住原因"].items()) or "—"
         out.append(f"{name:<8}{s['次数']:>4}{s['出结果']:>6}{s['金额正确']:>6}{s['算错没拦住']:>10}{s['自动接续过']:>10}{s.get('反思过', 0):>6}  {why}")
+    return out
+
+
+def load_summary(path: str | Path) -> dict:
+    """读一次回归的汇总：给输出目录或 summary.json 都行。"""
+    p = Path(path)
+    p = p / SUMMARY if p.is_dir() else p
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def compare(new: dict, old: dict) -> list[str]:
+    """和上一次回归逐场景对比（防止修一个场景、别的场景变差）：正确率、算错没拦住、完成率变差的标出来。
+    只比两次都跑了的场景；次数少时偶然性大，每个场景至少跑 3 次再下结论。"""
+    out = [f"{'场景':<8}{'正确率':>14}{'完成率':>14}{'算错没拦住':>12}{'平均步数':>14}  结论"]
+    worse = 0
+    for name, n in new["场景"].items():
+        o = old.get("场景", {}).get(name)
+        if not o:
+            out.append(f"{name:<8}{'（上次没跑）':>14}")
+            continue
+        bad = []
+        if n["正确率"] < o["正确率"]:
+            bad.append("正确率下降")
+        if n["算错没拦住"] / max(n["次数"], 1) > o["算错没拦住"] / max(o["次数"], 1):
+            bad.append("算错没拦住变多")
+        if n["完成率"] < o["完成率"]:
+            bad.append("完成率下降")
+        good = n["正确率"] > o["正确率"] or n["完成率"] > o["完成率"]
+        worse += bool(bad)
+        verdict = "变差：" + "、".join(bad) if bad else "变好" if good else "持平"
+        out.append(f"{name:<8}{o['正确率']:>6.0%} → {n['正确率']:<6.0%}{o['完成率']:>6.0%} → {n['完成率']:<6.0%}"
+                   f"{o['算错没拦住']:>4} → {n['算错没拦住']:<4}{o.get('平均步数', 0):>6} → {n.get('平均步数', 0):<6}  {verdict}")
+    few = min((s["次数"] for s in new["场景"].values()), default=0)
+    out.append(f"共 {worse} 个场景变差" + ("；每个场景只跑了 1～2 次，偶然性大，变差的场景请用 --runs 3 再跑确认" if few < 3 else ""))
     return out
 
 

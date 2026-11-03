@@ -15,9 +15,11 @@
   negcheck --out 案卷目录 --cases negative_cases.json [--sheet 表名=工作表 ...] 材料...
                                            坏数据回归：用该案卷的规则（不调用大模型）在逐个改坏的数据上重算，
                                            列出每种坏数据有没有被拦住
-  regress [--suite 场景.yaml] [--runs 3] [--model M] [--checker M2] [--only Q1,Q3] [--max-minutes 120] [--resume] --out 目录
+  regress [--suite 场景.yaml] [--runs 3] [--model M] [--checker M2] [--only Q1,Q3] [--max-minutes 120] [--resume] [--baseline 上次目录] --out 目录
                                            固定回归：每个场景跑 N 次（默认 3），和期望结果逐分比对，
                                            汇总写入 目录/summary.json（完成率、正确率、算错没拦住、卡住原因）
+                                           --baseline 上次的输出目录：跑完后逐场景对比，标出变差的场景
+  regress-compare 上次目录 这次目录         对比两次回归（不调用模型）：每次修复后看有没有别的场景变差
   serve --data 数据目录 [--host 127.0.0.1] [--port 8080] [--model M] [--checker M2]
                                            --checker：独立复读、独立算式改用另一个模型交叉验证（连不上时退回主模型）
                                            内网网页服务：看问题、填答复、传材料、运行下一轮、确认、按模板计算
@@ -84,6 +86,10 @@ def main(argv=None) -> int:
     p.add_argument("--max-minutes", type=float, default=0, help="单次运行（含自动接续）最多多少分钟，超过就跳过这一次接着跑下一个；0 表示不限")
     p.add_argument("--resume", action="store_true", help="接着上次没跑完的跑：同一个 --out 里已跑完的不再跑")
     p.add_argument("--check-only", action="store_true", help="只检查模型能不能调用（主模型和交叉验证模型），不开跑")
+    p.add_argument("--baseline", help="上一次回归的输出目录（或 summary.json）：跑完后逐场景对比，标出变差的场景")
+    p = sub.add_parser("regress-compare")
+    p.add_argument("old", help="上一次回归的输出目录或 summary.json")
+    p.add_argument("new", help="这一次回归的输出目录或 summary.json")
     p = sub.add_parser("serve")
     p.add_argument("--data", required=True, help="数据目录：用户、案卷、材料和结果都在这里")
     p.add_argument("--host", default="127.0.0.1", help="默认只监听本机；内网访问请放在 HTTPS 反向代理后面")
@@ -161,7 +167,13 @@ def main(argv=None) -> int:
                                max_minutes=a.max_minutes, resume=a.resume)
         print("\n" + "\n".join(rg.lines(summary)))
         print(f"\n汇总已写入 {Path(a.out) / rg.SUMMARY}")
+        if a.baseline:
+            print(f"\n和 {a.baseline} 对比：\n" + "\n".join(rg.compare(summary, rg.load_summary(a.baseline))))
         return 0 if summary["总计"]["算错没拦住"] == 0 else 2
+    if a.cmd == "regress-compare":
+        from bonus_agent import regress as rg
+        print("\n".join(rg.compare(rg.load_summary(a.new), rg.load_summary(a.old))))
+        return 0
     if a.cmd == "negcheck":
         from bonus_agent import case as cs
         from bonus_agent.auto import collect_files

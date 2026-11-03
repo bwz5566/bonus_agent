@@ -109,8 +109,11 @@ bonus-agent negcheck --out 案卷目录 --cases negative_cases.json --sheet sale
 **固定回归**：对一组场景各跑 N 次（默认 3），和期望结果逐分比对，汇总写入 `summary.json`（完成率、正确率、算错没拦住次数、卡住原因分类），用来判断每次改动是变好还是变坏。场景在 `evals/regress.yaml` 里配置（材料、排除的文件、期望结果、停下提问时用的答复文件）；返回码 2 表示有算错没拦住的：
 
 ```bash
-bonus-agent regress --out 回归输出目录 [--runs 3] [--only Q1,Q3] [--model M]
+bonus-agent regress --out 回归输出目录 [--runs 3] [--only Q1,Q3] [--model M] [--baseline 上次的输出目录]
+bonus-agent regress-compare 上次的输出目录 这次的输出目录      # 不调用模型，只对比两次汇总
 ```
+
+**防过拟合**：每次修复后跑全量（不只跑出问题的那个场景），用 `--baseline` 或 `regress-compare` 和上一次逐场景对比，标出正确率、完成率下降或算错没拦住变多的场景；只跑 1～2 次时偶然性大，变差的场景用 `--runs 3` 再确认。修复只能改通用机制，提示词里不能写某个场景专属的内容（`tests/test_prompt_leakage.py` 检查）。
 
 **思考 → 行动 → 观察（ReAct）**：每次调用工具都带一句思考（为什么做这一步、预期看到什么，出错时先说明原因），工具返回的结果作为观察进入下一步；思考、行动、观察逐步写进 `running_steps.txt` 和 `agent_log.json`。
 
