@@ -23,7 +23,10 @@ scenarios:
   - name: Q4
     inputs: ../examples/local_data/bonus_fixture_v4/input
     expected: ../examples/local_data/bonus_fixture_v4/05_最终期望结果_B批.xlsx
-  # Q6、Q7 的样例放在仓库外（和仓库同级的 bonus_fixture_v6 / v7 文件夹）；本机没有就跳过
+  # Q5、Q6、Q7 的样例放在仓库外（和仓库同级的 bonus_fixture_v5 / v6 / v7 文件夹）；本机没有就跳过
+  - name: Q5
+    inputs: ../../bonus_fixture_v5/01_输入材料              # 01_计算规则说明.docx、02_订单与回款.xlsx、03_人员与费率.xlsx
+    expected: ../../bonus_fixture_v5/02_验收答案_不要上传/04_最终期望结果.xlsx
   - name: Q6
     inputs: ../../bonus_fixture_v6/01_首轮输入              # R1 要补充材料，固定回归只核对首轮 R0
     expected: ../../bonus_fixture_v6/03_验收答案_不要上传/06_最终期望结果.xlsx
