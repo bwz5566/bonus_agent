@@ -89,6 +89,8 @@ def test_web_rounds_confirm_and_template(env):
     assert "已出结果" in job.message, job.message
     page = c.get(f"/cases/{cid}").text
     assert "result.xlsx" in page and "第 2 轮" in page
+    shown = [ln for ln in page.split("最新的在最上面")[1].split("</pre>")[0].splitlines() if ln.startswith("[")]
+    assert len(shown) >= 2 and shown[0] > shown[-1]          # 运行记录倒序：最新的一步在最上面（刷新回到顶部也看得到）
     # 只有 approver 能确认；口径单逐条确认之前不能确认结果
     assert post(c, store, f"/cases/{cid}/confirm").status_code == 403
     r = post(c, store, f"/cases/{cid}/confirm", {"note": "已核对"}, user="bob")

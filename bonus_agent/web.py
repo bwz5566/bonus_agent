@@ -633,7 +633,9 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             head = ("正在运行……" if job.status == "running" else
                     "本轮未完成（原因和处理办法见上方）" if job.status == "failed" or job.result == "FAILED" else job.message)
             info += (f"<p class='{cls}'>{e(head)}（{e(job.by)}，{e(job.started[11:16])} 开始）</p>"
-                     + (f"<pre>{e(chr(10).join(job.steps[-15:]))}</pre>" if job.steps else ""))
+                     # 最新的一步放在最上面：页面每 3 秒刷新一次会回到顶部，倒序才能一眼看到最新进展
+                     + (f"<p class='mut'>最近 {min(len(job.steps), 15)} 步，最新的在最上面：</p>"
+                        f"<pre>{e(chr(10).join(reversed(job.steps[-15:])))}</pre>" if job.steps else ""))
         if editor and busy and job and job.status == "running":
             info += form(f"/cases/{cid}/stop", "<p><button>停止</button> <span class='mut'>当前这一步做完后停下，已做的部分会保存</span></p>"
                          if not job.cancel else "<p class='mut'>正在停止……</p>", csrf)
