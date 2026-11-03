@@ -1527,7 +1527,11 @@ class Workspace:
             return f"辅助变量 {'、'.join(same)} 和规则变量同名，换个名字（如加 v_ 前缀），独立验算不能和规则混用"
         names = set().union(*(set(parse_names(t)) for t in asts))
         if not (names & set(rs.field_owner())) and not any(isinstance(c, Call) and c.fn == "count" for t in asts for c in walk(t)):
-            return "验算式没有用到任何数据字段。独立验算要从原始数据算起（字段、参数表），不能直接写结果数字"
+            # 1103 回归 Q7：模型把上一层的数（班组奖金池、本组权重合计）直接写成数字，被拦下后不知道怎么改，原样重复了 400 多次
+            return ("验算式没有用到任何数据字段。独立验算要从原始数据算起（字段、参数表），不能直接写结果数字。"
+                    "要用到别的层的数（如上一层的奖金池、本组的合计）时，用 helpers 在那一层另写辅助变量再引用："
+                    "helpers 写 {\"v_上层数\": {\"scope\": \"那一层的层级名\", \"expr\": \"按材料从字段算起的式子\"}}，"
+                    "expr 里引用 v_上层数；同一层的合计用 sum(本层辅助变量, of: \"本层的表名\")")
         digits = {id(c.args[1]) for t in asts for c in walk(t) if isinstance(c, Call) and c.fn == "round" and len(c.args) > 1}
         loose = [k for k in (lint._key(abs(n.value)) for t in asts for n in walk(t) if isinstance(n, Num) and id(n) not in digits)
                  if Decimal(k) not in lint.FREE and k not in lint.material_numbers(self._rule_text())]
