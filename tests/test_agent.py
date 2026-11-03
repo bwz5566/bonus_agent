@@ -460,6 +460,28 @@ def test_calls_repeated_in_rotation_are_stuck(tmp_path):
     assert len(ver) == 7
 
 
+def test_question_answered_by_material_is_sent_back(tmp_path):
+    """1103 回归 Q1：财务答复里写明了口径，模型却把两种理解拿去问财务。提问前先让交叉验证模型在材料里找原文：
+    找到、而且原文逐字核对得上，就退回让智能体按原文处理；智能体再问一次就直接记录。编出来的原文不算数。"""
+    import json
+    from bonus_agent import reread as rr
+    from bonus_agent.agent import run_agent
+    case, script = _agent_case()
+    llm = FakeLLM(script)
+    llm.images = GRADE_IMG
+    ws = run_agent(llm, [ANNUAL], tmp_path).ws
+    body = rr.material(ws)
+    line = next(x.strip() for x in body.splitlines() if len(x.strip()) >= 12 and not x.startswith("#"))
+    n = len(ws.questions)
+    llm.source = json.dumps({"answerable": True, "quote": line, "source": "材料", "answer": "按原文处理"}, ensure_ascii=False)
+    out = ws.ask_question("这个口径按哪种理解？", options=["甲", "乙"])
+    assert out.startswith("先别问财务") and line in out and len(ws.questions) == n
+    assert ws.ask_question("这个口径按哪种理解？原文说的是另一件事", options=["甲", "乙"]).startswith("已记录问题")
+    llm.source = json.dumps({"answerable": True, "quote": "材料里根本没有的一句话编出来的", "answer": "x"}, ensure_ascii=False)
+    assert ws.ask_question("另一个问题？").startswith("已记录问题")
+    assert any(str(m[0].get("content", "")).startswith("【查原文】") for m in llm.calls)
+
+
 def test_redefine_dataset_without_fields_and_evaluate_text(tmp_path):
     """Q3 网页运行：模型只想把表改成明细表（改 key / link），没写 fields，连续 3 次因缺参数失败；
     又想用 evaluate 看一行的编号，返回“需要数字”连续 3 次。现在重新定义可以沿用上次的字段，evaluate 能看文字取值。"""

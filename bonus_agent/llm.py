@@ -305,6 +305,7 @@ class FakeLLM(LLM):
         self.images: str | None = None      # 设置后，看图的调用一律返回它，不消耗预设回答
         self.reread: str | None = None      # 独立复读的回答（JSON 文本）；不设时复读结果为空
         self.calc: str | list[str] | None = None     # 独立算式的回答（几次改正时给列表，依次返回）；不设时为空
+        self.source: str | None = None      # 提问前查原文的回答（JSON 文本）；不设时为“材料里没有”
 
     def _next(self, *args):
         if callable(self._responder):
@@ -319,6 +320,9 @@ class FakeLLM(LLM):
         if str(messages[0].get("content", "")).startswith("【独立复读】") and \
                 (self.reread is not None or not callable(self._responder)):
             return self.reread or '{"items": []}'    # 独立复读：不消耗预设回答（脚本里接下来是工具调用）
+        if str(messages[0].get("content", "")).startswith("【查原文】") and \
+                (self.source is not None or not callable(self._responder)):
+            return self.source or '{"answerable": false}'
         if str(messages[0].get("content", "")).startswith("【独立算式】") and \
                 (self.calc is not None or not callable(self._responder)):
             if isinstance(self.calc, list):

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,6 +60,7 @@ PHASES = (     # 工作分阶段：每个阶段的产出都存在工作区里（
     ("核对并结束", "调用 finish；被拦下的逐条处理：规则错了就改，需要财务定的用 ask_question，数字对不上的不能自己放过",
      "finish 成功"),
 )
+SOURCE_CHECKS = 5               # 每轮提问前查原文最多几次（每次一次交叉验证模型调用）
 IDLE_WARN = 6                  # 连续这么多次只查询（evaluate / explain）、没有任何改动：提醒根据已查到的做决定；两倍就算卡住
 QUERY_TOOLS = {"evaluate", "explain"}
 MAX_REFLECT = 2                # 卡住时先让智能体停下来反思、换做法接着做，最多这么多次；再卡住才停下，把原因报给财务
@@ -211,7 +213,7 @@ TOOLS: list[dict] = [
                     "对不上时先想清楚是规则错了还是验算式写错了，改对的那一边；拿不准就 ask_question。",
      "parameters": _obj({"node": {**_S, "description": "要验算的对象，如 人员:S01"}, "expr": _S,
                          "basis": {**_S, "description": "依据的材料原文（条款号或原句）"},
-                         "at": {**_S, "description": "在哪个节点上计算，默认是 node 自己"}, "scheme": _S,
+                         "at": {**_S, "description": "在哪个节点上计算，默认是 node 自己。一般不要写：上层的数用 scope 为上层的辅助变量在 node 上直接引用"}, "scheme": _S,
                          "amount": {**_S, "enum": ["应得", "实发"], "description": "验算应得（默认）还是本次实发（扣暂缓、已发之后）"},
                          "helpers": {"type": "object", "description": "可选：验算自己定义的辅助变量 {名字: {scope, expr}}，"
                                      "写法同规则的 variables，不能和规则变量同名、不能引用规则变量。跨表的中间数先在对应层算出来，"
@@ -225,6 +227,13 @@ TOOLS: list[dict] = [
      "parameters": _obj({"summary": {**_S, "description": "两三句话说明：什么奖金、奖金池怎么来、怎么分、发放条件"},
                          "ignored": {"type": "array", "items": _obj({"ref": _S, "reason": _S})}}, ["summary"])},
 ]
+
+
+def _in_text(quote: str, text: str, least: int = 8) -> bool:
+    """quote 能在 text 里逐字找到（忽略空白、全半角和首尾标点），且至少 least 个字。"""
+    norm = lambda x: re.sub(r"\s+", "", unicodedata.normalize("NFKC", x or ""))
+    q = norm(quote).strip("。，,.；;：:「」“”\"'")
+    return len(q) >= least and q in norm(text)
 
 
 def _used_helpers(expr: str, pool: dict) -> dict:
@@ -519,6 +528,8 @@ class Workspace:
     reply_text: str = ""
     budget: str = ""
     checker_down: str = ""                                  # 交叉验证模型调用失败、改用主模型时的说明
+    _source_calls: int = 0                                  # 本轮提问前查原文的次数
+    _source_skip: bool = False                              # 刚查到原文退回过：下一次提问直接记录
     round: int = 1                                          # 第几轮（同一案卷和财务来回的次数）
     facts: list[fx.Fact] = field(default_factory=list)      # 参数台账：从材料里登记的参数和口径
     clauses: list[cl.Clause] = field(default_factory=list)  # 条款清单：每份规则文档的计算条款，及落在规则的哪里
@@ -1549,7 +1560,13 @@ class Workspace:
         try:
             v, rendered = self._probe(name, rec["expr"], rec["at"], helpers)
         except ToolError as e:
-            return f"验算式算不出来：{e}"
+            hint = ""
+            if rec["at"] != node:
+                # 1103 回归 Q1：验算小组却在部门上算（at 写部门），部门上取不到这个小组自己的权重、字段，换了十几种写法都报错
+                hint = (f"。你是在「{rec['at']}」上算「{node}」的：在别的对象上取不到「{node}」自己的字段和辅助变量。"
+                        f"去掉 at，直接在「{node}」上算：上层的数（如上层的奖金池）写成 scope 为上层层级的辅助变量，在下层直接引用；"
+                        f"同一个上层对象下各同级的合计写 sum(本层辅助变量, of: \"本层的表名\")，本对象的份额也可以写 share(本层辅助变量)")
+            return f"验算式算不出来：{e}{hint}"
         if isinstance(v, bool) or not isinstance(v, Decimal):
             return f"验算式算出的不是金额：{fmt(v)}"
         final, has_tail = got
@@ -1562,7 +1579,12 @@ class Workspace:
             if kind == "实发" or abs(v - Decimal(exact)) <= VERIFY_TOL:
                 self._verify_note = f"引擎 {fmt(final)} 元，独立验算 {fmt(v)} 元；差 {fmt(final - mine)} 元是按份额分配的舍入尾差"
                 return ""
-        return (f"{node} 的{kind}对不上：引擎算出 {fmt(final)} 元，独立验算 {rec['expr']} = {rendered} = {fmt(v)}。"
+        cents = abs(mine - final)
+        # 只差一两分：多半是舍入的位置不同（如一个先把应得舍到分再乘比例，一个乘完一次舍入），不是口径错
+        near = (f"只差 {fmt(cents)} 元，多半是舍入的位置不同：对照材料哪一步要先舍到分"
+                "（如先把应得舍到分、再乘比例后再舍，还是一次算完再舍），把验算式里的 round 放到同样的位置。") \
+            if Decimal(0) < cents <= Decimal("0.02") else ""
+        return (f"{node} 的{kind}对不上：引擎算出 {fmt(final)} 元，独立验算 {rec['expr']} = {rendered} = {fmt(v)}。{near}"
                 f"{self._engine_side(name, node, kind)}"
                 f"先想清楚哪一边不符合材料（{rec['basis'][:100]}）：用 explain 查看 {node} 的计算链逐项对照，规则错了就改规则后重新试算，"
                 "验算式错了就改验算式；拿不准就 ask_question")
@@ -1662,6 +1684,10 @@ class Workspace:
             if same.answer:
                 return f"这个问题（{same.id}）财务已答复：{same.answer}。请按答复处理"
             return f"这个问题已经问过（{same.id}），还在等财务答复"
+        if blocking:
+            found = self._answer_in_material(text, options or [])
+            if found:
+                return found
         q = Question(id=f"q{len(self.questions) + 1}", text=text, options=options or [], suggested=suggested,
                      related=related, blocking=blocking, round=self.round)
         self.questions.append(q)
@@ -1669,6 +1695,34 @@ class Workspace:
             return (f"已记录问题 {q.id}，等财务答复。不要自行选择口径或补出算法；"
                     "继续做不受影响的部分，全部问完后调用 finish 结束本轮")
         return f"已记录提示 {q.id}（不影响金额，不必等答复）"
+
+    def _answer_in_material(self, text: str, options: list[str]) -> str:
+        """提问前先查原文：让交叉验证模型只看材料（规则文档、财务答复、参数表，不含数据行）找能直接回答这个问题的原文。
+        找到、而且这句原文逐字核对得上，就先不问财务，把原文退回给智能体按原文处理（1103 回归 Q1：财务答复里写明了回款口径，
+        模型把两种理解拿去问财务）。智能体认为原文不够时再问一次，这次直接记录；每轮最多查 SOURCE_CHECKS 次，查不了就照常记录。"""
+        from bonus_agent import reread as rr
+        if self._source_skip or self._source_calls >= SOURCE_CHECKS:
+            self._source_skip = False
+            return ""
+        self._source_calls += 1
+        body = rr.material(self)
+        msgs = [{"role": "system", "content": prompt("source_check")},
+                {"role": "user", "content": body + "\n\n# 智能体准备问财务的问题\n" + text
+                 + ("\n可选答案：" + "；".join(map(str, options)) if options else "")}]
+        try:
+            data = parse_json(rr._ask(self, msgs))
+        except (LLMError, ValueError):
+            return ""
+        if not isinstance(data, dict) or data.get("answerable") is not True:
+            return ""
+        quote = str(data.get("quote") or "").strip()
+        if not _in_text(quote, body):
+            return ""          # 原文对不上（模型编的或改了字）：不算数，照常提问
+        self._source_skip = True
+        src = str(data.get("source") or "").strip()
+        return (f"先别问财务：独立核对在材料里找到了能回答这个问题的原文{f'（{src}）' if src else ''}：「{quote}」。"
+                f"按这句原文：{str(data.get('answer') or '').strip()}。请对照这句原文处理：规则或验算和原文不一致就改。"
+                "如果你认为这句原文回答不了这个问题，再调用一次 ask_question，在问题里写明这句原文为什么不够（这次会直接记录）")
 
     @property
     def pending(self) -> list[Question]:
