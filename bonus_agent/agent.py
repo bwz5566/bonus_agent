@@ -1426,18 +1426,36 @@ class Workspace:
             out[n.id] = v
         return out
 
-    def _independent_pool(self, name: str, spec: dict) -> dict[str, Decimal]:
-        """独立复读按材料写的奖金池算式，在奖金池所在层的每个对象上计算。返回 {对象: 金额}；写法不对、算不出来抛 ToolError。"""
+    def _independent_pool(self, name: str, spec: dict, strict: bool = False) -> dict[str, Decimal]:
+        """独立复读按材料写的奖金池算式，在奖金池所在层的每个对象上计算。返回 {对象: 金额}；写法不对、算不出来抛 ToolError。
+        strict：复读写算式时用，分档表有传入值不在任何一档里（比例悄悄成了 0）也算写法不对，交还复读改。"""
         rs, root, by_level, ev = self._independent_env(name, spec)
         targets = [root] if rs.pool.scope == "global" else by_level.get(rs.pool.scope, [])
-        return self._independent_eval(ev, str(spec["pool"]), targets, "奖金池")
+        out = self._independent_eval(ev, str(spec["pool"]), targets, "奖金池")
+        if strict:
+            self._independent_holes(rs, ev)
+        return out
 
-    def _independent_pay(self, name: str, spec: dict) -> dict[str, Decimal]:
+    @staticmethod
+    def _independent_holes(rs, ev) -> None:
+        # 和规则的程序检查同一条：复读的分档表漏了最低一段（如下限 0 又不含下限，传入 0 就不在任何一档），
+        # 不交还复读改的话，复读自己算错的数会被当成“规则可能错了”拿去问财务
+        holes = lint.tier_holes(rs, ev.tier_stats)
+        if holes:
+            raise ToolError("；".join(
+                f"分档表 {n} 有 {k} 个传入值不在任何一档里（第一档从 {lint._fmt(lo)} 起"
+                f"{'、不含下限' if not rs.tables[n].lower_inclusive else ''}，最小传入值 {lint._fmt(low)}），比例按 0 算了。"
+                f"按材料补上这一段：材料规定这些值按第一档算，就把第一档的下限写得更小（如低于可能的最小值）；规定不发就加一档比例 0"
+                for n, lo, k, low in holes))
+
+    def _independent_pay(self, name: str, spec: dict, strict: bool = False) -> dict[str, Decimal]:
         """独立复读按材料写的可发比例（本次可发上限 ÷ 应得），在发放层（最末层）每个对象上计算；没写返回 {}。"""
         if spec.get("pay_ratio") in (None, ""):
             return {}
         rs, root, by_level, ev = self._independent_env(name, spec)
         out = self._independent_eval(ev, str(spec["pay_ratio"]), by_level.get(rs.leaf.level, []), "可发比例")
+        if strict:
+            self._independent_holes(rs, ev)
         bad = [k for k, v in out.items() if v < 0 or v > 1]
         if bad:
             raise ToolError(f"可发比例要在 0~1 之间，{bad[0]} 上算出 {out[bad[0]]}")
@@ -2169,6 +2187,9 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     fail_why: dict[str, str | None] = {}   # 工具 -> 上次失败的原因（报错第一行的开头）
     stuck = ""
     undo: dict[tuple[str, str], int] = {}
+    # 同一个调用（参数、结果都一样）自上次有新进展以来出现了几次：几个调用轮流原样重复（如 4 个验算轮流提交、每次同样报错）时，
+    # 相邻两次并不相同，上面按“连续”计的检测都发现不了，按次数认
+    again: dict[tuple[str, str], int] = {}
     same_block, prev_full, long_block, prev_block = 0, set(), 0, set()
     reflected = 0
     idle = 0                           # 连续只查询、没有改动工作区的次数（参数每次不同，上面的重复检测发现不了）
@@ -2284,6 +2305,19 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 step.args = {**step.args, "_raw": c["raw"][:20000]}
             if ok and c["name"] in WRITE_TOOLS:
                 ws.changed = True
+            if (c["name"] not in READ_ONLY or not ok) and (sig, result) != last_write:   # 紧挨着的原样重复下面另有处理
+                key = (sig, result[:300])
+                if ok and c["name"] not in READ_ONLY and key not in again:
+                    again.clear()              # 写入类工具得到了新的结果：有进展，重新计
+                again[key] = again.get(key, 0) + 1
+                if again[key] >= MAX_STUCK:
+                    repeats = MAX_STUCK
+                    stuck = (f"同一个 {c['name']} 调用原样提交了 {again[key]} 次（中间夹着别的调用），结果每次都一样："
+                             f"{result.removeprefix('错误：')[:300]}")
+                elif again[key] == MAX_STUCK - 1:
+                    result += (f"\n注意：这个调用和之前的一次完全相同，结果也一样，原样再提交不会有变化。"
+                               f"按上面的结果换一种写法或做法；再原样提交一次就算卡住。下一步（程序判断）：{ws.next_hint()}")
+                    step.result = result
             if c["name"] in READ_ONLY and ok:
                 seen[sig] = len(steps) + 1
             elif c["name"] not in READ_ONLY:
@@ -2376,7 +2410,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             history.clear()
             history += [{"role": "user", "content": note}] + keep
             repeats, last_write, stuck, idle = 0, None, "", 0
-            for d in (fails, fail_why, seen, undo):
+            for d in (fails, fail_why, seen, undo, again):
                 d.clear()
             same_block, prev_full, long_block, prev_block = 0, set(), 0, set()
             steps.append(Step("（进入新阶段）", {}, note, True))
@@ -2391,7 +2425,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             history.clear()
             history.append({"role": "user", "content": note})
             repeats, last_write, stuck, idle = 0, None, "", 0
-            for d in (fails, fail_why, seen, undo):
+            for d in (fails, fail_why, seen, undo, again):
                 d.clear()
             same_block, prev_full, long_block, prev_block = 0, set(), 0, set()
             steps.append(Step("（反思）", {}, note, True))

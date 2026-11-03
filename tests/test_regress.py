@@ -152,3 +152,8 @@ def test_compare_flags_scenarios_that_got_worse(tmp_path):
     (tmp_path / "b.json").write_text(json.dumps(new, ensure_ascii=False), encoding="utf-8")
     assert load_summary(tmp_path / "a")["场景"]["Q1"]["不一致金额"] == 3
     assert main(["regress-compare", str(tmp_path / "a"), str(tmp_path / "b.json")]) == 0
+    # 以前算错了没拦住、现在拦下来停下提问：完成率降了也不算变差（1103 的 Q1、Q4）
+    old = summarize([RunRecord("Q1", 1, status="OK", correct=False, missed=True)], {})
+    new = summarize([RunRecord("Q1", 1, status="NEEDS_CONFIRMATION", cause="等财务答复")], {})
+    q1 = next(l for l in compare(new, old) if l.startswith("Q1"))
+    assert "变好：算错没拦住变少（改成停下提问）" in q1

@@ -309,15 +309,19 @@ def compare(new: dict, old: dict) -> list[str]:
             out.append(f"{name:<8}{'（上次没跑）':>14}")
             continue
         bad = []
+        miss_n, miss_o = n["算错没拦住"] / max(n["次数"], 1), o["算错没拦住"] / max(o["次数"], 1)
         if n["正确率"] < o["正确率"]:
             bad.append("正确率下降")
-        if n["算错没拦住"] / max(n["次数"], 1) > o["算错没拦住"] / max(o["次数"], 1):
+        if miss_n > miss_o:
             bad.append("算错没拦住变多")
-        if n["完成率"] < o["完成率"]:
+        # 以前算错了没拦住、现在拦下来停下提问：完成率是降了，但少出一份错的结果，不算变差
+        if o["完成率"] - n["完成率"] > max(miss_o - miss_n, 0) + 1e-9:
             bad.append("完成率下降")
-        good = n["正确率"] > o["正确率"] or n["完成率"] > o["完成率"]
+        good = n["正确率"] > o["正确率"] or n["完成率"] > o["完成率"] or miss_n < miss_o
         worse += bool(bad)
-        verdict = "变差：" + "、".join(bad) if bad else "变好" if good else "持平"
+        verdict = "变差：" + "、".join(bad) if bad else \
+            ("变好：算错没拦住变少" + ("（改成停下提问）" if n["完成率"] < o["完成率"] else "")
+             if miss_n < miss_o and n["正确率"] <= o["正确率"] else "变好") if good else "持平"
         out.append(f"{name:<8}{o['正确率']:>6.0%} → {n['正确率']:<6.0%}{o['完成率']:>6.0%} → {n['完成率']:<6.0%}"
                    f"{o['算错没拦住']:>4} → {n['算错没拦住']:<4}{o.get('平均步数', 0):>6} → {n.get('平均步数', 0):<6}  {verdict}")
     few = min((s["次数"] for s in new["场景"].values()), default=0)

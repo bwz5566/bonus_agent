@@ -284,9 +284,10 @@ def _sample(ws, base: list[dict], names: list[str]) -> dict:
             if n not in out["schemes"]:
                 errs.append(f"方案「{n}」：没有写奖金池算式")
                 continue
-            try:
-                ws._independent_pool(n, out["schemes"][n])
-                ws._independent_pay(n, out["schemes"][n])
+            try:      # 最后一次不再按分档漏段拦：改不好也留着比，不丢掉这份独立理解
+                strict = attempt < CALC_TRIES - 1
+                ws._independent_pool(n, out["schemes"][n], strict=strict)
+                ws._independent_pay(n, out["schemes"][n], strict=strict)
             except Exception as e:          # 算式是模型写的，任何报错都交还它自己改
                 errs.append(f"方案「{n}」：{str(e)[:400]}")
                 out["schemes"].pop(n)

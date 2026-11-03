@@ -444,6 +444,22 @@ def test_query_only_loop_is_nudged_then_stopped(tmp_path):
     assert ar.status == "FAILED" and "只用 evaluate / explain 查询" in ar.error, ar.error
 
 
+def test_calls_repeated_in_rotation_are_stuck(tmp_path):
+    """Q7：试算后 4 个 verify 轮流原样提交（每次同样报“没有用到数据字段”），相邻两次不同，
+    按“连续”计的检测都发现不了，跑了 430 次直到 tokens 用完。现在同一调用原样出现 3 次就算卡住，第 2 次先提醒。"""
+    from bonus_agent.agent import run_agent
+    case, script = _agent_case()
+    j = next(k for k, s in enumerate(script) if s["tool"] == "trial_run")
+    bad = [{"tool": "verify", "args": {"node": f"X{n}", "expr": f"{n} * 2"}} for n in range(3)]
+    llm = FakeLLM(script[:j + 1] + bad * 4 + script[j + 1:])
+    llm.images = GRADE_IMG
+    ar = run_agent(llm, [ANNUAL], tmp_path, reflect=0)
+    ver = [s for s in ar.steps if s.tool == "verify"]
+    assert "原样再提交不会有变化" in ver[3].result and "原样再提交" not in ver[2].result
+    assert ar.status == "FAILED" and "原样提交了 3 次" in ar.error, ar.error
+    assert len(ver) == 7
+
+
 def test_redefine_dataset_without_fields_and_evaluate_text(tmp_path):
     """Q3 网页运行：模型只想把表改成明细表（改 key / link），没写 fields，连续 3 次因缺参数失败；
     又想用 evaluate 看一行的编号，返回“需要数字”连续 3 次。现在重新定义可以沿用上次的字段，evaluate 能看文字取值。"""

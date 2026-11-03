@@ -165,6 +165,26 @@ def test_independent_pool_formula_compared_on_data(tmp_path):
     assert fix and "算不出来" in fix[0][-1]["content"]
 
 
+def test_independent_formula_tier_hole_is_sent_back(tmp_path):
+    """1103 的 Q4：复读把“不超过 L 取第一档”写成下限 0、不含下限的分档表，耗时为 0 的工单不在任何一档里，比例按 0 算，
+    算出的数和规则对不上，智能体只好拿去问财务。现在复读写算式时分档表有传入值落空，就带着报错交还复读改。"""
+    from bonus_agent.agent import run_agent
+    from bonus_agent.llm import FakeLLM
+    from tests.test_syn_acceptance import _script, run_case
+
+    def spec(lo):
+        d = json.loads(_calc(PROCESS_OK.replace("lookup(d, difficulty)", "lookup(d, difficulty) * tier_rate(t, base_bonus * 0)")))
+        d["schemes"]["PROCESS"]["tables"]["t"] = {"kind": "tier", "mode": "whole", "steps": [[lo, 1]], "lower_inclusive": False}
+        return json.dumps(d, ensure_ascii=False)
+    llm = FakeLLM(_script())
+    llm.calc = [spec(0), spec(-1)]
+    ar = run_agent(llm, [run_case.XLSX], tmp_path / "a")
+    assert ar.status == "OK", ar.error
+    fix = [m for m in llm.calls if str(m[0].get("content", "")).startswith("【独立算式】") and len(m) > 2]
+    assert fix and "不在任何一档里" in fix[0][-1]["content"]
+    assert ar.ws.reread["calc"]["schemes"]["PROCESS"]["tables"]["t"]["steps"][0][0] == -1
+
+
 def test_independent_pay_ratio_compared_on_data(tmp_path):
     """复读另写可发比例（本次可发上限 ÷ 应得），在发放层每个对象上和规则的可发上限比：
     写法不同但一样的不拦；回款没按本期销售单筛选（比例偏高）的拦下，写明两边的比例。"""

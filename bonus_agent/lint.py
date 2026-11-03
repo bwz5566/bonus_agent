@@ -411,15 +411,13 @@ def _coverage(rs: RuleSet, tiers: dict, coverage: list) -> tuple[list[tuple[str,
                                 f"（写进 ignored 说明原因），要么传进来的值不对：对照材料核对传入的表达式（取的哪一列、分子分母、"
                                 "相减的项、比值还是百分数、先汇总还是逐个对象算）"))
     # 分档表按比例取（全额累进或 tier_rate），有传入值低于第一档的下限：比例悄悄成了 0。第一档比例本来就是 0 的不算
-    for name, st in tiers.items():
-        t = rs.tables.get(name)
-        below = st.get("bands", {}).get(-1, 0)
-        if (isinstance(t, TierTable) and t.steps and below and Decimal(t.steps[0][1]) != 0
-                and (t.mode == "whole" or st.get("rate")) and name not in {g for g, _ in gates}):
-            lo = Decimal(t.steps[0][0])
-            gates.append((name, f"分档表 {name} 的第一档从 {_fmt(lo)} 起（比例 {_fmt(t.steps[0][1])}），实际有 {below} 个传入值"
-                                f"低于 {_fmt(lo)}（最小 {_fmt(st['min'])}），这些对象按规则拿到的比例是 0。核对材料对低于 {_fmt(lo)} 的规定："
-                                f"不发就在最前面加一档写明（下限写到可能的最小值，比例 0），按别的比例发就补上那一档；"
+    for name, lo, below, low in tier_holes(rs, tiers):
+        if name not in {g for g, _ in gates}:
+            t = rs.tables[name]
+            gates.append((name, f"分档表 {name} 的第一档从 {_fmt(lo)} 起（比例 {_fmt(t.steps[0][1])}"
+                                f"{'，不含 ' + _fmt(lo) + ' 本身' if not t.lower_inclusive else ''}），实际有 {below} 个传入值"
+                                f"不在任何一档里（最小 {_fmt(low)}），这些对象按规则拿到的比例是 0。核对材料对这些值的规定："
+                                f"不发就在最前面加一档写明（下限写到比可能的最小值还小，比例 0），按第一档发就把第一档的下限往下放；"
                                 "材料没说就问财务"))
     # 查找表部分取值落到默认值：没对上的键和表里某个键写法相近（全角半角、空格、多了后缀），多半是写法不一致
     misses: dict[str, dict[str, int]] = {}
@@ -449,6 +447,19 @@ def _coverage(rs: RuleSet, tiers: dict, coverage: list) -> tuple[list[tuple[str,
             f"{item} 里的 {what} {'始终成立' if r == '是' else '始终不成立'}（{n} 次）" for item, what, r, n in one[:6])
             + ("……" if len(one) > 6 else "") + "。防零、资格这类保护条件不触发很正常；筛选、分类条件始终一种结果的，核对取值和写法")
     return gates, warns
+
+
+def tier_holes(rs: RuleSet, tiers: dict) -> list[tuple[str, Decimal, int, Decimal]]:
+    """按比例取的分档表（全额累进，或用 tier_rate 取比例）有传入值低于第一档下限（不含下限时等于下限也算），
+    第一档比例又不是 0：这些值的比例悄悄成了 0。返回 [(表名, 第一档下限, 个数, 最小传入值)]。"""
+    out = []
+    for name, st in tiers.items():
+        t = rs.tables.get(name)
+        below = st.get("bands", {}).get(-1, 0)
+        if (isinstance(t, TierTable) and t.steps and below and Decimal(t.steps[0][1]) != 0
+                and (t.mode == "whole" or st.get("rate"))):
+            out.append((name, Decimal(t.steps[0][0]), below, Decimal(str(st["min"]))))
+    return out
 
 
 def _norm_key(k: str) -> str:

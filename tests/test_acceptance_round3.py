@@ -152,7 +152,7 @@ def test_silent_zero_tier_below_lowest_and_near_lookup_keys():
         return {"n": 10, "min": Decimal(mn), "max": Decimal("1.3"), "bands": {-1: n_below, 0: 4, 1: 6 - n_below}, "rate": rate}
     rep = lint.check(rs, {}, "", tiers={"rate": tier(2, "0.5"), "zero_first": tier(2, "-0.1"), "excess": tier(2, "50")})
     hit = [g for g in rep.gates if "第一档从" in g]
-    assert len(hit) == 1 and "rate" in hit[0] and "2 个传入值低于 0.8" in hit[0] and "参数表 rate" in rep.keys
+    assert len(hit) == 1 and "rate" in hit[0] and "2 个传入值不在任何一档里" in hit[0] and "参数表 rate" in rep.keys
     # 超额累进用 tier_rate 取比例时也一样会悄悄变 0
     rep = lint.check(rs, {}, "", tiers={"excess": tier(2, "50", rate=True)})
     assert any("excess" in g and "第一档从" in g for g in rep.gates)
