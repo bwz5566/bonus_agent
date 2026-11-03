@@ -404,6 +404,21 @@ def _repair_json(text: str, close: bool = True):
 HISTORY_THOUGHT_CHARS = 300     # 历史里保留的思考长度：之后每一步都要重发，太长的只留开头
 
 
+def _not_found_hint(id: str, known: list[str]) -> str:
+    """explain 找不到节点时，列出名字里带同样片段（如员工编号）的已有节点，而不是只给一个示例。"""
+    parts = [p for p in re.split(r"[:：/\-\s]+", id) if p]
+    hits = {p: [k for k in known if p in k] for p in parts}
+    near = []
+    for p in sorted((p for p in parts if hits[p]), key=lambda p: len(hits[p])):   # 最少见的片段（如员工编号）优先
+        near += [k for k in hits[p] if k not in near]
+        if len(near) >= 8:
+            break
+    msg = f"没有找到「{id}」的计算链（这个对象不在这次试算的节点里，可能不属于这个上级或这个方案）"
+    if near:
+        return msg + "。名字相近的节点：" + "、".join(near[:8])
+    return msg + "。节点 id 形如 " + "、".join(known[:5])
+
+
 def _short_thought(text: str) -> str:
     """回复（JSON）里的 thought 太长时，记进历史的只留开头；执行和运行步骤里用的仍是原文。"""
     try:
@@ -1214,8 +1229,12 @@ class Workspace:
         from bonus_agent import reread as rr
         res = rr.run(self)
         asked = " ".join(f"{q.text} {q.answer or ''}" for q in self.questions)
+        # 独立算式在数据上算出的数和规则不一样（至少两次独立写得一致）：智能体不能自己判定谁对、写进 ignored 放过，
+        # 只能改规则，或者把两种算法写给财务定（问题里写明方案名和“奖金池 / 可发比例”）
+        decided = [f"{q.text} {q.answer or ''}" for q in self.questions if not getattr(q, "withdrawn", "")]
         return [(k, t) for k, t in rr.compare(self, res) if k not in skipped and k.split(" ", 2)[2] not in asked] \
-            + [(k, t) for k, t in rr.calc_gaps(self, res) if k not in skipped]
+            + [(k, t) for k, t in rr.calc_gaps(self, res)
+               if not any(k.split(" ")[1] in q and k.split(" ", 2)[2] in q for q in decided)]
 
     def _open_gates(self, rep) -> list[str]:
         """还没处理的程序检查项：已写进 ignored，或已有问题提到这个取值 / 常数的，算处理过。
@@ -1268,7 +1287,7 @@ class Workspace:
         tr = res.traces
         keys = [k for k in tr if k == id or k.startswith(id + "/")] or [k for k in tr if id in k]
         if not keys:
-            raise ToolError(f"没有找到「{id}」的计算链，节点 id 形如 {next(iter(res.nodes), '')}")
+            raise ToolError(_not_found_hint(id, list(res.nodes) + [k for k in tr if k not in res.nodes]))
         out = []
         for k in keys[:12]:
             t = tr[k]
@@ -1628,9 +1647,14 @@ class Workspace:
                             + (f"\n……共 {len(gates)} 处" if len(gates) > 12 else ""))
         diffs = self._reread_gaps(skipped)
         if diffs:
-            raise ToolError("独立复读（同一模型另起一次，只看材料和表头，没看你的规则）和规则有这些出入。逐条对照材料原文核对："
+            other = getattr(self.llm, "checker_llm", None)
+            who = (f"另一个模型 {other.name} 另起一次" if other is not None and not self.checker_down else "同一模型另起一次")
+            raise ToolError(f"独立复读（{who}，只看材料和表头，没看你的规则）和规则有这些出入。逐条对照材料原文核对："
                             "规则错了就改规则；规则是对的（复读理解错了）就写进 finish 的 ignored，ref 写行首方括号里的编号，"
-                            "reason 引用材料原文说明依据；材料没写清、需要财务定的用 ask_question：\n"
+                            "reason 引用材料原文说明依据；材料没写清、需要财务定的用 ask_question。"
+                            "其中「复读 奖金池 / 复读 可发比例」是在数据上算出来的数对不上，不能写进 ignored："
+                            "找到两边从哪一步开始不一样，规则错了就改；你认为规则对，就用 ask_question 把两种算法和差异写给财务定"
+                            "（问题里写明方案名和“奖金池”或“可发比例”）：\n"
                             + "\n".join(f"- [{k}] {t}" for k, t in diffs[:15])
                             + (f"\n……共 {len(diffs)} 处" if len(diffs) > 15 else ""))
         left = self._verify_gaps()

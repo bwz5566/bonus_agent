@@ -347,11 +347,38 @@ def calc_gaps(ws, rr: dict) -> list[tuple[str, str]]:
                 total = sum(1 for f, _, _ in ws._caps(name).values() if f > 0)
                 eg = "；".join(f"{k} 复读 {_ratio(v)}、规则 {_ratio(t)}（可发上限 ÷ 应得）" for _, k, v, t in rows[:CALC_SHOW])
                 expr = f"可发比例 = {spec.get('pay_ratio')}"
+            mine = _rule_chain(ws, name, kind)
             out.append((f"复读 {kind} {name}",
                         f"复读只按材料独立写了方案「{name}」的{kind}算式，放到同一份数据上算，{len(rows)}/{total} 个对象和规则对不上"
                         f"（复读另写了一次也是这样）：{eg}。复读的写法：{expr}{how}"
-                        "。用 evaluate 把两边的中间数（如某个比率、某项合计）分别算出来，找到从哪一步开始不一样，再对照材料原文判断哪边对"))
+                        + (f"。规则的写法：{mine}" if mine else "")
+                        + "。逐项对照两边的筛选条件（期间、日期字段、状态）、口径和取整，用 evaluate 把两边的中间数分别算出来，"
+                          "找到从哪一步开始不一样，再对照材料原文判断哪边对"))
     return out
+
+
+def _rule_chain(ws, name: str, kind: str, limit: int = 10) -> str:
+    """规则里这一项（奖金池 / 可发比例）的算式和它引用的变量（逐层展开，最多 limit 个），和复读的写法并排给智能体对照。"""
+    try:
+        full = ws._merged(name)
+    except Exception:
+        return ""
+    variables = full.get("variables") or {}
+    if kind == "奖金池":
+        root = str((full.get("pool") or {}).get("expr", ""))
+    else:
+        root = "；".join(str(p.get("pay_ratio")) for p in full.get("payout") or [] if isinstance(p, dict) and p.get("pay_ratio"))
+    if not root:
+        return ""
+    seen, todo, parts = [], [root], []
+    while todo and len(seen) < limit:
+        for n in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", todo.pop(0)):
+            if n in variables and n not in seen:
+                seen.append(n)
+                v = variables[n] or {}
+                parts.append(f"{n}[{v.get('scope', 'global')}] = {v.get('expr', '')}")
+                todo.append(str(v.get("expr", "")))
+    return f"{kind} = {root}" + (f"；变量 {'；'.join(parts)}" if parts else "")
 
 
 def _ratio(v: Decimal) -> str:

@@ -130,6 +130,23 @@ def test_independent_pool_formula_compared_on_data(tmp_path):
     blocked = [s for s in ar.steps if s.tool == "finish" and not s.ok]
     assert ar.status != "OK" and blocked and "[复读 奖金池 PROCESS]" in blocked[0].result
     assert "部门:D01 复读" in blocked[0].result and "规则 222,727.50" in blocked[0].result
+    assert "规则的写法：奖金池 = " in blocked[0].result
+    # 在数据上算出来的数对不上：智能体不能自己写进 ignored 放过；把两种算法写给财务定（问题里写明方案和奖金池）就交财务
+    script = _script()
+    fin = script.pop()
+    script += [{**fin, "args": {**fin["args"], "ignored": [{"ref": "复读 奖金池 PROCESS", "reason": "规则是对的"}]}}] * 3
+    llm = FakeLLM(script)
+    llm.calc = _calc(PROCESS_OK.replace(" * lookup(d, difficulty)", ""))
+    ar = run_agent(llm, [run_case.XLSX], tmp_path / "d", reflect=0)
+    assert ar.status == "FAILED" and any("[复读 奖金池 PROCESS]" in st.result for st in ar.steps if st.tool == "finish")
+    script = _script()
+    fin = script.pop()
+    script += [{"tool": "ask_question", "args": {"text": "方案 PROCESS 的奖金池：规则乘了难度系数，独立算式没乘，按哪种算？",
+                                                 "options": ["乘难度系数", "不乘"]}}, fin]
+    llm = FakeLLM(script)
+    llm.calc = _calc(PROCESS_OK.replace(" * lookup(d, difficulty)", ""))
+    ar = run_agent(llm, [run_case.XLSX], tmp_path / "e")
+    assert ar.status == "NEEDS_CONFIRMATION", ar.error
     # 第一次写了不存在的字段：把报错交还它，第二次写对了就用第二次的
     llm = FakeLLM(_script())
     llm.calc = [_calc(PROCESS_OK.replace("base_bonus", "no_such_field")), _calc(PROCESS_OK)]

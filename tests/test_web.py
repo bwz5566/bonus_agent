@@ -349,3 +349,13 @@ def test_long_thought_is_shortened_in_history_only():
     assert len(got["thought"]) < HISTORY_THOUGHT_CHARS + 20 and got["tool"] == "trial_run"
     short = json.dumps({"thought": "试算", "tool": "trial_run"}, ensure_ascii=False)
     assert _short_thought(short) == short and _short_thought("不是 JSON") == "不是 JSON"
+
+
+def test_explain_missing_node_lists_similar_ids():
+    # 模型要的对象不在这个上级下（U007 不属于 J01），提示里要列出带 U007 的已有节点，而不是只给“形如 全部”
+    from bonus_agent.agent import _not_found_hint
+    known = ["全部"] + [f"参与分配:J0{j}-U00{u}" for j in (1, 2, 3) for u in range(1, 9) if (j, u) != (1, 7)]
+    msg = _not_found_hint("参与分配:J01-U007", known)
+    assert "参与分配:J02-U007" in msg and "参与分配:J03-U007" in msg
+    assert msg.index("J02-U007") < msg.index("J01-U001")
+    assert "全部" in _not_found_hint("XYZ", known)
