@@ -136,3 +136,49 @@ def test_unfiltered_status_and_period_are_flagged(tmp_path):
     assert any("「成本费用」" in g and "approved" in g and "是、否" in g for g in bad.gates) and "状态 approved" in bad.keys
     assert any("「成本费用」" in w and "expense_date" in w and "2026-05" in w for w in bad.warns)
     assert not [g for g in bad.gates if "「补充费用」" in g or "「补充收款」" in g]       # 没读到的补充表不管
+
+
+def test_silent_zero_tier_below_lowest_and_near_lookup_keys():
+    """悄悄归零的两条路：全额累进 / tier_rate 的传入值低于第一档下限（比例悄悄变 0）；查找表部分取值没对上、
+    落到默认值，而且和表里的键写法相近（全角半角、空格、多了后缀）。都要处理；第一档比例本来是 0、超额累进、
+    和表里的键不相近的取值不拦（后者只提示）。"""
+    from bonus_core.dsl.models import RuleSet as RS
+    rs = RS.model_validate({"name": "t", "version": "1", "datasets": {}, "pool": {"expr": "0"}, "allocation": [],
+                            "tables": {"rate": {"kind": "tier", "mode": "whole", "steps": [[0.8, 0.5], [1.0, 1.0]]},
+                                       "zero_first": {"kind": "tier", "mode": "whole", "steps": [[0, 0], [0.8, 0.5]]},
+                                       "excess": {"kind": "tier", "mode": "excess", "steps": [[100, 0.1], [200, 0.2]]},
+                                       "area": {"kind": "lookup", "mapping": {"华东": 1.1, "西部": 0.9, "Ａ类": 1.0}, "default": 1.0}}})
+    def tier(n_below, mn, rate=False):
+        return {"n": 10, "min": Decimal(mn), "max": Decimal("1.3"), "bands": {-1: n_below, 0: 4, 1: 6 - n_below}, "rate": rate}
+    rep = lint.check(rs, {}, "", tiers={"rate": tier(2, "0.5"), "zero_first": tier(2, "-0.1"), "excess": tier(2, "50")})
+    hit = [g for g in rep.gates if "第一档从" in g]
+    assert len(hit) == 1 and "rate" in hit[0] and "2 个传入值低于 0.8" in hit[0] and "参数表 rate" in rep.keys
+    # 超额累进用 tier_rate 取比例时也一样会悄悄变 0
+    rep = lint.check(rs, {}, "", tiers={"excess": tier(2, "50", rate=True)})
+    assert any("excess" in g and "第一档从" in g for g in rep.gates)
+    # 都在第一档以上：不拦
+    assert not [g for g in lint.check(rs, {}, "", tiers={"rate": {"n": 5, "min": Decimal("0.9"), "max": Decimal("1.2"),
+                                                                    "bands": {0: 2, 1: 3}}}).gates if "第一档从" in g]
+    cov = [{"item": "w", "kind": "lookup", "what": "area", "seen": {"华东": 5, "西部": 3, "默认值": 4},
+            "misses": {"华东区": 3, "其他": 1}},
+           {"item": "v", "kind": "lookup", "what": "area", "seen": {"默认值": 1}, "misses": {"华东区": 3, "其他": 1}}]
+    rep = lint.check(rs, {}, "", coverage=cov)
+    g = [x for x in rep.gates if "写法相近" in x]
+    assert len(g) == 1 and "「华东区」（3 次）↔ 表里的「华东」" in g[0] and "其他" not in g[0] and "参数表 area" in rep.keys
+    cov = [{"item": "w", "kind": "lookup", "what": "area", "seen": {"华东": 5, "默认值": 2}, "misses": {"其他": 2}}]
+    rep = lint.check(rs, {}, "", coverage=cov)
+    assert "参数表 area" not in rep.keys and any("「其他」2 次" in w for w in rep.warns)
+
+
+def test_engine_records_lookup_misses():
+    from bonus_core.dsl.models import RuleSet as RS
+    from bonus_core.engine.evaluator import Evaluator
+    from bonus_core.engine.tree import Node
+    rs = RS.model_validate({"name": "t", "version": "1", "datasets": {}, "pool": {"expr": "0"}, "allocation": [],
+                            "tables": {"area": {"kind": "lookup", "mapping": {"华东": 1.1}, "default": 1.0},
+                                       "rate": {"kind": "tier", "mode": "whole", "steps": [[0.8, 0.5]]}}})
+    root = Node("root", "root", None)
+    ev = Evaluator(rs, root, {})
+    assert ev.evaluate('lookup(area, "华东区") + lookup(area, "华东") + tier_rate(rate, 0.5)', root, "t/x", "t") == Decimal("2.1")
+    cov = [c for c in ev.coverage() if c["kind"] == "lookup"]
+    assert cov[0]["misses"] == {"华东区": 1} and ev.tier_stats["rate"]["rate"] and ev.tier_stats["rate"]["bands"] == {-1: 1}

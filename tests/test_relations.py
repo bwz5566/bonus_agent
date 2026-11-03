@@ -357,3 +357,21 @@ def test_nested_aggregation_over_unrelated_table_is_an_error():
         ev.evaluate('count(of: "项目", where: sum(contribution_score, of: "绩效评分") > 0)', g, "t/bad", "t")
     # 有关联的嵌套照常：项目行里汇总这个项目的销售明细
     assert ev.evaluate('sum(sum(sales_amount, of: "销售明细"), of: "项目")', g, "t/ok", "t") > 0
+
+
+def test_aggregation_over_table_hung_elsewhere_is_an_error():
+    """在某一层对挂在别处的表聚合（个人层汇总挂在小组 / 项目下的销售明细，小组层汇总部门目标）：这一层每个对象都取不到行，
+    以前悄悄算成 0，现在报错并说明表挂在哪一层。挂在本层及下面的表照常。"""
+    from bonus_core.engine.evaluator import Evaluator, EvalError
+    from bonus_core.engine.tree import build_tree
+    rs, _ = run("quarter")
+    data, _ = apply_mapping(rs, [XLSX], load_mapping(CASE / "mapping.yaml"))
+    root, by_level, _ = build_tree(rs, data)
+    ev = Evaluator(rs, root, by_level)
+    p, g = by_level["个人"][0], by_level["小组"][0]
+    with pytest.raises(EvalError, match="每个「个人」都取不到「销售明细」.*挂在「小组」这一层"):
+        ev.evaluate('sum(sales_amount, of: "销售明细")', p, "t/a", "t")
+    with pytest.raises(EvalError, match="每个「小组」都取不到「部门目标」.*挂在「部门」这一层"):
+        ev.evaluate('count(of: "部门目标")', g, "t/b", "t")
+    assert ev.evaluate('count(of: "项目参与")', p, "t/c", "t") >= 0
+    assert ev.evaluate('sum(sales_amount, of: "销售明细")', g, "t/d", "t") >= 0

@@ -11,6 +11,8 @@
 - 分档量纲：分档表的实际传入值全部落在同一档，而且和分档点差一个数量级以上（如传入比值、分档点却按分钟写），其他档从来用不上；
 - 覆盖报告：参数表（分档、查表）写了三种以上比例 / 取值，用了很多次（≥10）却只用上一种，等于常数，要对照材料判断；
   查表全部落到默认值（键和数据写法不一致）；条件分支始终只有一种结果（只提示）。程序只如实列出，不预设哪种分布算错；
+- 悄悄归零：按比例取的分档表有传入值低于第一档下限（比例成了 0，第一档比例又不是 0）；查表有取值落到默认值、
+  又和表里的键写法相近（如“华东区”和“华东”）。其余落到默认值的取值只提示；
 - 结构提示：筛选后全部为 0、定义了却没用到的变量。
 
 gates 在 finish 时必须处理（改规则、问财务，或写进 ignored 说明原因）；warns 只附在试算结果里。
@@ -408,14 +410,60 @@ def _coverage(rs: RuleSet, tiers: dict, coverage: list) -> tuple[list[tuple[str,
                                 f"全部是{only}，其他{h['unit']}从来没用上，这张表在本次数据上等于一个常数。要么数据确实都在这一{h['unit']}"
                                 f"（写进 ignored 说明原因），要么传进来的值不对：对照材料核对传入的表达式（取的哪一列、分子分母、"
                                 "相减的项、比值还是百分数、先汇总还是逐个对象算）"))
+    # 分档表按比例取（全额累进或 tier_rate），有传入值低于第一档的下限：比例悄悄成了 0。第一档比例本来就是 0 的不算
+    for name, st in tiers.items():
+        t = rs.tables.get(name)
+        below = st.get("bands", {}).get(-1, 0)
+        if (isinstance(t, TierTable) and t.steps and below and Decimal(t.steps[0][1]) != 0
+                and (t.mode == "whole" or st.get("rate")) and name not in {g for g, _ in gates}):
+            lo = Decimal(t.steps[0][0])
+            gates.append((name, f"分档表 {name} 的第一档从 {_fmt(lo)} 起（比例 {_fmt(t.steps[0][1])}），实际有 {below} 个传入值"
+                                f"低于 {_fmt(lo)}（最小 {_fmt(st['min'])}），这些对象按规则拿到的比例是 0。核对材料对低于 {_fmt(lo)} 的规定："
+                                f"不发就在最前面加一档写明（下限写到可能的最小值，比例 0），按别的比例发就补上那一档；"
+                                "材料没说就问财务"))
+    # 查找表部分取值落到默认值：没对上的键和表里某个键写法相近（全角半角、空格、多了后缀），多半是写法不一致
+    misses: dict[str, dict[str, int]] = {}
+    for c in coverage:
+        if c["kind"] == "lookup" and c.get("misses"):
+            misses.setdefault(c["what"], c["misses"])
+    done = {g for g, _ in gates}
+    for name, miss in misses.items():
+        t = rs.tables.get(name)
+        if not isinstance(t, LookupTable) or name in done:
+            continue
+        near = [(k, m) for k in miss for m in t.mapping if _near_key(k, m)]
+        if near:
+            gates.append((name, f"查找表 {name} 有取值没对上表里的键、落到了默认值，但和表里的键写法相近："
+                                + "、".join(f"数据里的「{k}」（{miss[k]} 次）↔ 表里的「{m}」" for k, m in near[:5])
+                                + "。多半是写法不一致：按数据的实际写法改键；确实是不同的取值、按默认值处理是材料规定的，就写进 ignored 说明原因"))
     one = [(c["item"], c["what"], *next(iter(c["seen"].items()))) for c in coverage
            if c["kind"] == "if" and len(c["seen"]) == 1 and sum(c["seen"].values()) >= 3]
     warns = []
+    for name, miss in misses.items():
+        if name not in {g for g, _ in gates}:
+            warns.append(f"查找表 {name} 有这些取值不在表里、按默认值算："
+                         + "、".join(f"「{k}」{n} 次" for k, n in list(miss.items())[:8])
+                         + "。核对材料是否规定这些取值按默认值处理")
     if one:
         warns.append("这些条件在数据上始终只有一种结果：" + "；".join(
             f"{item} 里的 {what} {'始终成立' if r == '是' else '始终不成立'}（{n} 次）" for item, what, r, n in one[:6])
             + ("……" if len(one) > 6 else "") + "。防零、资格这类保护条件不触发很正常；筛选、分类条件始终一种结果的，核对取值和写法")
     return gates, warns
+
+
+def _norm_key(k: str) -> str:
+    return re.sub(r"[\s()（）\[\]【】「」\"'_\-·.,，、:：;；/]", "", unicodedata.normalize("NFKC", str(k))).casefold()
+
+
+def _near_key(a: str, b: str) -> bool:
+    """两个取值写法相近：去掉空格、括号、标点、全半角和大小写后相同，或一个是另一个加了前后缀（较短的至少 2 个字）。"""
+    x, y = _norm_key(a), _norm_key(b)
+    if not x or not y or a == b:
+        return False
+    if x == y:
+        return True
+    short, long_ = sorted((x, y), key=len)
+    return len(short) >= 2 and (long_.startswith(short) or long_.endswith(short))
 
 
 _PAID = re.compile(r"预发|预付|预支|已发|已付|已支付|已领|prepa|paid|advance", re.I)

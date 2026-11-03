@@ -102,6 +102,8 @@ class Evaluator:
         self.tier_stats: dict[str, dict] = {}
         # 条件分支、查找表实际走到哪个结果：(所在计算项, "if"/"lookup", 条件或表名) -> {结果: 次数}，覆盖报告用
         self.outcomes: dict[tuple, dict[str, int]] = {}
+        # 查找表没对上键、落到默认值的取值：表名 -> {取值: 次数}
+        self.lookup_misses: dict[str, dict[str, int]] = {}
         self.layout = Layout(rs)
         # 只能在聚合里使用的字段 -> 所在的明细表/公司级表（不含主键/关联键）
         self.detail_fields = self.layout.row_only
@@ -110,10 +112,15 @@ class Evaluator:
         # 每一行所属的对象（层级对象、关联实体）：对行聚合时，行里再嵌套的聚合按这一行自己的对象算，
         # 不能沿用外层对象（否则项目层对参与记录求和时，每条记录都会读到整个项目的工时）
         self._home: dict[int, Node] = {}
+        self._ds_homes: dict[str, dict[str, int]] = {}      # 表 -> {行所属对象的层级: 行数}，判断“这一层取不到这张表的行”用
+        self._reach: dict[tuple, bool] = {}
         for n in [*root.walk(), *(m for tbl in self.index.values() for m in tbl.values())]:
-            for rows in n.own_rows.values():
+            for ds, rows in n.own_rows.items():
                 for r in rows:
-                    self._home.setdefault(id(r), n)
+                    if id(r) not in self._home:
+                        self._home[id(r)] = n
+                        h = self._ds_homes.setdefault(ds, {})
+                        h[n.level] = h.get(n.level, 0) + 1
 
     # ---------------- 对外接口 ----------------
     def evaluate(self, expr: str, node: Node, trace_id: str, rule_item: str) -> Decimal:
@@ -324,7 +331,7 @@ class Evaluator:
                 raise EvalError(f"{fn} 的第一个参数必须是阶梯表，得到 {t.text}", ctx.where)
             xv = self._num(x, ctx.where)
             r = tier_amount(t.v, xv) if fn == "tier" else tier_rate(t.v, xv)
-            self._tier_seen(c.args[0], t, xv)
+            self._tier_seen(c.args[0], t, xv, fn)
             return Val(r, f"{fn}({t.text}, {x.text})", x.deps, x.rows)
         if fn == "lookup":
             t, k = self.ev(c.args[0], ctx), self.ev(c.args[1], ctx)
@@ -337,7 +344,11 @@ class Evaluator:
                 r = t.v.default
             else:
                 raise EvalError(f"查找表 {c.args[0].id} 中没有 {key}，且没有默认值", ctx.where)
-            self._seen(ctx, "lookup", getattr(c.args[0], "id", t.text), key if key in t.v.mapping else "默认值")
+            tname = getattr(c.args[0], "id", t.text)
+            self._seen(ctx, "lookup", tname, key if key in t.v.mapping else "默认值")
+            if key not in t.v.mapping:      # 落到默认值的键：程序检查对照表里相近的键，发现写法不一致
+                miss = self.lookup_misses.setdefault(tname, {})
+                miss[key] = miss.get(key, 0) + 1
             return Val(r, fmt(r), k.deps, k.rows)
         if fn == "ratio":
             a, b = self.ev(c.args[0], ctx), self.ev(c.args[1], ctx)
@@ -414,13 +425,18 @@ class Evaluator:
 
     def coverage(self) -> list[dict]:
         """条件分支、查找表的命中分布：[{item, kind, what, seen}]，what 是条件原文或表名。"""
-        return [{"item": item, "kind": kind, "what": what if isinstance(what, str) and kind == "lookup" else unparse(what),
-                 "seen": dict(seen)} for (item, kind, what), seen in self.outcomes.items()]
+        out = [{"item": item, "kind": kind, "what": what if isinstance(what, str) and kind == "lookup" else unparse(what),
+                "seen": dict(seen)} for (item, kind, what), seen in self.outcomes.items()]
+        for c in out:
+            if c["kind"] == "lookup" and c["what"] in self.lookup_misses:
+                c["misses"] = dict(self.lookup_misses[c["what"]])
+        return out
 
-    def _tier_seen(self, arg, t: Val, x: Decimal) -> None:
+    def _tier_seen(self, arg, t: Val, x: Decimal, fn: str = "tier") -> None:
         name = getattr(arg, "id", None) or t.text
         st = self.tier_stats.setdefault(name, {"n": 0, "min": x, "max": x, "bands": {}})
         st["n"] += 1
+        st["rate"] = st.get("rate", False) or fn == "tier_rate"     # 按比例取（低于第一档时比例为 0）
         st["min"], st["max"] = min(st["min"], x), max(st["max"], x)
         b = tier_band(t.v, x)
         st["bands"][b] = st["bands"].get(b, 0) + 1
@@ -454,6 +470,14 @@ class Evaluator:
             raise EvalError(f"在「{node.level}」的每一行里对「{ds}」聚合，但「{ds}」和「{node.level}」没有关联，这一行取不到任何「{ds}」的行"
                             f"（会悄悄算成 0）。把这个条件或数移到外层聚合的外面，如 if(sum(…, of: \"{ds}\") > 0, sum(…, of: \"{node.level}\", where: …), 0)，"
                             f"或先在上一层定义变量再引用", ctx.where)
+        if not rows and self._ds_homes.get(ds) and not self._reachable(node, ds):
+            # 在某一层对一张挂在别处的表聚合（如个人层汇总挂在项目/小组下的销售明细，小组层汇总部门目标）：
+            # 这一层的每个对象都取不到它的行，原来会悄悄算成 0，改成报错
+            lv = self.layout.table_level.get(ds, -1)
+            home = self.rs.allocation[lv].level if lv >= 0 else "公司（最上层）"
+            raise EvalError(f"在「{node.level}」这一层对「{ds}」聚合，但每个「{node.level}」都取不到「{ds}」的行"
+                            f"（「{ds}」共 {sum(self._ds_homes[ds].values())} 行，挂在「{home}」这一层），结果会悄悄算成 0。「{ds}」不在「{node.level}」下面："
+                            f"在它所挂的那一层定义变量再引用，或检查「{ds}」的关联字段（define_dataset 的 link / key）是否写对", ctx.where)
         aux = ds in self.layout.aux
 
         def rctx(r):   # 关联实体的行在它自己的节点上求值，才能用到该实体的变量；其他行在它所属的下级对象上求值
@@ -493,6 +517,16 @@ class Evaluator:
                 else:
                     r = min(nums) if c.fn == "min" else max(nums)
         return Val(r, fmt(r), frozenset(deps), tuple(rows))
+
+    def _reachable(self, node: Node, ds: str) -> bool:
+        """和 node 同一层（层级或关联实体）的对象里，有没有哪个能取到表 ds 的行（按层缓存）。"""
+        k = (node.aux, node.level, ds)
+        if k not in self._reach:
+            peers = list(self.index.get(node.level, {}).values()) if node.aux else list(self.by_level.get(node.level, []))
+            if node not in peers:
+                peers.append(node)
+            self._reach[k] = any(p.rows(ds) for p in peers)
+        return self._reach[k]
 
     def _linked(self, ds: str, ent: str) -> bool:
         """表 ds 的行能不能挂到关联实体 ent 上：ds 就是 ent、带 ent 的编号字段，或沿关联逐级往上能到 ent。"""
