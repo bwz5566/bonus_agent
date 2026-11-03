@@ -148,10 +148,6 @@ class _ToAst(Transformer):
         return BinOp(str(op), l, r)
 
     def cmp_op(self, l, op, r):
-        if isinstance(l, Name) and l == r:      # 常见于想按“当前对象”筛选：where: id == id 对每一行都成立
-            raise ExprError(f"{l.id} {op} {r.id} 两边是同一个字段，对每一行结果都一样，起不到筛选作用。"
-                            f"想只取当前对象自己的行时不用写这个条件：在某一层（或关联实体）上汇总，"
-                            f"引擎只取这个对象关联的行；要按别的对象筛选，右边写具体的值")
         return Cmp(str(op), l, r)
 
     def and_op(self, l, r):
@@ -238,6 +234,17 @@ def _why(src: str, e: Exception) -> str:
     else:
         why = f"▲处的「{tok}」写法不对"
     return f"{why}。{total}出错位置（▲处）：{near}"
+
+
+def self_compares(node) -> list[str]:
+    """同一个字段和自己比较（project_id == project_id）：对每一行结果都一样，起不到筛选作用。
+    语法上合法（已冻结的模板照样能算），由智能体侧的检查拦下。"""
+    return [f"{x.left.id} {x.op} {x.right.id}" for x in walk(node)
+            if isinstance(x, Cmp) and isinstance(x.left, Name) and x.left == x.right]
+
+
+SELF_COMPARE_HINT = ("两边是同一个字段，对每一行结果都一样，起不到筛选作用。想只取当前对象自己的行时不用写这个条件："
+                     "在某一层（或关联实体）上汇总，引擎只取这个对象关联的行；要按别的对象筛选，右边写具体的值")
 
 
 def walk(node):

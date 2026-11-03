@@ -279,3 +279,14 @@ def test_trial_spot_check_and_missing_scope_guard(tmp_path):
         ar.ws._trial("QUARTER")
     ar.ws.drafts["共用"]["variables"]["n_proj"]["scope"] = "global"   # 明确写全局：放行
     ar.ws._trial("QUARTER")
+
+
+def test_compare_aligns_scheme_names(results):
+    """1103b 回归 Q1 第 3 次：智能体把方案起名「季度 / 过程奖 / 年度」，期望结果的方案列写 QUARTER / PROCESS / ANNUAL，
+    只有 R1、R2 靠修订名对上，其余“没有找到对应的金额”，被记成“算错没拦住”。实际五套金额全部逐分一致。
+    方案名对不上时按一一对应试一遍，取对上最多的；金额改错照样查得出来。"""
+    from bonus_agent.compare import compare_expected, report
+    renamed = {{"QUARTER": "季度", "PROCESS": "过程奖", "ANNUAL": "年度"}[k]: v for k, v in results.items()}
+    ms = compare_expected(renamed, EXPECTED_XLSX)
+    assert all(m.ok for m in ms if m.total) and all(m.total for m in ms if m.metric == "应得"), report(ms)
+    assert "「过程奖（期望结果里是 PROCESS）」" in "\n".join(report(ms))

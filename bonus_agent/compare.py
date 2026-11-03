@@ -95,7 +95,41 @@ def _figures(res: Result) -> dict[str, dict[str, Decimal]]:
 def compare_expected(results: dict[str, dict[str, Result]], path: str | Path, column: str | None = None,
                      where: dict[str, str] | None = None) -> list[Match]:
     """column：指定应得金额的列名（期望结果的列名认不出或有歧义时用）。
-    where：列名 -> 取值，只核对这些行（如期望结果里有几个版本，本次只算了其中一个）；没有这一列的工作表不受影响。"""
+    where：列名 -> 取值，只核对这些行（如期望结果里有几个版本，本次只算了其中一个）；没有这一列的工作表不受影响。
+    方案名对不上时（智能体起名「季度」，期望结果的方案列写 QUARTER），按一一对应试一遍，取对上金额最多的那种，
+    方案名写成「季度（期望结果里是 QUARTER）」。金额不一致照样记不一致，对应关系只影响去哪几行找。"""
+    labels = _scheme_labels(path)
+    ours = [s for s in results if s.upper() not in {x.upper() for x in labels}]
+    free = [x for x in labels if x.upper() not in {s.upper() for s in results}]
+    best = _compare(results, path, column, where)
+    if not ours or not free or len(ours) > 6 or len(free) > 6:
+        return best
+    from itertools import permutations
+    score = lambda ms: sum(m.matched for m in ms)
+    top, pick = score(best), None
+    for perm in permutations(free, min(len(ours), len(free))):
+        names = dict(zip(ours, perm))
+        ms = _compare({names.get(k, k): v for k, v in results.items()}, path, column, where)
+        if score(ms) > top:
+            top, pick, best = score(ms), names, ms
+    if pick:
+        back = {v: f"{k}（期望结果里是 {v}）" for k, v in pick.items()}
+        for m in best:
+            m.scheme = back.get(m.scheme, m.scheme)
+    return best
+
+
+def _scheme_labels(path) -> list[str]:
+    """期望结果里“方案”列的取值（列名含 方案 / scheme）。"""
+    out: list[str] = []
+    for st in detect(path):
+        for j, h in enumerate(st.headers):
+            if "方案" in str(h or "") or "scheme" in str(h or "").lower():
+                out += [t for _, vals in st.rows if (t := cell_text(vals[j])) and t not in out]
+    return out
+
+
+def _compare(results, path, column, where) -> list[Match]:
     tables = detect(path)
     for st in tables:
         for col, val in (where or {}).items():

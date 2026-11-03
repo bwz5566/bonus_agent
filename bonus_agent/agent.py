@@ -32,7 +32,7 @@ from bonus_core.data.patches import apply_patches
 from bonus_core.data.table_detect import table_at
 from bonus_core.dsl.functions import describe as describe_functions
 from bonus_core.dsl.models import DatasetDef, RuleSet, Variable
-from bonus_core.dsl.parser import Call, ExprError, Num, parse, walk
+from bonus_core.dsl.parser import SELF_COMPARE_HINT, Call, ExprError, Num, parse, self_compares, walk
 from bonus_core.dsl.parser import names as parse_names
 from bonus_core.dsl.scope import Layout
 from bonus_core.dsl.validator import validate
@@ -1440,6 +1440,12 @@ class Workspace:
         # 验算时定义过的辅助变量在 evaluate 里也能用（规则里同名的变量优先），按正式规则的语义计算
         rule_vars = set((self._merged(name).get("variables") or {}))
         extra = {k: v for k, v in _used_helpers(expr, self.check_vars).items() if k not in rule_vars}
+        try:
+            same_field = self_compares(parse(expr))
+        except ExprError:
+            same_field = []
+        if same_field:
+            raise ToolError(f"{'、'.join(dict.fromkeys(same_field))} {SELF_COMPARE_HINT}")
         v, rendered = self._probe(name, expr, node, extra=extra or None)
         return f"{expr} = {rendered} = {fmt(v)}"
 
@@ -1618,6 +1624,9 @@ class Workspace:
             asts = [parse(x) for x in srcs]
         except ExprError as e:
             return f"验算式写错了：{e}"
+        same_field = [c for t in asts for c in self_compares(t)]
+        if same_field:     # 1103 回归 Q2：where: project_id == project_id 把所有项目都加了进来，同一个验算对不上重试 8 次
+            return f"验算式里的 {'、'.join(dict.fromkeys(same_field))} {SELF_COMPARE_HINT}"
         rs = self._ruleset(name)
         same = sorted(set(helpers) & set(rs.variables))
         if same:

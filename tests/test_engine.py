@@ -264,7 +264,7 @@ def test_parse_errors_point_at_the_mistake():
 def test_comparing_a_field_with_itself_is_rejected():
     """1103 回归 Q2：辅助变量写了 where: project_id == project_id，想取“这一行所属的项目”，
     结果对每一行都成立、把所有项目都加进来，同一个验算对不上重试了 8 次。"""
-    from bonus_core.dsl.parser import ExprError, parse
-    with pytest.raises(ExprError, match="两边是同一个字段"):
-        parse('sum(v, of: "项目", where: project_id == project_id)')
-    parse('sum(v, of: "项目", where: project_id == "P01")')
+    from bonus_core.dsl.parser import parse, self_compares
+    # 语法上合法（已冻结的模板照样能算），由智能体侧的检查（验算、evaluate、规则检查）拦下
+    assert self_compares(parse('sum(v, of: "项目", where: project_id == project_id)')) == ["project_id == project_id"]
+    assert self_compares(parse('sum(v, of: "项目", where: project_id == "P01")')) == []

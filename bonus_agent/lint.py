@@ -26,7 +26,7 @@ from decimal import Decimal, InvalidOperation
 
 from bonus_core.data.table import Datasets
 from bonus_core.dsl.models import LookupTable, RuleSet, TierTable
-from bonus_core.dsl.parser import BinOp, Call, Cmp, ExprError, Name, Num, Str, parse, walk
+from bonus_core.dsl.parser import SELF_COMPARE_HINT, BinOp, Call, Cmp, ExprError, Name, Num, Str, parse, self_compares, walk
 
 # 不需要出处的常数：0、1、百分数换算、单位换算（月、天、小时、分钟、周）
 FREE = {Decimal(x) for x in ("0", "1", "-1", "12", "24", "60", "7", "365", "366", "0.01")} | {Decimal(10) ** i for i in range(1, 9)}
@@ -183,6 +183,12 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
                          "已发抵扣、超发待核对都显示为 0。改法：pool 写扣减前的应得；已发金额写进 offsets（scope 最末层或人员表，"
                          "expr 写已发合计），引擎算本次实发 = MAX(应得 − 已发, 0)，超发待核对 = MAX(已发 − 应得, 0)")
         rep.keys.append("抵扣 pool")
+    # 0''. 字段和自己比较（id == id）：永远成立，多半是想按当前对象筛选却写错了
+    for where, ast in _parsed(rs):
+        same = self_compares(ast)
+        if same:
+            rep.gates.append(f"{where} 里的 {'、'.join(dict.fromkeys(same))} {SELF_COMPARE_HINT}")
+            rep.keys.append(f"同字段比较 {where}")
     # 1. 常数要有出处
     miss: dict[str, set[str]] = {}
     for n, where in constants(rs):
