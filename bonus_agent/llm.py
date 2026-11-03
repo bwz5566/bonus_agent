@@ -105,10 +105,14 @@ def direct(base_url: str) -> bool:
         return False
 
 
+MAX_RETRIES = 6
+
+
 def openai_client(base_url: str, api_key: str, timeout: float):
     from openai import DefaultHttpxClient, OpenAI
     http = DefaultHttpxClient(trust_env=False) if direct(base_url) else None
-    return OpenAI(base_url=base_url, api_key=api_key, timeout=timeout, http_client=http)
+    # 网关偶发 502 / 503、连接中断时多重试几次（SDK 自带退避，约 0.5～8 秒一次）：几小时的回归不该因为一次抖动丢掉整次运行
+    return OpenAI(base_url=base_url, api_key=api_key, timeout=timeout, http_client=http, max_retries=MAX_RETRIES)
 
 
 def list_remote(provider: str, cfg: dict) -> list[str]:
