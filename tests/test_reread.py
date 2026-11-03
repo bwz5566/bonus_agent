@@ -147,6 +147,15 @@ def test_independent_pool_formula_compared_on_data(tmp_path):
     llm.calc = _calc(PROCESS_OK.replace(" * lookup(d, difficulty)", ""))
     ar = run_agent(llm, [run_case.XLSX], tmp_path / "e")
     assert ar.status == "NEEDS_CONFIRMATION", ar.error
+    # 问题措辞里没写“奖金池”（换了说法），但 related 写了这条的编号，同样算交给财务了：按编号认，不靠措辞
+    script = _script()
+    fin = script.pop()
+    script += [{"tool": "ask_question", "args": {"text": "PROCESS 的总额要不要乘难度系数？", "options": ["乘", "不乘"],
+                                                 "related": "复读 奖金池 PROCESS"}}, fin]
+    llm = FakeLLM(script)
+    llm.calc = _calc(PROCESS_OK.replace(" * lookup(d, difficulty)", ""))
+    ar = run_agent(llm, [run_case.XLSX], tmp_path / "f")
+    assert ar.status == "NEEDS_CONFIRMATION", ar.error
     # 第一次写了不存在的字段：把报错交还它，第二次写对了就用第二次的
     llm = FakeLLM(_script())
     llm.calc = [_calc(PROCESS_OK.replace("base_bonus", "no_such_field")), _calc(PROCESS_OK)]

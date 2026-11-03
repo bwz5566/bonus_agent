@@ -178,7 +178,7 @@ TOOLS: list[dict] = [
      "description": "向财务提问：材料之间有冲突、缺少必要的信息（参数、口径、数据）、或能有两种理解时使用。"
                     "不要自行假设或补出算法；提问后继续做不受影响的部分，问完后调用 finish 结束本轮，"
                     "财务答复后下一轮接着做。options 列出可选的理解，suggested 是你的建议（只供财务参考，不会被采用）。"
-                    "related 写受影响的方案或规则（如 方案名.offsets）。blocking=false 只用于不影响任何金额的提示。",
+                    "related 写受影响的方案或规则（如 方案名.offsets）；回应程序检查或复读的某一条时写它给的编号。blocking=false 只用于不影响任何金额的提示。",
      "parameters": _obj({"text": _S, "options": {"type": "array", "items": _S}, "suggested": _I, "related": _S,
                          "blocking": {"type": "boolean"}}, ["text", "options"])},
     {"name": "reply",
@@ -1231,10 +1231,20 @@ class Workspace:
         asked = " ".join(f"{q.text} {q.answer or ''}" for q in self.questions)
         # 独立算式在数据上算出的数和规则不一样（至少两次独立写得一致）：智能体不能自己判定谁对、写进 ignored 放过，
         # 只能改规则，或者把两种算法写给财务定（问题里写明方案名和“奖金池 / 可发比例”）
+        # 提问时 related 写了这条的编号就算处理过（按编号认，不靠问题措辞）；措辞里写到也认，作为兜底
+        refs = self._asked_refs()
         decided = [f"{q.text} {q.answer or ''}" for q in self.questions if not getattr(q, "withdrawn", "")]
-        return [(k, t) for k, t in rr.compare(self, res) if k not in skipped and k.split(" ", 2)[2] not in asked] \
+        return [(k, t) for k, t in rr.compare(self, res) if k not in skipped and k not in refs and k.split(" ", 2)[2] not in asked] \
             + [(k, t) for k, t in rr.calc_gaps(self, res)
-               if not any(k.split(" ")[1] in q and k.split(" ", 2)[2] in q for q in decided)]
+               if k not in refs and not any(k.split(" ")[1] in q and k.split(" ", 2)[2] in q for q in decided)]
+
+    def _asked_refs(self) -> set[str]:
+        """问题 related 里写到的检查项编号（可以用、；, 分隔写多个）。"""
+        out = set()
+        for q in self.questions:
+            if not getattr(q, "withdrawn", ""):
+                out |= {r.strip(" 「」[]【】") for r in re.split(r"[、;；,，\n]", q.related or "") if r.strip()}
+        return out
 
     def _open_gates(self, rep) -> list[str]:
         """还没处理的程序检查项：已写进 ignored，或已有问题提到这个取值 / 常数的，算处理过。
@@ -1243,9 +1253,12 @@ class Workspace:
         skipped = {str(i.get("ref", "")) for i in self.ignored if not str(i.get("ref", "")).startswith(NO_IGNORE)}
         asked = " ".join(f"{q.text} {q.answer or ''}" for q in self.questions)
         # 每条后面给出写进 ignored 用的 ref（模型自己拼的 ref 常对不上，同一条拦了又拦）
-        return [g + ("" if k.startswith(NO_IGNORE) else f"〔放过时 ignored 的 ref 写「{k}」〕")
+        refs = self._asked_refs()
+        return [g + (f"〔提问时 related 写「{k}」〕" if k.startswith(NO_IGNORE)
+                     else f"〔放过时 ignored 的 ref 写「{k}」，提问时 related 写同样内容〕")
+                if not k.startswith(MUST_FIX) else g
                 for g, k in zip(rep.gates, rep.keys)
-                if k.startswith(MUST_FIX) or (k not in skipped and k.split(" ", 1)[1] not in asked)]
+                if k.startswith(MUST_FIX) or (k not in skipped and k not in refs and k.split(" ", 1)[1] not in asked)]
 
     def _period_mismatch(self, name: str) -> str:
         """奖金池和分配权重用的统计期间（日期、period == "Q3" 这类取值）对不上时给出提示，常见于把按季度算的权重放在共用部分、
@@ -1651,10 +1664,10 @@ class Workspace:
             who = (f"另一个模型 {other.name} 另起一次" if other is not None and not self.checker_down else "同一模型另起一次")
             raise ToolError(f"独立复读（{who}，只看材料和表头，没看你的规则）和规则有这些出入。逐条对照材料原文核对："
                             "规则错了就改规则；规则是对的（复读理解错了）就写进 finish 的 ignored，ref 写行首方括号里的编号，"
-                            "reason 引用材料原文说明依据；材料没写清、需要财务定的用 ask_question。"
+                            "reason 引用材料原文说明依据；材料没写清、需要财务定的用 ask_question（related 写同一个编号）。"
                             "其中「复读 奖金池 / 复读 可发比例」是在数据上算出来的数对不上，不能写进 ignored："
                             "找到两边从哪一步开始不一样，规则错了就改；你认为规则对，就用 ask_question 把两种算法和差异写给财务定"
-                            "（问题里写明方案名和“奖金池”或“可发比例”）：\n"
+                            "（related 写行首方括号里的编号）：\n"
                             + "\n".join(f"- [{k}] {t}" for k, t in diffs[:15])
                             + (f"\n……共 {len(diffs)} 处" if len(diffs) > 15 else ""))
         left = self._verify_gaps()
