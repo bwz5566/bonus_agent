@@ -1812,6 +1812,11 @@ class Workspace:
 
     def answer_question(self, id: str, answer: str, file: str = "", quote: str = "") -> str:
         """对话时记录财务的原话；不在对话时，只能引用材料原文（如后来补充的答复文件）关闭问题，程序核对原文确实在材料里。"""
+        done = next((q for q in self.questions if q.id == id and q.answer and not q.withdrawn), None)
+        if done is not None and not self.chat_by:
+            # 财务已在网页“问题”里答复过：不用再记，以前这里会报“不能替财务回答”，模型以为答复没生效
+            return (f"{id} 已有财务答复：{done.answer}（{done.answered_by or '财务'}），不用再记录。"
+                    "直接按这个答复修改规则（set_rules），再试算")
         if not self.chat_by and (not file or not quote.strip()):
             raise ToolError("现在不是和财务对话，你不能替财务回答。材料里（如后来补充的答复文件）已经有这个问题的答复时，"
                             "file 写那个文件、quote 逐字复制答复原文，程序核对后关闭问题；材料里没有就继续等财务答复。"

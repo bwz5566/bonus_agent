@@ -482,6 +482,23 @@ def test_question_answered_by_material_is_sent_back(tmp_path):
     assert any(str(m[0].get("content", "")).startswith("【查原文】") for m in llm.calls)
 
 
+def test_answer_question_on_already_answered_question(tmp_path):
+    """网页 Q6 第 2 轮：财务已在“问题”里答复，模型开头又调用 answer_question 想记一遍，被报“不能替财务回答”，
+    以为答复没生效。已答复的问题现在直接告诉它答复内容、按答复改规则。"""
+    from bonus_agent.agent import run_agent
+    from bonus_agent.extract_rules import Question
+    case, script = _agent_case()
+    llm = FakeLLM(script)
+    llm.images = GRADE_IMG
+    ws = run_agent(llm, [ANNUAL], tmp_path).ws
+    ws.questions.append(Question(id="q9", text="系数取多少？", answer="1.0", answered_by="张会计"))
+    out = ws.answer_question(id="q9", answer="1.0")
+    assert "已有财务答复：1.0" in out and "按这个答复修改规则" in out
+    with pytest.raises(Exception, match="不能替财务回答"):
+        ws.questions.append(Question(id="q10", text="另一个？"))
+        ws.answer_question(id="q10", answer="2")
+
+
 def test_redefine_dataset_without_fields_and_evaluate_text(tmp_path):
     """Q3 网页运行：模型只想把表改成明细表（改 key / link），没写 fields，连续 3 次因缺参数失败；
     又想用 evaluate 看一行的编号，返回“需要数字”连续 3 次。现在重新定义可以沿用上次的字段，evaluate 能看文字取值。"""
