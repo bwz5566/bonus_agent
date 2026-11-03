@@ -552,6 +552,24 @@ def test_stray_quotes_and_misplaced_params_are_repaired():
     assert "note" in _missing_args("record_facts", e.value)
 
 
+def test_question_in_instruction_is_answered_first(tmp_path):
+    """上一轮没做完时，财务在对话框里发的文字按说明接着做；说明里带了提问，智能体把回答记在「回答财务」，
+    网页放在本轮回复的最前面（没算完也显示）。上一轮的回答不带到下一轮。"""
+    from types import SimpleNamespace
+    from bonus_agent.agent import ANSWER_NOTE, run_agent
+    from bonus_agent.web import round_text
+    case, script = _agent_case()
+    llm = FakeLLM([{"tool": "note", "args": {"topic": ANSWER_NOTE, "text": "按材料第 2 条处理"}}] + script)
+    llm.images = GRADE_IMG
+    ar = run_agent(llm, [ANNUAL], tmp_path, instruction="这里用的是哪条规则？")
+    assert any(ANSWER_NOTE in str(c) and "这里用的是哪条规则" in str(c) for c in llm.calls)
+    assert round_text(ar).startswith("按材料第 2 条处理")
+    assert not round_text(SimpleNamespace(error="", status="OK", round=1, ws=SimpleNamespace(summary="", notes={}))).startswith("\n")
+    llm2 = FakeLLM([{"tool": "finish", "args": {"summary": "完成"}}])
+    ar2 = run_agent(llm2, [ANNUAL], tmp_path)
+    assert ANSWER_NOTE not in ar2.ws.notes
+
+
 def test_redefine_dataset_without_fields_and_evaluate_text(tmp_path):
     """Q3 网页运行：模型只想把表改成明细表（改 key / link），没写 fields，连续 3 次因缺参数失败；
     又想用 evaluate 看一行的编号，返回“需要数字”连续 3 次。现在重新定义可以沿用上次的字段，evaluate 能看文字取值。"""

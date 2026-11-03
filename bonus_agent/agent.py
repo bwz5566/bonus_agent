@@ -75,6 +75,7 @@ WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", 
                "answer_question"}
 RULE_SUFFIXES = {".docx", ".pptx", ".pdf", ".png", ".jpg", ".jpeg", ".txt", ".md"}   # 规则文档：要登记参数
 CHAT_SOURCE = "财务对话"       # 财务在对话里贴的规则原文、口径说明：和材料一样可以引用核对
+ANSWER_NOTE = "回答财务"       # 财务的说明里带了提问：智能体把回答记在这条笔记里，网页放在本轮回复的开头（没算完也显示）
 PIN_DOC_CHARS = 12000          # 不超过这么长的文档全文附在任务里（材料包），不必用工具读
 PIN_TOTAL_CHARS = 40000        # 材料包里文档全文的总长上限
 PIN_SHEET_ROWS = 30            # 不超过这么多行的工作表整表附上，更长的只附表头和前几行
@@ -2308,6 +2309,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                         for i, a in enumerate(answers or []) if a.get("text") and a.get("answer") not in (None, "")]
     fresh = cs.apply_answers(ws.questions, answers)
     ws.said = _said(chat, message, instruction)
+    ws.notes.pop(ANSWER_NOTE, None)          # 上一轮的回答不带到这一轮
     handlers = {t["name"]: getattr(ws, t["name"]) for t in TOOLS}
     ws.transcribe_all()
     pack = ("\n\n【材料包】以下是本批次材料的内容（程序读取，图片已转写），每轮都附在这里、不会被裁剪。"
@@ -2326,7 +2328,9 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         task = ("请完成本批次的奖金计算。文件清单：\n" + ws.list_files() + _answers_text(answers)
                 + "\n\n完成后调用 finish。")
     if instruction and not message:      # 上传材料时附带的说明
-        task += f"\n\n财务随材料附的说明（必须照做；不明确或与材料冲突时用 ask_question 提问）：{instruction}"
+        task += (f"\n\n财务附的说明（必须照做；不明确或与材料冲突时用 ask_question 提问）：{instruction}"
+                 f"\n说明里如果有向你提的问题：先查清楚（金额和算式来自 explain / evaluate，不要自己算），"
+                 f"用 note 记下回答，topic 写「{ANSWER_NOTE}」，text 写给财务看的回答；然后接着完成这一轮。没有提问就不用记")
     task += pack
     mode = llm.tool_mode
     sys = system_prompt()

@@ -322,6 +322,14 @@ def output_kind(name: str) -> tuple[str, str]:
 
 
 def round_text(ar) -> str:
+    """每轮结束时在对话里的交代。财务的说明里带了提问时，智能体的回答放在最前面（没算完也显示）。"""
+    from bonus_agent.agent import ANSWER_NOTE
+    answer = (getattr(getattr(ar, "ws", None), "notes", None) or {}).get(ANSWER_NOTE, "")
+    text = _round_status(ar)
+    return f"{answer}\n\n{text}" if answer else text
+
+
+def _round_status(ar) -> str:
     if ar.error:
         return f"第 {ar.round} 轮没做完。{to_text(ar.error)}"
     if ar.status == "NEEDS_CONFIRMATION":
