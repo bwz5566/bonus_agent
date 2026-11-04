@@ -606,6 +606,7 @@ class Workspace:
     changed: bool = False                                   # 对话里改过规则、数据表、台账或问题
     reply_text: str = ""
     budget: str = ""
+    _verify_misses: dict = field(default_factory=dict)       # 每个对象（金额）验算对不上的次数，提示先核对验算式自己
     checker_down: str = ""                                  # 交叉验证模型调用失败、改用主模型时的说明
     _source_calls: int = 0                                  # 本轮提问前查原文的次数
     _source_skip: bool = False                              # 刚查到原文退回过：下一次提问直接记录
@@ -1570,6 +1571,46 @@ class Workspace:
         n = max(1, len(self._ruleset(name).payout))
         return {k: (Decimal(p.final), Decimal(p.cap or p.final), n) for k, p in res.payouts.items()}
 
+    def _var_values(self, name: str, nids: list[str], spec: dict | None = None) -> dict[str, dict[str, Decimal]]:
+        """在几个对象上算出每个变量的值：{对象: {变量: 值}}。spec 给出时算独立复读的辅助变量，否则算规则变量。
+        算不出来的（如下层变量在上层对象上要先聚合、文字或是否值）跳过。只建一次树，所有变量共用一个计算器。"""
+        if spec is not None and spec.get("_verify"):      # 独立验算的辅助变量：和 verify 一样用规则的参数表
+            rs = self._ruleset(name)
+            data, _ = self._data(rs)
+            data, _ = apply_patches(rs, data)
+            hv = {k: Variable.model_validate(v) for k, v in (spec.get("helpers") or {}).items()}
+            hv = {k: v.model_copy(update={"scope": _helper_scope(rs, k, v.scope)}) for k, v in hv.items()}
+            rs = rs.model_copy(update={"variables": hv})
+            root, by_level, _ = build_tree(rs, data)
+            ev = Evaluator(rs, root, by_level, self._refs(name))
+            ev.peer_scope = True
+            names = list(hv)
+        elif spec is not None:
+            rs, root, by_level, ev = self._independent_env(name, spec)
+            names = list(spec.get("helpers") or {})
+        else:
+            rs = self._ruleset(name)
+            data, _ = self._data(rs)
+            data, _ = apply_patches(rs, data)
+            root, by_level, _ = build_tree(rs, data)
+            ev = Evaluator(rs, root, by_level, self._refs(name))
+            names = list(rs.variables)
+        nodes = {n.id: n for n in root.walk()}
+        nodes.update({n.id: n for tbl in (root.index or {}).values() for n in tbl.values()})
+        out: dict[str, dict[str, Decimal]] = {}
+        for nid in nids:
+            if nid not in nodes:
+                continue
+            got = out.setdefault(nid, {})
+            for v in names:
+                try:
+                    x = ev.variable(v, nodes[nid]).v
+                except Exception:
+                    continue
+                if isinstance(x, Decimal) and not isinstance(x, bool):
+                    got[v] = x
+        return out
+
     def _pool_values(self, name: str) -> dict[str, Decimal]:
         """规则算出的奖金池（未修订的 R0），按奖金池所在层的对象。"""
         res = self.results[name]["R0"]
@@ -1593,7 +1634,7 @@ class Workspace:
         used = _used_helpers(expr, {**self.check_vars, **(helpers or {})})     # 之前定义过的辅助变量直接可用；记录里存全，单独可复算
         rec = {"expr": expr, "at": at or node, "basis": basis.strip(), "amount": amount,
                **({"helpers": used} if used else {})}
-        bad = self._verify_mismatch(name, node, rec)
+        bad = self._verify_mismatch(name, node, rec, explain=True)
         if helpers and not bad.startswith(("验算式写错了", "辅助变量", "验算式算不出来")):
             self.check_vars.update(helpers)      # 写法没问题的辅助变量留着复用（金额对不上时也留着，改哪个就重写哪个）
         if bad:
@@ -1616,8 +1657,9 @@ class Workspace:
         return {r.node_id: (Decimal(r.paid), any(tail(m) for m in getattr(r, "members", [r.node_id])))
                 for r in res.payout_rows()}
 
-    def _verify_mismatch(self, name: str, node: str, rec: dict) -> str:
-        """按当前规则和数据重新比对一条验算记录；一致返回空串，并把比对说明放在 _verify_note。"""
+    def _verify_mismatch(self, name: str, node: str, rec: dict, explain: bool = False) -> str:
+        """按当前规则和数据重新比对一条验算记录；一致返回空串，并把比对说明放在 _verify_note。
+        explain：这次是智能体调用 verify（不是事后重新比对），对不上时再逐步找分岔处、记对不上的次数。"""
         helpers = rec.get("helpers") or {}
         srcs = [rec["expr"]] + [str(h.get("expr", "")) for h in helpers.values()]
         try:
@@ -1679,10 +1721,36 @@ class Workspace:
         near = (f"只差 {fmt(cents)} 元，多半是舍入的位置不同：对照材料哪一步要先舍到分"
                 "（如先把应得舍到分、再乘比例后再舍，还是一次算完再舍），把验算式里的 round 放到同样的位置。") \
             if Decimal(0) < cents <= Decimal("0.02") else ""
+        key = _verify_key(name, node, kind)
+        if explain:
+            self._verify_misses[key] = self._verify_misses.get(key, 0) + 1
         return (f"{node} 的{kind}对不上：引擎算出 {fmt(final)} 元，独立验算 {rec['expr']} = {rendered} = {fmt(v)}。{near}"
-                f"{self._engine_side(name, node, kind)}"
+                f"{self._engine_side(name, node, kind)}{self._verify_split(name, node, rec) if explain else ''}"
                 f"先想清楚哪一边不符合材料（{rec['basis'][:100]}）：用 explain 查看 {node} 的计算链逐项对照，规则错了就改规则后重新试算，"
-                "验算式错了就改验算式；拿不准就 ask_question")
+                "验算式错了就改验算式；拿不准就 ask_question"
+                + (f"。{node} 已经对不上 {self._verify_misses[key]} 次：规则也可能是对的、错在验算式。"
+                   f"先用 evaluate 在 {node}（下层的辅助变量在它下面的对象上）把验算式里每个辅助变量算出来，"
+                   "和 explain 列出的规则中间数逐项对照，确认验算式本身没写错（筛选条件、汇总的表、取整），再决定改哪边"
+                   if explain and self._verify_misses.get(key, 0) >= 2 else ""))
+
+    def _verify_split(self, name: str, node: str, rec: dict) -> str:
+        """验算对不上时，在这个对象上逐个算验算式的辅助变量和规则的变量，指出从哪一步开始不一样（同复读对不上）。"""
+        from bonus_agent import reread as rr
+        helpers = rec.get("helpers") or {}
+        if not helpers:
+            return ""
+        try:
+            mine = self._var_values(name, [node], {"helpers": helpers, "_verify": True})
+            theirs = self._var_values(name, [node])
+        except Exception:
+            return ""
+        found = rr.split_steps(helpers, mine, theirs, [node])
+        if found:
+            return f"程序在 {node} 上逐个算了验算式的辅助变量和规则的变量：{found}。"
+        if mine.get(node) and theirs.get(node) and all(
+                any(rr._same_num(x, y) for y in theirs[node].values()) for x in mine[node].values()):
+            return "验算式的辅助变量在规则里都有同样的数，不一样的是最后把它们组合起来的这一步（验算式本身）。"
+        return ""
 
     def _lineage(self, name: str, node: str) -> str:
         """对象的归属链（如 个人:E015 → 小组:G04（2部1组）→ 部门:D02（行业业务部）），验算时按它取上级的池和权重合计。"""

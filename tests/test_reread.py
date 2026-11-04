@@ -255,3 +255,19 @@ def test_cross_check_uses_another_model_and_falls_back():
     main.checker_llm = FakeLLM(down, name="other")
     assert rr._ask(ws, [{"role": "user", "content": "x"}]) == "主" and "other 调用失败" in ws.checker_down
     assert rr._ask(ws, [{"role": "user", "content": "x"}]) == "主"          # 失败过一次就不再反复等它超时
+
+
+def test_independent_formula_gap_names_the_first_differing_step(tmp_path):
+    """1103b 回归 Q3、Q4：复读算对了、规则错了，智能体用 evaluate 试了 40 次也没找到差在哪。
+    现在程序在对不上的对象上逐个算两边的中间数，指出从哪一步开始不一样。"""
+    from bonus_agent.agent import run_agent
+    from bonus_agent.llm import FakeLLM
+    from tests.test_syn_acceptance import _script, run_case
+    wrong = PROCESS_OK.replace(" * lookup(d, difficulty)", "")
+    llm = FakeLLM(_script())
+    llm.calc = _calc("h_pool * 1", {"h_pool": {"scope": "部门", "expr": wrong}})
+    ar = run_agent(llm, [run_case.XLSX], tmp_path / "b")
+    blocked = [s for s in ar.steps if s.tool == "finish" and not s.ok]
+    assert blocked and "[复读 奖金池 PROCESS]" in blocked[0].result
+    text = blocked[0].result
+    assert "从这几步开始不一样" in text and "h_pool[部门]" in text, text[-600:]

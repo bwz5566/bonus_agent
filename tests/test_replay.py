@@ -4,6 +4,7 @@ fixtures/q55：Q55 第 1 轮真实模型的 17 步调用。它把“实发 = max
 导出的「个人发放」表应得、已发抵扣、超预发三列都是错的（实发碰巧对）。
 """
 import copy
+from decimal import Decimal
 import importlib.util
 import json
 from pathlib import Path
@@ -101,3 +102,29 @@ def test_q1_rerun_verify_calls_now_agree_with_engine():
     bad = {k: v for k, v in got.items() if v != "通过"}
     assert set(bad) == {(2, 16), (2, 19)}, got
     assert "在材料里找不到" in bad[(2, 16)] and "对不上" in bad[(2, 19)]
+
+
+def test_verify_mismatch_points_at_the_step(tmp_path):
+    """1103b 回归：验算一直对不上时，模型只会怀疑规则（Q2 规则其实是对的，错在验算式）。
+    现在程序在这个对象上逐个算验算式的辅助变量和规则的变量，说清哪几步两边一致、从哪一步开始不一样；
+    同一个对象第二次对不上时，提醒先核对验算式自己。"""
+    ar = run_agent(FakeLLM(corrected_steps()), [q55.make(tmp_path / "m")], tmp_path / "out", max_steps=30)
+    assert ar.status == "OK", ar.error
+    first = next(s for s in ar.steps if s.tool == "verify" and s.ok)
+    node = first.args["node"]
+    level = node.split(":")[0]
+    helpers = {**(first.args.get("helpers") or {}), "v_total": {"scope": level, "expr": first.args["expr"]}}
+    args = {**{k: v for k, v in first.args.items() if k not in ("thought", "helpers", "expr")},
+            "helpers": helpers, "expr": "v_total + 1"}
+    with pytest.raises(Exception) as e:
+        ar.ws.verify(**args)
+    assert "不一样的是最后把它们组合起来的这一步" in str(e.value), str(e.value)[-400:]
+    assert "已经对不上" not in str(e.value)
+    with pytest.raises(Exception) as e:
+        ar.ws.verify(**args)
+    assert "已经对不上 2 次" in str(e.value)
+    from bonus_agent.reread import split_steps
+    mine = {"A": {"h1": Decimal("2"), "h2": Decimal("7")}}
+    theirs = {"A": {"x": Decimal("2"), "y": Decimal("8")}}
+    text = split_steps({"h1": {"expr": "f"}, "h2": {"expr": "h1 * 3"}}, mine, theirs, ["A"])
+    assert "h1 在规则里都有同样的数" in text and "h2[global] = h1 * 3，在 A 上 = 7（它用到的 h1 两边一致）" in text

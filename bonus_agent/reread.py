@@ -349,13 +349,71 @@ def calc_gaps(ws, rr: dict) -> list[tuple[str, str]]:
                 eg = "；".join(f"{k} 复读 {_ratio(v)}、规则 {_ratio(t)}（可发上限 ÷ 应得）" for _, k, v, t in rows[:CALC_SHOW])
                 expr = f"可发比例 = {spec.get('pay_ratio')}"
             mine = _rule_chain(ws, name, kind)
+            split = _divergence(ws, name, spec, [k for _, k, _, _ in rows[:CALC_SHOW]])
             out.append((f"复读 {kind} {name}",
                         f"复读只按材料独立写了方案「{name}」的{kind}算式，放到同一份数据上算，{len(rows)}/{total} 个对象和规则对不上"
                         f"（复读另写了一次也是这样）：{eg}。复读的写法：{expr}{how}"
                         + (f"。规则的写法：{mine}" if mine else "")
-                        + "。逐项对照两边的筛选条件（期间、日期字段、状态）、口径和取整，用 evaluate 把两边的中间数分别算出来，"
-                          "找到从哪一步开始不一样，再对照材料原文判断哪边对"))
+                        + (f"。{split}" if split else
+                           "。逐项对照两边的筛选条件（期间、日期字段、状态）、口径和取整，用 evaluate 把两边的中间数分别算出来，"
+                           "找到从哪一步开始不一样，再对照材料原文判断哪边对")))
     return out
+
+
+def _same_num(a: Decimal, b: Decimal) -> bool:
+    return abs(a - b) <= max(Decimal("0.005"), abs(b) * Decimal("0.000001"))
+
+
+def _divergence(ws, name: str, spec: dict, nids: list[str]) -> str:
+    """程序替智能体找两边从哪一步开始不一样（1103b 回归 Q3、Q4：复读算对了，智能体用 evaluate 试了 40 次也没找到差在哪）。
+    在对不上的对象上分别算出复读的每个辅助变量和规则的每个变量，按数值配对：复读的某个辅助变量在这些对象上
+    规则里都有同样的数，就算两边一致；找出“自己不一致、但用到的辅助变量都一致”的那几个，就是开始分岔的地方。"""
+    helpers = spec.get("helpers") or {}
+    if not helpers or not nids:
+        return ""
+    try:
+        mine, theirs = ws._var_values(name, nids, spec), ws._var_values(name, nids)
+    except Exception:
+        return ""
+    found = split_steps(helpers, mine, theirs, nids)
+    if not found:
+        return ""
+    return ("程序已在对不上的对象上逐个算了两边的中间数：" + found
+            + "。对照材料原文判断这几步哪边对：规则错了就改规则；复读错了就写进 finish 的 ignored，reason 引用材料原文")
+
+
+def split_steps(helpers: dict, mine: dict, theirs: dict, nids: list[str]) -> str:
+    """mine：{对象: {辅助变量: 值}}；theirs：{对象: {规则变量: 值}}。说明哪些辅助变量两边一致、从哪几个开始不一样；
+    找不出分岔处返回空串。复读对不上和独立验算对不上共用。"""
+    objs = [k for k in nids if mine.get(k) and theirs.get(k)]
+    if not objs:
+        return ""
+
+    def matched(h):
+        return all(h in mine[k] and any(_same_num(mine[k][h], v) for v in theirs[k].values()) for k in objs)
+
+    deps = {h: [d for d in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", str((helpers[h] or {}).get("expr", ""))) if d in helpers]
+            for h in helpers}
+    known = [h for h in helpers if all(h in mine[k] for k in objs)]
+    same = {h for h in known if matched(h)}
+    first = [h for h in known if h not in same and all(d in same for d in deps[h] if d in known)]
+    if not first:
+        return ""
+    k = objs[0]
+    near = sorted(theirs[k].items(), key=lambda kv: len(kv[0]))[:12]
+    lines = [f"{h}[{(helpers[h] or {}).get('scope', 'global')}] = {(helpers[h] or {}).get('expr', '')}，"
+             f"在 {k} 上 = {_num_text(mine[k][h])}"
+             + (f"（它用到的 {'、'.join(d for d in deps[h] if d in same)} 两边一致）" if any(d in same for d in deps[h]) else "")
+             for h in first[:3]]
+    ok = "、".join(sorted(same)[:8])
+    return ((f"{ok} 在规则里都有同样的数（这些步骤两边一致）；" if ok else "")
+            + "从这几步开始不一样，规则里没有算出同样数的变量：" + "；".join(lines)
+            + f"。规则的变量在 {k} 上：" + "，".join(f"{n} = {_num_text(v)}" for n, v in near))
+
+
+def _num_text(v: Decimal) -> str:
+    q = v.quantize(Decimal("0.000001")).normalize()
+    return f"{q:f}"
 
 
 def _rule_chain(ws, name: str, kind: str, limit: int = 10) -> str:
