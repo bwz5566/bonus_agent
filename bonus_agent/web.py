@@ -233,7 +233,10 @@ class Runner:
 
     @staticmethod
     def _step(job: Job, out: Path, n: int, s) -> None:
-        line = f"[{n:02d}] {s.tool} {'✓' if s.ok else '✗'} {(s.result.splitlines() or [''])[0][:160]}"
+        cost = (f" | {getattr(s, 'at', '')} 模型 {getattr(s, 'model_secs', 0):.0f}s 工具 {getattr(s, 'secs', 0):.1f}s "
+                f"tokens {getattr(s, 'tokens_in', 0)}/{getattr(s, 'tokens_out', 0)}" + (" 深度思考" if getattr(s, "deep", False) else "")
+                if getattr(s, "at", "") else "")
+        line = f"[{n:02d}] {s.tool} {'✓' if s.ok else '✗'}{cost} {(s.result.splitlines() or [''])[0][:160]}"
         job.steps.append(line)
         try:     # 逐步落盘：强制关掉服务时也留下过程，便于排查
             with open(out / "running_steps.txt", "a" if n > 1 else "w", encoding="utf-8") as f:
@@ -325,8 +328,17 @@ def round_text(ar) -> str:
     """每轮结束时在对话里的交代。财务的说明里带了提问时，智能体的回答放在最前面（没算完也显示）。"""
     from bonus_agent.agent import ANSWER_NOTE
     answer = (getattr(getattr(ar, "ws", None), "notes", None) or {}).get(ANSWER_NOTE, "")
-    text = _round_status(ar)
+    text = _round_status(ar) + usage_text(getattr(ar, "usage", None))
     return f"{answer}\n\n{text}" if answer else text
+
+
+def usage_text(u: dict | None) -> str:
+    """一轮的用时和用量，附在每轮的交代后面。"""
+    if not u:
+        return ""
+    return (f"\n（本轮用时 {u.get('secs', 0) // 60} 分 {u.get('secs', 0) % 60} 秒，{u.get('steps', 0)} 步"
+            + (f"，其中深度思考 {u['deep_steps']} 步" if u.get("deep_steps") else "")
+            + f"；调用模型 {u.get('calls', 0)} 次，输入 {u.get('prompt_tokens', 0):,} tokens，输出 {u.get('completion_tokens', 0):,} tokens）")
 
 
 def _round_status(ar) -> str:

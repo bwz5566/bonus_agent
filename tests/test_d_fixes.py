@@ -126,3 +126,63 @@ def test_images_with_the_same_transcript_are_shown_once():
     ws.transcribe_all()
     text = ws.read_document("规则.pptx", 0, limit=10 ** 9)
     assert text.count("Firstunion") == 1 and text.count("转写内容和图片 #1 相同") == 2
+
+
+def _rs(extra_vars=None, pool="tier(rate, 1000)"):
+    from bonus_core.dsl.models import RuleSet
+    return RuleSet.model_validate({
+        "name": "t", "version": "1", "datasets": {}, "pool": {"expr": pool}, "allocation": [],
+        "tables": {"rate": {"kind": "tier", "mode": "whole", "steps": [[0, "0.01"], [500, "0.02"]]},
+                   "coef": {"kind": "tier", "mode": "whole", "steps": [[0, "1"], [1, "0.9"]]}},
+        "variables": extra_vars or {}})
+
+
+def test_parameter_tables_and_coefficients_left_out_of_the_calculation_are_gated():
+    """D：区域 / 客户任务系数、呆滞逾期系数、欠款冻结的表都建了，提成里却没用上就结束了。"""
+    from bonus_agent import lint
+    rep = lint.check(_rs({"k": {"expr": "tier_rate(coef, 2)"}}), {}, "提成按全额计算")
+    assert "未用 k" in rep.keys and any("没有接进" in g for g in rep.gates)
+    assert "未用 coef" not in rep.keys          # 有变量用它，先提示变量
+    rep = lint.check(_rs(), {}, "提成按全额计算")
+    assert "未用 coef" in rep.keys and "未用 rate" not in rep.keys
+    rep = lint.check(_rs({"k": {"expr": "tier_rate(coef, 2)"}}, pool="tier(rate, 1000) * k"), {}, "提成按全额计算")
+    assert not [k for k in rep.keys if k.startswith("未用")]
+    # 别的方案用到了：不拦
+    rep = lint.check(_rs(), {}, "提成按全额计算", reached_elsewhere={"coef"})
+    assert "未用 coef" not in rep.keys
+
+
+def test_tier_method_must_be_stated_in_materials():
+    from bonus_agent import lint
+    assert "阶梯方式 rate" in lint.check(_rs(), {}, "销售额 500 万以上提成 2%").keys
+    assert "阶梯方式 rate" not in lint.check(_rs(), {}, "超额累进，每段按各自比例").keys
+
+
+def test_name_with_percent_in_one_cell_is_flagged(tmp_path):
+    p = tmp_path / "名单.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "名单"
+    for r in (["项目", "负责人"], ["P1", "甲"], ["P2", "乙50%"]):
+        ws.append(r)
+    wb.save(p)
+    w = Workspace(FakeLLM(["x"]), build_inventory(collect_files([tmp_path])))
+    out = w.define_dataset("名单", "名单.xlsx", "名单", {"pid": {"column": "项目", "type": "id"},
+                                                     "emp": {"column": "负责人", "type": "text"}}, key="pid")
+    assert "名称+百分比" in out and "乙50%" in out
+
+
+def test_steps_and_rounds_record_time_and_tokens(tmp_path):
+    _roster(tmp_path)
+    out = tmp_path / "out"
+    llm = FakeLLM([{"tool": "list_files"}, {"tool": "finish", "args": {"summary": "x"}}])
+    ar = run_agent(llm, [tmp_path / "名单.xlsx"], out, max_steps=2)
+    s = next(s for s in ar.steps if s.tool == "list_files")
+    assert s.at and s.secs >= 0 and hasattr(s, "tokens_in")
+    assert ar.usage["steps"] == len(ar.steps) and ar.usage["calls"] >= 2
+    case = json.loads((out / "case.json").read_text(encoding="utf-8"))
+    assert case["rounds"][-1]["usage"]["calls"] == ar.usage["calls"]
+    log = json.loads((out / "agent_log.json").read_text(encoding="utf-8"))
+    assert log["usage"] == ar.usage and "model_secs" in log["steps"][0]
+    from bonus_agent.web import round_text
+    assert "本轮用时" in round_text(ar)

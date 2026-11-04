@@ -178,7 +178,7 @@ def _compared(rs: RuleSet, negated: set[str] | None = None) -> dict[str, dict[st
 
 def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, sourced: str = "",
           headers: dict[str, str] | None = None, tiers: dict | None = None, used_elsewhere: set[str] | None = None,
-          coverage: list | None = None) -> Report:
+          coverage: list | None = None, reached_elsewhere: set[str] | None = None) -> Report:
     """text：规则材料原文（规则文档、财务的话和答复）。sourced 非空时（如有图片没转写）常数出处无法核对，只提示。
     headers：字段 -> Excel 表头原文（含工作表名），判断字段含义时不只看智能体起的名字。
     tiers：引擎记录的分档表实际取值分布；coverage：查找表、条件分支的命中分布；used_elsewhere：其他方案用到的名字（一个金额字段只要有方案用到就不算漏用）。"""
@@ -281,9 +281,39 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
             rep.gates.append(msg)
             rep.keys.append(f"参数表 {name}")
     rep.warns += cov_warns
-    # 结构提示
+    # 6'. 阶梯直接算金额（tier）时，全额累进还是超额累进算出来差很多；材料和答复都没说是哪种，不能自己定
+    if norm.strip() and not _TIER_HOW.search(norm):        # 没有材料原文（只校验结构）时不查
+        for t in sorted(_tier_called(rs)):
+            tb = rs.tables.get(t)
+            if isinstance(tb, TierTable) and len(tb.steps) >= 2:
+                (rep.warns if sourced else rep.gates).append(f"阶梯表 {t} 写的是 {tb.mode}（{'整笔按所在档的比例' if tb.mode == 'whole' else '超额部分分段累加'}），"
+                                 "材料和财务答复都没说是全额（整笔按所在档）还是超额累进（每段按各自比例）。两种算法差很多，"
+                                 "用 ask_question 问财务，问题里各举一个金额按两种算法的结果")
+                if not sourced:       # 没有规则文档可核对时只提示
+                    rep.keys.append(f"阶梯方式 {t}")
+    # 7. 参数表、用参数表算的变量定义了，却没接进计算（如系数表建了、提成里没乘）：要么接上，要么说明为什么不用
     used = _reachable(rs)
-    idle = [n for n in rs.variables if n not in used]
+    live = reached(rs) | (reached_elsewhere or set())
+    in_vars = {x.id for w, ast in _parsed(rs) if w.startswith("variables.") for x in walk(ast) if isinstance(x, Name)}
+    for t in rs.tables:
+        if t not in live and t not in in_vars:      # 有变量用它时，下面提示那个变量
+            rep.gates.append(f"参数表 {t} 定义了，但奖金池、变量、权重、发放、抵扣和校验都没有用到。"
+                             "核对材料：它对应的规则（如系数、扣减、暂缓、冻结）是否漏接进计算；确实不用，删掉它或写进 ignored 说明原因")
+            rep.keys.append(f"未用 {t}")
+    for n, v in rs.variables.items():
+        if n in live:
+            continue
+        try:
+            tabs = {x.id for x in walk(parse(v.expr)) if isinstance(x, Name) and x.id in rs.tables}
+        except ExprError:
+            continue
+        if tabs:
+            rep.gates.append(f"变量 {n} 按参数表 {'、'.join(sorted(tabs))} 算出来，但没有接进奖金池、权重、发放或抵扣。"
+                             "核对材料：这一项（如系数、扣减、暂缓）是否应该乘进或扣进金额；只是展示用的写进 ignored 说明原因")
+            rep.keys.append(f"未用 {n}")
+    # 结构提示
+    flagged = {k.removeprefix("未用 ") for k in rep.keys}
+    idle = [n for n in rs.variables if n not in used and n not in flagged]
     if idle:
         rep.warns.append(f"变量 {'、'.join(idle[:10])} 定义了，但奖金池、权重、发放、抵扣和校验都没有用到。"
                          "是不是漏接进计算了（如封顶、扣减）？只是展示用的可以不管")
@@ -568,6 +598,25 @@ def _copied(rs: RuleSet, data: Datasets) -> dict[str, tuple[str, str, str]]:
             if hit:
                 out[name] = hit
                 break
+    return out
+
+
+_TIER_HOW = re.compile(r"累进|超额|分段|全额|整笔|全部按|按所在档|按达到的档|按达成的档")
+
+
+def _tier_called(rs: RuleSet) -> set[str]:
+    """用 tier(...) 直接算金额的阶梯表名。"""
+    return {c.args[0].id for _, ast in _parsed(rs) for c in walk(ast)
+            if isinstance(c, Call) and c.fn == "tier" and c.args and isinstance(c.args[0], Name)}
+
+
+def reached(rs: RuleSet) -> set[str]:
+    """计算真正用到的名字：从奖金池、权重、发放、抵扣、校验出发能到达的变量，以及它们引用的参数表名、字段名。"""
+    seen = _reachable(rs)
+    out = set(seen)
+    for where, ast in _parsed(rs):
+        if not where.startswith("variables.") or where.removeprefix("variables.") in seen:
+            out |= {x.id for x in walk(ast) if isinstance(x, Name)}
     return out
 
 

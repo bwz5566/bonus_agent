@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import unicodedata
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from dataclasses import dataclass, field
@@ -601,6 +602,11 @@ class Step:
     ok: bool
     thought: str = ""
     deep: bool = False            # 这一步是在深度思考下做的（出错、卡住后）
+    at: str = ""                  # 开始时间
+    secs: float = 0.0             # 工具执行用时（秒）
+    model_secs: float = 0.0       # 这次模型回复用时（一次回复里有几个调用时记在第一个上）
+    tokens_in: int = 0            # 这次模型回复的输入 / 输出 tokens（同上）
+    tokens_out: int = 0
 
 
 @dataclass
@@ -1554,9 +1560,16 @@ class Workspace:
         heads = {f"{n}.{f}": f"{m.sheet or ''} {c}" for n, m in self.mapping.items() for f, c in m.columns.items()}
         others = {w for k, d in self.drafts.items() if k != name
                   for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", json.dumps(d, ensure_ascii=False))}
+        elsewhere: set[str] = set()
+        for s in self.schemes:          # 共用的参数表、变量只要有一个方案用到就不算没用
+            if s != name:
+                try:
+                    elsewhere |= lint.reached(self._ruleset(s))
+                except Exception:
+                    pass
         rep = self.lint[name] = lint.check(rs, data, self._rule_text(), base.traces, sourced=self._sources_readable(),
                                            headers=heads, tiers=base.tier_stats, used_elsewhere=others,
-                                           coverage=base.coverage)
+                                           coverage=base.coverage, reached_elsewhere=elsewhere)
         if rep.warns:
             lines.append("程序检查提示：\n" + "\n".join(f"- {w}" for w in rep.warns[:8]))
         gates = self._open_gates(rep)
@@ -2508,6 +2521,7 @@ class AgentResult:
     results: dict[str, dict[str, Result]] = field(default_factory=dict)  # 方案 -> 修订 -> 结果
     reply: str = ""                                                      # 对话时给财务的回复
     deep_steps: int = 0                                                  # 本轮用了几步深度思考
+    usage: dict = field(default_factory=dict)                            # 本轮用时、步数、模型调用次数和 tokens（含预筛、复读等额外调用）
 
     @property
     def single(self) -> bool:
@@ -2606,6 +2620,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                         f"至少要 {MIN_CONTEXT}，建议 131072。请管理员调大模型服务的上下文长度（vLLM 启动参数 --max-model-len；"
                         "超过模型原生长度的要同时开 YaRN），再重试")
     used0 = llm.usage.prompt_tokens + llm.usage.completion_tokens    # 本轮开始前的累计用量（自动接续时同一个模型对象接着用）
+    u0, t0 = (llm.usage.calls, llm.usage.prompt_tokens, llm.usage.completion_tokens), time.time()
     ws = Workspace(llm, build_inventory(files))
     out = Path(out_dir) if out_dir is not None else None
     case = cs.load_case(out) if out is not None else None      # --new 也保留历次记录，只是不接着上一轮的工作区
@@ -2694,6 +2709,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         # 缓存标记：系统提示 + 任务固定不变；历史在两次整理之间只追加，标在历史最后一条上
         body = [{"role": "user", "content": task, "_cache": True}] + history[:-1] \
             + ([{**history[-1], "_cache": True}] if history else [])
+        t_model, u_in, u_out = time.time(), llm.usage.prompt_tokens, llm.usage.completion_tokens
         if mode == "json":
             msgs = [{"role": "system", "content": sys + JSON_PROTOCOL + json.dumps(TOOLS, ensure_ascii=False)}] + body + tail
             try:
@@ -2739,6 +2755,8 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                     break
                 history.append({"role": "user", "content": "请调用工具继续工作；全部完成后调用 finish。"})
                 continue
+        model_secs = time.time() - t_model
+        model_tokens = (llm.usage.prompt_tokens - u_in, llm.usage.completion_tokens - u_out)
         turn_start, skipped = len(history) - 1, 0     # 本轮 assistant 消息的位置；被拦下的重复调用数
         turn_steps = len(steps)                       # 本轮第一步的位置：深度思考的内容记在它上面，并据本轮结果决定下一步是否思考
         failed_now: set[str] = set()                  # 这次回复里已经算过一次失败的工具
@@ -2761,6 +2779,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                                else {"role": "tool", "tool_call_id": c["id"], "content": result})
                 skipped += 1
                 continue
+            t_tool = time.time()
             try:
                 args = json.loads(c["arguments"] or "{}")
                 fn = handlers.get(c["name"])
@@ -2788,7 +2807,10 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 result = result[:MAX_RESULT_CHARS] + "……（已截断）"
             if not thought:
                 result += "\n（提醒：每次调用都先在 thought 里写思考：上一步观察到了什么、为什么做这一步、预期看到什么。）"
-            step = Step(c["name"], args if isinstance(args, dict) else {}, result, ok, thought)
+            step = Step(c["name"], args if isinstance(args, dict) else {}, result, ok, thought,
+                        at=time.strftime("%H:%M:%S", time.localtime(t_tool)), secs=round(time.time() - t_tool, 2))
+            if len(steps) == turn_steps:     # 本次回复的第一个调用：记上模型用时和 tokens
+                step.model_secs, (step.tokens_in, step.tokens_out) = round(model_secs, 2), model_tokens
             if c.get("raw") and c["raw"] != c["arguments"]:     # 模型的原文（格式有误、程序改过或没能执行）留档，便于做回放用例
                 step.args = {**step.args, "_raw": c["raw"][:20000]}
             if ok and c["name"] in WRITE_TOOLS:
@@ -2886,6 +2908,9 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             if reasoning and len(steps) > turn_steps:
                 st = steps[turn_steps]
                 st.thought = f"【深度思考】{reasoning.strip()[:DEEP_SHOW]}" + (f"\n{st.thought}" if st.thought else "")
+        if len(steps) > turn_steps:       # 模型这次回复的用时和 tokens 记在本次第一个调用上
+            first = steps[turn_steps]
+            first.model_secs, (first.tokens_in, first.tokens_out) = round(model_secs, 2), model_tokens
         deep_why = _deep_reason(steps[turn_steps:], skipped, ws, fails)
         if skipped and skipped == len(calls):
             # 整轮都是被拦下的重复调用：不把它留在历史里，否则小模型会照着历史接着重复；只留一句说明
@@ -2960,6 +2985,9 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                      rulesets={s: rss[s] for s in tested}, results=tested)
     ar.draft_results, ar.round, ar.changes = draft, rnd["n"], changes
     ar.deep_steps = deep_used
+    ar.usage = {"secs": round(time.time() - t0), "steps": len(steps), "deep_steps": deep_used,
+                "calls": llm.usage.calls - u0[0], "prompt_tokens": llm.usage.prompt_tokens - u0[1],
+                "completion_tokens": llm.usage.completion_tokens - u0[2]}
     ar.reply = ws.reply_text
     ar.pending = [q.model_dump() for q in ws.pending]
     if last and last.get("digest") is not None and tested:
@@ -2980,7 +3008,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                           if k in ("mapping", "rules", "review") or k.startswith(("rules:", "adjust:"))}
         if message:
             rnd["message"] = {"by": ws.chat_by, "text": message}
-        rnd.update(status=ar.status, error=error, pending=[q.id for q in ws.pending], summary=ws.summary,
+        rnd.update(status=ar.status, error=error, usage=ar.usage, pending=[q.id for q in ws.pending], summary=ws.summary,
                    answered=[q.id for q in fresh], changes=changes, drafts=json.loads(json.dumps(ws.drafts)),
                    digest=cs.digest(tested) if tested else (last or {}).get("digest"))
         case = case or {"created": rnd["at"], "rounds": []}
@@ -3296,7 +3324,7 @@ def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None =
         + yaml.safe_dump(qrows, allow_unicode=True, sort_keys=False), encoding="utf-8")
     paths["log"] = out / "agent_log.json"
     paths["log"].write_text(json.dumps({"summary": ws.summary, "error": ar.error, "transcripts": ws.transcripts,
-                                        "triage": ws.triage, "steps": [vars(s) for s in ar.steps]}, ensure_ascii=False, indent=2),
+                                        "triage": ws.triage, "usage": ar.usage, "steps": [vars(s) for s in ar.steps]}, ensure_ascii=False, indent=2),
                             encoding="utf-8")
     if ar.status == "FAILED":       # 没做完（没通过检查或独立验算）：不出结果文件，免得被当成结果用；过程在 agent_log 里
         return paths

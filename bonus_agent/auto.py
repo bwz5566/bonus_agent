@@ -230,6 +230,9 @@ def _fix_column(col: str, headers: list[str]) -> str | None:
     return norm[close[0]] if close else None
 
 
+_NAME_PCT = re.compile(r"^[^\d%％]{1,20}?\s*\d+(?:\.\d+)?\s*[%％]$")
+
+
 def filter_sheet(st: SheetTable, flt: dict | None) -> tuple[SheetTable, str]:
     """按 filter（列名 -> 允许的取值）筛选行，返回 (筛选后的表, 错误信息)。"""
     if not flt:
@@ -332,6 +335,14 @@ def check_dataset(name: str, pd: PlanDataset, st: SheetTable, field_types: dict[
                           f"这是明细表，去掉 key，写 link=它所属对象的编号。"
                           f"如果是没有单独的主表、要按 {pd.key} 汇总（每个 {pd.key} 一个对象），只保留 {pd.key} 一个字段并写 distinct: true，"
                           f"其他表写 link={pd.key} 挂上来，在 scope=「{name}」的变量里汇总")
+    for f, fd in fields.items():        # 名字和比例写在一格里（如“某某50%”）：不是一个新对象，要问财务怎么拆
+        if fd.type not in ("id", "text"):
+            continue
+        i = st.headers.index(cols[f])
+        mixed = sorted({cell_text(v[i]) for _, v in st.rows if isinstance(v[i], str) and _NAME_PCT.match(v[i].strip())})
+        if mixed:
+            warnings.append(f"「{name}」字段 {f} 有 {len(mixed)} 种取值是“名称+百分比”写在一格里（如 {'、'.join(mixed[:3])}），"
+                            "会被当成一个新的对象。用 ask_question 问财务这些格子怎么拆（谁、占多少），问题里列出这些写法")
     if bad:
         errors.append(f"「{name}」有字段类型与数据不符：" + "；".join(bad[:5])
                       + "。请改成与数据相符的类型；月份、期间这类标签如果不参与日期计算，用 text 即可")
