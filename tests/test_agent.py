@@ -266,9 +266,15 @@ def test_agent_stops_looping_and_paginates(monkeypatch):
 def test_agent_token_budget():
     from bonus_agent.agent import run_agent
     llm = FakeLLM([{"tool": "list_files"}])
-    llm.usage.prompt_tokens = 2_000_000
+    llm.usage.prompt_tokens = 2_000_000          # 之前几轮（自动接续时共用同一个模型对象）用掉的不算进本轮
+    real = llm.chat_tools
+
+    def costly(*a, **kw):
+        llm.usage.prompt_tokens += 600_000
+        return real(*a, **kw)
+    llm.chat_tools = costly
     ar = run_agent(llm, [ANNUAL], max_tokens=1_000_000)
-    assert not ar.ok and "tokens" in ar.error and not ar.steps
+    assert not ar.ok and "tokens" in ar.error and len([s for s in ar.steps if not s.tool.startswith("（")]) == 2
 
 
 def test_briefing_pins_short_docs_and_small_sheets():

@@ -148,6 +148,22 @@ def _is_segment_header(row: list, header: list[str]) -> bool:
     return len(cells) >= max(2, 0.5 * named) and same >= 2 and same >= 0.3 * len(cells) and differ >= 1
 
 
+def unpivot_sheet(st: SheetTable, columns: list[str], value: str, label: str = "") -> SheetTable:
+    """把几列同一类的值（如销售负责人、执行人、客户经理各一列人名）展开成每个值一行：其余列照抄，
+    展开的值放在 value 列，label 列记它原来在哪一列（如 角色）。空格子不展开；合计行不要。"""
+    idx = [st.headers.index(c) for c in columns]
+    keep = [i for i in range(len(st.headers)) if i not in idx]
+    headers = [st.headers[i] for i in keep] + [value] + ([label] if label else [])
+    rows = []
+    for j, vals in st.rows:
+        base = [vals[i] for i in keep]
+        for c, i in zip(columns, idx):
+            if vals[i] in (None, "") or (isinstance(vals[i], str) and not vals[i].strip()):
+                continue
+            rows.append((j, base + [vals[i]] + ([c] if label else [])))
+    return SheetTable(st.file, st.sheet, st.header_row, headers, rows, [], st.confidence, list(st.repeats), list(st.segments))
+
+
 def blank_header(i: int) -> str:
     """没有表头的第 i 列（0 起）的名字，如 “第1列(无表头)”。"""
     return f"第{i + 1}列(无表头)"

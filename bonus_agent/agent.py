@@ -29,7 +29,7 @@ from bonus_agent.extract_rules import Extraction, Question, check_quotes, prompt
 from bonus_agent.llm import LLM, LLMError, image_part, parse_json
 from bonus_core.data.mapping import DatasetMapping, apply_mapping
 from bonus_core.data.patches import apply_patches
-from bonus_core.data.table_detect import table_at
+from bonus_core.data.table_detect import table_at, unpivot_sheet
 from bonus_core.dsl.functions import describe as describe_functions
 from bonus_core.dsl.models import DatasetDef, RuleSet, Variable
 from bonus_core.dsl.parser import SELF_COMPARE_HINT, Call, ExprError, Num, parse, self_compares, walk
@@ -163,6 +163,10 @@ TOOLS: list[dict] = [
                          "distinct": {"type": "boolean", "description": "可选：按 key 的不同取值各建一个对象（同一编号的多行合成一个，"
                                       "其余字段在同一编号下要一样）。没有单独的主表、又要按这个编号汇总时用，如从明细里得到每个客户一个“客户”"},
                          "filter": {"type": "object", "description": '可选：只取这些行，{"列名": "取值"} 或 {"列名": ["取值1", "取值2"]}'},
+                         "unpivot": {"type": "object", "description":
+                                     '可选：几列放的是同一类值（如几个角色列各放一个人名）时展开成每个值一行：'
+                                     '{"columns": ["列1", "列2"], "value": "展开后的列名", "label": "记原列名的列名，如 角色"}。'
+                                     '空格子不展开；fields 和 filter 用展开后的列名。从这几列取全部对象时配合 key + distinct'},
                          "fields": {"type": "object", "additionalProperties": FIELD_SCHEMA,
                                     "description": "字段名（英文小写加下划线） -> 定义。重新定义同一张表、字段不变时可以不写（沿用上一次的）"}},
                         ["name", "file", "sheet"])},
@@ -697,7 +701,7 @@ class Workspace:
         pages = (self.triage.get(d.name) or {}).get("pages", {})
         header = _repeated_lines(d) if len({b.page for b in d.blocks}) >= TRIAGE_MIN_PAGES else set()
         same = self._same_images(d)
-        parts, k, page, run, shown = [], 0, object(), [], set()
+        parts, k, page, run, shown, said = [], 0, object(), [], set(), {}
 
         def flush():
             if run:
@@ -728,6 +732,12 @@ class Workspace:
                 if t is not None and _empty_transcript(t):
                     parts.append(f"[图片 #{k}：没有可用的文字内容]")
                     continue
+                flat = re.sub(r"\s+", "", t or "")
+                if flat and flat in said:     # 图片不一样、转写出来的字一样（每页的 logo、模板）：只给一次
+                    parts.append(f"[图片 #{k}：转写内容和图片 #{said[flat]} 相同]")
+                    continue
+                if flat:
+                    said[flat] = k
                 parts.append(f"[图片 #{k}]" + (f"（已转写）\n{t}" if t else "（用 view_image 查看）"
                                                if self.llm.image_llm else "（当前模型不能看图，未转写）"))
             elif b.text:
@@ -1085,20 +1095,20 @@ class Workspace:
     # ---- 数据表 ----
     def define_dataset(self, name: str, file: str, sheet: str, fields: dict | None = None, key: str | None = None,
                        link: str | None = None, desc: str = "", header_rows: list[int] | None = None,
-                       filter: dict | None = None, distinct: bool = False) -> str:
+                       filter: dict | None = None, distinct: bool = False, unpivot: dict | None = None) -> str:
         reuse = ""
         if not fields:      # 重新定义时只改 key / link / filter：沿用上一次的字段（模型常只写要改的部分，反复因缺 fields 失败）
             fields = self._prev_fields.get(name)
             if not fields:
                 raise ToolError(f"缺少 fields（字段名 -> {{column, type}}）。「{name}」之前没有定义成功过，要写全字段")
             reuse = f"没写 fields，沿用上一次定义「{name}」时的 {len(fields)} 个字段"
-        out = self._define_dataset(name, file, sheet, fields, key, link, desc, header_rows, filter, distinct)
+        out = self._define_dataset(name, file, sheet, fields, key, link, desc, header_rows, filter, distinct, unpivot)
         self._prev_fields[name] = fields
         return out + (f"\n{reuse}" if reuse else "")
 
     def _define_dataset(self, name: str, file: str, sheet: str, fields: dict, key: str | None = None,
                         link: str | None = None, desc: str = "", header_rows: list[int] | None = None,
-                        filter: dict | None = None, distinct: bool = False) -> str:
+                        filter: dict | None = None, distinct: bool = False, unpivot: dict | None = None) -> str:
         f = self._file(file)
         try:
             st = table_at(f, sheet, header_rows) if header_rows else self.inv.sheet(f"{f.name}/{sheet}")
@@ -1106,6 +1116,10 @@ class Workspace:
             raise ToolError(str(e)) from None
         if st is None:
             raise ToolError(f"{f.name}/{sheet} 没有自动识别出表格，请先 read_sheet 查看，再用 header_rows 指定表头行")
+        raw = st
+        spec = _unpivot_spec(unpivot, st) if unpivot else None
+        if spec:
+            st = unpivot_sheet(st, spec["columns"], spec["value"], spec.get("label") or "")
         fixed = []
         if isinstance(fields, dict):     # key / link 写成了 Excel 列名（如 entity_id），而字段已改名（dept_id ← entity_id）
             for which, val in (("key", key), ("link", link)):
@@ -1123,6 +1137,10 @@ class Workspace:
                                                                          for v in filter.values())):
             raise ToolError('filter 的格式是 {"列名": "取值"} 或 {"列名": ["取值1", "取值2"]}')
         flt = {str(k): ([str(x) for x in v] if isinstance(v, list) else str(v)) for k, v in (filter or {}).items()}
+        held = self._filter_drops_pending(st, flt)
+        if held:
+            raise ToolError("未保存：filter 排除了还在等财务答复的问题里问到的记录（" + "；".join(held) + "）。"
+                            "财务答复前不要自己排除，答复后按答复处理；先做不受影响的部分，然后 finish 等答复")
         d, m, warnings, errors = check_dataset(name, pd, st, types, header_rows, flt)
         if errors:
             owner = next((n for n, o in self.datasets.items() if n != name and key and o.key == key), None)
@@ -1130,6 +1148,8 @@ class Workspace:
                 errors.append(f"{key} 是「{owner}」的主键，这张表应写 link={key}（不写 key），每行挂到对应的{owner}上")
             raise ToolError("未保存，请修正：\n" + "\n".join(f"- {e}" for e in fixed + errors))
         warnings = fixed + warnings
+        if spec:
+            m.unpivot = spec
         prev = (self.datasets.get(name), self.mapping.get(name))
         self.datasets[name], self.mapping[name] = d, m
         bad, loose = self._link_mismatch(name)
@@ -1150,18 +1170,40 @@ class Workspace:
         lines = [f"已保存「{name}」（{kind}），{len(st.rows)} 行" + (f"，另有 {len(st.totals)} 行合计（不计入）" if st.totals else "")
                  + (f"，另有 {len(st.repeats)} 行是重复的表头（第 {'、'.join(map(str, st.repeats[:5]))} 行，不计入）"
                     if getattr(st, "repeats", None) else "")]
-        if getattr(st, "segments", None):
-            used = {st.headers.index(c) for c in m.columns.values() if c in st.headers}
-            hit = [(j, {i: c for i, c in ch.items() if i in used}) for j, ch in st.segments]
+        if getattr(raw, "segments", None):
+            cols = set(m.columns.values()) | set((spec or {}).get("columns") or [])
+            used = {raw.headers.index(c) for c in cols if c in raw.headers}
+            hit = [(j, {i: c for i, c in ch.items() if i in used}) for j, ch in raw.segments]
             if any(ch for _, ch in hit):
-                warnings.append(_segments_text(st, used) + "。数据按列的位置读（同一列在各段都归到同一个字段）："
+                warnings.append(_segments_text(raw, used) + "。数据按列的位置读（同一列在各段都归到同一个字段）："
                                 "用到的这些列在两段里含义不一样时（如一段是金额、一段是比例文字），用 ask_question 问财务，不要猜")
             else:
-                lines.append(_segments_text(st))
+                lines.append(_segments_text(raw))
+        if spec:
+            lines.append(f"已把 {len(spec['columns'])} 列（{'、'.join(spec['columns'])}）展开成每个值一行（空格子不展开），"
+                         f"值在「{spec['value']}」列" + (f"，原列名在「{spec['label']}」列" if spec.get("label") else ""))
         lines += [f"注意：{w}" for w in warnings]
         lines += [f"关联提示：{h}" for h in self._relation_hints(name)]
         lines.append("前 3 行（金额已换算为元）：" + json.dumps(sample, ensure_ascii=False))
         return "\n".join(lines)
+
+    def _filter_drops_pending(self, st, flt: dict) -> list[str]:
+        """filter 筛掉的行里，筛选列的取值出现在待答复问题原文里的：问题 -> 这些取值。"""
+        if not flt or not self.pending:
+            return []
+        from bonus_core.data.mapping import cell_text
+        from bonus_agent.auto import filter_sheet
+        kept, _ = filter_sheet(st, flt)
+        keep = {j for j, _ in kept.rows}
+        dropped = {c: {cell_text(v[st.headers.index(c)]) for j, v in st.rows if j not in keep}
+                   for c in flt if c in st.headers}
+        out = []
+        for q in self.pending:
+            text = q.text + " " + " ".join(q.options)
+            hit = sorted({x for vals in dropped.values() for x in vals if x and len(x) >= 2 and x in text})
+            if hit:
+                out.append(f"{q.id}：{'、'.join(hit[:8])}")
+        return out
 
     def _values(self, name: str, fld: str) -> list[str]:
         """数据表某个字段的全部取值（文字），用来判断表之间的关联。"""
@@ -1171,6 +1213,8 @@ class Workspace:
             if m.header_rows else self.inv.sheet(f"{Path(m.file).name}/{m.sheet}")
         if st is None or fld not in m.columns:
             return []
+        if m.unpivot:
+            st = unpivot_sheet(st, m.unpivot["columns"], m.unpivot["value"], m.unpivot.get("label") or "")
         st, _ = filter_sheet(st, m.filter or None)
         i = st.headers.index(m.columns[fld])
         return [cell_text(v[i]) for _, v in st.rows if v[i] not in (None, "")]
@@ -1269,6 +1313,10 @@ class Workspace:
         name = self._scheme(scheme, for_write=True)
         if name == SHARED and parts.get("pool") is not None:
             raise ToolError("pool 是每个方案自己的，不能写在共用部分")
+        temp = _temp_wording(parts, self._corpus)
+        if temp:      # 为了让试算通过写的临时口径：算出来的数没有意义，还会被当成结果
+            raise ToolError(f"未保存：规则里写了「{temp}」。规则只能按材料和财务答复写，不能用临时、假设的口径凑出试算结果。"
+                            "口径不清楚就 ask_question，受影响的部分等答复后再写，先做不受影响的部分")
         draft = json.loads(json.dumps(self.drafts.get(name, {})))
         for k in ("tables", "variables"):
             for n, v in (parts.get(k) or {}).items():
@@ -2040,7 +2088,7 @@ class Workspace:
             found = self._answer_in_material(text, options or [])
             if found:
                 return found
-        q = Question(id=f"q{len(self.questions) + 1}", text=text, options=options or [], suggested=suggested,
+        q = Question(id=_next_qid(self.questions), text=text, options=options or [], suggested=suggested,
                      related=related, blocking=blocking, round=self.round)
         self.questions.append(q)
         if blocking:
@@ -2557,6 +2605,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         raise ToolError(f"模型服务的上下文长度只有 {ctx} tokens（max_model_len），智能体每一步的输入就有约 4～5 万 tokens，"
                         f"至少要 {MIN_CONTEXT}，建议 131072。请管理员调大模型服务的上下文长度（vLLM 启动参数 --max-model-len；"
                         "超过模型原生长度的要同时开 YaRN），再重试")
+    used0 = llm.usage.prompt_tokens + llm.usage.completion_tokens    # 本轮开始前的累计用量（自动接续时同一个模型对象接着用）
     ws = Workspace(llm, build_inventory(files))
     out = Path(out_dir) if out_dir is not None else None
     case = cs.load_case(out) if out is not None else None      # --new 也保留历次记录，只是不接着上一轮的工作区
@@ -2564,7 +2613,8 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     prints = cs.fingerprint(files)
     rnd = cs.new_round(case, prints)
     ws.round = rnd["n"]
-    if answers is None and resumed and (out / "questions.yaml").exists():
+    # 上一轮没存下工作区（如中途崩溃）时，财务在 questions.yaml 里填的答复也要带上，不能丢
+    if answers is None and out is not None and (out / "questions.yaml").exists():
         answers = yaml.safe_load((out / "questions.yaml").read_text(encoding="utf-8")) or []
     last = case["rounds"][-1] if case and case.get("rounds") else None
     changes = None
@@ -2629,7 +2679,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         if should_stop and should_stop():
             error = f"已手动停止（第 {len(steps)} 步）"
             break
-        used = llm.usage.prompt_tokens + llm.usage.completion_tokens
+        used = llm.usage.prompt_tokens + llm.usage.completion_tokens - used0     # 只算本轮的用量
         if max_tokens and used >= max_tokens:
             error = f"tokens 用量 {used} 达到上限 {max_tokens}，已停止"
             break
@@ -2863,6 +2913,14 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             if on_step:
                 on_step(len(steps), steps[-1])
             continue
+        if (repeats >= MAX_STUCK or any(n >= MAX_STUCK for n in fails.values())) and ws.pending:
+            # 已经向财务提了阻断问题、又卡住了：多半就卡在等答复的地方。本轮到此为止等答复（不算失败），不再试错烧 tokens
+            ws.summary = ws.summary or f"本轮停在：{stuck[:200]}。已提的问题答复后接着做"
+            ws.done = True
+            steps.append(Step("（等答复）", {}, f"已有 {len(ws.pending)} 个问题等财务答复，又卡在：{stuck[:300]}。本轮先停下等答复", True))
+            if on_step:
+                on_step(len(steps), steps[-1])
+            break
         if (repeats >= MAX_STUCK or any(n >= MAX_STUCK for n in fails.values())) and reflected < reflect:
             # 卡住了先不停：清掉原地打转的对话历史（小模型会照着历史接着重复，也白占上下文），
             # 只留卡在哪、试过什么、程序的判断，让智能体回到材料和数据重新想、换一种做法。工作区（数据表、规则、台账）都保留
@@ -2912,7 +2970,11 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         h, t, _ = check_quotes(rs, ws.inv.docs)
         ar.quote_hits, ar.quote_total = ar.quote_hits + h, ar.quote_total + t
     if out is not None:
-        ar.outputs = write_agent_outputs(ar, out, answers)
+        try:
+            ar.outputs = write_agent_outputs(ar, out, answers)
+        except Exception as e:      # 写输出文件出错：本轮的工作区和财务答复照样存下，下一轮接着做，不能整轮白做
+            ar.outputs = {}
+            error = ar.error = (ar.error + "；" if ar.error else "") + f"写输出文件出错（{type(e).__name__}: {str(e)[:300]}）"
         rnd["inputs"] = [str(f) for f in ws.data_files]
         rnd["outputs"] = {k: [p.name, cs.sha256(p)] for k, p in ar.outputs.items()
                           if k in ("mapping", "rules", "review") or k.startswith(("rules:", "adjust:"))}
@@ -3000,6 +3062,59 @@ def _phase_note(ws: Workspace, k: int) -> str:
             "为了腾出上下文，之前的对话已清空（只留下刚完成的最后一步）。材料包仍在任务里；读过的结论在参数台账、条款清单、笔记和规则摘要里（见工作区状态），"
             "直接用，不要从头重读材料。\n"
             f"这一阶段要做：{PHASES[k][1]}。\n完成标准：{PHASES[k][2]}。")
+
+
+_TEMP_RULE = re.compile(r"临时(?:口径|公式|方案|规则|处理|取值|按)|暂按|假设[为是按]|占位|先凑|凑[出个]")
+
+
+def _temp_wording(parts: dict, corpus) -> str:
+    """规则里（原文摘录 sources 除外）自己写的“临时口径、暂按、假设为”之类：材料原文里没有这个说法时返回它。"""
+    texts = []
+
+    def walk(v, key=""):
+        if key in ("sources", "quote"):
+            return
+        if isinstance(v, dict):
+            for k, x in v.items():
+                walk(x, str(k))
+        elif isinstance(v, list):
+            for x in v:
+                walk(x, key)
+        elif isinstance(v, str):
+            texts.append(v)
+    walk(parts)
+    for t in texts:
+        m = _TEMP_RULE.search(t)
+        if m and not any(fx.norm(m.group()) in c for c in corpus().values()):
+            return m.group()
+    return ""
+
+
+def _unpivot_spec(spec, st) -> dict:
+    """校验 define_dataset 的 unpivot：{"columns": [几列], "value": 展开后的列名, "label": 记原列名的列名（可选）}。"""
+    if not isinstance(spec, dict) or not isinstance(spec.get("columns"), list) or not spec.get("value"):
+        raise ToolError('unpivot 的格式是 {"columns": ["列1", "列2"], "value": "展开后的列名", "label": "记原列名的列名（可选）"}')
+    cols = [str(c).strip() for c in spec["columns"]]
+    bad = [c for c in cols if c not in st.headers]
+    if len(cols) < 2 or bad:
+        raise ToolError((f"unpivot 的列「{'、'.join(bad)}」不在表头中，可选：{[h for h in st.headers if h]}" if bad
+                         else "unpivot 至少要写 2 列"))
+    if len(set(cols)) != len(cols) or any(st.headers.count(c) > 1 for c in cols):
+        raise ToolError("unpivot 的列名重复，或表头里有同名的几列，没法区分；先用 header_rows 指定表头或换列")
+    value, label = str(spec["value"]).strip(), str(spec.get("label") or "").strip()
+    rest = [h for h in st.headers if h not in cols]
+    for n in (value, label):
+        if n and n in rest:
+            raise ToolError(f"unpivot 展开后的列名「{n}」和表里已有的列重名，换一个")
+    if value == label:
+        raise ToolError("unpivot 的 value 和 label 要用不同的列名")
+    return {"columns": cols, "value": value, **({"label": label} if label else {})}
+
+
+def _next_qid(questions) -> str:
+    """新问题的编号：接着已有的最大编号往后排（已有的可能来自上一次没存下工作区的运行），不和旧问题撞号。"""
+    nums = [int(m.group(1)) for q in questions for m in [re.fullmatch(r"q(\d+)", str(q.id))] if m]
+    return f"q{max(nums + [len(questions)]) + 1}"
 
 
 def _segments_text(st, used: set[int] | None = None) -> str:

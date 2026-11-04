@@ -17,7 +17,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict
 
 from bonus_core.data.table import ConvertError, Datasets, Row, RowRef, StdTable, convert
-from bonus_core.data.table_detect import SheetTable, detect, table_at
+from bonus_core.data.table_detect import SheetTable, detect, table_at, unpivot_sheet
 from bonus_core.dsl.models import RuleSet
 from bonus_core.dsl.parser import names, parse
 from bonus_core.engine.issues import Issue
@@ -45,6 +45,7 @@ class DatasetMapping(BaseModel):
     header_rows: list[int] | None = None  # 自动识别的表头不对时，指定 Excel 表头行号
     columns: dict[str, str]            # 标准字段 -> 列名
     filter: dict[str, list[str] | str] = {}  # 只取这些行：列名 -> 允许的取值（如 目标值表里 entity_type 为 group 的行）
+    unpivot: dict | None = None        # 几列同一类的值展开成每个值一行：{"columns": [...], "value": 列名, "label": 列名}（先展开再筛选）
     confidence: dict[str, float] = {}  # 推荐时填写
     confirmed_by: str | None = None
 
@@ -201,6 +202,12 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping) -> tup
             where = "/".join(x for x in (m.file, m.sheet) if x) or "按表头查找"
             issues.append(Issue.block("sheet_missing", f"找不到「{ds_name}」对应的工作表（{where}）", ds_name))
             continue
+        if m.unpivot:
+            bad = [c for c in m.unpivot.get("columns") or [] if c not in st.headers]
+            if bad:
+                issues.append(Issue.block("column_missing", f"unpivot 的列「{'、'.join(bad)}」不在 sheet「{st.sheet}」中", ds_name))
+                continue
+            st = unpivot_sheet(st, m.unpivot["columns"], m.unpivot["value"], m.unpivot.get("label") or "")
         for f in ds.fields:
             if f not in m.columns and f in needed:
                 issues.append(Issue.block("field_unmapped", f"规则用到的字段 {f}（{ds.fields[f].desc}）没有对应的列", ds_name))
