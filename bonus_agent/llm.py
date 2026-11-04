@@ -383,6 +383,7 @@ class FakeLLM(LLM):
         self.reread: str | None = None      # 独立复读的回答（JSON 文本）；不设时复读结果为空
         self.calc: str | list[str] | None = None     # 独立算式的回答（几次改正时给列表，依次返回）；不设时为空
         self.source: str | None = None      # 提问前查原文的回答（JSON 文本）；不设时为“材料里没有”
+        self.triage = None                  # 材料预筛的回答：JSON 文本，或按消息生成回答的函数；不设时一页都不折叠
 
     def _next(self, *args):
         if callable(self._responder):
@@ -397,6 +398,10 @@ class FakeLLM(LLM):
         if str(messages[0].get("content", "")).startswith("【独立复读】") and \
                 (self.reread is not None or not callable(self._responder)):
             return self.reread or '{"items": []}'    # 独立复读：不消耗预设回答（脚本里接下来是工具调用）
+        if str(messages[0].get("content", "")).startswith("【材料预筛】"):
+            if callable(self.triage):
+                return self.triage(messages)
+            return self.triage or '{"pages": []}'     # 材料预筛：不消耗预设回答
         if str(messages[0].get("content", "")).startswith("【查原文】") and \
                 (self.source is not None or not callable(self._responder)):
             return self.source or '{"answerable": false}'

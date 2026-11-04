@@ -65,7 +65,7 @@ def material(ws) -> str:
     from bonus_agent.agent import CHAT_SOURCE, _json_data_summary
     parts = []
     for d in ws.inv.docs:
-        text = ws.read_document(d.name, 0, limit=10 ** 9)
+        text = ws.read_document(d.name, 0, limit=10 ** 9, folded=True)   # 独立复读看全文（预筛折叠的页也看），作为兜底
         if len(text) > DATA_JSON_CHARS and _json_data_summary(ws._file(d.name)):    # 大的结构化数据文件（数据行），不给
             continue
         if text.strip():

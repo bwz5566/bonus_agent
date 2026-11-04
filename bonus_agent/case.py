@@ -53,6 +53,7 @@ def snapshot(ws) -> dict:
         "verified": ws.verified,
         "check_vars": ws.check_vars,
         "reread": ws.reread,
+        "triage": ws.triage,
     }
 
 
@@ -70,6 +71,7 @@ def restore(ws, snap: dict) -> None:
     ws.conflicts = {k: Conflict.model_validate(c) for k, c in snap.get("conflicts", {}).items()}
     ws.check_vars = snap.get("check_vars", {})
     ws.reread = snap.get("reread", {})
+    ws.triage = snap.get("triage", {})
     ws.verified = snap.get("verified", {})     # 验算式留着，按本轮的规则和数据重新比对
     ws.untested = set(ws.schemes)            # 数据或答复可能变了，每个方案都要重新试算
 

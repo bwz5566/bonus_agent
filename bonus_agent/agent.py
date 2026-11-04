@@ -77,6 +77,10 @@ WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", 
 RULE_SUFFIXES = {".docx", ".pptx", ".pdf", ".png", ".jpg", ".jpeg", ".txt", ".md"}   # 规则文档：要登记参数
 CHAT_SOURCE = "财务对话"       # 财务在对话里贴的规则原文、口径说明：和材料一样可以引用核对
 ANSWER_NOTE = "回答财务"       # 财务的说明里带了提问：智能体把回答记在这条笔记里，网页放在本轮回复的开头（没算完也显示）
+TRIAGE_MIN_PAGES = 4            # 至少这么多页的文档才做预筛（短文档整份都有用的多，不值得多调一次模型）
+TRIAGE_CHUNK_CHARS = 24000      # 预筛一次送给模型的字数上限，超过就分几次
+TRIAGE_PAGE_CHARS = 900         # 每页送多少字给模型判断
+FOLD_LABELS = ("背景", "装饰", "空白")    # 预筛判为这几类、又没有表格和带单位数字的页，折叠成一行，不进上下文
 PIN_DOC_CHARS = 12000          # 不超过这么长的文档全文附在任务里（材料包），不必用工具读
 PIN_TOTAL_CHARS = 40000        # 材料包里文档全文的总长上限
 PIN_SHEET_ROWS = 30            # 不超过这么多行的工作表整表附上，更长的只附表头和前几行
@@ -104,7 +108,9 @@ TOOLS: list[dict] = [
     {"name": "list_files", "description": "列出本批次所有文件；Excel 列出每个工作表及自动识别的表头。",
      "parameters": _obj({})},
     {"name": "read_document", "description": "读取 Word / PPT / 图片文件的文字和表格（图片显示为占位符，用 view_image 查看）。",
-     "parameters": _obj({"file": _S, "offset": {**_I, "description": "从第几个字符开始，默认 0"}}, ["file"])},
+     "parameters": _obj({"file": _S, "offset": {**_I, "description": "从第几个字符开始，默认 0"},
+                         "folded": {"type": "boolean", "description": "可选：true 时把预筛折叠起来的页（背景介绍、封面等）也一起返回"}},
+                        ["file"])},
     {"name": "view_image", "description": "查看文件中的第 index 张图片（从 1 开始，默认 1），返回图片内容的逐字转写。",
      "parameters": _obj({"file": _S, "index": _I, "focus": {**_S, "description": "可选：希望重点看清的内容"}},
                         ["file"])},
@@ -602,6 +608,7 @@ class Workspace:
     drafts: dict[str, dict] = field(default_factory=dict)  # 方案 -> 规则草稿（tables / variables / pool / allocation ...）
     questions: list[Question] = field(default_factory=list)
     transcripts: dict[str, str] = field(default_factory=dict)
+    triage: dict[str, dict] = field(default_factory=dict)   # 材料预筛：文档 -> {"hash": 内容指纹, "pages": {页码: {label, reason, topic, fold}}}
     results: dict[str, dict[str, Result]] = field(default_factory=dict)   # 方案 -> 修订（R0 为基准）-> 结果
     untested: set[str] = field(default_factory=set)        # 最近修改后还没试算成功的方案
     summary: str = ""
@@ -668,7 +675,7 @@ class Workspace:
                          f"record_facts / record_clauses 引用时 file 写「{CHAT_SOURCE}」）")
         return "\n".join(lines)
 
-    def read_document(self, file: str, offset: int = 0, limit: int = MAX_RESULT_CHARS - 200) -> str:
+    def read_document(self, file: str, offset: int = 0, limit: int = MAX_RESULT_CHARS - 200, folded: bool = False) -> str:
         f = self._file(file)
         d = next((d for d in self.inv.docs if d.name == f.name), None)
         if d is None:
@@ -679,23 +686,114 @@ class Workspace:
         if summary and limit < 10 ** 9:
             return (summary + "\n这是结构化数据文件，不能逐页读、也不能直接定义成数据表。"
                     "同样的数据在 Excel 里有时用 Excel 的工作表定义数据表；它是唯一来源时请用 ask_question 请财务提供 Excel。")
-        parts, k = [], 0
-        same = self._same_images(d)
-        for b in d.blocks:
-            if b.kind == "image":
-                k += 1
-                if k in same:       # 和前面某张一模一样（多为每页都有的模板图、logo）：不再重复转写内容
-                    parts.append(f"{b.label()} 图片 #{k}（和图片 #{same[k]} 完全相同，不再重复）")
-                    continue
-                t = self.transcripts.get(f"{d.name}#{k}")
-                parts.append(f"{b.label()} 图片 #{k}" + (f"（已转写）\n{t}" if t else "（用 view_image 查看）"
-                                                          if self.llm.image_llm else "（当前模型不能看图，未转写）"))
-            elif b.text:
-                parts.append(f"{b.label()}\n{b.text}")
-        text = "\n\n".join(parts)
+        text = self._render_doc(d, folded)
         chunk = text[offset:offset + limit]
         more = len(text) - offset - len(chunk)
         return chunk + (f"\n\n……还有 {more} 字，用 offset={offset + len(chunk)} 继续读取" if more > 0 else "")
+
+    def _render_doc(self, d, folded: bool = False) -> str:
+        """文档的文字：按页分段，页首标一次页码；预筛判为背景、装饰、空白的页折叠成一行（folded=True 时照常展开）；
+        每页都重复的页眉只留第一次；和前面相同的图片、转写不出内容的图片只留一句。"""
+        pages = (self.triage.get(d.name) or {}).get("pages", {})
+        header = _repeated_lines(d) if len({b.page for b in d.blocks}) >= TRIAGE_MIN_PAGES else set()
+        same = self._same_images(d)
+        parts, k, page, run, shown = [], 0, object(), [], set()
+
+        def flush():
+            if run:
+                a, z = run[0][0], run[-1][0]
+                span = f"第{a}页" if a == z else f"第{a}–{z}页"
+                why = "；".join(dict.fromkeys(f"{r[1]}：{r[2]}" for r in run))[:300]
+                parts.append(f"[{span} 已折叠（预筛判为不参与计算）：{why}。需要时 read_document 带 folded=true 查看]")
+                run.clear()
+        for b in d.blocks:
+            if b.page != page:
+                page = b.page
+                info = pages.get(str(page)) or pages.get(page) or {}
+                if info.get("fold") and not folded:
+                    run.append((page, info.get("label", ""), info.get("reason", "")))
+                else:
+                    flush()
+                    parts.append(f"—— {d.name}" + (f" 第{page}页" if page else "") + " ——")
+            if b.kind == "image":
+                k += 1
+            info = pages.get(str(b.page)) or pages.get(b.page) or {}
+            if info.get("fold") and not folded:
+                continue
+            if b.kind == "image":
+                if k in same:       # 和前面某张一模一样（多为每页都有的模板图、logo）：不再重复转写内容
+                    parts.append(f"[图片 #{k}：和图片 #{same[k]} 完全相同]")
+                    continue
+                t = self.transcripts.get(f"{d.name}#{k}")
+                if t is not None and _empty_transcript(t):
+                    parts.append(f"[图片 #{k}：没有可用的文字内容]")
+                    continue
+                parts.append(f"[图片 #{k}]" + (f"（已转写）\n{t}" if t else "（用 view_image 查看）"
+                                               if self.llm.image_llm else "（当前模型不能看图，未转写）"))
+            elif b.text:
+                text = b.text
+                if header:
+                    keep = [ln for ln in text.split("\n") if ln.strip() not in header or ln.strip() not in shown]
+                    shown |= {ln.strip() for ln in text.split("\n") if ln.strip() in header}
+                    text = "\n".join(keep).strip()
+                    if not text:
+                        continue
+                parts.append(("[表格]\n" if b.kind == "table" else "") + text)
+        flush()
+        return "\n\n".join(parts)
+
+    def triage_all(self) -> None:
+        """材料预筛：多页的规则文档先让模型按页分类（规则 / 参数 / 数据说明 / 背景 / 装饰 / 空白），
+        背景、装饰、空白而且没有表格和带单位数字的页折叠起来，不进上下文。模型出错或输出不对就不折叠（宁可多留）。
+        独立复读、常数出处核对仍看全文。内容没变的文档不重复预筛。"""
+        import hashlib
+        for d in self.inv.docs:
+            pages = _doc_pages(d, self.transcripts)
+            if len(pages) < TRIAGE_MIN_PAGES:
+                continue
+            h = hashlib.sha1("\n".join(f"{p}:{t}" for p, t in pages.items()).encode()).hexdigest()[:16]
+            if (self.triage.get(d.name) or {}).get("hash") == h:
+                continue
+            labels: dict[str, dict] = {}
+            chunk, size = [], 0
+            batches = []
+            for p, t in pages.items():
+                piece = f"### 第{p}页\n{t[:TRIAGE_PAGE_CHARS]}"
+                if chunk and size + len(piece) > TRIAGE_CHUNK_CHARS:
+                    batches.append(chunk)
+                    chunk, size = [], 0
+                chunk.append(piece)
+                size += len(piece)
+            if chunk:
+                batches.append(chunk)
+            try:
+                for part in batches:
+                    out = self.llm.chat_json([{"role": "system", "content": prompt("triage")},
+                                              {"role": "user", "content": f"【材料预筛】文件 {d.name}\n\n" + "\n\n".join(part)}],
+                                             temperature=0)
+                    for it in (out.get("pages") or []) if isinstance(out, dict) else []:
+                        if isinstance(it, dict) and str(it.get("page", "")).strip():
+                            labels[str(it["page"]).strip()] = {"label": str(it.get("label", "")).strip(),
+                                                               "reason": str(it.get("reason", "")).strip()[:120],
+                                                               "topic": str(it.get("topic", "") or "").strip()[:60]}
+            except (LLMError, ValueError, TypeError):
+                continue        # 预筛失败不影响开工：整份照常给
+            tables = {str(b.page) for b in d.blocks if b.kind == "table"}
+            for p, info in labels.items():
+                text = pages.get(p if p in pages else int(p) if p.isdigit() else p, "")
+                # 兜底：有表格、有带单位的数字（%、万、元、系数等）的页不折叠，哪怕模型判成了背景
+                info["fold"] = info["label"] in FOLD_LABELS and p not in tables and not _has_figures(text)
+            self.triage[d.name] = {"hash": h, "pages": labels}
+
+    def triage_report(self) -> list[str]:
+        """预筛折叠了哪些页（给财务和模型看）：文件 -> 页码和理由。"""
+        out = []
+        for name, t in self.triage.items():
+            folded = [(p, i) for p, i in (t.get("pages") or {}).items() if i.get("fold")]
+            if folded:
+                pages = "、".join(f"第{p}页" for p, _ in sorted(folded, key=lambda x: int(x[0]) if x[0].isdigit() else 0))
+                out.append(f"{name}：折叠了 {pages}（{'、'.join(dict.fromkeys(i['label'] for _, i in folded))}）")
+        return out
 
     def _same_images(self, d) -> dict[int, int]:
         """文档里和前面某张字节完全相同的图片：序号 -> 第一次出现的序号（PPT 每页的 logo、模板底图）。"""
@@ -780,6 +878,10 @@ class Workspace:
         较早的对话被裁剪也不会丢，模型不用反复读。"""
         self.pinned = set()
         parts, used = [], 0
+        if self.triage_report():
+            parts.append("材料预筛（程序先让模型逐页分类）把介绍、目录、致谢这类不参与计算的页折叠了，文中标了“已折叠”：\n"
+                         + "\n".join(f"- {r}" for r in self.triage_report())
+                         + "\n觉得折叠的页里可能有规则时，用 read_document 带 folded=true 查看。")
         for d in self.inv.docs:
             text = self.read_document(d.name, 0, limit=10 ** 9)
             summary = _json_data_summary(self._file(d.name)) if len(text) > PIN_DOC_CHARS else ""
@@ -2138,8 +2240,8 @@ class Workspace:
             lines.append("- 尚未写入规则")
         if self.facts:
             by = {}
-            for f in self.facts:
-                by.setdefault(f.file, []).append(f.name)
+            for f in self.facts:      # 带上取值：清空对话后不用为了看数值重读材料
+                by.setdefault(f.file, []).append(f"{f.name}={str(f.value)[:40]}" if len(self.facts) <= 150 else f.name)
             lines.append(f"- 参数台账 {len(self.facts)} 条（再登记同一参数请用相同的名字）：")
             lines += [f"  · {k}：{'、'.join(dict.fromkeys(v))}" for k, v in by.items()]
         if self.clauses:
@@ -2471,6 +2573,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     ws.notes.pop(ANSWER_NOTE, None)          # 上一轮的回答不带到这一轮
     handlers = {t["name"]: getattr(ws, t["name"]) for t in TOOLS}
     ws.transcribe_all()
+    ws.triage_all()
     pack = ("\n\n【材料包】以下是本批次材料的内容（程序读取，图片已转写），每轮都附在这里、不会被裁剪。"
             "标了“全文 / 整表”的不要再用工具读；数据表只附了前几行，define_dataset 会读取全部行。\n\n" + ws.briefing())
     if message:             # 对话：财务的一条消息。先按现有规则试算一遍，便于回答和查算式
@@ -2889,6 +2992,56 @@ def _phase_note(ws: Workspace, k: int) -> str:
             f"这一阶段要做：{PHASES[k][1]}。\n完成标准：{PHASES[k][2]}。")
 
 
+_FIGURE = re.compile(r"\d(?:[\d,.]*)\s*(?:%|％|‰|万|亿|元|倍|pcs|PCS|Kg|kg)|系数|比例|阶梯|[<>≤≥]\s*\d")
+_EMPTY_IMAGE = re.compile(r"看不清|无法辨认|无可转写|没有可转写|无文字|无内容|空白|无关|没有.{0,8}(?:内容|文字|信息)|标志|商标|logo|LOGO|Logo|装饰|背景图")
+
+
+def _has_figures(text: str) -> bool:
+    """页里有带单位的数、比例、阶梯这类参数痕迹：不折叠。"""
+    return bool(_FIGURE.search(text or ""))
+
+
+def _empty_transcript(t: str) -> bool:
+    """转写不出内容的图片（logo、装饰图、“看不清”）：空的，或只用一两句说看不清、是标志、没有相关内容。
+    带数字的一律算有内容；很短但没这些字样的（如流程图里的“按季度发放”）也照常给。"""
+    s = re.sub(r"\s+", "", t or "")
+    if re.search(r"\d", s):
+        return False
+    return not s or (len(s) <= 60 and bool(_EMPTY_IMAGE.search(s)))
+
+
+def _doc_pages(d, transcripts: dict[str, str]) -> dict:
+    """文档按页的文字（含有内容的图片转写），页码 -> 文字；没有页码的文档整份算一页。"""
+    out: dict = {}
+    k = 0
+    for b in d.blocks:
+        p = b.page if b.page is not None else 1
+        if b.kind == "image":
+            k += 1
+            t = transcripts.get(f"{d.name}#{k}", "")
+            text = "" if _empty_transcript(t) else t
+        else:
+            text = b.text or ""
+        if text:
+            out[p] = (out.get(p, "") + "\n" + text).strip()
+        else:
+            out.setdefault(p, "")
+    return out
+
+
+def _repeated_lines(d) -> set[str]:
+    """每页都重复的页眉、页脚（如“XX 制度 - 某章节”）：作为页首或页尾一行的短行，至少 3 页、过半的页里都有。
+    只看页首页尾，避免把正文里反复出现的小标题（如各奖项都有的“考核方式”）当成页眉去掉。"""
+    from collections import Counter
+    pages: dict = {}
+    for b in d.blocks:
+        if b.text and b.kind != "table":
+            pages.setdefault(b.page, []).extend(ln.strip() for ln in b.text.split("\n") if ln.strip())
+    n = len(pages)
+    cnt = Counter(ln for lines in pages.values() for ln in {lines[0], lines[-1]} if len(ln) <= 40)
+    return {ln for ln, c in cnt.items() if c >= 3 and c >= 0.5 * n and not re.fullmatch(r"[\d.\s/第页共-]+", ln)}
+
+
 DEEP_SHOW = 4000                 # 步骤记录里留多少思考内容（全文只在当次请求里）
 FORMAT_ERRORS = ("错误：参数", "错误：没有工具")    # 参数格式这类小错：程序已经说清楚怎么改，第一次不用深度思考
 
@@ -3008,7 +3161,7 @@ def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None =
         + yaml.safe_dump(qrows, allow_unicode=True, sort_keys=False), encoding="utf-8")
     paths["log"] = out / "agent_log.json"
     paths["log"].write_text(json.dumps({"summary": ws.summary, "error": ar.error, "transcripts": ws.transcripts,
-                                        "steps": [vars(s) for s in ar.steps]}, ensure_ascii=False, indent=2),
+                                        "triage": ws.triage, "steps": [vars(s) for s in ar.steps]}, ensure_ascii=False, indent=2),
                             encoding="utf-8")
     if ar.status == "FAILED":       # 没做完（没通过检查或独立验算）：不出结果文件，免得被当成结果用；过程在 agent_log 里
         return paths

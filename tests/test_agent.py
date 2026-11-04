@@ -275,14 +275,14 @@ def test_briefing_pins_short_docs_and_small_sheets():
     from bonus_agent.agent import Workspace
     from bonus_agent.auto import build_inventory, collect_files
     inp = ROOT / "evals" / "cases" / "syn_acceptance" / "inputs"
-    ws = Workspace(FakeLLM(["（图片转写）"]), build_inventory(collect_files([inp])))
+    ws = Workspace(FakeLLM(["（图片转写）毛利率 30% 以上系数 1.2"]), build_inventory(collect_files([inp])))
     ws.transcribe_all()
     pack = ws.briefing()
     # 规则文档、确认单、参数表整份附上；大的 JSON 和长数据表只附开头
     assert {"01_奖金制度.docx", "02_规则补充.pptx", "finance_answers.json", "毛利率系数图.png",
             "04_计算参数.xlsx/阶梯与系数"} <= ws.pinned
     assert "business_data.json" not in ws.pinned and "03_业务输入.xlsx/销售明细" not in ws.pinned
-    assert "Q_OFFSET" in pack and "R_Q_TIER" in pack and "（图片转写）" in pack and len(pack) < 30000
+    assert "Q_OFFSET" in pack and "R_Q_TIER" in pack and "（图片转写）毛利率 30% 以上系数 1.2" in pack and len(pack) < 30000
     assert "材料包" in ws.read_document("01_奖金制度.docx")
     assert "材料包" in ws.read_sheet("04_计算参数.xlsx", "数值参数")
     assert "第7行" in ws.read_sheet("03_业务输入.xlsx", "销售明细", start_row=7, rows=3)
