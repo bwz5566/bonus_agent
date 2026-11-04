@@ -91,6 +91,41 @@ def test_blank_header_column_and_repeated_header_row(tmp_path):
     assert st.headers[0] == "第1列(无表头)" and [v[0] for _, v in st.rows] == ["K1", "K2", "K3"] and st.repeats == [4]
 
 
+def test_second_header_with_different_names_starts_a_segment(tmp_path):
+    """两段数据拼在一张表，第二段的表头有几列改了名或空着（如“客户经理1”改成“客户经理”、“金额1”改成“金额”）：
+    那一行不当数据（原来在数字列报“无法解析为数字”），并说明哪几列名字变了；数据仍按列的位置读。"""
+    from bonus_agent.agent import _segments_text
+    p = tmp_path / "s.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "名单"
+    head = ["日期", "客户", "负责人", "金额", "客户经理1", "客户经理2", "金额1", "其他金额"]
+    for r in (head, [202601, "C1", "甲", None, "乙", None, None, None], [202601, "C2", "甲", None, "丙", None, None, None],
+              ["日期", "客户", "负责人", "金额", "客户经理", None, "金额", "其他金额"],
+              [202602, "C3", None, None, "丁", "戊", "丁80%，戊20%", None]):
+        ws.append(r)
+    wb.save(p)
+    st = next(s for s in detect(p) if s.sheet == "名单")
+    assert [v[1] for _, v in st.rows] == ["C1", "C2", "C3"] and not st.repeats
+    assert st.segments and st.segments[0][0] == 4
+    assert st.rows[-1][1][5] == "戊" and st.rows[-1][1][6] == "丁80%，戊20%"
+    text = _segments_text(st)
+    assert "第 4 行是另一段数据的表头" in text and "「客户经理1」在这一段叫「客户经理」" in text
+    assert "「客户经理2」在这一段没有列名" in text and "「金额1」在这一段叫「金额」" in text
+
+
+def test_text_data_rows_are_not_mistaken_for_headers(tmp_path):
+    p = tmp_path / "s.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "部门"
+    for r in (["部门编号", "部门名称", "负责人"], ["D1", "销售部", "甲"], ["D2", "部门名称", "乙"], ["D3", "研发部", "丙"]):
+        ws.append(r)
+    wb.save(p)
+    st = next(s for s in detect(p) if s.sheet == "部门")
+    assert len(st.rows) == 3 and not st.segments and not st.repeats
+
+
 def test_numbers_with_units_and_bad_text():
     assert to_decimal("0.24%") == D("0.0024") and to_decimal("5000万") == D(50000000) and to_decimal("1.5亿") == D(150000000)
     with pytest.raises(ValidationError):       # 原来是 decimal.InvalidOperation，整次运行崩掉
@@ -150,3 +185,23 @@ def test_identical_images_are_transcribed_once():
     ws.transcribe_all()
     assert llm.usage.calls - n0 == 2 and ws.transcripts["规则.pptx#3"] == "LOGO"
     assert "和图片 #1 完全相同" in ws.read_document("规则.pptx", 0, limit=10 ** 9)
+
+
+def test_define_dataset_warns_when_used_column_is_renamed_in_a_segment(tmp_path):
+    from bonus_agent.agent import Workspace
+    from bonus_agent.auto import build_inventory, collect_files
+    from bonus_agent.llm import FakeLLM
+    p = tmp_path / "s.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "名单"
+    for r in (["客户", "负责人", "客户经理1", "比例说明"], ["C1", "甲", "乙", None], ["C2", "甲", "丙", None],
+              ["客户", "负责人", "客户经理", "拆分"], ["C3", "甲", "丁", "丁80%，戊20%"]):
+        ws.append(r)
+    wb.save(p)
+    w = Workspace(FakeLLM(["x"]), build_inventory(collect_files([tmp_path])))
+    out = w.define_dataset("名单", "s.xlsx", "名单", {"cust": {"column": "客户", "type": "id"},
+                                                     "mgr": {"column": "客户经理1", "type": "text"}}, link=None)
+    assert "3 行" in out and "注意：第 5 行是另一段数据的表头" not in out
+    assert "第 4 行是另一段数据的表头" in out and "「客户经理1」在这一段叫「客户经理」" in out and "ask_question" in out
+    assert "比例说明" not in out.split("注意：", 1)[1].split("\n")[0]      # 没用到的列不在提醒里

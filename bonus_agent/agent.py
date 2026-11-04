@@ -853,6 +853,8 @@ class Workspace:
         st = self.inv.sheet(f"{f.name}/{sheet}")
         head = (f"工作表共 {total} 行" + (f"，自动识别表头在第 {st.header_row} 行、{len(st.rows)} 行数据" if st else "，未自动识别出表格")
                 + f"；以下为第 {start_row}~{min(start_row + rows - 1, total)} 行")
+        if st and st.segments:
+            head += "\n" + _segments_text(st)
         end = start_row + rows - 1
         tail = (f"\n（还有第 {end + 1}~{total} 行，用 start_row={end + 1} 继续；数据表不必读完，define_dataset 会读取全部行）"
                 if end < total else "\n（已到末尾）")
@@ -1148,6 +1150,14 @@ class Workspace:
         lines = [f"已保存「{name}」（{kind}），{len(st.rows)} 行" + (f"，另有 {len(st.totals)} 行合计（不计入）" if st.totals else "")
                  + (f"，另有 {len(st.repeats)} 行是重复的表头（第 {'、'.join(map(str, st.repeats[:5]))} 行，不计入）"
                     if getattr(st, "repeats", None) else "")]
+        if getattr(st, "segments", None):
+            used = {st.headers.index(c) for c in m.columns.values() if c in st.headers}
+            hit = [(j, {i: c for i, c in ch.items() if i in used}) for j, ch in st.segments]
+            if any(ch for _, ch in hit):
+                warnings.append(_segments_text(st, used) + "。数据按列的位置读（同一列在各段都归到同一个字段）："
+                                "用到的这些列在两段里含义不一样时（如一段是金额、一段是比例文字），用 ask_question 问财务，不要猜")
+            else:
+                lines.append(_segments_text(st))
         lines += [f"注意：{w}" for w in warnings]
         lines += [f"关联提示：{h}" for h in self._relation_hints(name)]
         lines.append("前 3 行（金额已换算为元）：" + json.dumps(sample, ensure_ascii=False))
@@ -2990,6 +3000,16 @@ def _phase_note(ws: Workspace, k: int) -> str:
             "为了腾出上下文，之前的对话已清空（只留下刚完成的最后一步）。材料包仍在任务里；读过的结论在参数台账、条款清单、笔记和规则摘要里（见工作区状态），"
             "直接用，不要从头重读材料。\n"
             f"这一阶段要做：{PHASES[k][1]}。\n完成标准：{PHASES[k][2]}。")
+
+
+def _segments_text(st, used: set[int] | None = None) -> str:
+    """表中间另一段表头的说明：哪一行、哪几列的列名和上面不同。used 给出时只列用到的列。"""
+    out = []
+    for j, ch in st.segments:
+        diff = [f"第{i + 1}列「{a}」在这一段" + (f"叫「{b}」" if b else "没有列名")
+                for i, (a, b) in sorted(ch.items()) if used is None or i in used]
+        out.append(f"第 {j} 行是另一段数据的表头（不计入数据）" + ("，" + "、".join(diff[:8]) if diff else "，列名和上面一样"))
+    return "；".join(out)
 
 
 _FIGURE = re.compile(r"\d(?:[\d,.]*)\s*(?:%|％|‰|万|亿|元|倍|pcs|PCS|Kg|kg)|系数|比例|阶梯|[<>≤≥]\s*\d")

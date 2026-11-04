@@ -237,7 +237,8 @@ def filter_sheet(st: SheetTable, flt: dict | None) -> tuple[SheetTable, str]:
     keep = row_filter(st.headers, flt)
     if isinstance(keep, str):
         return st, keep
-    out = SheetTable(st.file, st.sheet, st.header_row, st.headers, [r for r in st.rows if keep(r[1])], [], st.confidence, st.repeats)
+    out = SheetTable(st.file, st.sheet, st.header_row, st.headers, [r for r in st.rows if keep(r[1])], [], st.confidence, st.repeats,
+                     st.segments)
     if not out.rows:
         seen = {c: sorted({cell_text(v[st.headers.index(c)]) for _, v in st.rows})[:20] for c in flt}
         return st, f"按 filter {flt} 筛选后没有任何行，这些列实际的取值：{seen}"

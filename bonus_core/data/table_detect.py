@@ -20,6 +20,9 @@ class SheetTable:
     totals: list[tuple[int, list]] = field(default_factory=list)  # 合计行，用于对账
     confidence: float = 1.0
     repeats: list[int] = field(default_factory=list)              # 数据中间重复出现的表头行（Excel 行号），不计入数据
+    # 数据中间出现的另一段表头（几段数据拼在一起、列名有出入）：(Excel 行号, {列下标: (原列名, 这一段的列名)})。
+    # 这一行不计入数据；数据仍按列的位置读（同一列），列名有出入的列由使用方提示核对两段含义是否一致
+    segments: list[tuple[int, dict]] = field(default_factory=list)
 
     def column(self, header: str) -> list:
         i = self.headers.index(header)
@@ -112,14 +115,37 @@ def _build(grid, file: str, title: str, header_idx: list[int]) -> SheetTable:
             header[i] = blank_header(i)
     t = SheetTable(file, title, header_idx[0] + 1, header)
     names = [h for h in header if h]
+    active = list(header)              # 当前这一段的表头
     for j, row in body:
         if _filled(row) == 0:
             continue
-        if names and _is_header_copy(row, header):      # 数据中间又夹了一行表头（几段数据拼在一起时常见）：不是数据
+        if names and _is_header_copy(row, active):      # 数据中间又夹了一行同样的表头（几段数据拼在一起时常见）：不是数据
             t.repeats.append(j)
+            continue
+        if names and _is_segment_header(row, active):  # 另一段的表头，有几列的列名和上面不同
+            changed = {}
+            for i, v in enumerate(row):
+                new = str(v).strip() if v not in (None, "") else ""
+                if new != active[i] and (new or active[i]):
+                    changed[i] = (header[i], new)
+                    if new:
+                        active[i] = new
+            t.segments.append((j, changed))
             continue
         (t.totals if _is_total(row) else t.rows).append((j, row))
     return t
+
+
+def _is_segment_header(row: list, header: list[str]) -> bool:
+    """这一行是另一段表的表头：全是文字，至少一半有名字的列都填了，其中至少 2 格、三成以上和当前表头相同（同一类表），
+    但又有和当前表头不同的列名。全是文字的普通数据行（如 部门编号 | 部门名称）很少会和表头有两格以上相同。"""
+    cells = [(str(v).strip(), h) for v, h in zip(row, header) if v not in (None, "")]
+    if not cells or any(not _is_text(v) for v in row if v not in (None, "")):
+        return False
+    named = sum(1 for h in header if h and not h.endswith("(无表头)"))
+    same = sum(1 for v, h in cells if v == h)
+    differ = sum(1 for v, h in cells if v != h)
+    return len(cells) >= max(2, 0.5 * named) and same >= 2 and same >= 0.3 * len(cells) and differ >= 1
 
 
 def blank_header(i: int) -> str:
