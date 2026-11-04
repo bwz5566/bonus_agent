@@ -381,7 +381,8 @@ def _agent(a, cfg) -> int:
     u = llm.usage
     cached = f"（其中命中缓存 {u.cached_tokens}）" if u.cached_tokens else ""
     print(f"共 {len(ar.steps)} 步，调用模型 {u.calls} 次，输入 {u.prompt_tokens} tokens{cached}，输出 {u.completion_tokens} tokens，"
-          f"平均每次输入 {u.prompt_tokens // max(u.calls, 1)}，耗时 {u.latency_s:.0f} 秒")
+          f"平均每次输入 {u.prompt_tokens // max(u.calls, 1)}，耗时 {u.latency_s:.0f} 秒"
+          + (f"；其中 {ar.deep_steps} 步出错后深度思考" if ar.deep_steps else ""))
     return {"OK": 0, "NEEDS_CONFIRMATION": 3}.get(ar.status, 1)
 
 

@@ -60,6 +60,21 @@ def material_numbers(text: str) -> set[str]:
     return out
 
 
+def percent_only(text: str) -> set[str]:
+    """材料里只以百分数（或千分数）出现、从没单独出现过的数（如只写过“0.24%”的 0.24）。
+    规则里写成 0.24 多半是漏了 %，金额会差 100 倍。"""
+    t = unicodedata.normalize("NFKC", text)
+    t = re.sub(r"(?<=\d),(?=\d{3})", "", t)
+    pct, bare = set(), set()
+    for m in _NUM.finditer(t):
+        try:
+            k = _key(Decimal(m.group(1)))
+        except InvalidOperation:
+            continue
+        (pct if m.group(2) in ("%", "％", "‰") else bare).add(k)
+    return pct - bare
+
+
 @dataclass
 class Report:
     gates: list[str] = field(default_factory=list)       # finish 前必须处理
@@ -189,14 +204,23 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
         if same:
             rep.gates.append(f"{where} 里的 {'、'.join(dict.fromkeys(same))} {SELF_COMPARE_HINT}")
             rep.keys.append(f"同字段比较 {where}")
-    # 1. 常数要有出处
+    # 1. 常数要有出处；材料里只写成百分数的，规则里不能漏了 %
     miss: dict[str, set[str]] = {}
+    unit: dict[str, set[str]] = {}
+    pct_only = percent_only(text)
     for n, where in constants(rs):
         if where.removeprefix("tables.") in copied:
+            continue
+        if _key(abs(n)) in pct_only and abs(n) not in FREE:
+            unit.setdefault(_key(abs(n)), set()).add(where)
             continue
         if n in FREE or abs(n) in FREE or _key(abs(n)) in nums:
             continue
         miss.setdefault(_key(n), set()).add(where)
+    for k, ws in unit.items():
+        rep.gates.append(f"常数 {k}（{'、'.join(sorted(ws))}）在材料里只以 {k}% 出现：规则里应写 {_key(Decimal(k) / 100)}"
+                         f"（或写成 \"{k}%\"），现在会大 100 倍。确实就是 {k} 才保留")
+        rep.keys.append(f"百分号 {k}")
     for k, ws in miss.items():
         if sourced:
             rep.warns.append(f"常数 {k}（{'、'.join(sorted(ws))}）在材料文字里找不到出处（{sourced}），请自己核对")

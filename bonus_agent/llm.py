@@ -42,6 +42,48 @@ class LLMError(RuntimeError):
     pass
 
 
+THINK_BUDGET = 8192               # 百炼千问思考时每步思考 tokens 的上限
+THINK_KEYS = ("enable_thinking", "thinking")      # 各家“思考开关”的参数名：千问 / vLLM 模板用 enable_thinking，DeepSeek 用 thinking
+
+
+def think_switch(body: dict | None, top: bool = True) -> dict | None:
+    """按配置里“关闭思考”的写法，推出“打开思考”的请求参数，不用给每个模型另写一份：
+    百炼千问 {enable_thinking: false}、vLLM {chat_template_kwargs: {enable_thinking / thinking: false}}、
+    DeepSeek {thinking: {type: disabled}}。找不到关闭开关（模型本身不思考，或已经一直在思考）返回 None。"""
+    if not body:
+        return None
+    out, found = {}, False
+    for k, v in body.items():
+        if k in THINK_KEYS and v is False:
+            out[k], found = True, True
+            if top and k == "enable_thinking" and "thinking_budget" not in body:     # 百炼的写法：顺带限制一步的思考长度
+                out["thinking_budget"] = THINK_BUDGET
+        elif k == "thinking" and isinstance(v, dict) and v.get("type") == "disabled":
+            out[k], found = {**v, "type": "enabled"}, True
+        elif isinstance(v, dict):
+            sub = think_switch(v, top=False)
+            if sub is not None:
+                out[k], found = {**v, **sub}, True
+    return out if found else None
+
+
+def _merge(a: dict | None, b: dict | None) -> dict:
+    """合并请求参数，嵌套的字典（如 chat_template_kwargs）逐项合并，后者优先。"""
+    out = dict(a or {})
+    for k, v in (b or {}).items():
+        out[k] = _merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
+def _reasoning(msg) -> str:
+    """思考内容：vLLM、百炼、DeepSeek 放在 reasoning_content（新版 vLLM 叫 reasoning），没有就是空。"""
+    for k in ("reasoning_content", "reasoning"):
+        v = getattr(msg, k, None) or (getattr(msg, "model_extra", None) or {}).get(k)
+        if isinstance(v, str) and v.strip():
+            return v
+    return ""
+
+
 def load_config(path: str | Path | None = None, secrets: str | Path | None = None) -> dict:
     """读取模型配置，并合并 secrets.yaml（API Key、专属域名等，不入库）。
 
@@ -178,6 +220,13 @@ class LLM:
     vision: bool = True               # 能否看图；不能看图时由 vision_llm 转写图片（没配置就不转写）
     vision_llm: "LLM | None" = None
     checker_llm: "LLM | None" = None  # 交叉验证（独立复读、独立算式）用的另一个模型；没配置就用自己
+    # 深度思考（按需）：智能体出错、卡住时这一步临时打开思考，想清楚错在哪再动手；平时不开，省时间和 tokens。
+    # think_body 是打开思考时追加的请求参数，默认从 extra_body 的关闭开关推出来（见 think_switch），None 表示这个模型不能切换
+    think_body: dict | None = None
+    think_max_tokens: int = 16384     # 思考也占输出 tokens，思考的那一步放宽
+    think_timeout: float = 900        # 本地模型思考一步可能要几分钟
+    think_echo: bool = False          # 下一步把这一步的思考内容带回去（DeepSeek 思考模式下工具调用要求带回）
+    last_reasoning: str = ""          # 最近一次思考调用的思考内容
     usage: Usage = field(default_factory=Usage)
 
     @classmethod
@@ -192,6 +241,16 @@ class LLM:
         llm = cls(name, m["model"], prov["base_url"], provider_key(prov), m.get("json_mode", "json_object"),
                   m.get("extra_body"), m.get("tool_mode", "native"), cache=m.get("cache"),
                   tools_extra_body=m.get("tools_extra_body"), timeout=float(m.get("timeout", 300)))
+        t = m.get("think", "auto")      # auto：按关闭开关推出来；false：不切换；字典：打开思考时的请求参数
+        if t == "auto":
+            llm.think_body = think_switch(_merge(m.get("extra_body"), m.get("tools_extra_body")))
+        elif isinstance(t, dict):
+            llm.think_body = t
+        elif t not in (False, None):
+            raise LLMError(f"模型 {name} 的 think 应是 auto、false 或请求参数，得到 {t!r}")
+        llm.think_max_tokens = int(m.get("think_max_tokens", llm.think_max_tokens))
+        llm.think_timeout = float(m.get("think_timeout", max(llm.think_timeout, llm.timeout)))
+        llm.think_echo = bool(m.get("think_echo", "thinking" in (llm.think_body or {})))
         v = m.get("vision", True)       # true：自己看图；false：不能看图；模型名：用那个模型转写图片
         if isinstance(v, str):
             if v == name or cfg["models"].get(v, {}).get("vision", True) is not True:
@@ -221,10 +280,17 @@ class LLM:
             u.cached_tokens = (getattr(details, "cached_tokens", None) or 0) if details else 0
         self.usage += u
 
+    @property
+    def can_think(self) -> bool:
+        return self.think_body is not None
+
     def _prepare(self, messages: list[dict]) -> list[dict]:
-        """去掉内部用的 _cache 标记；开启显式缓存时，把标记换成 cache_control（缓存到该消息为止的前缀）。"""
+        """去掉内部用的 _cache 标记；开启显式缓存时，把标记换成 cache_control（缓存到该消息为止的前缀）。
+        思考内容（reasoning_content）只在要求带回的服务上保留，别的服务不认这个字段。"""
         out = []
         for m in messages:
+            if "reasoning_content" in m and not (self.think_echo and m["reasoning_content"]):
+                m = {k: v for k, v in m.items() if k != "reasoning_content"}
             if "_cache" not in m:
                 out.append(m)
                 continue
@@ -234,8 +300,14 @@ class LLM:
             out.append(m)
         return out
 
-    def _client(self):
-        return openai_client(self.base_url, self.api_key, self.timeout)
+    def _client(self, think: bool = False):
+        return openai_client(self.base_url, self.api_key, self.think_timeout if think else self.timeout)
+
+    def _think(self, think: bool, body: dict, max_tokens: int) -> tuple[bool, dict, int]:
+        """这一步是否真的思考、请求参数、输出上限。模型不能切换思考时照常调用。"""
+        if not (think and self.can_think):
+            return False, body, max_tokens
+        return True, _merge(body, self.think_body), max(max_tokens, self.think_max_tokens)
 
     def context_window(self) -> int | None:
         """模型服务的上下文长度（vLLM 在 /models 里返回 max_model_len）；查不到返回 None，不影响调用。"""
@@ -251,44 +323,49 @@ class LLM:
         return self._ctx
 
     def chat(self, messages: list[dict], *, schema: dict | None = None, json_out: bool = False,
-             temperature: float = 0.1, max_tokens: int = 8192) -> str:
+             temperature: float = 0.1, max_tokens: int = 8192, think: bool = False) -> str:
+        """think：这一次打开思考（JSON 协议的智能体出错后用）。思考时不加 response_format：
+        部分服务思考模式下不支持 JSON 输出，结果仍按容错方式解析。思考内容放在 last_reasoning。"""
+        think, body, max_tokens = self._think(think, dict(self.extra_body or {}), max_tokens)
         kwargs = dict(model=self.model, messages=self._prepare(messages), temperature=temperature, max_tokens=max_tokens)
-        if self.extra_body:
-            kwargs["extra_body"] = self.extra_body
-        if json_out or schema:
+        if body:
+            kwargs["extra_body"] = body
+        if (json_out or schema) and not think:
             if schema and self.json_mode == "json_schema":
                 kwargs["response_format"] = {"type": "json_schema", "json_schema": {"name": "output", "schema": schema}}
             else:
                 kwargs["response_format"] = {"type": "json_object"}
         t0 = time.monotonic()
         try:
-            resp = self._client().chat.completions.create(**kwargs)
+            resp = self._client(think).chat.completions.create(**kwargs)
         except Exception as e:  # 网络、鉴权、限流等
             raise LLMError(f"{self.name} 调用失败：{e}") from e
         self._usage(resp, t0)
+        self.last_reasoning = _reasoning(resp.choices[0].message) if think else ""
         return resp.choices[0].message.content or ""
 
     def chat_json(self, messages: list[dict], **kw):
         return parse_json(self.chat(messages, json_out=True, **kw))
 
     def chat_tools(self, messages: list[dict], tools: list[dict], *, temperature: float = 0.1,
-                   max_tokens: int = 8192) -> dict:
-        """工具调用。返回 {"content": 文本, "tool_calls": [{"id", "name", "arguments"(JSON 字符串)}]}。"""
+                   max_tokens: int = 8192, think: bool = False) -> dict:
+        """工具调用。返回 {"content": 文本, "tool_calls": [{"id", "name", "arguments"(JSON 字符串)}], "reasoning": 思考内容}。
+        think：这一步打开思考（模型不能切换时照常调用，reasoning 为空）。"""
+        think, body, max_tokens = self._think(think, _merge(self.extra_body, self.tools_extra_body), max_tokens)
         kwargs = dict(model=self.model, messages=self._prepare(messages), tools=tools, temperature=temperature,
                       max_tokens=max_tokens)
-        body = {**(self.extra_body or {}), **(self.tools_extra_body or {})}
         if body:
             kwargs["extra_body"] = body
         t0 = time.monotonic()
         try:
-            resp = self._client().chat.completions.create(**kwargs)
+            resp = self._client(think).chat.completions.create(**kwargs)
         except Exception as e:
             raise LLMError(f"{self.name} 调用失败：{e}") from e
         self._usage(resp, t0)
         msg = resp.choices[0].message
         calls = [{"id": c.id, "name": c.function.name, "arguments": c.function.arguments or "{}"}
                  for c in (msg.tool_calls or [])]
-        return {"content": msg.content or "", "tool_calls": calls}
+        return {"content": msg.content or "", "tool_calls": calls, "reasoning": _reasoning(msg) if think else ""}
 
 
 class FakeLLM(LLM):

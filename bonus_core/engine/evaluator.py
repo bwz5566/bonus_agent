@@ -464,13 +464,20 @@ class Evaluator:
             if owners and not any(a.level in owners for a in node.chain()):
                 node = next((a for o in owners for ref in self._refs(ctx.row) for a in ref.chain() if a.level == o), node)
         rows = node.rows(ds)
+        via_ref = False
+        if not rows and ds in self.layout.aux and not node.aux and ctx.row is None:
+            # 层级对象对一张关联实体表聚合（如项目层按本项目的客户编码取呆滞库存表的金额）：取本对象引用到的那个实体的行；
+            # 本对象的编号在那张表里没有（如这个客户没有呆滞库存）就是没有行，sum 为 0，按材料决定怎么算
+            k = self.rs.datasets[ds].key
+            if k and any(k in n.attrs for n in node.chain()):
+                rows, via_ref = [r.row for r in self._node_refs(node) if r.level == ds], True
         if not rows and ctx.row is not None and node.aux and not self._linked(ds, node.level):
             # 在关联实体的行里（如逐张工单筛选时）对一张和它没有关联的表聚合（如员工的出勤确认）：这一行取不到那张表的任何行，
             # 原来会悄悄算成 0（条件永远不成立、金额少算），改成报错让写法改正
             raise EvalError(f"在「{node.level}」的每一行里对「{ds}」聚合，但「{ds}」和「{node.level}」没有关联，这一行取不到任何「{ds}」的行"
                             f"（会悄悄算成 0）。把这个条件或数移到外层聚合的外面，如 if(sum(…, of: \"{ds}\") > 0, sum(…, of: \"{node.level}\", where: …), 0)，"
                             f"或先在上一层定义变量再引用", ctx.where)
-        if not rows and self._ds_homes.get(ds) and not self._reachable(node, ds):
+        if not rows and not via_ref and self._ds_homes.get(ds) and not self._reachable(node, ds):
             # 在某一层对一张挂在别处的表聚合（如个人层汇总挂在项目/小组下的销售明细，小组层汇总部门目标）：
             # 这一层的每个对象都取不到它的行，原来会悄悄算成 0，改成报错
             lv = self.layout.table_level.get(ds, -1)

@@ -110,3 +110,15 @@ def test_tolerance_in_check_needs_no_source():
     got = {(str(n), w) for n, w in constants(rs)}
     assert ("0.0001", "variables.v") in got and ("5", "checks.big") in got
     assert not any(n != "1" and w in ("checks.share_sum", "checks.rev") for n, w in got)
+
+
+def test_percent_written_without_percent_sign_is_gated(tmp_path):
+    """D1：材料写“每单 0.5%”，规则写成 0.5（漏了 %），金额大 100 倍：要拦下。写 0.005 或 "0.5%" 都通过。"""
+    w = case(tmp_path / "c", rule="每人奖金 = 有效工单数 × 12.5 × 0.5%，扣减后低于 0 的按 0 计。工单状态为已关闭、处理中或已作废。")
+    w.set_rules(scheme="月度", variables={"n": {"scope": "个人", "expr": 'count(of: "工单", where: review == "有效")'}},
+                pool={"expr": "round(max(n * 12.5 * 0.5, 0), 2)", "scope": "个人"}, allocation=[{"level": "个人", "key": "emp_id"}])
+    w.trial_run()
+    assert any("只以 0.5% 出现" in g for g in gates(w))
+    w.set_rules(scheme="月度", pool={"expr": "round(max(n * 12.5 * 0.005, 0), 2)", "scope": "个人"})
+    w.trial_run()
+    assert not any("百分" in g or "只以" in g for g in gates(w))

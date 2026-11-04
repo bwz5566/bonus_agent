@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated, Literal, Union
 
@@ -23,10 +23,16 @@ def to_decimal(v) -> Decimal:
     if isinstance(v, (int, float)):
         return Decimal(str(v))
     if isinstance(v, str):
-        s = v.strip().replace(",", "")
-        if s.endswith("%"):
-            return Decimal(s[:-1]) / Decimal(100)
-        return Decimal(s)
+        s = v.strip().replace(",", "").replace("，", "")
+        scale = Decimal(1)
+        for suffix, k in (("%", Decimal("0.01")), ("万", Decimal(10000)), ("亿", Decimal(10) ** 8)):
+            if s.endswith(suffix):
+                s, scale = s[:-len(suffix)].strip(), k
+                break
+        try:
+            return Decimal(s) * scale if scale != 1 else Decimal(s)
+        except InvalidOperation:    # 不是数字：报成普通的校验错误（原来会让整次运行崩掉，只留下 ConversionSyntax）
+            raise ValueError(f"无法转换为数字: {v!r}（写数字，可带 %、万、亿）") from None
     raise ValueError(f"无法转换为数字: {v!r}")
 
 
@@ -57,6 +63,7 @@ class FieldDef(_Base):
     desc: str = ""
     unit: Literal["元", "万元"] | None = None
     values: list[str] | None = None
+    if_empty: str | None = None       # 空单元格按这个值处理（材料写明或财务答复过的口径）；不写时空值是数据问题，会被拦下
 
 
 class DatasetDef(_Base):
@@ -73,6 +80,9 @@ class DatasetDef(_Base):
     key: str | None = None
     link: str | None = None
     fields: dict[str, FieldDef]
+    # 按 key 的不同取值各建一个对象（如明细表里每个客户一个“客户”对象）：同一编号的多行合成一个，
+    # 其余字段在同一编号下必须一样。没有单独的主表、又要按这个编号汇总时用
+    distinct: bool = False
 
 
 class TierTable(RuleItem):

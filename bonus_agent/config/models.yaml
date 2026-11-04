@@ -32,7 +32,14 @@ default: qwen-a
 #   cache: explicit               百炼显式缓存（命中部分按输入价 10% 计费，5 分钟有效）。只对支持的模型开启，
 #                                 目前候选开源模型都不支持；私有化 vLLM 自带前缀缓存，无需配置
 #   tools_extra_body: {...}       智能体工具调用时额外的参数，覆盖 extra_body。如打开思考（enable_thinking: true），
-#                                 thinking_budget 限制每步思考的 tokens
+#                                 thinking_budget 限制每步思考的 tokens。写了就是每一步都思考
+#   think: auto | false | {...}   按需深度思考：平时不思考，智能体出错、卡住时那一步临时打开思考，想清楚错在哪再改，
+#                                 改对了就切回来。auto（默认）从 extra_body 里的关闭开关推出打开的参数
+#                                 （enable_thinking: false / chat_template_kwargs 里的 enable_thinking、thinking: false /
+#                                 thinking: {type: disabled}）；false 不切换；也可以直接写打开思考时追加的请求参数
+#   think_max_tokens: 16384       思考那一步的输出上限（思考内容也算在里面）
+#   think_timeout: 900            思考那一步的超时（秒）
+#   think_echo: true | false      下一步把思考内容带回去；DeepSeek（thinking 参数）默认带回，其他默认不带
 # 千问 3.5 及以后的模型默认可能开启思考模式，抽取时统一关闭（enable_thinking: false），
 # 否则耗时和 tokens 会明显增加，且部分模型思考模式下不支持 JSON 输出。
 models:
@@ -110,8 +117,8 @@ models:
     vision: deepseek-flash
 
   # ---- 内网自建 Qwen（2026-11-02 起默认用 A）----
-  # 深度思考默认关（和 deepseek-flash 一致，Q1–Q7 都是在不思考下算对的）；要试思考时把 tools_extra_body 打开、timeout 改 600，
-  # 只对智能体每一步生效，抽取、复读等要 JSON 的调用仍然不思考
+  # 平时不思考（Q1–Q7 都是在不思考下算对的）；出错、卡住时按需打开思考（think: auto，从 enable_thinking: false 推出来）。
+  # 想每一步都思考时把 tools_extra_body 打开；抽取、复读等要 JSON 的调用始终不思考
   qwen-a:                       # 服务 A：Qwen3.8-27B-FP8，上下文 1M
     provider: local_qwen
     model: qwen-chat
@@ -138,6 +145,7 @@ models:
     provider: local_vllm
     model: deepseek-ai/DeepSeek-V4-Flash
     json_mode: json_schema
+    extra_body: {chat_template_kwargs: {thinking: false}}    # vLLM 里 DeepSeek 模板的思考开关；按需思考时打开
 
 # 选型时参与对比的模型（bonus-eval 默认跑 candidates，也可用 --models open,reference 等指定分组）
 # 3.6 和 3.5 同尺寸各一个，用来看新一代是否明显更好；稠密 27B 和 MoE 35B-A3B 部署成本不同。

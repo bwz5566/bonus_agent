@@ -225,10 +225,32 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping) -> tup
                     issues.append(Issue.block("convert", f"{f}: {e}", str(src)))
                     rv[f] = None
             t.rows.append(Row(rv, src))
+        if ds.distinct and ds.key:
+            t.rows, clash = _distinct(t.rows, ds.key)
+            if clash:
+                issues.append(Issue.block("distinct_conflict", f"「{ds_name}」按 {ds.key} 合并时，同一编号的 {clash[0]} 取值不同"
+                                          f"（如 {clash[1]}：{clash[2]}）：这个字段不属于“每个 {ds.key} 一个”的对象，从 fields 去掉，"
+                                          f"或改在原表上按 link 汇总", ds_name))
         data[ds_name] = t
         issues += _reconcile(st, idx, ds, t)
         issues += _sanity(ds_name, ds, t, needed)
     return data, issues
+
+
+def _distinct(rows: list[Row], key: str) -> tuple[list[Row], tuple | None]:
+    """同一编号只留第一行；其余字段在同一编号下不一样时返回 (字段, 编号, 两个取值)。空编号的行不算对象。"""
+    first: dict = {}
+    for r in rows:
+        k = r.values.get(key)
+        if k is None:
+            continue
+        if k not in first:
+            first[k] = r
+            continue
+        for f, v in r.values.items():
+            if v != first[k].values.get(f):
+                return list(first.values()), (f, k, f"{first[k].values.get(f)} / {v}")
+    return list(first.values()), None
 
 
 def cell_text(v) -> str:
@@ -276,7 +298,9 @@ def _sanity(ds_name, ds, t: StdTable, needed) -> list[Issue]:
         vals = [(r.values[f], r.src) for r in t.rows]
         empty = [str(s) for v, s in vals if v is None]
         if empty:
-            out.append(Issue.block("value_empty", f"「{ds_name}」字段 {f} 有 {len(empty)} 个空值", ", ".join(empty[:5])))
+            out.append(Issue.block("value_empty", f"「{ds_name}」字段 {f} 有 {len(empty)} 个空值。空值怎么算要有依据："
+                                   f"材料写明了就照写，没写就 ask_question 问财务（列出这几行和备注）；"
+                                   f"确定后在 define_dataset 的这个字段里写 if_empty（如 0）", ", ".join(empty[:5])))
         if fd.type == "money":
             nums = [v for v, _ in vals if v is not None]
             neg = [str(s) for v, s in vals if v is not None and v < 0]

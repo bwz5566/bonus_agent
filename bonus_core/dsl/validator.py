@@ -240,6 +240,28 @@ class _ScopeCheck:
             self._visit(ast, -1 if scope is None else self.lay.index.get(scope, -1), None, None)
         return self.issues
 
+    def _ref_aux(self, ds: str, ctx: int) -> bool:
+        """ds 是关联实体表，而 ctx 这一层（或上层）的对象行上有它的主键：可以按本对象的编号取它的行。"""
+        if ds not in self.lay.aux:
+            return False
+        k = self.rs.datasets[ds].key
+        mine = [n for n, lv in self.lay.table_level.items() if 0 <= lv <= ctx and n != ds and n not in self.lay.aux]
+        lv_ds = [ed[0] for lv in self.rs.allocation[:ctx + 1] if (ed := self.rs.entity_dataset(lv.key))]
+        return bool(k) and any(k in self.rs.datasets[n].fields for n in set(mine) | set(lv_ds))
+
+    def _shared_ids(self, ds: str, ctx: int) -> list[tuple[str, str]]:
+        """上层的表 ds 和 ctx 这一层的表共有的编号/文字字段（如客户编码），可以用来把 ds 变成关联实体。"""
+        mine = [n for n, lv in self.lay.table_level.items() if lv == ctx and n != ds]
+        d = self.rs.datasets[ds]
+        out = []
+        for f, fd in d.fields.items():
+            if fd.type not in ("id", "text"):
+                continue
+            own = next((n for n in mine if f in self.rs.datasets[n].fields), None)
+            if own:
+                out.append((f, own))
+        return sorted(out, key=lambda x: d.fields[x[0]].type != "id")
+
     def _block(self, code: str, msg: str):
         if msg not in self.seen:
             self.seen.add(msg)
@@ -274,7 +296,9 @@ class _ScopeCheck:
                                                      f"聚合不到属于本{ent}的行")
                 else:
                     tl = self.lay.table_level[ds]
-                    if tl < ctx:
+                    if tl < ctx and self._ref_aux(ds, ctx):
+                        pass        # 关联实体表：本层对象按自己行上的编号（如客户编码）取到对应实体的行
+                    elif tl < ctx:
                         d = self.rs.datasets[ds]
                         key = self.rs.allocation[ctx].key if 0 <= ctx < len(self.rs.allocation) else None
                         if key and key in d.fields and d.key != key:
@@ -292,6 +316,14 @@ class _ScopeCheck:
                             else:
                                 fix = (f"如果「{ds}」的行应属于「{lab(ctx)}」层的对象，给它加上该层的编号字段并写 link；"
                                        f"确实是上层的数据，才把这个计算放到「{lab(tl)}」层或更上层")
+                                shared = self._shared_ids(ds, ctx)
+                                if shared:
+                                    f0, own = shared[0]
+                                    fix = (f"「{ds}」和本层的「{own}」都有 {f0}：要按“本对象的 {f0}”取「{ds}」的数，"
+                                           f"把「{ds}」定义成关联实体（define_dataset 写 key={f0}，不写 link），"
+                                           f"本层就能直接引用它的字段和 scope=「{ds}」的变量（{f0} 取不到的对象没有值，按材料定怎么算）。"
+                                           f"{f0} 在「{ds}」里有重复时先确认重复的行该合计还是取一条（拿不准就 ask_question），"
+                                           f"不要在公司级表、上一层、本层之间来回换")
                         self._block("agg_above", f"{node.fn}(...) 聚合的数据表「{ds}」挂在「{lab(tl)}」层，在「{lab(ctx)}」层"
                                                  f"聚合不到任何行。{fix}")
                 inner = ds if ds in self.lay.aux else ent

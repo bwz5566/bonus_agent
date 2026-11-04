@@ -19,6 +19,7 @@ class SheetTable:
     rows: list[tuple[int, list]] = field(default_factory=list)    # (Excel 行号, 值)
     totals: list[tuple[int, list]] = field(default_factory=list)  # 合计行，用于对账
     confidence: float = 1.0
+    repeats: list[int] = field(default_factory=list)              # 数据中间重复出现的表头行（Excel 行号），不计入数据
 
     def column(self, header: str) -> list:
         i = self.headers.index(header)
@@ -104,13 +105,34 @@ def _build(grid, file: str, title: str, header_idx: list[int]) -> SheetTable:
                   for a, b in zip(header, nxt)]
     start = header_idx[-1] + 1
     width = len(header)
+    body = [(j, (list(row) + [None] * width)[:width]) for j, row in enumerate(grid[start:], start=start + 1)]
+    for i, h in enumerate(header):
+        # 表头是空的、下面却有数据的列（如用公式拼出来的编号列）：起个固定的名字，才能被选用；否则只能拿别的列顶替
+        if not h and any(row[i] not in (None, "") for _, row in body):
+            header[i] = blank_header(i)
     t = SheetTable(file, title, header_idx[0] + 1, header)
-    for j, row in enumerate(grid[start:], start=start + 1):
-        row = (list(row) + [None] * width)[:width]
+    names = [h for h in header if h]
+    for j, row in body:
         if _filled(row) == 0:
+            continue
+        if names and _is_header_copy(row, header):      # 数据中间又夹了一行表头（几段数据拼在一起时常见）：不是数据
+            t.repeats.append(j)
             continue
         (t.totals if _is_total(row) else t.rows).append((j, row))
     return t
+
+
+def blank_header(i: int) -> str:
+    """没有表头的第 i 列（0 起）的名字，如 “第1列(无表头)”。"""
+    return f"第{i + 1}列(无表头)"
+
+
+def _is_header_copy(row: list, header: list[str]) -> bool:
+    """这一行和表头基本一样（有表头的列里八成以上相同，且至少 2 列）：是重复的表头行。"""
+    pairs = [(str(v).strip(), h) for v, h in zip(row, header) if h and not h.endswith("(无表头)") and v not in (None, "")]
+    same = sum(1 for v, h in pairs if v == h)
+    named = sum(1 for h in header if h and not h.endswith("(无表头)"))
+    return same >= 2 and same >= 0.8 * named
 
 
 def table_at(path: str | Path, sheet: str, header_rows: list[int]) -> SheetTable:

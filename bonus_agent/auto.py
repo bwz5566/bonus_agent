@@ -20,13 +20,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from bonus_agent.extract_rules import ExtractResult, Question, extract, prompt
 from bonus_agent.llm import LLM, LLMError, parse_json
 from bonus_agent.parsing.docs import PARSERS, Block, ParsedDoc, md_table, parse_any
 from bonus_core.data.mapping import DatasetMapping, Mapping, apply_mapping, cell_text, row_filter
-from bonus_core.data.table import convert
+from bonus_core.data.table import ConvertError, convert
 from bonus_core.data.table_detect import SheetTable, detect
 from bonus_core.dsl.models import DatasetDef, FieldDef, FieldType, RuleSet
 from bonus_core.engine.allocation import AdjustConflict
@@ -145,6 +145,12 @@ class PlanField(BaseModel):
     type: FieldType
     desc: str = ""
     unit: str | None = None
+    if_empty: str | None = None
+
+    @field_validator("if_empty", mode="before")
+    @classmethod
+    def _text(cls, v):
+        return None if v in (None, "") else str(v)
 
 
 class PlanDataset(BaseModel):
@@ -154,6 +160,7 @@ class PlanDataset(BaseModel):
     key: str | None = None
     link: str | None = None
     fields: dict[str, PlanField]
+    distinct: bool = False
 
 
 class PlanLevel(BaseModel):
@@ -230,7 +237,7 @@ def filter_sheet(st: SheetTable, flt: dict | None) -> tuple[SheetTable, str]:
     keep = row_filter(st.headers, flt)
     if isinstance(keep, str):
         return st, keep
-    out = SheetTable(st.file, st.sheet, st.header_row, st.headers, [r for r in st.rows if keep(r[1])], [], st.confidence)
+    out = SheetTable(st.file, st.sheet, st.header_row, st.headers, [r for r in st.rows if keep(r[1])], [], st.confidence, st.repeats)
     if not out.rows:
         seen = {c: sorted({cell_text(v[st.headers.index(c)]) for _, v in st.rows})[:20] for c in flt}
         return st, f"按 filter {flt} 筛选后没有任何行，这些列实际的取值：{seen}"
@@ -272,11 +279,17 @@ def check_dataset(name: str, pd: PlanDataset, st: SheetTable, field_types: dict[
                 errors.append(f"「{name}」字段 {f} 有 {len(values)} 种取值，不适合作为 enum，请改为 text")
                 continue
         prev = field_types.get(f)
-        if prev and prev[1] != name and prev[0] != pf.type:
-            errors.append(f"字段 {f} 在「{prev[1]}」里是 {prev[0]}，在「{name}」里是 {pf.type}；同名字段类型必须一致")
+        if prev and prev[1] != name and prev[0] != pf.type and {prev[0], pf.type} != {"id", "text"}:   # 编号和文字取值一样，可以互相关联
+            errors.append(f"字段 {f} 在「{prev[1]}」里是 {prev[0]}，在「{name}」里是 {pf.type}；同名字段类型必须一致，"
+                          f"改成 {prev[0]}（或把「{prev[1]}」的改成 {pf.type}）")
         field_types.setdefault(f, (pf.type, name))
         fields[f] = FieldDef(type=pf.type, desc=pf.desc or col, unit=unit if pf.type == "money" else None,
-                             values=values)
+                             values=values, if_empty=pf.if_empty)
+        if pf.if_empty is not None:
+            try:
+                convert(pf.if_empty, FieldDef(type=pf.type, unit=fields[f].unit, values=values))
+            except ConvertError as e:
+                errors.append(f"「{name}」字段 {f} 的 if_empty={pf.if_empty!r} 不是 {pf.type} 类型的值：{e}")
         cols[f] = col
     for k in (pd.key, pd.link):
         if k and ("," in k or "+" in k or " " in k.strip()):
@@ -300,15 +313,32 @@ def check_dataset(name: str, pd: PlanDataset, st: SheetTable, field_types: dict[
         from collections import Counter
         i = st.headers.index(cols[pd.key])
         dup = [(k, n) for k, n in Counter(cell_text(v[i]) for _, v in st.rows if v[i] not in (None, "")).items() if n > 1]
-        if dup:
+        if dup and pd.distinct:
+            others = [f for f in fields if f != pd.key]
+            for f in others:            # 同一编号下其余字段要一样，否则不是“每个编号一个”的对象
+                j = st.headers.index(cols[f])
+                seen: dict = {}
+                for _, v in st.rows:
+                    k = cell_text(v[i])
+                    if k and seen.setdefault(k, cell_text(v[j])) != cell_text(v[j]):
+                        errors.append(f"「{name}」distinct 按 {pd.key} 合并时，{f} 在同一编号下取值不同（如 {k}："
+                                      f"{seen[k]} / {cell_text(v[j])}）：从 fields 去掉 {f}，需要它时在原表上按 link 汇总")
+                        break
+            warnings.append(f"按 {pd.key} 的不同取值建对象：{len(st.rows)} 行合成 "
+                            f"{len({cell_text(v[i]) for _, v in st.rows if v[i] not in (None, '')})} 个")
+        elif dup:
             errors.append(f"「{name}」的 key={pd.key} 有重复值（如 {dup[0][0]} 出现 {dup[0][1]} 次），说明不是每行一个对象："
-                          f"这是明细表，去掉 key，写 link=它所属对象的编号")
+                          f"这是明细表，去掉 key，写 link=它所属对象的编号。"
+                          f"如果是没有单独的主表、要按 {pd.key} 汇总（每个 {pd.key} 一个对象），只保留 {pd.key} 一个字段并写 distinct: true，"
+                          f"其他表写 link={pd.key} 挂上来，在 scope=「{name}」的变量里汇总")
     if bad:
         errors.append(f"「{name}」有字段类型与数据不符：" + "；".join(bad[:5])
                       + "。请改成与数据相符的类型；月份、期间这类标签如果不参与日期计算，用 text 即可")
     if errors:
         return None, None, warnings, errors
-    return (DatasetDef(desc=pd.desc, key=pd.key, link=pd.link, fields=fields),
+    if pd.distinct and not pd.key:
+        return None, None, warnings, [f"「{name}」写了 distinct 却没写 key：distinct 是按 key 的不同取值建对象"]
+    return (DatasetDef(desc=pd.desc, key=pd.key, link=pd.link, fields=fields, distinct=pd.distinct and bool(pd.key)),
             DatasetMapping(file=st.file, sheet=st.sheet, header_rows=header_rows, columns=cols, filter=flt or {}),
             warnings, [])
 

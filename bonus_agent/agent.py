@@ -63,6 +63,7 @@ PHASES = (     # 工作分阶段：每个阶段的产出都存在工作区里（
 SOURCE_CHECKS = 5               # 每轮提问前查原文最多几次（每次一次交叉验证模型调用）
 IDLE_WARN = 6                  # 连续这么多次只查询（evaluate / explain）、没有任何改动：提醒根据已查到的做决定；两倍就算卡住
 QUERY_TOOLS = {"evaluate", "explain"}
+DEEP_LIMIT = 24                # 每一轮最多这么多步用深度思考（出错、卡住的那几步），防止一直思考把时间和 tokens 用完
 MAX_REFLECT = 2                # 卡住时先让智能体停下来反思、换做法接着做，最多这么多次；再卡住才停下，把原因报给财务
 KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保留全文
 BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
@@ -95,6 +96,8 @@ _I = {"type": "integer"}
 FIELD_SCHEMA = _obj({"column": {**_S, "description": "Excel 表头原文"},
                      "type": {"type": "string", "enum": ["money", "number", "int", "ratio", "text", "enum", "date", "id"]},
                      "unit": {"type": "string", "enum": ["元", "万元"], "description": "money 字段必填"},
+                     "if_empty": {"type": "string", "description": "可选：这一列的空单元格按这个值处理（如 0）。"
+                                  "只在材料写明或财务答复过时填，说明里写依据；拿不准先 ask_question"},
                      "desc": _S}, ["column", "type"])
 
 TOOLS: list[dict] = [
@@ -151,6 +154,8 @@ TOOLS: list[dict] = [
      "parameters": _obj({"name": {**_S, "description": "中文表名，如 人员、合同明细"}, "file": _S, "sheet": _S,
                          "header_rows": {"type": "array", "items": _I, "description": "可选：表头所在的 Excel 行号，多行表头写多个"},
                          "key": _S, "link": _S, "desc": _S,
+                         "distinct": {"type": "boolean", "description": "可选：按 key 的不同取值各建一个对象（同一编号的多行合成一个，"
+                                      "其余字段在同一编号下要一样）。没有单独的主表、又要按这个编号汇总时用，如从明细里得到每个客户一个“客户”"},
                          "filter": {"type": "object", "description": '可选：只取这些行，{"列名": "取值"} 或 {"列名": ["取值1", "取值2"]}'},
                          "fields": {"type": "object", "additionalProperties": FIELD_SCHEMA,
                                     "description": "字段名（英文小写加下划线） -> 定义。重新定义同一张表、字段不变时可以不写（沿用上一次的）"}},
@@ -585,6 +590,7 @@ class Step:
     result: str
     ok: bool
     thought: str = ""
+    deep: bool = False            # 这一步是在深度思考下做的（出错、卡住后）
 
 
 @dataclass
@@ -674,9 +680,13 @@ class Workspace:
             return (summary + "\n这是结构化数据文件，不能逐页读、也不能直接定义成数据表。"
                     "同样的数据在 Excel 里有时用 Excel 的工作表定义数据表；它是唯一来源时请用 ask_question 请财务提供 Excel。")
         parts, k = [], 0
+        same = self._same_images(d)
         for b in d.blocks:
             if b.kind == "image":
                 k += 1
+                if k in same:       # 和前面某张一模一样（多为每页都有的模板图、logo）：不再重复转写内容
+                    parts.append(f"{b.label()} 图片 #{k}（和图片 #{same[k]} 完全相同，不再重复）")
+                    continue
                 t = self.transcripts.get(f"{d.name}#{k}")
                 parts.append(f"{b.label()} 图片 #{k}" + (f"（已转写）\n{t}" if t else "（用 view_image 查看）"
                                                           if self.llm.image_llm else "（当前模型不能看图，未转写）"))
@@ -687,12 +697,31 @@ class Workspace:
         more = len(text) - offset - len(chunk)
         return chunk + (f"\n\n……还有 {more} 字，用 offset={offset + len(chunk)} 继续读取" if more > 0 else "")
 
+    def _same_images(self, d) -> dict[int, int]:
+        """文档里和前面某张字节完全相同的图片：序号 -> 第一次出现的序号（PPT 每页的 logo、模板底图）。"""
+        import hashlib
+        first, out = {}, {}
+        for k, b in enumerate([b for b in d.blocks if b.kind == "image"], start=1):
+            h = hashlib.sha1(b.image or b"").hexdigest() if b.image else None
+            if h is None:
+                continue
+            if h in first:
+                out[k] = first[h]
+            else:
+                first[h] = k
+        return out
+
     def view_image(self, file: str, index: int = 1, focus: str = "") -> str:
         f = self._file(file)
         d = next((d for d in self.inv.docs if d.name == f.name), None)
         imgs = [b for b in d.blocks if b.kind == "image"] if d else []
         if not 1 <= index <= len(imgs):
             raise ToolError(f"{file} 中有 {len(imgs)} 张图片，index 应在 1~{len(imgs)}")
+        orig = self._same_images(d).get(index)
+        if orig and not focus and f"{d.name}#{orig}" in self.transcripts:     # 一模一样的图只转写一次
+            text = self.transcripts[f"{d.name}#{orig}"]
+            self.transcripts[f"{d.name}#{index}"] = text
+            return f"（和图片 #{orig} 完全相同）\n{text}"
         b = imgs[index - 1]
         seer = self.llm.image_llm
         if seer is None:
@@ -736,8 +765,11 @@ class Workspace:
         if self.llm.image_llm is None:
             return
         for d in self.inv.docs:
+            same = self._same_images(d)
             for k, _ in enumerate([b for b in d.blocks if b.kind == "image"], start=1):
-                if f"{d.name}#{k}" not in self.transcripts:
+                if k in same and f"{d.name}#{same[k]}" in self.transcripts:
+                    self.transcripts[f"{d.name}#{k}"] = self.transcripts[f"{d.name}#{same[k]}"]
+                elif f"{d.name}#{k}" not in self.transcripts:
                     try:
                         self.view_image(d.name, k)
                     except (LLMError, ToolError):
@@ -949,20 +981,20 @@ class Workspace:
     # ---- 数据表 ----
     def define_dataset(self, name: str, file: str, sheet: str, fields: dict | None = None, key: str | None = None,
                        link: str | None = None, desc: str = "", header_rows: list[int] | None = None,
-                       filter: dict | None = None) -> str:
+                       filter: dict | None = None, distinct: bool = False) -> str:
         reuse = ""
         if not fields:      # 重新定义时只改 key / link / filter：沿用上一次的字段（模型常只写要改的部分，反复因缺 fields 失败）
             fields = self._prev_fields.get(name)
             if not fields:
                 raise ToolError(f"缺少 fields（字段名 -> {{column, type}}）。「{name}」之前没有定义成功过，要写全字段")
             reuse = f"没写 fields，沿用上一次定义「{name}」时的 {len(fields)} 个字段"
-        out = self._define_dataset(name, file, sheet, fields, key, link, desc, header_rows, filter)
+        out = self._define_dataset(name, file, sheet, fields, key, link, desc, header_rows, filter, distinct)
         self._prev_fields[name] = fields
         return out + (f"\n{reuse}" if reuse else "")
 
     def _define_dataset(self, name: str, file: str, sheet: str, fields: dict, key: str | None = None,
                         link: str | None = None, desc: str = "", header_rows: list[int] | None = None,
-                        filter: dict | None = None) -> str:
+                        filter: dict | None = None, distinct: bool = False) -> str:
         f = self._file(file)
         try:
             st = table_at(f, sheet, header_rows) if header_rows else self.inv.sheet(f"{f.name}/{sheet}")
@@ -978,7 +1010,8 @@ class Workspace:
                     fixed.append(f"{which} 写的是列名 {val}，已改成对应的字段名 {hit[0]}（key / link 要写字段名）")
                     key, link = (hit[0], link) if which == "key" else (key, hit[0])
         try:
-            pd = PlanDataset(sheet=sheet, key=key or None, link=link or None, desc=desc, fields=fields)
+            pd = PlanDataset(sheet=sheet, key=key or None, link=link or None, desc=desc, fields=fields,
+                             distinct=bool(distinct))
         except ValidationError as e:
             raise ToolError(f"参数格式不对：{e}") from None
         types = {fn: (fd.type, n) for n, d in self.datasets.items() if n != name for fn, fd in d.fields.items()}
@@ -993,7 +1026,16 @@ class Workspace:
                 errors.append(f"{key} 是「{owner}」的主键，这张表应写 link={key}（不写 key），每行挂到对应的{owner}上")
             raise ToolError("未保存，请修正：\n" + "\n".join(f"- {e}" for e in fixed + errors))
         warnings = fixed + warnings
+        prev = (self.datasets.get(name), self.mapping.get(name))
         self.datasets[name], self.mapping[name] = d, m
+        bad, loose = self._link_mismatch(name)
+        if bad:          # 关联字段的取值一个都对不上：多半映射错了列（如编号列没有表头，拿别的列顶替），保存了也全挂不上
+            if prev[0] is None:
+                del self.datasets[name], self.mapping[name]
+            else:
+                self.datasets[name], self.mapping[name] = prev
+            raise ToolError("未保存，请修正：\n" + "\n".join(f"- {e}" for e in bad))
+        warnings += loose
         self.untested |= set(self.schemes)
         kind = f"实体表，主键 {d.key}" if d.key else f"明细表，关联 {d.link}" if d.link else "公司级表"
         sample = []
@@ -1001,7 +1043,9 @@ class Workspace:
         st, _ = filter_sheet(st, flt)
         for _, vals in st.rows[:3]:
             sample.append({fn: fmt(convert(vals[st.headers.index(c)], d.fields[fn])) for fn, c in m.columns.items()})
-        lines = [f"已保存「{name}」（{kind}），{len(st.rows)} 行" + (f"，另有 {len(st.totals)} 行合计（不计入）" if st.totals else "")]
+        lines = [f"已保存「{name}」（{kind}），{len(st.rows)} 行" + (f"，另有 {len(st.totals)} 行合计（不计入）" if st.totals else "")
+                 + (f"，另有 {len(st.repeats)} 行是重复的表头（第 {'、'.join(map(str, st.repeats[:5]))} 行，不计入）"
+                    if getattr(st, "repeats", None) else "")]
         lines += [f"注意：{w}" for w in warnings]
         lines += [f"关联提示：{h}" for h in self._relation_hints(name)]
         lines.append("前 3 行（金额已换算为元）：" + json.dumps(sample, ensure_ascii=False))
@@ -1018,6 +1062,39 @@ class Workspace:
         st, _ = filter_sheet(st, m.filter or None)
         i = st.headers.index(m.columns[fld])
         return [cell_text(v[i]) for _, v in st.rows if v[i] not in (None, "")]
+
+    def _link_mismatch(self, name: str) -> tuple[list[str], list[str]]:
+        """按 link 关联的表和被关联的实体表，取值要对得上：一个都对不上就不保存（返回错误），
+        对上不到一半给提醒。两张表谁先定义都查（后定义实体表时，查已经按它关联的表）。"""
+        d = self.datasets[name]
+        pairs = []
+        if d.link:
+            owner = next((n for n, o in self.datasets.items() if n != name and o.key == d.link), None)
+            if owner:
+                pairs.append((name, owner))
+        if d.key:
+            pairs += [(n, name) for n, o in self.datasets.items() if n != name and o.link == d.key]
+        bad, loose = [], []
+        try:
+            for child, owner in pairs:
+                fld = self.datasets[child].link
+                vals, keys = set(self._values(child, fld)), set(self._values(owner, fld))
+                if not vals or not keys:
+                    continue
+                hit = len(vals & keys)
+                col = self.mapping[child].columns.get(fld, fld)
+                miss = sorted(vals - keys)[:3]
+                if hit == 0:
+                    msg = (f"「{child}」的 {fld}（列「{col}」）取值和「{owner}」的主键 {fld} 一个都对不上："
+                           f"本表如 {sorted(vals)[:3]}，「{owner}」如 {sorted(keys)[:3]}。多半是映射错了列，"
+                           f"或编号要由几列拼成；先 read_sheet 看清是哪一列（没有表头的列也能选，名字见表头列表），不要拿别的列顶替")
+                    (bad if child == name else loose).append(msg)
+                elif hit < len(vals) / 2:
+                    loose.append(f"「{child}」的 {fld} 只有 {hit}/{len(vals)} 个取值能在「{owner}」里找到（对不上的如 {miss}），"
+                                 f"对不上的行挂不到任何{owner}上；确认列和编号写法（空格、大小写、前导 0）")
+        except Exception:      # 取值失败不影响保存
+            pass
+        return bad, loose
 
     def _relation_hints(self, name: str) -> list[str]:
         """程序按数据判断的关联问题：编号列取值是别的表的主键却没同名、link 找不到被关联的表、该写 key 的没写。"""
@@ -2084,7 +2161,9 @@ class Workspace:
                                           else "等待答复" if q.blocking else "提示")
                       for q in self.questions]
         if self.transcripts:
-            lines.append(f"- 已查看图片：{', '.join(self.transcripts)}")
+            names = list(self.transcripts)
+            lines.append(f"- 已查看图片：{', '.join(names)}" if len(names) <= 12
+                         else f"- 已查看图片 {len(names)} 张（{', '.join(names[:6])} 等）")
         for s in self.schemes:
             r = self.results.get(s, {})
             lines.append(f"- 试算「{s}」：" + ("最近修改后尚未试算" if s in self.untested or not r else
@@ -2268,6 +2347,7 @@ class AgentResult:
     compared: bool = False                                              # 上一轮有结果，做了金额对比
     results: dict[str, dict[str, Result]] = field(default_factory=dict)  # 方案 -> 修订 -> 结果
     reply: str = ""                                                      # 对话时给财务的回复
+    deep_steps: int = 0                                                  # 本轮用了几步深度思考
 
     @property
     def single(self) -> bool:
@@ -2346,9 +2426,11 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
               on_step: Callable[[int, Step], None] | None = None, resume: bool = True,
               should_stop: Callable[[], bool] | None = None, instruction: str | None = None,
               message: str | None = None, by: str = "", chat: list[dict] | None = None,
-              reflect: int = MAX_REFLECT) -> AgentResult:
+              reflect: int = MAX_REFLECT, deep: int = DEEP_LIMIT) -> AgentResult:
     """max_steps 和 max_tokens 都是安全上限：模型调用 finish 就结束，正常不会用满。
     reflect：卡住时在本轮内反思、换做法的次数上限（清掉打转的对话历史，带上卡在哪、试过什么，工作区保留），用完再停下。
+    deep：按需深度思考的步数上限。平时不思考；上一步出错、被拦下、原样重复或停下来反思后，下一步先分析错在哪、
+    该怎么改（附一段分析提示，模型支持时同时打开思考），成功了就切回普通模式。0 表示不用。
 
     out_dir 是案卷目录：里面已有上一轮的 case.json 时（resume=True），从上一轮的工作区接着做，
     财务答复默认读取案卷里的 questions.yaml。"""
@@ -2429,6 +2511,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     reflected = 0
     idle = 0                           # 连续只查询、没有改动工作区的次数（参数每次不同，上面的重复检测发现不了）
     reached = ws.phase()               # 本轮到过的最远阶段：往前推进到新阶段时清空对话历史；改规则退回前面的阶段再回来不清
+    deep_why, deep_used = "", 0        # 下一步要深度思考的原因（空：普通模式）；本轮已用的深度思考步数
     for turn in range(max_steps):
         if should_stop and should_stop():
             error = f"已手动停止（第 {len(steps)} 步）"
@@ -2441,17 +2524,21 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         ws.budget = f"已用 {len(steps)} 步，上限 {max_steps} 步" + (f"；tokens 已用 {used}，上限 {max_tokens}" if max_tokens else "")
         if _shrink(history, max_history_chars):
             seen.clear()       # 较早的结果已省略，重新读取是合理的
-        tail = [{"role": "user", "content": ws.state()}]
+        think = bool(deep_why) and deep_used < deep
+        if think:
+            deep_used += 1
+        tail = [{"role": "user", "content": ws.state() + (_deep_note(deep_why, steps) if think else "")}]
         # 缓存标记：系统提示 + 任务固定不变；历史在两次整理之间只追加，标在历史最后一条上
         body = [{"role": "user", "content": task, "_cache": True}] + history[:-1] \
             + ([{**history[-1], "_cache": True}] if history else [])
         if mode == "json":
             msgs = [{"role": "system", "content": sys + JSON_PROTOCOL + json.dumps(TOOLS, ensure_ascii=False)}] + body + tail
             try:
-                text = llm.chat(msgs, json_out=True, temperature=AGENT_TEMPERATURE)
+                text = llm.chat(msgs, json_out=True, temperature=AGENT_TEMPERATURE, **({"think": True} if think else {}))
             except LLMError as e:
                 error = str(e)
                 break
+            reasoning = getattr(llm, "last_reasoning", "") if think else ""
             history.append({"role": "assistant", "content": _short_thought(text)})
             try:
                 act = parse_json(text)
@@ -2468,7 +2555,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         else:
             msgs = [{"role": "system", "content": sys}] + body + tail
             try:
-                reply = llm.chat_tools(msgs, openai_tools(), temperature=AGENT_TEMPERATURE)
+                reply = llm.chat_tools(msgs, openai_tools(), temperature=AGENT_TEMPERATURE, **({"think": True} if think else {}))
             except LLMError as e:
                 if turn == 0:  # 模型或服务不支持原生工具调用，改用 JSON 协议
                     mode = "json"
@@ -2476,7 +2563,9 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 error = str(e)
                 break
             calls = [{**c, "raw": c["arguments"], "arguments": _fix_arguments(c["arguments"])} for c in reply["tool_calls"]]
+            reasoning = (reply.get("reasoning") or "") if think else ""
             history.append({"role": "assistant", "content": reply["content"],
+                            **({"reasoning_content": reasoning} if reasoning else {}),
                             **({"tool_calls": [{"id": c["id"], "type": "function",
                                                 "function": {"name": c["name"], "arguments": _short_thought(c["arguments"])}}
                                                for c in calls]} if calls else {})})
@@ -2488,6 +2577,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 history.append({"role": "user", "content": "请调用工具继续工作；全部完成后调用 finish。"})
                 continue
         turn_start, skipped = len(history) - 1, 0     # 本轮 assistant 消息的位置；被拦下的重复调用数
+        turn_steps = len(steps)                       # 本轮第一步的位置：深度思考的内容记在它上面，并据本轮结果决定下一步是否思考
         failed_now: set[str] = set()                  # 这次回复里已经算过一次失败的工具
         said = "" if mode == "json" else (reply.get("content") or "").strip()     # 原生工具调用时模型写在正文里的思考
         for c in calls:
@@ -2627,6 +2717,13 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 history.append({"role": "user", "content": f"【{c['name']} 的结果】\n{result}"})
             else:
                 history.append({"role": "tool", "tool_call_id": c["id"], "content": result})
+        if think:
+            for st in steps[turn_steps:]:
+                st.deep = True
+            if reasoning and len(steps) > turn_steps:
+                st = steps[turn_steps]
+                st.thought = f"【深度思考】{reasoning.strip()[:DEEP_SHOW]}" + (f"\n{st.thought}" if st.thought else "")
+        deep_why = _deep_reason(steps[turn_steps:], skipped, ws, fails)
         if skipped and skipped == len(calls):
             # 整轮都是被拦下的重复调用：不把它留在历史里，否则小模型会照着历史接着重复；只留一句说明
             del history[turn_start:]
@@ -2648,6 +2745,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             for d in (fails, fail_why, seen, undo, again):
                 d.clear()
             same_block, prev_full, long_block, prev_block = 0, set(), 0, set()
+            deep_why = ""
             steps.append(Step("（进入新阶段）", {}, note, True))
             if on_step:
                 on_step(len(steps), steps[-1])
@@ -2656,6 +2754,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             # 卡住了先不停：清掉原地打转的对话历史（小模型会照着历史接着重复，也白占上下文），
             # 只留卡在哪、试过什么、程序的判断，让智能体回到材料和数据重新想、换一种做法。工作区（数据表、规则、台账）都保留
             reflected += 1
+            deep_why = f"卡住了：{stuck[:300]}"       # 反思后的第一步一定深度思考
             note = _reflection(ws, stuck, steps, reflected, reflect)
             history.clear()
             history.append({"role": "user", "content": note})
@@ -2689,6 +2788,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     ar = AgentResult(ws, steps, rss.get(first), tested[first]["R0"] if first else None, error,
                      rulesets={s: rss[s] for s in tested}, results=tested)
     ar.draft_results, ar.round, ar.changes = draft, rnd["n"], changes
+    ar.deep_steps = deep_used
     ar.reply = ws.reply_text
     ar.pending = [q.model_dump() for q in ws.pending]
     if last and last.get("digest") is not None and tested:
@@ -2787,6 +2887,47 @@ def _phase_note(ws: Workspace, k: int) -> str:
             "为了腾出上下文，之前的对话已清空（只留下刚完成的最后一步）。材料包仍在任务里；读过的结论在参数台账、条款清单、笔记和规则摘要里（见工作区状态），"
             "直接用，不要从头重读材料。\n"
             f"这一阶段要做：{PHASES[k][1]}。\n完成标准：{PHASES[k][2]}。")
+
+
+DEEP_SHOW = 4000                 # 步骤记录里留多少思考内容（全文只在当次请求里）
+FORMAT_ERRORS = ("错误：参数", "错误：没有工具")    # 参数格式这类小错：程序已经说清楚怎么改，第一次不用深度思考
+
+
+def _deep_reason(turn: list[Step], skipped: int, ws: Workspace, fails: dict[str, int]) -> str:
+    """这一步的结果是否要求下一步深度思考：失败（参数格式小错第一次除外）、被拦下的原样重复、
+    程序提醒快要卡住、保存的规则还有阻断问题。返回原因（给模型看的一句话），不需要时返回空。"""
+    for st in turn:
+        if st.tool.startswith("（"):
+            continue
+        head = st.result.removeprefix("错误：").split("\n", 1)[0][:300]
+        if not st.ok and (not st.result.startswith(FORMAT_ERRORS) or fails.get(st.tool, 0) >= 2):
+            return f"{st.tool} 失败：{head}"
+        if "\n注意：" in st.result:
+            return f"{st.tool} 的结果里有提醒：{st.result.split(chr(10) + '注意：', 1)[1][:300]}"
+        if st.ok and st.tool == "set_rules" and getattr(ws, "last_blocking", None):
+            return f"set_rules 保存了，但还有阻断问题：{head}"
+    if skipped:
+        return "又原样做了一遍之前做过的操作，结果和之前一样"
+    return ""
+
+
+def _deep_note(why: str, steps: list[Step] = ()) -> str:
+    """深度思考那一步附在工作区状态后面的分析要求（通用，不针对具体材料），带上最近试过、没成功的做法。"""
+    tried = []
+    for st in reversed(steps):
+        if st.tool.startswith("（进入新阶段") or len(tried) >= 6:
+            break
+        if not st.ok:
+            head = " ".join(x.strip() for x in st.result.removeprefix("错误：").split("\n")[:2])[:160]
+            tried.append(f"\n  · {st.tool}：{head}")
+    seen = "".join(dict.fromkeys(reversed(tried)))
+    return ("\n\n【这一步先深度思考，再调用工具】上一步没有成功：" + why +
+            (f"\n最近试过、没有成功的做法（不要原样再试）：{seen}" if seen else "") +
+            "\n先在思考里把下面几件事想清楚，再只做一个最有把握的改动："
+            "\n1. 错误或提示具体指向哪里：规则写法、验算式、对数据的理解（列、取值、编号在哪一层），还是材料本身没写清；"
+            "\n2. 前几步是不是已经在同一处改过：是的话说明方向不对，回到材料原文和数据重新核对，不要在原写法上小修小补；"
+            "\n3. 这次准备怎么改，为什么能解决；能用 explain / evaluate 看一眼中间数就先看，不要凭印象；"
+            "\n4. 口径确实拿不准、或材料之间冲突，用 ask_question 把差异写给财务，不要硬凑。")
 
 
 def _reflection(ws: Workspace, stuck: str, steps: list[Step], n: int, limit: int) -> str:

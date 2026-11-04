@@ -127,6 +127,7 @@ class RunRecord:
     rounds: int = 0
     auto_continued: int = 0
     reflections: int = 0             # 卡住时在本轮内停下来反思、换做法的次数
+    deep_steps: int = 0              # 出错后深度思考的步数
     answered_rounds: int = 0
     questions: list[str] = field(default_factory=list)
     checked: int = 0                 # 核对的金额个数
@@ -170,6 +171,7 @@ def run_once(sc: Scenario, i: int, out: Path, llm_factory: Callable[[], object],
             new = False
             steps += len(ar.steps)
             rec.reflections += sum(1 for s in ar.steps if s.tool == "（反思）")
+            rec.deep_steps += ar.deep_steps
             rec.rounds += 1
             log(f"  {sc.name} 第 {i} 次 · 第 {ar.round} 轮：{ar.status}" + (f"（{ar.error[:80]}）" if ar.error else ""))
             rec.questions += [q.text for q in ar.ws.pending if q.text not in rec.questions]
@@ -271,6 +273,7 @@ def summarize(records: list[RunRecord], meta: dict) -> dict:
                 "算错没拦住": sum(1 for r in rs if r.missed),
                 "自动接续过": sum(1 for r in rs if r.auto_continued),     # 中途卡住、自动接着做才完成的次数（稳定性）
                 "反思过": sum(1 for r in rs if r.reflections),           # 卡住时在本轮内停下来反思、换做法的次数
+                "深度思考步数": round(sum(r.deep_steps for r in rs) / n, 1) if n else 0,   # 平均每次
                 "完成率": round(len(done) / n, 3) if n else 0,
                 "正确率": round(sum(1 for r in rs if r.correct) / n, 3) if n else 0,
                 "卡住原因": causes,
