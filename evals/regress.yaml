@@ -34,3 +34,7 @@ scenarios:
   - name: Q7
     inputs: ../../bonus_fixture_v7/01_输入材料
     expected: ../../bonus_fixture_v7/02_验收答案_不要上传/06_128人期望结果.xlsx
+  # Q8：真实提成业务（1-9 月销售 + 预算/呆滞/逾期/毛利率系数 + 欠款冻结 + 分配名单），只在本机有，仓库里没有原始数据
+  - name: Q8
+    inputs: ../../bonus_fixture_v8/01_输入材料
+    expected: ../../bonus_fixture_v8/02_验收答案_不要上传/04_最终期望结果.xlsx
