@@ -217,7 +217,7 @@ def _score(rec: RunRecord, ar, sc: Scenario, out: Path) -> None:
             ms = compare_expected(ar.results, sc.expected, sc.expected_column, sc.expected_where)
             rec.check = report(ms)
             rec.checked = sum(m.total for m in ms)
-            rec.wrong = sum(len(m.diffs) for m in ms)
+            rec.wrong = sum(len(m.diffs) + len(m.missing) + len(m.blank) for m in ms)
             rec.correct = rec.checked > 0 and all(m.ok for m in ms if m.total or m.ambiguous) and \
                 all(m.total or m.ambiguous for m in ms if m.metric == "应得")
             rec.missed = not rec.correct

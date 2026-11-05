@@ -25,7 +25,9 @@ FIXES = {
     "detail_outside_agg": "明细表的字段只能写在聚合里面：sum(字段, of: \"明细表\", where: ...)。",
     "global_in_level": "变量没写 scope 就是全公司合计：按对象计算的要写 scope（层级名或实体表名）。",
     "parent_key_missing": "上级编号不在本层实体表里：一个对象对应上一层多条记录（如一人参与多个项目）时，最末层用那张记录表"
-                          "（如 参与分配，key=参与编号、parent_key=项目编号），按人汇总抵扣用 offsets 的 scope=人员表。",
+                          "（如 参与分配，key=参与编号、parent_key=项目编号），按人汇总抵扣用 offsets 的 scope=人员表。"
+                          "记录表没有每行唯一的编号列时（如展开后的分配名单），在 define_dataset 里加一个字段 "
+                          "{\"column\": \"（行号）\", \"type\": \"id\"} 作 key，程序用 Excel 行号当编号（展开后同一行加 -1、-2）。",
     "level_no_parent": "非最上层的层级要写 parent_key（指向上一层主键的字段）。",
     "payout_scope": "发放条件写在最末层；跨记录按人汇总再抵扣预发的，用 offsets，scope 写人员表。",
     "payout_ratio": "发放条件二选一：pay_ratio 可发比例（如 if(warranty_done == \"是\", 1, 0.8)）或 hold_ratio 暂缓比例。",
@@ -33,7 +35,7 @@ FIXES = {
     "tier_order": "阶梯 steps 是 [[下限, 比例], ...]，下限严格递增，最后一档不写上限（不要用 null 或极大数占位）。",
     "tier_empty": "阶梯 steps 至少一档：[[0, 0.05], [100000, 0.08]]。",
     "key_dup": "同一编号出现多行：数据录错了就提问财务；如果一个编号本来就对应多行（如一人参与多个项目），这张表不是这个编号的实体表，"
-               "改用每行唯一的编号作 key，或写成 link 明细表。",
+               "改用每行唯一的编号作 key（没有这样的列时用 {\"column\": \"（行号）\", \"type\": \"id\"}），或写成 link 明细表。",
     "key_empty": "主键为空的行：数据缺失要提问财务；合计行、说明行用 define_dataset 的 filter 排除。",
     "link_unmatched": "编号在上级表里找不到：漏录的要提问财务；应排除的记录用 filter 排除，不要改数据。",
     "link_bad": "link 写本表里指向上级（层级主键或关联实体主键）的编号字段，字段名要和上级主键同名。"

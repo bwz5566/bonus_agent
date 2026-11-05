@@ -259,10 +259,11 @@ def build(ws, results: dict | None = None) -> list[dict]:
     all_lint = [t for ts in lint_texts.values() for t in ts]
     rows: list[dict] = []
 
-    def add(scheme, section, item, reading, refs, rule_item="", res=None, flag="", extra=""):
+    def add(scheme, section, item, reading, refs, rule_item="", res=None, flag="", extra="", basis=""):
+        # key 决定财务的确认是否还有效：口径变了（含计算对象 scope 这类不在 reading 里的结构）就要重新确认
         rows.append({"scheme": scheme, "section": section, "item": item, "reading": reading + (f"\n{extra}" if extra else ""),
                      "source": _sources(ws.clauses, refs), "example": _example(res, rule_item) if rule_item else "",
-                     "flag": flag, "key": _key(scheme, section, item, reading)})
+                     "flag": flag, "key": _key(scheme, section, item, reading, *([basis] if basis else []))})
 
     for scheme, d in ws.drafts.items():
         own = [s for s in results if s != SHARED]
@@ -290,7 +291,8 @@ def build(ws, results: dict | None = None) -> list[dict]:
             spec = spec or {}
             add(scheme, "计算项", f"{variables[v]}（{v}）", plain(spec.get("expr", ""), nm), [v, f"variables.{v}"],
                 rule_item=v, res=res, flag=_flags(texts, [f"变量 {v} ", f"变量 {v}、", f"、{v} "]),
-                extra="\n".join(x for x in (f"计算对象：{spec.get('scope')}" if spec.get("scope") else "", _branches(res, v, nm)) if x))
+                extra="\n".join(x for x in (f"计算对象：{spec.get('scope')}" if spec.get("scope") else "", _branches(res, v, nm)) if x),
+                basis=f"scope={spec.get('scope') or 'global'}")
         pool = d.get("pool") or {}
         if pool.get("expr"):
             add(scheme, "奖金池", f"奖金池（按{pool.get('scope') or '全部'}计算）", plain(pool["expr"], nm), ["pool"],

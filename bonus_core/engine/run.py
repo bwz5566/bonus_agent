@@ -377,10 +377,17 @@ class Engine:
                 offset += v.quantize(CENT, ROUND_HALF_UP)
             final = sum((Decimal(p.final) for p in ps), Decimal(0))
             held = sum((Decimal(p.held) for p in ps), Decimal(0))
-            cap = sum((Decimal(p.paid) for p in ps), Decimal(0))     # 最末层自己的抵扣（如有）已先扣
-            ded = min(cap, offset)
+            # 最末层自己也有抵扣时（如参与记录扣一次、人员再扣一次），汇总表要把两层都列上，账才对得上：
+            # 可发上限 = 最末层可发上限之和；已发抵扣、实际抵扣、超发 = 最末层的 + 本层的；本次实发 = 可发上限 − 实际抵扣
+            cap = sum((Decimal(p.cap or p.paid) for p in ps), Decimal(0))
+            left = sum((Decimal(p.paid) for p in ps), Decimal(0))     # 最末层抵扣后剩下的
+            ded = min(left, offset)
+            leaf_off = sum((Decimal(p.offset or 0) for p in ps), Decimal(0))
+            leaf_ded = sum((Decimal(p.deducted or 0) for p in ps), Decimal(0))
+            leaf_over = sum((Decimal(p.overpaid or 0) for p in ps), Decimal(0))
             out[e.id] = RollupResult(e.id, ent, str(k), e.label, [m.id for m in ms], str(final), str(held), str(cap),
-                                     str(offset), str(ded), str(cap - ded), str(max(offset - cap, Decimal(0)).quantize(CENT)))
+                                     str(leaf_off + offset), str(leaf_ded + ded), str(left - ded),
+                                     str((leaf_over + max(offset - left, Decimal(0))).quantize(CENT)))
         return out
 
 

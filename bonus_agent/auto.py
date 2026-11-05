@@ -227,6 +227,8 @@ def _fix_column(col: str, headers: list[str]) -> str | None:
     if c in norm:
         return norm[c]
     close = difflib.get_close_matches(c, list(norm), n=1, cutoff=0.85)
+    if close and any(h.startswith(f"{norm[close[0]]}(") and h.endswith("列)") for h in headers):
+        return None         # 有几列同名（后面的带列字母）：拿不准是哪一列，不自动改，让智能体照表头列表选
     return norm[close[0]] if close else None
 
 
@@ -241,7 +243,7 @@ def filter_sheet(st: SheetTable, flt: dict | None) -> tuple[SheetTable, str]:
     if isinstance(keep, str):
         return st, keep
     out = SheetTable(st.file, st.sheet, st.header_row, st.headers, [r for r in st.rows if keep(r[1])], [], st.confidence, st.repeats,
-                     st.segments)
+                     st.segments, st.remaps, st.unsure)
     if not out.rows:
         seen = {c: sorted({cell_text(v[st.headers.index(c)]) for _, v in st.rows})[:20] for c in flt}
         return st, f"按 filter {flt} 筛选后没有任何行，这些列实际的取值：{seen}"

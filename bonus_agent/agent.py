@@ -30,7 +30,7 @@ from bonus_agent.extract_rules import Extraction, Question, check_quotes, prompt
 from bonus_agent.llm import LLM, LLMError, image_part, parse_json
 from bonus_core.data.mapping import DatasetMapping, apply_mapping
 from bonus_core.data.patches import apply_patches
-from bonus_core.data.table_detect import table_at, unpivot_sheet
+from bonus_core.data.table_detect import ROW_ID, add_row_ids, table_at, unpivot_sheet
 from bonus_core.dsl.functions import describe as describe_functions
 from bonus_core.dsl.models import DatasetDef, RuleSet, Variable
 from bonus_core.dsl.parser import SELF_COMPARE_HINT, Call, ExprError, Num, parse, self_compares, walk
@@ -73,7 +73,7 @@ NO_IGNORE = ("查找表 ", "抵扣 ")    # 程序检查里不能写进 ignored �
 MUST_FIX = ("抵扣 ",)              # 连提问也不能放过、只能改规则的项
 REREAD_TIMES = 3                   # 一轮里同一份文档累计读到全文的这么多倍后，只给小段
 REREAD_MIN = 60000                 # 短文档反复读不费多少，读够这么多字才限制
-REREAD_SMALL = 4000                # 限制后每次还能读的字数
+REREAD_SMALL = 1500                # 限制后每次还能读的字数（一次正常读取最多约 5800 字）
 GATES_SHOWN = 15                   # 程序检查一次列出的条数
 
 
@@ -122,6 +122,7 @@ TOOLS: list[dict] = [
      "parameters": _obj({})},
     {"name": "read_document", "description": "读取 Word / PPT / 图片文件的文字和表格（图片显示为占位符，用 view_image 查看）。",
      "parameters": _obj({"file": _S, "offset": {**_I, "description": "从第几个字符开始，默认 0"},
+                         "limit": {**_I, "description": "可选：最多读多少字，只看某一段时用（如 3000）"},
                          "folded": {"type": "boolean", "description": "可选：true 时把预筛折叠起来的页（背景介绍、封面等）也一起返回"}},
                         ["file"])},
     {"name": "view_image", "description": "查看文件中的第 index 张图片（从 1 开始，默认 1），返回图片内容的逐字转写。",
@@ -179,7 +180,8 @@ TOOLS: list[dict] = [
                          "unpivot": {"type": "object", "description":
                                      '可选：几列放的是同一类值（如几个角色列各放一个人名）时展开成每个值一行：'
                                      '{"columns": ["列1", "列2"], "value": "展开后的列名", "label": "记原列名的列名，如 角色"}。'
-                                     '空格子不展开；fields 和 filter 用展开后的列名。从这几列取全部对象时配合 key + distinct'},
+                                     '空格子不展开；fields 和 filter 用展开后的列名。从这几列取全部对象时配合 key + distinct。'
+                                     '展开后没有每行唯一的编号、又要当最末层时，加字段 {"column": "（行号）", "type": "id"} 作 key'},
                          "fields": {"type": "object", "additionalProperties": FIELD_SCHEMA,
                                     "description": "字段名（英文小写加下划线） -> 定义。重新定义同一张表、字段不变时可以不写（沿用上一次的）"}},
                         ["name", "file", "sheet"])},
@@ -712,16 +714,20 @@ class Workspace:
         text = self._render_doc(d, folded)
         done = self.doc_reads.get(f.name, 0)
         inner = limit >= 10 ** 9            # 程序自己读全文（简报、复读）：不计、不限
+        limit = max(1, min(int(limit or 0) or MAX_RESULT_CHARS - 200, MAX_RESULT_CHARS - 200)) if not inner else limit
+        note = ""
         if not inner and limit > REREAD_SMALL and done >= max(REREAD_TIMES * len(text), REREAD_MIN):
-            # 同一份文档整段整段地反复读（如每核对一条条款就把整份 PPT 再读一遍）：上下文和 tokens 很快用光，结果也不会更准
-            return (f"{f.name} 这一轮已经读了约 {done:,} 字（全文 {len(text):,} 字的 {done / max(len(text), 1):.1f} 倍），不再整段返回。"
-                    "条款和参数已经记在条款清单和台账里，核对时直接看那里；确实要再看原文某处，"
-                    f"用 offset 指到那一页、limit 不超过 {REREAD_SMALL} 字只读那一段。拿不准的口径用 ask_question 问财务")
+            # 同一份文档整段整段地反复读（如每核对一条条款就把整份 PPT 再读一遍）：上下文和 tokens 很快用光，结果也不会更准。
+            # 只给 offset 处的一小段
+            limit = REREAD_SMALL
+            note = (f"\n\n（{f.name} 这一轮已经读了约 {done:,} 字，是全文 {len(text):,} 字的 {done / max(len(text), 1):.1f} 倍，"
+                    f"之后每次只给 {REREAD_SMALL} 字。条款和参数已经记在条款清单和台账里，核对时直接看那里；"
+                    "要看原文某处，用 offset 指到那一页。拿不准的口径用 ask_question 问财务）")
         chunk = text[offset:offset + limit]
         if not inner:
             self.doc_reads[f.name] = done + len(chunk)
         more = len(text) - offset - len(chunk)
-        return chunk + (f"\n\n……还有 {more} 字，用 offset={offset + len(chunk)} 继续读取" if more > 0 else "")
+        return chunk + (f"\n\n……还有 {more} 字，用 offset={offset + len(chunk)} 继续读取" if more > 0 else "") + note
 
     def _render_doc(self, d, folded: bool = False) -> str:
         """文档的文字：按页分段，页首标一次页码；预筛判为背景、装饰、空白的页折叠成一行（folded=True 时照常展开）；
@@ -770,7 +776,7 @@ class Workspace:
                                                if self.llm.image_llm else "（当前模型不能看图，未转写）"))
             elif b.text:
                 text = b.text
-                if header:
+                if header and b.kind != "table":      # 表格里的行不当页眉去掉
                     keep = [ln for ln in text.split("\n") if ln.strip() not in header or ln.strip() not in shown]
                     shown |= {ln.strip() for ln in text.split("\n") if ln.strip() in header}
                     text = "\n".join(keep).strip()
@@ -1148,6 +1154,16 @@ class Workspace:
         spec = _unpivot_spec(unpivot, st) if unpivot else None
         if spec:
             st = unpivot_sheet(st, spec["columns"], spec["value"], spec.get("label") or "")
+        if isinstance(fields, dict) and any(isinstance(d, dict) and d.get("column") == ROW_ID for d in fields.values()):
+            st = add_row_ids(st)
+        if getattr(raw, "unsure", None):      # 另一段表头对不上第一段、又没法按列名对回：用到这些列就不能保存
+            want = {d.get("column") for d in (fields or {}).values() if isinstance(d, dict)} | set((spec or {}).get("columns") or [])
+            used = {raw.headers.index(c) for c in want if c in raw.headers}
+            unsure = sorted({raw.headers[i] for _, ix in raw.unsure for i in ix if i in used})
+            if unsure:
+                raise ToolError(f"未保存：{_segments_text(raw, used)}。用到的列「{'、'.join(unsure)}」在另一段里没法按列名对回第一段"
+                                "（列名重复或对不上），不知道该读哪一列。用 ask_question 问财务这两段各列的对应关系，"
+                                "或用 header_rows 只取其中一段分别定义")
         fixed = []
         if isinstance(fields, dict):     # key / link 写成了 Excel 列名（如 entity_id），而字段已改名（dept_id ← entity_id）
             for which, val in (("key", key), ("link", link)):
@@ -1201,9 +1217,15 @@ class Workspace:
         if getattr(raw, "segments", None):
             cols = set(m.columns.values()) | set((spec or {}).get("columns") or [])
             used = {raw.headers.index(c) for c in cols if c in raw.headers}
+            moved = [(j, {i: k for i, k in mp.items() if k in used or i in used}) for j, mp in getattr(raw, "remaps", [])]
+            if any(mp for _, mp in moved):
+                lines.append("注意：" + "；".join(
+                    f"第 {j} 行起的一段把列换了位置，已按列名挪回：" + "、".join(f"第{i + 1}列→第{k + 1}列「{raw.headers[k]}」"
+                                                             for i, k in sorted(mp.items()))
+                    for j, mp in moved if mp))
             hit = [(j, {i: c for i, c in ch.items() if i in used}) for j, ch in raw.segments]
             if any(ch for _, ch in hit):
-                warnings.append(_segments_text(raw, used) + "。数据按列的位置读（同一列在各段都归到同一个字段）："
+                warnings.append(_segments_text(raw, used) + "。列名都能对回第一段的已按列名挪回；新出现的列名按列的位置读："
                                 "用到的这些列在两段里含义不一样时（如一段是金额、一段是比例文字），用 ask_question 问财务，不要猜")
             else:
                 lines.append(_segments_text(raw))
@@ -1243,6 +1265,8 @@ class Workspace:
             return []
         if m.unpivot:
             st = unpivot_sheet(st, m.unpivot["columns"], m.unpivot["value"], m.unpivot.get("label") or "")
+        if ROW_ID in m.columns.values():
+            st = add_row_ids(st)
         st, _ = filter_sheet(st, m.filter or None)
         i = st.headers.index(m.columns[fld])
         return [cell_text(v[i]) for _, v in st.rows if v[i] not in (None, "")]
@@ -1593,7 +1617,7 @@ class Workspace:
         rep = self.lint[name] = lint.check(rs, data, self._rule_text(), base.traces, sourced=self._sources_readable(),
                                            headers=heads, tiers=base.tier_stats, used_elsewhere=others,
                                            coverage=base.coverage, reached_elsewhere=elsewhere,
-                                           said="\n".join([self.said] + [f"{q.text} {q.answer}" for q in self.questions if q.answer]))
+                                           said=self._finance_said())
         if rep.warns:
             lines.append("程序检查提示：\n" + "\n".join(f"- {w}" for w in rep.warns[:8]))
         gates = self._open_gates(rep)
@@ -1603,6 +1627,18 @@ class Workspace:
                          + (f"\n……还有 {len(gates) - GATES_SHOWN} 处没列出（先处理上面的，改完再 trial_run 会列出其余的）"
                             if len(gates) > GATES_SHOWN else ""))
         return "\n".join(lines)
+
+    def _finance_said(self) -> str:
+        """财务自己说过的话：对话原文和各问题的答复。答复只是选了一个选项（很短）时带上问题和选项，
+        否则只带答复本身（问题是智能体写的，里面提到“累进”不等于财务说过）。"""
+        parts = [self.said]
+        for q in self.questions:
+            a = str(q.answer or "").strip()
+            if not a:
+                continue
+            short = len(a) <= 12
+            parts.append(f"{q.text} {' '.join(q.options)} {a}" if short else a)
+        return "\n".join(parts)
 
     def _unmatched_text(self, issues) -> str:
         """编号在上级表里找不到（link_unmatched）：按表汇总行数和编号；同一批编号第二次还对不上，明确要求去问财务，不要换着法子绕。"""

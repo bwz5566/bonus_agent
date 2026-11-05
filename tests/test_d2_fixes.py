@@ -62,7 +62,7 @@ def test_percent_written_as_whole_numbers_elsewhere_is_not_a_missing_percent():
 
 
 def test_name_with_percent_in_data_is_a_gate():
-    rep = lint.check(_rs("1"), _data("emp", ["张三", "李四", "王五50%"]), "按人分配")
+    rep = lint.check(_rs('if(emp == "张三", 1, 1)'), _data("emp", ["张三", "李四", "王五50%"]), "按人分配 张三")
     assert "名称百分比 王五50%" in rep.keys
 
 
@@ -105,18 +105,23 @@ def _doc_ws():
 
 
 def test_whole_document_reread_again_and_again_is_cut_short():
+    from bonus_agent.agent import REREAD_SMALL
     ws = _doc_ws()
     full = len(ws._render_doc(ws.inv.docs[0]))
-    for _ in range(3):
+    for _ in range(4):
         off = 0
         while off < full:
-            out = ws.read_document("制度.pptx", off, limit=20000)
-            assert "不再整段返回" not in out
-            off += 20000
-    out = ws.read_document("制度.pptx", 0, limit=20000)
-    assert "不再整段返回" in out
-    small = ws.read_document("制度.pptx", 100, limit=2000)
-    assert "不再整段返回" not in small and len(small) <= 2100
+            out = ws.read_document("制度.pptx", off)
+            assert "之后每次只给" not in out
+            off += 5800
+            if ws.doc_reads["制度.pptx"] >= 3 * full:
+                break
+        if ws.doc_reads["制度.pptx"] >= 3 * full:
+            break
+    out = ws.read_document("制度.pptx", 300)
+    assert "之后每次只给" in out and out.index("（制度.pptx 这一轮") <= REREAD_SMALL + 40
+    small = ws.read_document("制度.pptx", 100, limit=1000)      # 只读一小段：照常给
+    assert "之后每次只给" not in small and len(small) <= 1100
     assert "条款内容" in ws.read_document("制度.pptx", 0, limit=10 ** 9)     # 程序自己读全文不受限
 
 

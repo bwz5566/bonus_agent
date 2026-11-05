@@ -43,10 +43,12 @@ class Match:
     total: int = 0
     diffs: list[tuple[str, Decimal, Decimal]] = field(default_factory=list)   # (编号, 期望, 实际)
     ambiguous: list[tuple[str, list[str]]] = field(default_factory=list)  # (工作表, 几列都可能是这个指标)
+    missing: list[tuple[str, Decimal]] = field(default_factory=list)      # 期望结果里有、本次结果里没有的对象 (编号, 期望)
+    blank: list[str] = field(default_factory=list)                         # 本次结果里有、期望结果里金额为空的对象
 
     @property
     def ok(self) -> bool:
-        return self.total > 0 and self.matched == self.total and not self.ambiguous
+        return self.total > 0 and self.matched == self.total and not self.ambiguous and not self.missing and not self.blank
 
     @property
     def sheet(self) -> str:
@@ -149,9 +151,13 @@ def _compare(results, path, column, where) -> list[Match]:
                         total.ambiguous.append((st.sheet, m.ambiguous))
                     fresh = [(k, e, a) for k, e, a in m.diffs if k not in seen]
                     keys = m.keys - seen
-                    if not keys:
+                    lost = [(k, e) for k, e in m.missing if k not in seen and k not in {x for x, _ in total.missing}]
+                    if not keys and not lost:
                         continue
                     seen |= keys
+                    total.missing += lost
+                    total.blank += [k for k in m.blank if k not in total.blank]
+                    total.total += len(lost)
                     total.sources.append((st.sheet, m.column))
                     total.total += len(keys)
                     total.matched += len(keys) - len(fresh)
@@ -173,6 +179,8 @@ class _SheetMatch:
     keys: set[str] = field(default_factory=set)
     diffs: list = field(default_factory=list)
     ambiguous: list[str] = field(default_factory=list)
+    missing: list = field(default_factory=list)       # (编号, 期望)：期望里有、结果里没有
+    blank: list = field(default_factory=list)         # 编号：结果里有、期望的金额为空
 
     @property
     def matched(self) -> int:
@@ -228,8 +236,16 @@ def _best_in(st, scheme, rev, metric, ours, schemes, revs, column=None) -> _Shee
         return _SheetMatch()
     j = cand[0]
     pairs = [(texts[id_col][r], _num(cols[j][r])) for r in rows]
+    blank = sorted({k for k, v in pairs if v is None})
     pairs = [(k, v) for k, v in pairs if v is not None]
-    return _SheetMatch(st.headers[j], {k for k, _ in pairs}, [(k, v, ours[k]) for k, v in pairs if abs(v - ours[k]) > TOL])
+    # 期望结果里有金额、本次结果里却没有这个对象的（如漏算了某个人）：只比共有的编号会漏掉，要单独列出
+    missing = {}
+    for r in range(len(st.rows)):
+        k, v = texts[id_col][r], _num(cols[j][r])
+        if keep[r] and k and k not in ours and v is not None:
+            missing.setdefault(k, v)
+    return _SheetMatch(st.headers[j], {k for k, _ in pairs}, [(k, v, ours[k]) for k, v in pairs if abs(v - ours[k]) > TOL],
+                       missing=sorted(missing.items()), blank=blank)
 
 
 def report(matches: list[Match]) -> list[str]:
@@ -250,6 +266,11 @@ def report(matches: list[Match]) -> list[str]:
             for sheet, cols in m.ambiguous:
                 line += (f"；{m.metric}无法确定用哪一列（「{sheet}」里 {'、'.join(cols)} 都可能是），"
                          "未核对，请用 --expected-column 指定列名")
+            if m.missing:
+                line += (f"；期望结果里有、本次结果里没有的 {len(m.missing)} 个：" + "、".join(f"{k}（期望 {e:,}）" for k, e in m.missing[:10])
+                         + ("……" if len(m.missing) > 10 else ""))
+            if m.blank:
+                line += f"；期望结果里{m.metric}为空的 {len(m.blank)} 个：" + "、".join(m.blank[:10]) + ("……" if len(m.blank) > 10 else "")
             if not m.diffs:
                 continue
             line += (f"；{m.metric}不一致（对照{'；'.join(f'「{s}」的「{c}」列' for s, c in m.sources)}）："

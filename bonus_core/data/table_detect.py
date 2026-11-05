@@ -23,6 +23,10 @@ class SheetTable:
     # 数据中间出现的另一段表头（几段数据拼在一起、列名有出入）：(Excel 行号, {列下标: (原列名, 这一段的列名)})。
     # 这一行不计入数据；数据仍按列的位置读（同一列），列名有出入的列由使用方提示核对两段含义是否一致
     segments: list[tuple[int, dict]] = field(default_factory=list)
+    # 另一段只是把几列换了位置（列名都能在第一段表头里找到）：这一段的数据已按列名挪回第一段的位置。(Excel 行号, {原位置: 挪到的位置})
+    remaps: list[tuple[int, dict]] = field(default_factory=list)
+    # 另一段的列名对不上、又没法按列名挪回（几列都叫同一个名字等）：(Excel 行号, [涉及的列下标])，用到这些列时要先问清楚
+    unsure: list[tuple[int, list]] = field(default_factory=list)
 
     def column(self, header: str) -> list:
         i = self.headers.index(header)
@@ -114,9 +118,11 @@ def _build(grid, file: str, title: str, header_idx: list[int]) -> SheetTable:
         if not h and any(row[i] not in (None, "") for _, row in body):
             header[i] = blank_header(i)
     active = list(header)              # 当前这一段的表头（原样，用来认重复表头和分段表头）
+    base = list(header)                # 第一段的表头：别的段按列名对回这里
     header = dedupe_headers(header)
     t = SheetTable(file, title, header_idx[0] + 1, header)
     names = [h for h in header if h]
+    perm: dict[int, int] = {}          # 当前这一段要挪位置的列：这一段的位置 -> 第一段的位置
     for j, row in body:
         if _filled(row) == 0:
             continue
@@ -132,9 +138,40 @@ def _build(grid, file: str, title: str, header_idx: list[int]) -> SheetTable:
                     if new:
                         active[i] = new
             t.segments.append((j, changed))
+            perm, unsure = _segment_perm(row, base)
+            if perm:
+                t.remaps.append((j, dict(perm)))
+            if unsure:
+                t.unsure.append((j, unsure))
             continue
+        if perm:          # 这一段换了列的位置：按列名挪回第一段的位置，同一个字段读到的是同一种数
+            moved = list(row)
+            for i, k in perm.items():
+                moved[k] = row[i]
+            row = moved
         (t.totals if _is_total(row) else t.rows).append((j, row))
     return t
+
+
+def _segment_perm(row: list, base: list[str]) -> tuple[dict[int, int], list[int]]:
+    """另一段的表头和第一段比：列名在第一段里唯一出现、位置不同的列，挪回第一段的位置。
+    挪完必须是一一对应（不会两列挪到同一处、也不会把没挪走的列盖掉），否则不挪，返回拿不准的列。"""
+    width = len(base)
+    names = [str(v).strip() if v not in (None, "") else "" for v in list(row)[:width]] + [""] * max(0, width - len(row))
+    target = list(range(width))
+    unsure = []
+    for i, n in enumerate(names):
+        if not n or n == base[i]:
+            continue
+        hits = [k for k, h in enumerate(base) if h == n]
+        if len(hits) == 1:
+            target[i] = hits[0]
+        elif len(hits) > 1:
+            unsure.append(i)
+    if len(set(target)) != width:      # 挪了会撞：哪几列撞了就算拿不准
+        dup = {k for k in target if target.count(k) > 1}
+        return {}, sorted(set(unsure) | {i for i, k in enumerate(target) if k in dup})
+    return {i: k for i, k in enumerate(target) if k != i}, unsure
 
 
 def _is_segment_header(row: list, header: list[str]) -> bool:
@@ -146,6 +183,11 @@ def _is_segment_header(row: list, header: list[str]) -> bool:
     named = sum(1 for h in header if h and not h.endswith("(无表头)"))
     same = sum(1 for v, h in cells if v == h)
     differ = sum(1 for v, h in cells if v != h)
+    if differ and len(cells) >= 2:     # 同样的列名换了位置（如“收入、成本”对调）：几乎每格都是第一段的某个列名
+        known = {h for h in header if h}
+        inside = sum(1 for v, _ in cells if v in known)
+        if inside >= max(2, 0.8 * named) and inside >= 0.8 * len(cells):
+            return True
     return len(cells) >= max(2, 0.5 * named) and same >= 2 and same >= 0.3 * len(cells) and differ >= 1
 
 
@@ -162,7 +204,26 @@ def unpivot_sheet(st: SheetTable, columns: list[str], value: str, label: str = "
             if vals[i] in (None, "") or (isinstance(vals[i], str) and not vals[i].strip()):
                 continue
             rows.append((j, base + [vals[i]] + ([c] if label else [])))
-    return SheetTable(st.file, st.sheet, st.header_row, headers, rows, [], st.confidence, list(st.repeats), list(st.segments))
+    return SheetTable(st.file, st.sheet, st.header_row, headers, rows, [], st.confidence, list(st.repeats), list(st.segments),
+                      list(st.remaps), list(st.unsure))
+
+
+ROW_ID = "（行号）"      # 虚拟列：每行的 Excel 行号（展开后同一行的几条加 -1、-2），给没有唯一编号列的明细表当编号
+
+
+def add_row_ids(st: SheetTable) -> SheetTable:
+    """在表的最后加一列 ROW_ID：没有每行唯一编号的明细表（如展开后的分配名单）也能当最末层、写 key。"""
+    if ROW_ID in st.headers:
+        return st
+    from collections import Counter
+    many = Counter(j for j, _ in st.rows)
+    seq: dict[int, int] = {}
+    rows = []
+    for j, vals in st.rows:
+        seq[j] = seq.get(j, 0) + 1
+        rows.append((j, list(vals) + [f"{j}-{seq[j]}" if many[j] > 1 else str(j)]))
+    return SheetTable(st.file, st.sheet, st.header_row, list(st.headers) + [ROW_ID], rows, [], st.confidence,
+                      list(st.repeats), list(st.segments), list(st.remaps), list(st.unsure))
 
 
 def dedupe_headers(header: list[str]) -> list[str]:

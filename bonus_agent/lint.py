@@ -292,7 +292,12 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
                 rep.keys.append(f"取值 {v}")
     # 3'. 名称和百分比写在一格里（如“张三50%”）：会被当成一个新的对象、全额参与，比例丢了
     from bonus_agent.auto import _NAME_PCT
+    # 只看规则用到的字段和对象编号（主键、关联、层级键）：备注这类文字列里的“回款比例50%”不算
+    keyed = _names(rs) | {d.key for d in rs.datasets.values() if d.key} | {d.link for d in rs.datasets.values() if d.link} \
+        | {lv.key for lv in rs.allocation} | {lv.parent_key for lv in rs.allocation if lv.parent_key}
     for fld, have in values.items():
+        if fld not in keyed:
+            continue
         mixed = sorted(v for v in have if _NAME_PCT.match(v.strip()))
         if mixed and len(mixed) < len(have):
             rep.gates.append(f"数据里「{fld}」有 {len(mixed)} 种取值把名称和百分比写在一格里（如 {'、'.join(mixed[:4])}），"

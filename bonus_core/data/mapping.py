@@ -17,7 +17,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict
 
 from bonus_core.data.table import ConvertError, Datasets, Row, RowRef, StdTable, convert
-from bonus_core.data.table_detect import SheetTable, detect, table_at, unpivot_sheet
+from bonus_core.data.table_detect import ROW_ID, SheetTable, add_row_ids, detect, table_at, unpivot_sheet
 from bonus_core.dsl.models import RuleSet
 from bonus_core.dsl.parser import names, parse
 from bonus_core.engine.issues import Issue
@@ -202,12 +202,21 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping) -> tup
             where = "/".join(x for x in (m.file, m.sheet) if x) or "按表头查找"
             issues.append(Issue.block("sheet_missing", f"找不到「{ds_name}」对应的工作表（{where}）", ds_name))
             continue
+        used_cols = set(m.columns.values()) | set((m.unpivot or {}).get("columns") or [])
+        unsure = sorted({st.headers[i] for _, cols in getattr(st, "unsure", []) for i in cols
+                         if i < len(st.headers) and st.headers[i] in used_cols})
+        if unsure:     # 另一段表头的列名对不上、又没法按列名对回去：用到的列读到的可能是别的数，不能算
+            issues.append(Issue.block("segment_unsure", f"「{ds_name}」的 sheet「{st.sheet}」中间另一段表头的列对不上第一段，"
+                                      f"用到的列「{'、'.join(unsure)}」在那一段里不知道该读哪一列", ds_name))
+            continue
         if m.unpivot:
             bad = [c for c in m.unpivot.get("columns") or [] if c not in st.headers]
             if bad:
                 issues.append(Issue.block("column_missing", f"unpivot 的列「{'、'.join(bad)}」不在 sheet「{st.sheet}」中", ds_name))
                 continue
             st = unpivot_sheet(st, m.unpivot["columns"], m.unpivot["value"], m.unpivot.get("label") or "")
+        if ROW_ID in m.columns.values():
+            st = add_row_ids(st)
         for f in ds.fields:
             if f not in m.columns and f in needed:
                 issues.append(Issue.block("field_unmapped", f"规则用到的字段 {f}（{ds.fields[f].desc}）没有对应的列", ds_name))
