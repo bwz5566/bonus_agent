@@ -71,6 +71,18 @@ BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
 READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate"}
 NO_IGNORE = ("查找表 ", "抵扣 ")    # 程序检查里不能写进 ignored 放过的项
 MUST_FIX = ("抵扣 ",)              # 连提问也不能放过、只能改规则的项
+REREAD_TIMES = 3                   # 一轮里同一份文档累计读到全文的这么多倍后，只给小段
+REREAD_MIN = 60000                 # 短文档反复读不费多少，读够这么多字才限制
+REREAD_SMALL = 4000                # 限制后每次还能读的字数
+GATES_SHOWN = 15                   # 程序检查一次列出的条数
+
+
+def _GATE_ORDER(key: str) -> int:
+    """程序检查项的先后：会让整片结果算错或悄悄为 0 的（取值对不上、参数表没接上、照抄、抵扣）在前，
+    要问财务的口径（阶梯方式、名称+百分比）其次，常数出处最后（条数多，常常只是核对一下）。"""
+    head = key.split(" ", 1)[0]
+    return {"抵扣": 0, "查找表": 0, "取值": 1, "未用": 1, "同字段比较": 1, "分档": 2, "参数表": 2, "名称百分比": 2,
+            "阶梯方式": 2, "金额": 3, "状态": 3}.get(head, 4 if head in ("常数", "百分号") else 3)
 VERIFY_TOL = Decimal("0.005")   # 按份额分配时，独立算式和引擎未舍入的份额之差不超过半分，才算尾差
 WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", "remove_facts", "ask_question",
                "record_clauses", "cover_clauses",
@@ -650,6 +662,7 @@ class Workspace:
     read_nums: dict = field(default_factory=dict)           # 方案 -> 规则读取的数据字段里出现的数（直接读表的参数算用上了）
     lint: dict = field(default_factory=dict)                # 方案 -> 程序检查结果（lint.Report），finish 前要处理其中的 gates
     said: str = ""                                          # 财务在对话里发过的文字：和材料一样可以引用（file 写「财务对话」）
+    doc_reads: dict = field(default_factory=dict)           # 本轮每份文档已读的字数（不存进案卷，每轮从 0 起）
 
     @property
     def data_files(self) -> list[Path]:
@@ -697,7 +710,16 @@ class Workspace:
             return (summary + "\n这是结构化数据文件，不能逐页读、也不能直接定义成数据表。"
                     "同样的数据在 Excel 里有时用 Excel 的工作表定义数据表；它是唯一来源时请用 ask_question 请财务提供 Excel。")
         text = self._render_doc(d, folded)
+        done = self.doc_reads.get(f.name, 0)
+        inner = limit >= 10 ** 9            # 程序自己读全文（简报、复读）：不计、不限
+        if not inner and limit > REREAD_SMALL and done >= max(REREAD_TIMES * len(text), REREAD_MIN):
+            # 同一份文档整段整段地反复读（如每核对一条条款就把整份 PPT 再读一遍）：上下文和 tokens 很快用光，结果也不会更准
+            return (f"{f.name} 这一轮已经读了约 {done:,} 字（全文 {len(text):,} 字的 {done / max(len(text), 1):.1f} 倍），不再整段返回。"
+                    "条款和参数已经记在条款清单和台账里，核对时直接看那里；确实要再看原文某处，"
+                    f"用 offset 指到那一页、limit 不超过 {REREAD_SMALL} 字只读那一段。拿不准的口径用 ask_question 问财务")
         chunk = text[offset:offset + limit]
+        if not inner:
+            self.doc_reads[f.name] = done + len(chunk)
         more = len(text) - offset - len(chunk)
         return chunk + (f"\n\n……还有 {more} 字，用 offset={offset + len(chunk)} 继续读取" if more > 0 else "")
 
@@ -1498,7 +1520,8 @@ class Workspace:
                                     created_at=f"{len(done) + i:06d}") for i, a in enumerate(rev["adjust"])]
                 res[rev["name"]] = eng.compute(list(done))
         except EngineError as e:
-            raise ToolError(f"方案「{name}」试算失败：\n" + "\n".join(f"- {i}" for i in e.issues[:8]) + fixes.hints(e.issues)) from None
+            raise ToolError(f"方案「{name}」试算失败：\n" + "\n".join(f"- {i}" for i in e.issues[:8]) + fixes.hints(e.issues)
+                            + self._unmatched_text(e.issues)) from None
         except (EvalError, AdjustConflict, ValueError) as e:
             raise ToolError(f"方案「{name}」试算失败：{e}") from None
         self.results[name] = res
@@ -1569,14 +1592,46 @@ class Workspace:
                     pass
         rep = self.lint[name] = lint.check(rs, data, self._rule_text(), base.traces, sourced=self._sources_readable(),
                                            headers=heads, tiers=base.tier_stats, used_elsewhere=others,
-                                           coverage=base.coverage, reached_elsewhere=elsewhere)
+                                           coverage=base.coverage, reached_elsewhere=elsewhere,
+                                           said="\n".join([self.said] + [f"{q.text} {q.answer}" for q in self.questions if q.answer]))
         if rep.warns:
             lines.append("程序检查提示：\n" + "\n".join(f"- {w}" for w in rep.warns[:8]))
         gates = self._open_gates(rep)
         if gates:
             lines.append(f"程序检查发现 {len(gates)} 处要处理（finish 前必须改好、问财务，或写进 finish 的 ignored 说明原因）：\n"
-                         + "\n".join(f"- {g}" for g in gates[:10]))
+                         + "\n".join(f"- {g}" for g in gates[:GATES_SHOWN])
+                         + (f"\n……还有 {len(gates) - GATES_SHOWN} 处没列出（先处理上面的，改完再 trial_run 会列出其余的）"
+                            if len(gates) > GATES_SHOWN else ""))
         return "\n".join(lines)
+
+    def _unmatched_text(self, issues) -> str:
+        """编号在上级表里找不到（link_unmatched）：按表汇总行数和编号；同一批编号第二次还对不上，明确要求去问财务，不要换着法子绕。"""
+        groups: dict[tuple[str, str, str], list[str]] = {}
+        for i in issues:
+            m = re.match(r"「(.+?)」中 (\S+?)=(.*) 在「(.+?)」中找不到", getattr(i, "message", "")) \
+                if getattr(i, "code", "") == "link_unmatched" else None
+            if m:
+                groups.setdefault((m.group(1), m.group(2), m.group(4)), []).append(m.group(3))
+        if not groups:
+            return ""
+        seen = getattr(self, "_unmatched_seen", {})
+        self._unmatched_seen = seen
+        lines = []
+        again = False
+        for (tbl, fld, level), keys in groups.items():
+            uniq = sorted(set(keys))
+            sig = (tbl, fld, level, tuple(uniq[:50]))
+            seen[sig] = seen.get(sig, 0) + 1
+            again |= seen[sig] >= 2
+            lines.append(f"「{tbl}」有 {len(keys)} 行的 {fld} 在「{level}」里找不到（{len(uniq)} 个编号，如 {'、'.join(uniq[:6])}）")
+        out = "\n汇总：" + "；".join(lines) + "。"
+        if again:
+            out += ("\n同一批编号已经第 2 次对不上了。不要再换着改规则或映射绕开，也不要自己决定排除或补录："
+                    "编号写法不同（空格、大小写、前导 0）才改映射；否则现在就用 ask_question 问财务这些记录怎么处理"
+                    "（问题里写上表名、行数、编号例子，选项如：补录到上级表 / 不参与计算 / 归到某一类），先做不受影响的部分，然后 finish 等答复")
+        else:
+            out += "先核对编号写法和映射的列；是漏录还是该排除，材料没写就用 ask_question 问财务，不要自己补数据或排除"
+        return out
 
     def _rule_text(self) -> str:
         """规则材料的原文（规则文档、没定义成数据表的工作表、财务的话和答复），程序检查用来找常数和取值的出处。"""
@@ -1628,10 +1683,11 @@ class Workspace:
         asked = " ".join(f"{q.text} {q.answer or ''}" for q in self.questions)
         # 每条后面给出写进 ignored 用的 ref（模型自己拼的 ref 常对不上，同一条拦了又拦）
         refs = self._asked_refs()
+        pairs = sorted(zip(rep.gates, rep.keys), key=lambda p: _GATE_ORDER(p[1]))   # 会让结果整片算错的排在前面，常数出处排最后
         return [g + (f"〔提问时 related 写「{k}」〕" if k.startswith(NO_IGNORE)
                      else f"〔放过时 ignored 的 ref 写「{k}」，提问时 related 写同样内容〕")
                 if not k.startswith(MUST_FIX) else g
-                for g, k in zip(rep.gates, rep.keys)
+                for g, k in pairs
                 if k.startswith(MUST_FIX) or (k not in skipped and k not in refs and k.split(" ", 1)[1] not in asked)]
 
     def _period_mismatch(self, name: str) -> str:
@@ -2172,8 +2228,9 @@ class Workspace:
         gates = [f"方案「{s}」：{g}" for s in self.schemes if s in self.lint for g in self._open_gates(self.lint[s])]
         if gates:
             raise ToolError("程序检查还有没处理的（逐条改规则；需要财务确认的用 ask_question；确实无关的写进 ignored，"
-                            "ref 照抄每条末尾〔〕里给出的写法，reason 说明原因）：\n" + "\n".join(f"- {g}" for g in gates[:12])
-                            + (f"\n……共 {len(gates)} 处" if len(gates) > 12 else ""))
+                            "ref 照抄每条末尾〔〕里给出的写法，reason 说明原因）：\n" + "\n".join(f"- {g}" for g in gates[:GATES_SHOWN])
+                            + (f"\n……共 {len(gates)} 处，还有 {len(gates) - GATES_SHOWN} 处没列出（先处理上面的）"
+                               if len(gates) > GATES_SHOWN else ""))
         diffs = self._reread_gaps(skipped)
         if diffs:
             other = getattr(self.llm, "checker_llm", None)

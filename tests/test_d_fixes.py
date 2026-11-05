@@ -155,7 +155,7 @@ def test_parameter_tables_and_coefficients_left_out_of_the_calculation_are_gated
 def test_tier_method_must_be_stated_in_materials():
     from bonus_agent import lint
     assert "阶梯方式 rate" in lint.check(_rs(), {}, "销售额 500 万以上提成 2%").keys
-    assert "阶梯方式 rate" not in lint.check(_rs(), {}, "超额累进，每段按各自比例").keys
+    assert "阶梯方式 rate" not in lint.check(_rs(), {}, "500 以上 2%，超额累进，每段按各自比例").keys
 
 
 def test_name_with_percent_in_one_cell_is_flagged(tmp_path):

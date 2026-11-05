@@ -75,6 +75,27 @@ def percent_only(text: str) -> set[str]:
     return pct - bare
 
 
+_PCT_CTX = re.compile(r"%|％|比例|占比|百分|分成|分配|提成|系数")
+
+
+def percent_sources(text: str) -> tuple[set[str], set[str]]:
+    """材料里能作为小数比例出处的数：(写成 x% 换算成的 x/100, 不带 % 的数换算成的 x/100)。
+    后一种是表格里的数（如“分配比例”一栏的 42.5），前后 300 字内有“%”“比例”这类字样才算。"""
+    t = unicodedata.normalize("NFKC", text)
+    t = re.sub(r"(?<=\d),(?=\d{3})", "", t)
+    pct, ctx = set(), set()
+    for m in _NUM.finditer(t):
+        try:
+            n = Decimal(m.group(1))
+        except InvalidOperation:
+            continue
+        if m.group(2) in ("%", "％"):
+            pct.add(_key(n / 100))
+        elif not m.group(2) and 1 <= n <= 100 and _PCT_CTX.search(t[max(0, m.start() - 300):m.end() + 300]):
+            ctx.add(_key(n / 100))
+    return pct, ctx
+
+
 @dataclass
 class Report:
     gates: list[str] = field(default_factory=list)       # finish 前必须处理
@@ -178,10 +199,11 @@ def _compared(rs: RuleSet, negated: set[str] | None = None) -> dict[str, dict[st
 
 def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, sourced: str = "",
           headers: dict[str, str] | None = None, tiers: dict | None = None, used_elsewhere: set[str] | None = None,
-          coverage: list | None = None, reached_elsewhere: set[str] | None = None) -> Report:
+          coverage: list | None = None, reached_elsewhere: set[str] | None = None, said: str = "") -> Report:
     """text：规则材料原文（规则文档、财务的话和答复）。sourced 非空时（如有图片没转写）常数出处无法核对，只提示。
     headers：字段 -> Excel 表头原文（含工作表名），判断字段含义时不只看智能体起的名字。
-    tiers：引擎记录的分档表实际取值分布；coverage：查找表、条件分支的命中分布；used_elsewhere：其他方案用到的名字（一个金额字段只要有方案用到就不算漏用）。"""
+    tiers：引擎记录的分档表实际取值分布；coverage：查找表、条件分支的命中分布；used_elsewhere：其他方案用到的名字（一个金额字段只要有方案用到就不算漏用）。
+    said：财务的话和答复（阶梯算法只要财务说过就算写明）。"""
     rep = Report()
     norm = unicodedata.normalize("NFKC", text)
     nums = material_numbers(text)
@@ -207,7 +229,9 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
     # 1. 常数要有出处；材料里只写成百分数的，规则里不能漏了 %
     miss: dict[str, set[str]] = {}
     unit: dict[str, set[str]] = {}
-    pct_only = percent_only(text)
+    scaled, in_table = percent_sources(text)
+    pct_only = percent_only(text) - scaled      # 材料里另有 25% 的，0.25 不算漏了百分号
+    nums = nums | in_table
     for n, where in constants(rs):
         if where.removeprefix("tables.") in copied:
             continue
@@ -236,10 +260,24 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
         if not have:
             continue
         for lit, ws in lits.items():
-            if lit not in have and lit not in norm:
+            if lit in have:
+                continue
+            if lit not in norm:
                 rep.gates.append(f"「{fld}」写的取值「{lit}」（{'、'.join(sorted(ws))}）在数据和材料里都没有；数据里的取值是："
                                  f"{'、'.join(list(have)[:12])}。按数据的实际写法改，对应关系拿不准就 ask_question")
                 rep.keys.append(f"取值 {lit}")
+                continue
+            # 材料里的叫法和数据的写法不一样（如材料写“客户经理”，数据是“客户经理1”“客户经理2”；“南方国家区”和“南方国家部”）：
+            # 规则照材料写，一行都对不上，这部分悄悄成了 0
+            near = _near_values(lit, have)
+            if near:
+                rep.gates.append(f"「{fld}」写的取值「{lit}」（{'、'.join(sorted(ws))}）是材料里的叫法，数据里没有这个取值，"
+                                 f"规则按它比较一行都对不上。数据里相近的取值：{'、'.join(f'{v}（{have[v]} 行）' for v in near[:8])}。"
+                                 "按数据的实际写法改（对应几个取值就都写上，用 or 连接）；材料的叫法和数据对应不上或拿不准，用 ask_question 问财务")
+                rep.keys.append(f"取值 {lit}")
+            elif len(have) <= MAX_CATEGORIES:
+                rep.warns.append(f"「{fld}」写的取值「{lit}」（{'、'.join(sorted(ws))}）在数据里没有，按它比较一行都对不上；"
+                                 f"数据里的取值是：{'、'.join(list(have)[:12])}。核对是否是数据的另一种写法")
         if len(have) > MAX_CATEGORIES:
             continue
         for v, cnt in have.items():
@@ -252,6 +290,15 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
                 rep.gates.append(f"数据里「{fld}」有取值「{v}」（{cnt} 行），材料和规则都没提到，现在的规则会把它{how}。"
                                  "用 ask_question 问财务这类记录怎么处理（问题里写上这个取值）")
                 rep.keys.append(f"取值 {v}")
+    # 3'. 名称和百分比写在一格里（如“张三50%”）：会被当成一个新的对象、全额参与，比例丢了
+    from bonus_agent.auto import _NAME_PCT
+    for fld, have in values.items():
+        mixed = sorted(v for v in have if _NAME_PCT.match(v.strip()))
+        if mixed and len(mixed) < len(have):
+            rep.gates.append(f"数据里「{fld}」有 {len(mixed)} 种取值把名称和百分比写在一格里（如 {'、'.join(mixed[:4])}），"
+                             "现在会被当成一个单独的对象、按整行参与计算，百分比没起作用。用 ask_question 问财务这些格子怎么拆"
+                             "（是谁、各占多少），问题里列出这些写法；答复后按答复拆分")
+            rep.keys.append(f"名称百分比 {mixed[0]}")
     # 4. 读了数据表却漏用了表里的金额字段
     for ds, fld in _unused_money(rs, used_elsewhere or set()):
         head = (headers or {}).get(f"{ds}.{fld}", "").strip()
@@ -282,15 +329,19 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
             rep.keys.append(f"参数表 {name}")
     rep.warns += cov_warns
     # 6'. 阶梯直接算金额（tier）时，全额累进还是超额累进算出来差很多；材料和答复都没说是哪种，不能自己定
-    if norm.strip() and not _TIER_HOW.search(norm):        # 没有材料原文（只校验结构）时不查
-        for t in sorted(_tier_called(rs)):
-            tb = rs.tables.get(t)
-            if isinstance(tb, TierTable) and len(tb.steps) >= 2:
-                (rep.warns if sourced else rep.gates).append(f"阶梯表 {t} 写的是 {tb.mode}（{'整笔按所在档的比例' if tb.mode == 'whole' else '超额部分分段累加'}），"
-                                 "材料和财务答复都没说是全额（整笔按所在档）还是超额累进（每段按各自比例）。两种算法差很多，"
-                                 "用 ask_question 问财务，问题里各举一个金额按两种算法的结果")
-                if not sourced:       # 没有规则文档可核对时只提示
-                    rep.keys.append(f"阶梯方式 {t}")
+    # 只认财务的话 / 答复，或材料里这张表的分档点、比例附近写明的算法；材料别处出现“累进”“分段”不算
+    if norm.strip() and not _TIER_HOW.search(unicodedata.normalize("NFKC", said)):   # 没有材料原文（只校验结构）时不查
+        for t, how in sorted(_tier_amount_tables(rs).items()):
+            tb = rs.tables[t]
+            if _tier_stated(norm, tb):
+                continue
+            algo = ("超额部分分段累加" if tb.mode == "excess" else "整笔按所在档的比例") if how == "tier" else \
+                "用 tier_rate 取所在档的比例再乘金额，等于整笔按所在档的比例（全额）"
+            (rep.warns if sourced else rep.gates).append(
+                f"阶梯表 {t} 现在是{algo}。材料里这张表附近和财务答复都没说是全额（整笔按所在档）还是超额累进（每段按各自比例），"
+                "两种算法差很多，不能默认。用 ask_question 问财务，问题里各举一个金额按两种算法的结果")
+            if not sourced:       # 没有规则文档可核对时只提示
+                rep.keys.append(f"阶梯方式 {t}")
     # 7. 参数表、用参数表算的变量定义了，却没接进计算（如系数表建了、提成里没乘）：要么接上，要么说明为什么不用
     used = _reachable(rs)
     live = reached(rs) | (reached_elsewhere or set())
@@ -604,6 +655,49 @@ def _copied(rs: RuleSet, data: Datasets) -> dict[str, tuple[str, str, str]]:
 _TIER_HOW = re.compile(r"累进|超额|分段|全额|整笔|全部按|按所在档|按达到的档|按达成的档")
 
 
+def _tier_amount_tables(rs: RuleSet) -> dict[str, str]:
+    """按金额分档算提成的阶梯表 -> 用法（tier / tier_rate）：tier(...) 直接算金额的（至少 2 档）；
+    tier_rate(...) 取比例的，各档比例都像提成比例（都小于 0.3、至少两档不同且不为 0），不是 0.8、1.1 这类系数。"""
+    out: dict[str, str] = {}
+    for t in _tier_called(rs):
+        tb = rs.tables.get(t)
+        if isinstance(tb, TierTable) and len(tb.steps) >= 2:
+            out[t] = "tier"
+    for _, ast in _parsed(rs):
+        for c in walk(ast):
+            if isinstance(c, Call) and c.fn == "tier_rate" and c.args and isinstance(c.args[0], Name):
+                tb = rs.tables.get(c.args[0].id)
+                if not isinstance(tb, TierTable) or c.args[0].id in out:
+                    continue
+                rates = [Decimal(str(r)) for _, r in tb.steps]
+                if len({r for r in rates if r}) >= 2 and all(Decimal(0) <= r < Decimal("0.3") for r in rates):
+                    out[c.args[0].id] = "tier_rate"
+    return out
+
+
+def _tier_stated(norm: str, tb: TierTable) -> bool:
+    """材料里这张表的分档点或比例出现的地方，前后 300 字内写了全额 / 超额 / 累进这类算法。"""
+    want = set()
+    for lo, r in tb.steps:
+        for x in (lo, r):
+            try:
+                d = Decimal(str(x))
+            except InvalidOperation:
+                continue
+            if d not in (Decimal(0), Decimal(1)):
+                want.add(_key(d))
+    t = re.sub(r"(?<=\d),(?=\d{3})", "", norm)
+    for m in _NUM.finditer(t):
+        try:
+            n = Decimal(m.group(1))
+        except InvalidOperation:
+            continue
+        keys = {_key(n)} | ({_key(n * _SCALE[m.group(2)])} if m.group(2) else set())
+        if keys & want and _TIER_HOW.search(t[max(0, m.start() - 300):m.end() + 300]):
+            return True
+    return False
+
+
 def _tier_called(rs: RuleSet) -> set[str]:
     """用 tier(...) 直接算金额的阶梯表名。"""
     return {c.args[0].id for _, ast in _parsed(rs) for c in walk(ast)
@@ -663,6 +757,29 @@ def _zero(x) -> bool:
 
 _NEG = ("不", "非", "未", "无", "没有")
 _PAIRS = (("有", "无"), ("是", "否"), ("已", "未"), ("合格", "不合格"), ("通过", "不通过"))
+
+
+def _near_values(lit: str, have: dict[str, int]) -> list[str]:
+    """数据里和规则取值写法相近的取值：互相包含（去掉空格、大小写），或字面相似度 ≥ 0.75（至少 2 个字相同）。"""
+    import difflib
+
+    def plain(x: str) -> str:
+        return re.sub(r"\s+", "", unicodedata.normalize("NFKC", x)).lower()
+    a = plain(lit)
+    if not a:
+        return []
+    out = []
+    for v in have:
+        b = plain(v)
+        if not b or b == a:
+            if b == a:
+                out.append(v)
+            continue
+        if (len(a) >= 2 and a in b) or (len(b) >= 2 and b in a):
+            out.append(v)
+        elif min(len(a), len(b)) >= 2 and difflib.SequenceMatcher(None, a, b).ratio() >= 0.75:
+            out.append(v)
+    return sorted(out, key=lambda v: (-difflib.SequenceMatcher(None, a, plain(v)).ratio(), -have[v]))
 
 
 def _opposite(v: str, lits) -> bool:

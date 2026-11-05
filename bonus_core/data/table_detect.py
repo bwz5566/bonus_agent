@@ -113,9 +113,10 @@ def _build(grid, file: str, title: str, header_idx: list[int]) -> SheetTable:
         # 表头是空的、下面却有数据的列（如用公式拼出来的编号列）：起个固定的名字，才能被选用；否则只能拿别的列顶替
         if not h and any(row[i] not in (None, "") for _, row in body):
             header[i] = blank_header(i)
+    active = list(header)              # 当前这一段的表头（原样，用来认重复表头和分段表头）
+    header = dedupe_headers(header)
     t = SheetTable(file, title, header_idx[0] + 1, header)
     names = [h for h in header if h]
-    active = list(header)              # 当前这一段的表头
     for j, row in body:
         if _filled(row) == 0:
             continue
@@ -162,6 +163,24 @@ def unpivot_sheet(st: SheetTable, columns: list[str], value: str, label: str = "
                 continue
             rows.append((j, base + [vals[i]] + ([c] if label else [])))
     return SheetTable(st.file, st.sheet, st.header_row, headers, rows, [], st.confidence, list(st.repeats), list(st.segments))
+
+
+def dedupe_headers(header: list[str]) -> list[str]:
+    """同一张表里几列同名（如三列都叫“区域”）：第一列保持原名，后面的加上 Excel 列字母，如“区域(Z列)”，才能分别选用。"""
+    from openpyxl.utils import get_column_letter
+    seen, out = set(header), []
+    first: set[str] = set()
+    for i, h in enumerate(header):
+        if h and h in first:
+            new = f"{h}({get_column_letter(i + 1)}列)"
+            while new in seen:
+                new += "'"
+            seen.add(new)
+            out.append(new)
+        else:
+            first.add(h)
+            out.append(h)
+    return out
 
 
 def blank_header(i: int) -> str:
