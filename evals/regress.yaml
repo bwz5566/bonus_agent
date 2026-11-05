@@ -42,3 +42,7 @@ scenarios:
   - name: Q9
     inputs: ../../bonus_fixture_v9/01_输入材料
     expected: ../../bonus_fixture_v9/02_验收答案_不要上传/04_最终期望结果.xlsx
+  # Q10：财务定了口径——两行手工冻结（同客户另一编码）改为正常发放；预算里“美加组”是笔误，统一为“美加课”（输入材料同步改）
+  - name: Q10
+    inputs: ../../bonus_fixture_v10/01_输入材料
+    expected: ../../bonus_fixture_v10/02_验收答案_不要上传/04_最终期望结果.xlsx
