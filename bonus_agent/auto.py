@@ -161,6 +161,7 @@ class PlanDataset(BaseModel):
     link: str | None = None
     fields: dict[str, PlanField]
     distinct: bool = False
+    unmatched: str = "block"
 
 
 class PlanLevel(BaseModel):
@@ -232,7 +233,7 @@ def _fix_column(col: str, headers: list[str]) -> str | None:
     return norm[close[0]] if close else None
 
 
-_NAME_PCT = re.compile(r"^[^\d%％]{1,20}?\s*\d+(?:\.\d+)?\s*[%％]$")
+_NAME_PCT = re.compile(r"^[^\d%％]{1,20}?\s*\d+(?:\.\d+)?\s*[%％]\s*[)）]?$")   # 张三50%、张三(50%)、张三（50%）
 
 
 def filter_sheet(st: SheetTable, flt: dict | None) -> tuple[SheetTable, str]:
@@ -352,7 +353,8 @@ def check_dataset(name: str, pd: PlanDataset, st: SheetTable, field_types: dict[
         return None, None, warnings, errors
     if pd.distinct and not pd.key:
         return None, None, warnings, [f"「{name}」写了 distinct 却没写 key：distinct 是按 key 的不同取值建对象"]
-    return (DatasetDef(desc=pd.desc, key=pd.key, link=pd.link, fields=fields, distinct=pd.distinct and bool(pd.key)),
+    return (DatasetDef(desc=pd.desc, key=pd.key, link=pd.link, fields=fields, distinct=pd.distinct and bool(pd.key),
+                       unmatched="ignore" if pd.unmatched == "ignore" and pd.link and not pd.key else "block"),
             DatasetMapping(file=st.file, sheet=st.sheet, header_rows=header_rows, columns=cols, filter=flt or {}),
             warnings, [])
 

@@ -192,10 +192,15 @@ def build_tree(rs: RuleSet, data: Datasets) -> tuple[Node, dict[str, list[Node]]
             issues.append(Issue.block("link_bad", f"「{name}」的 link 字段 {ds.link} 不是层级主键，也不是关联实体的主键",
                                       where=name))
             continue
+        dropped: list[str] = []
         for row in data[name].rows:
-            n = _parent_node(lay, name, row, root, nodes, index, issues)
+            n = _parent_node(lay, name, row, root, nodes, index, issues, dropped if ds.unmatched == "ignore" else None)
             if n is not None:
                 n.own_rows.setdefault(name, []).append(row)
+        if dropped:
+            keys = list(dict.fromkeys(dropped))
+            issues.append(Issue.warn("link_ignored", f"「{name}」有 {len(dropped)} 行的 {ds.link} 在上级里找不到，按 unmatched: ignore "
+                                     f"不参与计算（{len(keys)} 个编号，如 {'、'.join(keys[:6])}）", where=name))
 
     # 5. 编号引用：每张表中带有关联实体编号的行，记到被引用的实体上
     for name, ds in rs.datasets.items():
@@ -247,7 +252,7 @@ def _aux_order(lay: Layout) -> list[str]:
     return out
 
 
-def _parent_node(lay: Layout, name: str, row: Row, root: Node, nodes, index, issues) -> Node | None:
+def _parent_node(lay: Layout, name: str, row: Row, root: Node, nodes, index, issues, dropped: list | None = None) -> Node | None:
     kind, target, f = lay.parent[name]
     if kind == "root":
         return root
@@ -259,5 +264,8 @@ def _parent_node(lay: Layout, name: str, row: Row, root: Node, nodes, index, iss
         level = target
         n = index.get(target, {}).get(str(k)) if k is not None else None
     if n is None:
+        if dropped is not None:        # 财务确认过查不到的不参与：不阻断，汇总成一条提示
+            dropped.append(str(k))
+            return None
         issues.append(Issue.block("link_unmatched", f"「{name}」中 {f}={k} 在「{level}」中找不到", where=str(row.src)))
     return n

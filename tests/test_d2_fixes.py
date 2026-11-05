@@ -120,8 +120,8 @@ def test_whole_document_reread_again_and_again_is_cut_short():
             break
     out = ws.read_document("制度.pptx", 300)
     assert "之后每次只给" in out and out.index("（制度.pptx 这一轮") <= REREAD_SMALL + 40
-    small = ws.read_document("制度.pptx", 100, limit=1000)      # 只读一小段：照常给
-    assert "之后每次只给" not in small and len(small) <= 1100
+    small = ws.read_document("制度.pptx", 100, limit=1000)      # 只读一小段：照常给，但也计数
+    assert "条款内容" in small and small.index("（制度.pptx 这一轮") <= 1040
     assert "条款内容" in ws.read_document("制度.pptx", 0, limit=10 ** 9)     # 程序自己读全文不受限
 
 

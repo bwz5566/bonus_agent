@@ -74,6 +74,7 @@ MUST_FIX = ("抵扣 ",)              # 连提问也不能放过、只能改规�
 REREAD_TIMES = 3                   # 一轮里同一份文档累计读到全文的这么多倍后，只给小段
 REREAD_MIN = 60000                 # 短文档反复读不费多少，读够这么多字才限制
 REREAD_SMALL = 1500                # 限制后每次还能读的字数（一次正常读取最多约 5800 字）
+REREAD_EXTRA = 10                  # 限制后最多再读这么多次小段，之后只给提示（防止用很小的 limit 把全文再读一遍）
 GATES_SHOWN = 15                   # 程序检查一次列出的条数
 
 
@@ -174,6 +175,9 @@ TOOLS: list[dict] = [
      "parameters": _obj({"name": {**_S, "description": "中文表名，如 人员、合同明细"}, "file": _S, "sheet": _S,
                          "header_rows": {"type": "array", "items": _I, "description": "可选：表头所在的 Excel 行号，多行表头写多个"},
                          "key": _S, "link": _S, "desc": _S,
+                         "unmatched": {"type": "string", "enum": ["block", "ignore"], "description":
+                                       "可选：明细表的 link 编号在上级里找不到时怎么办。默认 block（试算阻断，要问财务）；"
+                                       "财务答复过“找不到的不参与 / 按默认值”后才可写 ignore，这些行不参与计算"},
                          "distinct": {"type": "boolean", "description": "可选：按 key 的不同取值各建一个对象（同一编号的多行合成一个，"
                                       "其余字段在同一编号下要一样）。没有单独的主表、又要按这个编号汇总时用，如从明细里得到每个客户一个“客户”"},
                          "filter": {"type": "object", "description": '可选：只取这些行，{"列名": "取值"} 或 {"列名": ["取值1", "取值2"]}'},
@@ -716,10 +720,15 @@ class Workspace:
         inner = limit >= 10 ** 9            # 程序自己读全文（简报、复读）：不计、不限
         limit = max(1, min(int(limit or 0) or MAX_RESULT_CHARS - 200, MAX_RESULT_CHARS - 200)) if not inner else limit
         note = ""
-        if not inner and limit > REREAD_SMALL and done >= max(REREAD_TIMES * len(text), REREAD_MIN):
+        if not inner and done >= max(REREAD_TIMES * len(text), REREAD_MIN):
             # 同一份文档整段整段地反复读（如每核对一条条款就把整份 PPT 再读一遍）：上下文和 tokens 很快用光，结果也不会更准。
-            # 只给 offset 处的一小段
-            limit = REREAD_SMALL
+            # 只给 offset 处的一小段；小段也只给有限几次，用很小的 limit 逐段读同样绕不开
+            small = self.doc_reads.get(f.name + "#small", 0)
+            if small >= REREAD_EXTRA:
+                return (f"{f.name} 这一轮已经读了约 {done:,} 字（全文 {len(text):,} 字），限制后又读了 {small} 段，不再给原文。"
+                        "条款和参数已经记在条款清单和台账里，直接看那里；拿不准的口径用 ask_question 问财务。")
+            self.doc_reads[f.name + "#small"] = small + 1
+            limit = min(limit, REREAD_SMALL)
             note = (f"\n\n（{f.name} 这一轮已经读了约 {done:,} 字，是全文 {len(text):,} 字的 {done / max(len(text), 1):.1f} 倍，"
                     f"之后每次只给 {REREAD_SMALL} 字。条款和参数已经记在条款清单和台账里，核对时直接看那里；"
                     "要看原文某处，用 offset 指到那一页。拿不准的口径用 ask_question 问财务）")
@@ -1129,20 +1138,22 @@ class Workspace:
     # ---- 数据表 ----
     def define_dataset(self, name: str, file: str, sheet: str, fields: dict | None = None, key: str | None = None,
                        link: str | None = None, desc: str = "", header_rows: list[int] | None = None,
-                       filter: dict | None = None, distinct: bool = False, unpivot: dict | None = None) -> str:
+                       filter: dict | None = None, distinct: bool = False, unpivot: dict | None = None,
+                       unmatched: str = "block") -> str:
         reuse = ""
         if not fields:      # 重新定义时只改 key / link / filter：沿用上一次的字段（模型常只写要改的部分，反复因缺 fields 失败）
             fields = self._prev_fields.get(name)
             if not fields:
                 raise ToolError(f"缺少 fields（字段名 -> {{column, type}}）。「{name}」之前没有定义成功过，要写全字段")
             reuse = f"没写 fields，沿用上一次定义「{name}」时的 {len(fields)} 个字段"
-        out = self._define_dataset(name, file, sheet, fields, key, link, desc, header_rows, filter, distinct, unpivot)
+        out = self._define_dataset(name, file, sheet, fields, key, link, desc, header_rows, filter, distinct, unpivot, unmatched)
         self._prev_fields[name] = fields
         return out + (f"\n{reuse}" if reuse else "")
 
     def _define_dataset(self, name: str, file: str, sheet: str, fields: dict, key: str | None = None,
                         link: str | None = None, desc: str = "", header_rows: list[int] | None = None,
-                        filter: dict | None = None, distinct: bool = False, unpivot: dict | None = None) -> str:
+                        filter: dict | None = None, distinct: bool = False, unpivot: dict | None = None,
+                        unmatched: str = "block") -> str:
         f = self._file(file)
         try:
             st = table_at(f, sheet, header_rows) if header_rows else self.inv.sheet(f"{f.name}/{sheet}")
@@ -1171,9 +1182,19 @@ class Workspace:
                 if len(hit) == 1:
                     fixed.append(f"{which} 写的是列名 {val}，已改成对应的字段名 {hit[0]}（key / link 要写字段名）")
                     key, link = (hit[0], link) if which == "key" else (key, hit[0])
+        unmatched = str(unmatched or "block").strip().lower()
+        if unmatched == "ignore":
+            if not link or key:
+                raise ToolError("unmatched: ignore 只用于写了 link、没写 key 的明细表")
+            # 财务说过的话，或财务答复过的问题（问题里写了表名、答复说怎么处理）：问题原文这里也算，表名多半只出现在问题里
+            told = "\n".join([self.said] + [f"{q.text} {q.answer}" for q in self.questions if str(q.answer or "").strip()])
+            sh = "" if re.fullmatch(r"(?i)sheet\s*\d*|工作表\s*\d*", str(sheet or "").strip()) else sheet   # Sheet1 这类名字到处都有，不算
+            if not any(x and x in told for x in (name, sh, Path(str(file)).stem)):
+                raise ToolError(f"未保存：unmatched: ignore 要有财务的答复依据。先用 ask_question 问财务「{name}」里在上级找不到的记录怎么处理"
+                                "（问题里写上表名、编号例子），财务答复“不参与 / 按默认值”后再写 ignore")
         try:
             pd = PlanDataset(sheet=sheet, key=key or None, link=link or None, desc=desc, fields=fields,
-                             distinct=bool(distinct))
+                             distinct=bool(distinct), unmatched=unmatched)
         except ValidationError as e:
             raise ToolError(f"参数格式不对：{e}") from None
         types = {fn: (fd.type, n) for n, d in self.datasets.items() if n != name for fn, fd in d.fields.items()}
@@ -1667,6 +1688,8 @@ class Workspace:
                     "（问题里写上表名、行数、编号例子，选项如：补录到上级表 / 不参与计算 / 归到某一类），先做不受影响的部分，然后 finish 等答复")
         else:
             out += "先核对编号写法和映射的列；是漏录还是该排除，材料没写就用 ask_question 问财务，不要自己补数据或排除"
+        out += ("。财务答复“找不到的不参与 / 按默认值（如系数 1）”时，重新 define_dataset 这张明细表并写 unmatched: \"ignore\"，"
+                "按对象取值的地方用 if(count(...) == 0, 默认值, ...) 写出默认值")
         return out
 
     def _rule_text(self) -> str:

@@ -230,13 +230,16 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
     miss: dict[str, set[str]] = {}
     unit: dict[str, set[str]] = {}
     scaled, in_table = percent_sources(text)
-    pct_only = percent_only(text) - scaled      # 材料里另有 25% 的，0.25 不算漏了百分号
+    pct_strict = percent_only(text)             # 材料里只以 x% 出现、从没单独出现过的数
+    pct_only = pct_strict - scaled              # 材料里另有 25% 的，0.25 不算漏了百分号
+    rate_tables = _pct_rate_tables(rs, pct_strict)     # 各档比例在材料里全都只写成 x%：整张表漏了百分号
     nums = nums | in_table
     for n, where in constants(rs):
         if where.removeprefix("tables.") in copied:
             continue
-        if _key(abs(n)) in pct_only and abs(n) not in FREE:
-            unit.setdefault(_key(abs(n)), set()).add(where)
+        k = _key(abs(n))
+        if abs(n) not in FREE and (k in pct_only or (where.removeprefix("tables.") in rate_tables and k in pct_strict)):
+            unit.setdefault(k, set()).add(where)
             continue
         if n in FREE or abs(n) in FREE or _key(abs(n)) in nums:
             continue
@@ -335,10 +338,11 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
     rep.warns += cov_warns
     # 6'. 阶梯直接算金额（tier）时，全额累进还是超额累进算出来差很多；材料和答复都没说是哪种，不能自己定
     # 只认财务的话 / 答复，或材料里这张表的分档点、比例附近写明的算法；材料别处出现“累进”“分段”不算
-    if norm.strip() and not _TIER_HOW.search(unicodedata.normalize("NFKC", said)):   # 没有材料原文（只校验结构）时不查
-        for t, how in sorted(_tier_amount_tables(rs).items()):
+    said_n = unicodedata.normalize("NFKC", said)
+    if norm.strip():         # 没有材料原文（只校验结构）时不查
+        for t, how in sorted(_tier_amount_tables(rs, pct_strict).items()):
             tb = rs.tables[t]
-            if _tier_stated(norm, tb):
+            if _tier_stated(norm, tb) or _tier_stated(said_n, tb) or _TIER_SAID.search(said_n):
                 continue
             algo = ("超额部分分段累加" if tb.mode == "excess" else "整笔按所在档的比例") if how == "tier" else \
                 "用 tier_rate 取所在档的比例再乘金额，等于整笔按所在档的比例（全额）"
@@ -658,9 +662,12 @@ def _copied(rs: RuleSet, data: Datasets) -> dict[str, tuple[str, str, str]]:
 
 
 _TIER_HOW = re.compile(r"累进|超额|分段|全额|整笔|全部按|按所在档|按达到的档|按达成的档")
+# 财务答复里明确说了阶梯算法的（“全额”“整笔”单独出现常指别的事，如“全额冻结”，要和阶梯、档位连在一起才算）
+_TIER_SAID = re.compile(r"累进|(?:阶梯|分档|档位|提成档|点数)[^。；\n]{0,20}(?:全额|整笔|超额|分段|所在档)|"
+                        r"(?:全额|整笔|超额|分段)[^。；\n]{0,20}(?:阶梯|分档|档位|计提|提成比例|点数)|按所在档|按达到的档|按达成的档")
 
 
-def _tier_amount_tables(rs: RuleSet) -> dict[str, str]:
+def _tier_amount_tables(rs: RuleSet, pct_strict: set[str] | None = None) -> dict[str, str]:
     """按金额分档算提成的阶梯表 -> 用法（tier / tier_rate）：tier(...) 直接算金额的（至少 2 档）；
     tier_rate(...) 取比例的，各档比例都像提成比例（都小于 0.3、至少两档不同且不为 0），不是 0.8、1.1 这类系数。"""
     out: dict[str, str] = {}
@@ -675,8 +682,22 @@ def _tier_amount_tables(rs: RuleSet) -> dict[str, str]:
                 if not isinstance(tb, TierTable) or c.args[0].id in out:
                     continue
                 rates = [Decimal(str(r)) for _, r in tb.steps]
-                if len({r for r in rates if r}) >= 2 and all(Decimal(0) <= r < Decimal("0.3") for r in rates):
+                # 各档比例材料里都只写成 x%（漏了百分号、写成了 0.5 这类大数）的也算提成比例表
+                pct = bool(pct_strict) and all(_key(r) in pct_strict for r in rates if r)
+                if len({r for r in rates if r}) >= 2 and (pct or all(Decimal(0) <= r < Decimal("0.3") for r in rates)):
                     out[c.args[0].id] = "tier_rate"
+    return out
+
+
+def _pct_rate_tables(rs: RuleSet, pct_strict: set[str]) -> set[str]:
+    """阶梯表的各档比例（不为 0 的、至少两档）在材料里全都只以 x% 出现：多半整张表都漏了百分号（如 0.50% 写成 0.5）。"""
+    out = set()
+    for name, tb in rs.tables.items():
+        if not isinstance(tb, TierTable):
+            continue
+        rates = {_key(Decimal(str(r))) for _, r in tb.steps if Decimal(str(r))}
+        if len(rates) >= 2 and rates <= pct_strict:
+            out.add(name)
     return out
 
 

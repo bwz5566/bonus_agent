@@ -83,6 +83,9 @@ class DatasetDef(_Base):
     # 按 key 的不同取值各建一个对象（如明细表里每个客户一个“客户”对象）：同一编号的多行合成一个，
     # 其余字段在同一编号下必须一样。没有单独的主表、又要按这个编号汇总时用
     distinct: bool = False
+    # 明细表 / 关联实体的 link 编号在上级里找不到时：block（默认，阻断并要求问财务）；ignore（财务确认过“查不到的不参与”，
+    # 这些行不挂到任何对象上，试算结果里提示有几行）
+    unmatched: Literal["block", "ignore"] = "block"
 
 
 class TierTable(RuleItem):
