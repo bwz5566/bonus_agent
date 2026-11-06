@@ -194,12 +194,18 @@ class ConfirmError(ValueError):
     pass
 
 
-def confirm(out: Path, by: str, note: str = "", data: list[Path] | None = None, review: bool = True) -> Path:
+def confirm(out: Path, by: str, note: str = "", data: list[Path] | None = None, review: bool = True, *, scenario: str | None = None) -> Path:
     """财务确认最新一轮：核对口径单已逐条确认、输出文件没被改过、按这些文件复算与该轮结果逐分一致，然后冻结成 template/。
 
     只能确认最新的一轮，且该轮已出结果（状态 OK）。返回模板目录。
     review=False：口径单已在线下核对（命令行确认时用 --no-review 明确说明）。
     """
+    from bonus_agent.scenarios import ScenarioError, require_settlement
+    try:
+        require_settlement(scenario)
+    except ScenarioError as exc:
+        raise ConfirmError(str(exc)) from exc
+
     import yaml
 
     from bonus_core.dsl.models import RuleSet

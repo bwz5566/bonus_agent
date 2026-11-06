@@ -48,6 +48,7 @@ def main(argv=None) -> int:
     p.add_argument("--rules", required=True)
     p.add_argument("data", nargs="+")
     p = sub.add_parser("run")
+    p.add_argument("--scenario", required=True)
     p.add_argument("--rules", required=True)
     p.add_argument("--mapping", required=True)
     p.add_argument("--out", required=True)
@@ -55,13 +56,21 @@ def main(argv=None) -> int:
     p.add_argument("--json", help="同时输出 JSON 结果")
     p.add_argument("data", nargs="+")
     p = sub.add_parser("run-template")
+    p.add_argument("--scenario", required=True)
     p.add_argument("--template", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("data", nargs="+")
     a = ap.parse_args(argv)
 
-    if a.cmd == "run-template":
-        return _run_template(a)
+    if a.cmd in {"run", "run-template"}:
+        from bonus_agent.scenarios import ScenarioError, require_settlement
+        try:
+            require_settlement(a.scenario)
+        except ScenarioError as exc:
+            print(f"Settlement rejected: {exc}")
+            return 1
+        if a.cmd == "run-template":
+            return _run_template(a)
 
     if a.cmd == "detect":
         for f in a.data:

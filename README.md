@@ -272,3 +272,11 @@ vllm serve deepseek-ai/DeepSeek-V4-Flash --port 8000 --tensor-parallel-size 4 --
 - 计算说明 Word 生成（模板 + 数字占位符校验）
 - 问题分工（按类型指定答复人）、更细的权限
 - LangGraph 状态机与人工确认节点
+
+## Scenario packs — Phase A
+
+See [the pack contract](docs/scenario_pack_contract.md). CLI `auto`, `confirm`,
+`bonus run`, and `bonus run-template` require `--scenario`. Web cases require an
+explicit scenario. All three supplied packs are `pending_finance / TODO`; formal
+settlement and publication are blocked until finance supplies real contracts,
+published rules and validation. Exploratory engine APIs remain available.
