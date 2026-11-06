@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 PACKS = Path(__file__).parent / "packs"
 COMPONENTS = ("input_contract", "rule_package", "validation_suite", "output_contract")
@@ -22,6 +22,10 @@ class Placeholder(BaseModel):
 class PackSchema(Placeholder):
     schema_version: Literal[1]
     scenario: str
+    # Capability allowlists (deny by default). Empty = only global read-only skills.
+    # MCP entries are exact "server/tool" names; a server name alone grants nothing.
+    allowed_tools: list[str] = Field(default_factory=list)
+    allowed_mcp: list[str] = Field(default_factory=list)
 
 
 class ScenarioPack(BaseModel):
