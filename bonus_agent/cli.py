@@ -63,6 +63,7 @@ def main(argv=None) -> int:
     p.add_argument("--no-llm", action="store_true")
     p.add_argument("data", nargs="+")
     p = sub.add_parser("confirm")
+    p.add_argument("--scenario", required=True)
     p.add_argument("--out", required=True, help="案卷目录")
     p.add_argument("--by", required=True, help="确认人")
     p.add_argument("--note", default="", help="确认说明")
@@ -105,6 +106,7 @@ def main(argv=None) -> int:
     p.add_argument("--display", default="", help="显示的姓名（记入答复人、确认人）")
     p.add_argument("--password-stdin", action="store_true", help="从标准输入读口令（脚本用）")
     p = sub.add_parser("auto")
+    p.add_argument("--scenario", required=True)
     p.add_argument("--model")
     p.add_argument("--checker", help="交叉验证（独立复读、独立算式）用的另一个模型，如 qwen-a；不写就用主模型自己验证")
     p.add_argument("--answers", help="财务答复文件（默认读案卷目录里的 questions.yaml）")
@@ -118,6 +120,14 @@ def main(argv=None) -> int:
     p.add_argument("--pipeline", action="store_true", help="使用固定流程（规划 → 抽取 → 计算），不让模型自主调度")
     p.add_argument("paths", nargs="+", help="本批次的规则文档、Excel 数据，或只包含它们的文件夹")
     a = ap.parse_args(argv)
+
+    if a.cmd in {"auto", "confirm"}:
+        from bonus_agent.scenarios import ScenarioError, load_pack
+        try:
+            load_pack(a.scenario)
+        except ScenarioError as exc:
+            print(f"Scenario rejected: {exc}")
+            return 1
 
     if a.cmd == "user":
         import getpass
@@ -259,7 +269,7 @@ def main(argv=None) -> int:
     if a.cmd == "confirm":
         from bonus_agent.case import ConfirmError, confirm
         try:
-            tpl = confirm(Path(a.out), a.by, a.note, [Path(x) for x in a.data] or None, review=not a.no_review)
+            tpl = confirm(Path(a.out), a.by, a.note, [Path(x) for x in a.data] or None, review=not a.no_review, scenario=a.scenario)
         except ConfirmError as e:
             print(f"不能确认：{e}")
             return 1

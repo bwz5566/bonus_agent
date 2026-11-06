@@ -38,13 +38,14 @@ def as_(c, name):
     if name not in c.sids:
         assert login(c, name).status_code == 303
         c.sids[name] = c.cookies.get("bonus_session")
+    c.cookies.clear()  # Avoid duplicate host/domain cookies when switching test users.
     c.cookies.set("bonus_session", c.sids[name])
     return c
 
 
 def post(c, store, url, data=None, files=None, user="alice"):
     as_(c, user)
-    return c.post(url, data={"csrf": store.csrf(c.sids[user]), **(data or {})}, files=files, follow_redirects=False)
+    return c.post(url, data={"csrf": store.csrf(c.sids[user]), **({"scenario": "annual_bonus", **(data or {})} if url == "/cases" else (data or {}))}, files=files, follow_redirects=False)
 
 
 def wait(app, cid):
@@ -52,7 +53,10 @@ def wait(app, cid):
     return app.state.runner.jobs[cid]
 
 
-def test_web_rounds_confirm_and_template(env):
+def test_web_rounds_confirm_and_template(env, monkeypatch):
+    # Exercise legacy freeze mechanics in isolation; production gate tested separately.
+    monkeypatch.setattr("bonus_agent.scenarios.require_settlement", lambda scenario: None)
+    monkeypatch.setattr("bonus_agent.web.require_settlement", lambda scenario: None)
     app, store, scripts, c, m = env
     r = c.get("/cases/x", follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/login?next=/cases/x"     # 没登录先去登录页
@@ -139,7 +143,7 @@ def test_running_case_is_locked(env):
         gate.wait(10)
         return FakeLLM([{"tool": "finish", "args": {"summary": "x"}}])
     app.state.runner.llm_factory = slow
-    cid = store.create("t", "x")
+    cid = store.create("t", "x", "annual_bonus")
     (store.dir(cid) / "materials" / "数据.xlsx").write_bytes((m / "数据.xlsx").read_bytes())
     post(c, store, f"/cases/{cid}/run")
     assert post(c, store, f"/cases/{cid}/run").status_code == 409
@@ -196,7 +200,7 @@ def test_login_logout_and_lockout(env):
 
 def test_chat_window(env):
     app, store, scripts, c, m = env
-    cid = store.create("对话", "张会计")
+    cid = store.create("对话", "张会计", "annual_bonus")
     for p in m.iterdir():
         (store.dir(cid) / "materials" / p.name).write_bytes(p.read_bytes())
     scripts.append([{"tool": "record_facts", "args": {"facts": [F5, F6]}}, *CLAUSES, DATASET,
@@ -233,7 +237,7 @@ def test_failure_explained_with_retry(env):
     x = explain("智能体卡住了，已停止以免继续消耗 tokens：verify 连续 3 次失败，最后一次：错误：验算式算不出来：计算失败："
                 "变量 v_ew 属于「员工」层级，不能在「个人」层直接引用（需要聚合）（位置：个人:E007）")
     assert "算不出来" in x["title"] and "没对上" not in x["title"] and "不需要你回答" in x["title"]   # 写法问题，不问财务
-    cid = store.create("失败", "张会计")
+    cid = store.create("失败", "张会计", "annual_bonus")
     (store.dir(cid) / "materials" / "数据.xlsx").write_bytes((m / "数据.xlsx").read_bytes())
     scripts.append([{"tool": "trial_run"}] * 3)          # 连续失败 3 次，自动停下；程序自动接着做 2 轮，仍卡住才交给财务
     post(c, store, f"/cases/{cid}/run")
@@ -257,7 +261,7 @@ def test_failure_explained_with_retry(env):
 
 def test_upload_in_chat(env):
     app, store, scripts, c, m = env
-    cid = store.create("附件", "张会计")
+    cid = store.create("附件", "张会计", "annual_bonus")
     files = [("files", (p.name, p.read_bytes())) for p in m.iterdir()]
     scripts.append([{"tool": "finish", "args": {"summary": "x"}}])
     assert post(c, store, f"/cases/{cid}/chat", {"text": "这是第一批材料"}, files=files).status_code == 303
@@ -273,7 +277,7 @@ def test_upload_in_chat(env):
 
 def test_steps_written_while_running(env):
     app, store, scripts, c, m = env
-    cid = store.create("过程", "张会计")
+    cid = store.create("过程", "张会计", "annual_bonus")
     (store.dir(cid) / "materials" / "数据.xlsx").write_bytes((m / "数据.xlsx").read_bytes())
     scripts.append([{"tool": "trial_run"}] * 3)
     post(c, store, f"/cases/{cid}/run")
@@ -333,7 +337,7 @@ def test_rejected_upload_keeps_existing_files(env, monkeypatch):
     """#8 新文件被拒（太大）时：原来的期望结果还在；一批材料里有一个被拒，整批都不写入。"""
     import bonus_agent.web as web
     app, store, scripts, c, m = env
-    cid = store.create("上传", "张会计")
+    cid = store.create("上传", "张会计", "annual_bonus")
     post(c, store, f"/cases/{cid}/expected", files=[("files", ("期望.xlsx", b"old"))])
     monkeypatch.setattr(web, "MAX_UPLOAD", 10)
     r = post(c, store, f"/cases/{cid}/expected", files=[("files", ("新期望.xlsx", b"x" * 20))])

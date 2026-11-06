@@ -25,6 +25,8 @@ import secrets
 import shutil
 import threading
 import time
+from bonus_agent.scenarios import ScenarioError, list_scenarios, load_pack, require_settlement
+
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -121,12 +123,13 @@ class Store:
             raise KeyError(cid)
         return d
 
-    def create(self, name: str, by: str) -> str:
+    def create(self, name: str, by: str, scenario: str) -> str:
+        load_pack(scenario)
         cid = secrets.token_hex(6)
         d = self.root / "cases" / cid
         for sub in ("materials", "expected", "out", "runs"):
             (d / sub).mkdir(parents=True)
-        (d / "meta.json").write_text(json.dumps({"name": name, "created": now(), "created_by": by}, ensure_ascii=False),
+        (d / "meta.json").write_text(json.dumps({"name": name, "scenario": scenario, "created": now(), "created_by": by}, ensure_ascii=False),
                                      encoding="utf-8")
         self.audit(cid, by, "新建案卷", name=name)
         return cid
@@ -218,6 +221,7 @@ class Runner:
     def start(self, cid: str, user: str, new: bool = False, message: str | None = None,
               instruction: str | None = None) -> Job:
         """message：对话（提问或修改）；instruction：随上传材料附的说明，按正常一轮处理。"""
+        load_pack(self.store.meta(cid).get("scenario"))
         with self.lock:
             if self.running(cid):
                 raise RuntimeError("这个案卷正在运行，请等本轮结束")
@@ -605,7 +609,9 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
     def index(u: dict = Depends(user)):
         rows = "".join(f"<tr><td><a href='/cases/{cid}'>{e(m['name'])}</a></td><td>{status_text(c)}</td>"
                        f"<td class='mut'>{e(m['created_by'])} · {e(m['created'][:16])}</td></tr>" for cid, m, c in store.cases())
+        options = "".join(f"<option value='{e(x)}'>{e(x)} (pending_finance)</option>" for x in list_scenarios())
         new = form("/cases", "<input type='text' name='name' placeholder='如 2026 年 Q3 季度奖' required> "
+                             "<select name='scenario' required><option value=''>请选择场景</option>" + options + "</select>"
                              "<p><button>新建案卷</button></p>", u["csrf"]) if "editor" in u["roles"] else ""
         body = (f"<h1>案卷</h1><section><div class='wrap'><table><tr><th>名称</th><th>状态</th><th>创建</th></tr>{rows}</table></div>"
                 + ("" if rows else "<p class='mut'>还没有案卷</p>") + "</section>"
@@ -619,7 +625,11 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         name = str(f.get("name", "")).strip()[:100]
         if not name:
             raise HTTPException(400, "请填写名称")
-        return back(store.create(name, u["display"]))
+        try:
+            cid = store.create(name, u["display"], str(f.get("scenario", "")))
+        except ScenarioError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return back(cid)
 
     @app.get("/cases/{cid}", response_class=HTMLResponse)
     def view(cid: str, request: Request, u: dict = Depends(user)):
@@ -872,7 +882,7 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
                 rv.mark_sent(d / "out")
                 return back(cid)
             runner.start(cid, u["display"], new=f.get("new") == "1")
-        except RuntimeError as err:
+        except (RuntimeError, ScenarioError) as err:
             raise HTTPException(409, str(err)) from None
         return back(cid)
 
@@ -912,7 +922,7 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
                 runner.start(cid, u["display"], instruction=text)
             else:
                 runner.start(cid, u["display"], message=text)
-        except RuntimeError as err:
+        except (RuntimeError, ScenarioError) as err:
             raise HTTPException(409, str(err)) from None
         return back(cid)
 
@@ -924,7 +934,7 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         f = await posted(request, u)
         note = str(f.get("note", "")).strip()[:500]
         try:
-            tpl = cs.confirm(d / "out", by=u["display"], note=note)
+            tpl = cs.confirm(d / "out", by=u["display"], note=note, scenario=store.meta(cid).get("scenario"))
         except cs.ConfirmError as err:
             store.audit(cid, u["display"], "确认被拒绝", reason=str(err))
             return back(cid, f"不能确认：{err}")
@@ -937,9 +947,13 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         from bonus_core.template import Template
         need(u, "editor")
         d = case_dir(cid)
+        f = await posted(request, u)
+        try:
+            require_settlement(store.meta(cid).get("scenario"))
+        except ScenarioError as exc:
+            raise HTTPException(400, str(exc)) from None
         run_dir = d / "runs" / (datetime.now().strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(2))
         (run_dir / "data").mkdir(parents=True)
-        f = await posted(request, u)
         saved = []
         for x in [x for x in f.getlist("files") if getattr(x, "filename", "")]:
             try:
