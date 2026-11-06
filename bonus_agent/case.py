@@ -32,13 +32,28 @@ def fingerprint(files: list[Path]) -> dict[str, str]:
 
 def load_case(out: Path) -> dict | None:
     p = Path(out) / CASE_FILE
-    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    # case.json 丢失（如写盘中途崩溃）：开启平台状态存储时从最近的检查点恢复
+    from bonus_agent.infra import checkpoints
+    return checkpoints.latest_case(out)
 
 
 def save_case(out: Path, case: dict) -> Path:
     p = Path(out) / CASE_FILE
     p.write_text(json.dumps(case, ensure_ascii=False, indent=1), encoding="utf-8")
+    _checkpoint(out, case)
     return p
+
+
+def _checkpoint(out: Path, case: dict) -> None:
+    """每次存案卷后同步写一份检查点（仅在设置了 BONUS_AGENT_STATE_DIR 时）；失败不影响 case.json。"""
+    from bonus_agent.infra import checkpoints
+    try:
+        checkpoints.save_round(out, case)
+    except Exception as e:  # noqa: BLE001 - durability mirror must never break the round
+        import warnings
+        warnings.warn(f"检查点写入失败：{type(e).__name__}: {e}", RuntimeWarning, stacklevel=3)
 
 
 def snapshot(ws) -> dict:
