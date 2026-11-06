@@ -17,7 +17,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict
 
 from bonus_core.data.table import ConvertError, Datasets, Row, RowRef, StdTable, convert
-from bonus_core.data.table_detect import ROW_ID, SheetTable, add_row_ids, detect, table_at, unpivot_sheet
+from bonus_core.data.table_detect import ROW_ID, SheetTable, add_row_ids, detect, table_at, unpivot_by
 from bonus_core.dsl.models import RuleSet
 from bonus_core.dsl.parser import names, parse
 from bonus_core.engine.issues import Issue
@@ -214,7 +214,7 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping) -> tup
             if bad:
                 issues.append(Issue.block("column_missing", f"unpivot 的列「{'、'.join(bad)}」不在 sheet「{st.sheet}」中", ds_name))
                 continue
-            st = unpivot_sheet(st, m.unpivot["columns"], m.unpivot["value"], m.unpivot.get("label") or "")
+            st = unpivot_by(st, m.unpivot)
         if ROW_ID in m.columns.values():
             st = add_row_ids(st)
         for f in ds.fields:

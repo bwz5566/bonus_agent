@@ -305,7 +305,8 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
         if mixed and len(mixed) < len(have):
             rep.gates.append(f"数据里「{fld}」有 {len(mixed)} 种取值把名称和百分比写在一格里（如 {'、'.join(mixed[:4])}），"
                              "现在会被当成一个单独的对象、按整行参与计算，百分比没起作用。用 ask_question 问财务这些格子怎么拆"
-                             "（是谁、各占多少），问题里列出这些写法；答复后按答复拆分")
+                             "（是谁、各占多少、余下的怎么处理），问题里列出这些写法；财务答复后必须在数据里真的拆开（这列是 unpivot 展开的角色列时，"
+                             "用 unpivot 的 share / remainder 参数），不能只在回复里写“已拆分”：数据里还是这些写法，这一项就一直会拦")
             rep.keys.append(f"名称百分比 {mixed[0]}")
     # 4. 读了数据表却漏用了表里的金额字段
     for ds, fld in _unused_money(rs, used_elsewhere or set()):
@@ -374,11 +375,42 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
     # 结构提示
     flagged = {k.removeprefix("未用 ") for k in rep.keys}
     idle = [n for n in rs.variables if n not in used and n not in flagged]
+    fields = {f for d in rs.datasets.values() for f in (d.fields or {})}
+    reading = []
+    live_names = live          # 含别的方案用到的：共用的变量别的方案接上了就不算没接
+    for n in idle:
+        if n in live:
+            continue            # 读了数据表的字段（自己读，或经过别的变量读）、却没接进计算：多半是该扣的金额、该冻结的记录漏接了，不能只提示
+        todo, seen, hit = [n], set(), False
+        while todo and not hit:
+            m = todo.pop()
+            if m in seen or m not in rs.variables:
+                continue
+            seen.add(m)
+            try:
+                nm = {x.id for x in walk(parse(rs.variables[m].expr)) if isinstance(x, Name)}
+            except ExprError:
+                continue
+            hit = bool(nm & (fields - live_names))        # 只算计算里别处没读过的字段：只是把已接上的东西再加工一遍的展示变量，不拦
+            todo += [x for x in nm if x not in used]
+        if hit:
+            reading.append(n)
+    for n in reading:
+        rep.gates.append(f"变量 {n} 读了数据表里的数据，但没有接进奖金池、权重、发放、抵扣和校验（它被别的变量用到之前不算接上）。"
+                         "核对材料：这一项（如冻结、暂缓、扣减、系数）是否应该乘进或扣进金额，现在奖金池没有用它，算出来的数不受它影响；"
+                         "只是展示用的写进 ignored 说明原因")
+        rep.keys.append(f"未用 {n}")
+    idle = [n for n in idle if n not in reading]
     if idle:
         rep.warns.append(f"变量 {'、'.join(idle[:10])} 定义了，但奖金池、权重、发放、抵扣和校验都没有用到。"
                          "是不是漏接进计算了（如封顶、扣减）？只是展示用的可以不管")
     if traces:
-        rep.warns += _all_zero(rs, traces)
+        for n, msg in _all_zero(rs, traces):
+            if n in used:          # 接进了计算、却在所有对象上都是 0：筛选或取值多半写错（如冻结、暂缓一个都没挂上），要处理
+                rep.gates.append(msg + "。材料确实说这一期没有符合的记录，写进 ignored 说明原因")
+                rep.keys.append(f"全零 {n}")
+            else:
+                rep.warns.append(msg)
     return rep
 
 
@@ -395,7 +427,7 @@ def _read(rs: RuleSet, names: set[str]) -> list[str]:
 
 def _unused_money(rs: RuleSet, elsewhere: set[str]) -> list[tuple[str, str]]:
     """(数据表, 金额字段)：表里有字段被规则用到，金额字段本身却哪个方案都没用到。"""
-    names = _names(rs) | elsewhere
+    names = reached(rs) | elsewhere        # 只算真正接进计算的：定义了却没人用的变量里读到的字段不算用过
     return [(ds, f) for ds in _read(rs, names) for f, fd in (rs.datasets[ds].fields or {}).items()
             if fd.type == "money" and f not in names]
 
@@ -576,8 +608,10 @@ def tier_holes(rs: RuleSet, tiers: dict) -> list[tuple[str, Decimal, int, Decima
     for name, st in tiers.items():
         t = rs.tables.get(name)
         below = st.get("bands", {}).get(-1, 0)
+        # 超额累进直接算金额（tier）：起征点是正数时，低于它不发是正常的；起征点是 0（或负数）而传入值是负数（如退货、冲销），
+        # 负数落不进任何一档，金额悄悄成了 0，而不是按第一档比例得出负数。这种也要问
         if (isinstance(t, TierTable) and t.steps and below and Decimal(t.steps[0][1]) != 0
-                and (t.mode == "whole" or st.get("rate"))):
+                and (t.mode == "whole" or st.get("rate") or Decimal(t.steps[0][0]) <= 0)):
             out.append((name, Decimal(t.steps[0][0]), below, Decimal(str(st["min"]))))
     return out
 
@@ -758,7 +792,7 @@ def _reachable(rs: RuleSet) -> set[str]:
     return seen
 
 
-def _all_zero(rs: RuleSet, traces: dict) -> list[str]:
+def _all_zero(rs: RuleSet, traces: dict) -> list[tuple[str, str]]:
     """按条件筛选明细的变量，在所有对象上都是 0：多半是筛选条件或取值写错了。"""
     out = []
     for n, v in rs.variables.items():
@@ -770,7 +804,7 @@ def _all_zero(rs: RuleSet, traces: dict) -> list[str]:
             continue
         vals = [t.value for k, t in traces.items() if k.endswith(f"/{n}")]
         if len(vals) >= 3 and all(_zero(x) for x in vals):
-            out.append(f"变量 {n} 带筛选条件，在全部 {len(vals)} 个对象上都是 0。核对筛选条件和取值写法是否和数据一致")
+            out.append((n, f"变量 {n} 带筛选条件，在全部 {len(vals)} 个对象上都是 0。核对筛选条件和取值写法是否和数据一致"))
     return out
 
 

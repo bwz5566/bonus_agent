@@ -30,7 +30,7 @@ from bonus_agent.extract_rules import Extraction, Question, check_quotes, prompt
 from bonus_agent.llm import LLM, LLMError, image_part, parse_json
 from bonus_core.data.mapping import DatasetMapping, apply_mapping
 from bonus_core.data.patches import apply_patches
-from bonus_core.data.table_detect import ROW_ID, add_row_ids, table_at, unpivot_sheet
+from bonus_core.data.table_detect import ROW_ID, add_row_ids, table_at, unpivot_by
 from bonus_core.dsl.functions import describe as describe_functions
 from bonus_core.dsl.models import DatasetDef, RuleSet, Variable
 from bonus_core.dsl.parser import SELF_COMPARE_HINT, Call, ExprError, Num, parse, self_compares, walk
@@ -71,6 +71,7 @@ BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
 READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate"}
 NO_IGNORE = ("查找表 ", "抵扣 ")    # 程序检查里不能写进 ignored 放过的项
 MUST_FIX = ("抵扣 ",)              # 连提问也不能放过、只能改规则的项
+_CURRENCY_HEAD = re.compile(r"币种|币别|币制|结算币|外币|汇率|(?<![A-Za-z])(?:currency|exchange\s*rate|fx)(?![A-Za-z])", re.I)
 REREAD_TIMES = 3                   # 一轮里同一份文档累计读到全文的这么多倍后，只给小段
 REREAD_MIN = 60000                 # 短文档反复读不费多少，读够这么多字才限制
 REREAD_SMALL = 1500                # 限制后每次还能读的字数（一次正常读取最多约 5800 字）
@@ -83,7 +84,7 @@ def _GATE_ORDER(key: str) -> int:
     要问财务的口径（阶梯方式、名称+百分比）其次，常数出处最后（条数多，常常只是核对一下）。"""
     head = key.split(" ", 1)[0]
     return {"抵扣": 0, "查找表": 0, "取值": 1, "未用": 1, "同字段比较": 1, "分档": 2, "参数表": 2, "名称百分比": 2,
-            "阶梯方式": 2, "金额": 3, "状态": 3}.get(head, 4 if head in ("常数", "百分号") else 3)
+            "阶梯方式": 2, "币种": 2, "全零": 1, "金额": 3, "状态": 3}.get(head, 4 if head in ("常数", "百分号") else 3)
 VERIFY_TOL = Decimal("0.005")   # 按份额分配时，独立算式和引擎未舍入的份额之差不超过半分，才算尾差
 WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", "remove_facts", "ask_question",
                "record_clauses", "cover_clauses",
@@ -185,6 +186,9 @@ TOOLS: list[dict] = [
                                      '可选：几列放的是同一类值（如几个角色列各放一个人名）时展开成每个值一行：'
                                      '{"columns": ["列1", "列2"], "value": "展开后的列名", "label": "记原列名的列名，如 角色"}。'
                                      '空格子不展开；fields 和 filter 用展开后的列名。从这几列取全部对象时配合 key + distinct。'
+                                     '格子里写成“名字+百分比”（如 张三50%）、财务答复了怎么拆之后：加 "share": "记比例的列名"，名字和比例就拆开'
+                                     '（比例是小数，没写百分比的是 1，字段类型用 ratio，权重里乘上它）；财务说余下的部分记为“未分配”时再加 '
+                                     '"remainder": "{label}未分配"（{label} 换成原列名；余下的部分另记一行，比例是 1 − 写明的比例）'
                                      '展开后没有每行唯一的编号、又要当最末层时，加字段 {"column": "（行号）", "type": "id"} 作 key'},
                          "fields": {"type": "object", "additionalProperties": FIELD_SCHEMA,
                                     "description": "字段名（英文小写加下划线） -> 定义。重新定义同一张表、字段不变时可以不写（沿用上一次的）"}},
@@ -1164,7 +1168,7 @@ class Workspace:
         raw = st
         spec = _unpivot_spec(unpivot, st) if unpivot else None
         if spec:
-            st = unpivot_sheet(st, spec["columns"], spec["value"], spec.get("label") or "")
+            st = unpivot_by(st, spec)
         if isinstance(fields, dict) and any(isinstance(d, dict) and d.get("column") == ROW_ID for d in fields.values()):
             st = add_row_ids(st)
         if getattr(raw, "unsure", None):      # 另一段表头对不上第一段、又没法按列名对回：用到这些列就不能保存
@@ -1276,6 +1280,43 @@ class Workspace:
                 out.append(f"{q.id}：{'、'.join(hit[:8])}")
         return out
 
+    def _currency_gates(self, rs) -> list[tuple[str, str]]:
+        """数据表所在的工作表里有币种、汇率这类列，规则却没用它们：金额可能混着外币，或者要按汇率折算后再计提。
+        材料和财务都没说怎么折算时必须问；已经问过（问题或答复里提到这个列名）、或写进 ignored 的不再拦。"""
+        from bonus_core.data.mapping import cell_text
+        out, seen = [], set()
+        reached = lint.reached(rs)
+        asked = " ".join(f"{q.text} {q.answer or ''}" for q in self.questions)
+        for name, m in self.mapping.items():
+            try:
+                st = table_at(Path(m.file) if Path(m.file).exists() else self._file(Path(m.file).name), m.sheet, m.header_rows) \
+                    if m.header_rows else self.inv.sheet(f"{Path(m.file).name}/{m.sheet}")
+            except Exception:
+                continue
+            ds = rs.datasets.get(name)
+            if st is None or ds is None or not any(fd.type == "money" for fd in (ds.fields or {}).values()):
+                continue
+            mapped = {c: f for f, c in m.columns.items()}
+            for h in st.headers:
+                if not h or not _CURRENCY_HEAD.search(h) or h in seen:
+                    continue
+                f = mapped.get(h)
+                if f is not None and f in reached:        # 已经映射成字段、规则也用到了
+                    continue
+                if h in asked:
+                    continue
+                i = st.headers.index(h)
+                vals = {cell_text(v[i]) for _, v in st.rows if v[i] not in (None, "")}
+                if h and len(vals) <= 1 and not (vals and re.search(r"汇率|rate|fx", h, re.I) and vals != {"1"}):
+                    continue                  # 整列只有一种币种（或汇率都是 1）：没有折算的问题
+                seen.add(h)
+                out.append((f"数据表「{name}」所在的工作表里有「{h}」这一列（币种 / 汇率），"
+                            f"{'规则没有读它' if f is None else f'字段 {f} 没有接进计算'}。金额列里可能混着外币，或者计提前要按汇率折算"
+                            "（折算用哪个汇率、有没有扣减、折算后的金额算不算计提基数）。材料没写清的，用 ask_question 问财务："
+                            "问题里写列名和例子；答复后把这一列映射成字段，在规则里按答复折算",
+                            f"币种 {h}"))
+        return out
+
     def _values(self, name: str, fld: str) -> list[str]:
         """数据表某个字段的全部取值（文字），用来判断表之间的关联。"""
         from bonus_core.data.mapping import cell_text
@@ -1285,7 +1326,7 @@ class Workspace:
         if st is None or fld not in m.columns:
             return []
         if m.unpivot:
-            st = unpivot_sheet(st, m.unpivot["columns"], m.unpivot["value"], m.unpivot.get("label") or "")
+            st = unpivot_by(st, m.unpivot)
         if ROW_ID in m.columns.values():
             st = add_row_ids(st)
         st, _ = filter_sheet(st, m.filter or None)
@@ -1639,6 +1680,9 @@ class Workspace:
                                            headers=heads, tiers=base.tier_stats, used_elsewhere=others,
                                            coverage=base.coverage, reached_elsewhere=elsewhere,
                                            said=self._finance_said())
+        for g, k in self._currency_gates(rs):
+            rep.gates.append(g)
+            rep.keys.append(k)
         if rep.warns:
             lines.append("程序检查提示：\n" + "\n".join(f"- {w}" for w in rep.warns[:8]))
         gates = self._open_gates(rep)
@@ -1747,7 +1791,8 @@ class Workspace:
                      else f"〔放过时 ignored 的 ref 写「{k}」，提问时 related 写同样内容〕")
                 if not k.startswith(MUST_FIX) else g
                 for g, k in pairs
-                if k.startswith(MUST_FIX) or (k not in skipped and k not in refs and k.split(" ", 1)[1] not in asked)]
+                if k.startswith(MUST_FIX) or (k not in skipped and (k.startswith("名称百分比") or (
+                    k not in refs and k.split(" ", 1)[1] not in asked)))]       # 名称百分比：问过、答复过也不算处理，数据里真的拆开才算
 
     def _period_mismatch(self, name: str) -> str:
         """奖金池和分配权重用的统计期间（日期、period == "Q3" 这类取值）对不上时给出提示，常见于把按季度算的权重放在共用部分、
@@ -3246,13 +3291,17 @@ def _unpivot_spec(spec, st) -> dict:
     if len(set(cols)) != len(cols) or any(st.headers.count(c) > 1 for c in cols):
         raise ToolError("unpivot 的列名重复，或表头里有同名的几列，没法区分；先用 header_rows 指定表头或换列")
     value, label = str(spec["value"]).strip(), str(spec.get("label") or "").strip()
+    share, remainder = str(spec.get("share") or "").strip(), str(spec.get("remainder") or "").strip()
+    if remainder and not share:
+        raise ToolError("unpivot 写了 remainder 就要同时写 share（记比例的列名）")
     rest = [h for h in st.headers if h not in cols]
-    for n in (value, label):
+    for n in (value, label, share):
         if n and n in rest:
             raise ToolError(f"unpivot 展开后的列名「{n}」和表里已有的列重名，换一个")
-    if value == label:
-        raise ToolError("unpivot 的 value 和 label 要用不同的列名")
-    return {"columns": cols, "value": value, **({"label": label} if label else {})}
+    if len({n for n in (value, label, share) if n}) != len([n for n in (value, label, share) if n]):
+        raise ToolError("unpivot 的 value、label、share 要用不同的列名")
+    return {"columns": cols, "value": value, **({"label": label} if label else {}), **({"share": share} if share else {}),
+            **({"remainder": remainder} if remainder else {})}
 
 
 def _next_qid(questions) -> str:

@@ -1,6 +1,8 @@
 """识别格式不固定的 Excel：找表头行、展开合并单元格、剔除合计行。"""
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -191,21 +193,47 @@ def _is_segment_header(row: list, header: list[str]) -> bool:
     return len(cells) >= max(2, 0.5 * named) and same >= 2 and same >= 0.3 * len(cells) and differ >= 1
 
 
-def unpivot_sheet(st: SheetTable, columns: list[str], value: str, label: str = "") -> SheetTable:
+_NAME_SHARE = re.compile(r"^(?P<name>.*?)\s*[(（]?\s*(?P<pct>\d+(?:\.\d+)?)\s*[%％]\s*[)）]?$")
+
+
+def split_name_share(text) -> tuple[str, "Decimal | None"]:
+    """“张三50%”“张三(50%)”拆成 (张三, 0.5)；没有百分比（或前面没有名字）原样返回、比例是 None。"""
+    from decimal import Decimal
+    if not isinstance(text, str):
+        return text, None
+    m = _NAME_SHARE.match(text.strip())
+    if not m or not m.group("name").strip() or not re.search(r"[^\d\s%％.]", m.group("name")):
+        return text, None
+    return m.group("name").strip(), Decimal(m.group("pct")) / 100
+
+
+def unpivot_sheet(st: SheetTable, columns: list[str], value: str, label: str = "", share: str = "", remainder: str = "") -> SheetTable:
     """把几列同一类的值（如销售负责人、执行人、客户经理各一列人名）展开成每个值一行：其余列照抄，
-    展开的值放在 value 列，label 列记它原来在哪一列（如 角色）。空格子不展开；合计行不要。"""
+    展开的值放在 value 列，label 列记它原来在哪一列（如 角色）。空格子不展开；合计行不要。
+    share 非空时：格子里“名字+百分比”（如 张三50%）拆开，名字放 value、比例放 share 列（小数，没写百分比的是 1）；
+    remainder 非空时：比例不足 1 的，余下的部分另记一行（名字用 remainder，其中 {label} 换成原列名，比例是余下的部分）。"""
+    from decimal import Decimal
     idx = [st.headers.index(c) for c in columns]
     keep = [i for i in range(len(st.headers)) if i not in idx]
-    headers = [st.headers[i] for i in keep] + [value] + ([label] if label else [])
+    headers = [st.headers[i] for i in keep] + [value] + ([label] if label else []) + ([share] if share else [])
     rows = []
     for j, vals in st.rows:
         base = [vals[i] for i in keep]
         for c, i in zip(columns, idx):
             if vals[i] in (None, "") or (isinstance(vals[i], str) and not vals[i].strip()):
                 continue
-            rows.append((j, base + [vals[i]] + ([c] if label else [])))
+            v, pct = split_name_share(vals[i]) if share else (vals[i], None)
+            rows.append((j, base + [v] + ([c] if label else []) + ([pct if pct is not None else Decimal(1)] if share else [])))
+            if share and remainder and pct is not None and pct < 1:
+                rows.append((j, base + [remainder.replace("{label}", c)] + ([c] if label else []) + [Decimal(1) - pct]))
     return SheetTable(st.file, st.sheet, st.header_row, headers, rows, [], st.confidence, list(st.repeats), list(st.segments),
                       list(st.remaps), list(st.unsure))
+
+
+def unpivot_by(st: SheetTable, spec: dict) -> SheetTable:
+    """按 define_dataset / 映射里存的 unpivot 说明展开。"""
+    return unpivot_sheet(st, spec["columns"], spec["value"], spec.get("label") or "", spec.get("share") or "",
+                         spec.get("remainder") or "")
 
 
 ROW_ID = "（行号）"      # 虚拟列：每行的 Excel 行号（展开后同一行的几条加 -1、-2），给没有唯一编号列的明细表当编号

@@ -5,7 +5,9 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import re
+import unicodedata
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 
 from bonus_core.data.table import Datasets, Row
@@ -180,6 +182,7 @@ def build_tree(rs: RuleSet, data: Datasets) -> tuple[Node, dict[str, list[Node]]
                 n.parent = parent
                 parent.aux_children.append(n)
     root.index = index
+    data = _canonical_refs(rs, lay, data, nodes, index, issues)
 
     # 4. 明细表：按 link 字段挂到对应层级的节点或关联实体上
     for name, ds in rs.datasets.items():
@@ -233,6 +236,48 @@ def build_tree(rs: RuleSet, data: Datasets) -> tuple[Node, dict[str, list[Node]]
         n.aux_children.sort(key=lambda c: (c.level, c.key))
     by_level = {lv.level: sorted(nodes[lv.level].values(), key=lambda n: n.key) for lv in levels}
     return root, by_level, issues
+
+
+def _norm_id(v) -> str:
+    """编号的宽松写法：全角半角、大小写、前后和中间多余的空格不算不同（Excel 的 VLOOKUP 也是这样对的）。"""
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", str(v))).strip().casefold()
+
+
+def _canonical_refs(rs: RuleSet, lay: Layout, data: Datasets, nodes, index, issues: list[Issue]) -> Datasets:
+    """明细表的 link 编号、其他表引用关联实体的编号，和上级的编号只差大小写 / 全半角 / 空格、而且宽松写法下只对上唯一一个时，
+    按上级的写法对上，并提示改了哪些（不改的话会被当成找不到，客户系数之类悄悄取了默认值）。不改原数据，返回换过行的副本。"""
+    jobs: list[tuple[str, str, dict]] = []
+    for name, ds in rs.datasets.items():
+        if name not in data:
+            continue
+        if ds.key is None and lay.parent.get(name, ("bad",))[0] in ("level", "aux"):
+            kind, target, f = lay.parent[name]
+            keys = nodes[lay.rs.allocation[target].level] if kind == "level" else index.get(target, {})
+            jobs.append((name, f, keys))
+        for f in ds.fields:
+            target = lay.aux_by_key.get(f)
+            if target is not None and f != ds.key and target in index:
+                jobs.append((name, f, index[target]))
+    out = dict(data)
+    for name, f, keys in jobs:
+        wide: dict[str, list[str]] = {}
+        for k in keys:
+            wide.setdefault(_norm_id(k), []).append(k)
+        fixed: dict[str, str] = {}
+        rows = []
+        for r in out[name].rows:
+            v = r.values.get(f)
+            if v is not None and str(v) not in keys:
+                hit = wide.get(_norm_id(v), [])
+                if len(hit) == 1:
+                    fixed[str(v)] = hit[0]
+                    r = replace(r, values={**r.values, f: hit[0]})
+            rows.append(r)
+        if fixed:
+            out[name] = replace(out[name], rows=rows)
+            issues.append(Issue.warn("link_normalized", f"「{name}」中 {f} 有 {len(fixed)} 种写法只差大小写 / 全半角 / 空格，"
+                                     "已按上级的写法对上：" + "、".join(f"{a}→{b}" for a, b in list(fixed.items())[:6]), where=name))
+    return out
 
 
 def _aux_order(lay: Layout) -> list[str]:

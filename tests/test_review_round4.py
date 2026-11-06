@@ -104,3 +104,137 @@ def test_unmatched_ignore_rejected_on_entity_table(tmp_path):
     with pytest.raises(ToolError, match="只用于"):
         w.define_dataset("客户", "客户.xlsx", "客户", {"cust": {"column": "客户", "type": "id"}}, key="cust",
                          unmatched="ignore")
+
+
+# ---- D4：财务的答复没落实到规则里，检查没拦住 ----
+def _rs_yaml(text):
+    return RuleSet.model_validate(yaml.safe_load(text))
+
+
+_FREEZE = '''
+name: t
+version: v1
+datasets:
+  项目: {key: pid, fields: {pid: {type: id}, amt: {type: money}}}
+  冻结: {link: pid, fields: {pid: {type: id}, amount: {type: money}}}
+pool: {scope: 项目, expr: "%s"}
+allocation:
+  - {level: 项目, key: pid, weight: "1"}
+variables:
+  frozen: {scope: 项目, expr: 'sum(amount, of: "冻结")'}
+  payable: {scope: 项目, expr: "amt - frozen"}
+'''
+
+
+def test_variable_that_reads_data_but_is_not_wired_into_the_pool_is_a_gate():
+    rs = _rs_yaml(_FREEZE % "amt * 0.1")           # payable / frozen 都没接进奖金池
+    rep = lint.check(rs, {}, "")
+    assert "未用 frozen" in rep.keys and "未用 payable" in rep.keys
+    assert any("没有接进" in g for g in rep.gates)
+    ok = lint.check(_rs_yaml(_FREEZE % "payable * 0.1"), {}, "")
+    assert not [k for k in ok.keys if k.startswith("未用")], ok.keys
+
+
+def test_money_field_read_only_by_an_unwired_variable_counts_as_unused():
+    rs = _rs_yaml(_FREEZE % "amt * 0.1")
+    assert ("冻结", "amount") in lint._unused_money(rs, set())
+    ok = _rs_yaml(_FREEZE % "payable * 0.1")
+    assert ("冻结", "amount") not in lint._unused_money(ok, set())
+
+
+def test_negative_amounts_fall_below_a_zero_threshold_excess_tier():
+    from decimal import Decimal as D
+    rs = RuleSet.model_validate({"name": "t", "version": "1", "datasets": {}, "allocation": [], "pool": {"expr": "tier(r, 1)"},
+                                 "tables": {"r": {"kind": "tier", "mode": "excess", "steps": [[0, "0.003"], [1000000, "0.0033"]]}}})
+    st = {"r": {"n": 10, "min": D("-4163.73"), "max": D("900000"), "bands": {-1: 2, 0: 8}}}
+    assert lint.tier_holes(rs, st) and any("第一档从" in g for g in lint.check(rs, {}, "", tiers=st).gates)
+    pos = RuleSet.model_validate({"name": "t", "version": "1", "datasets": {}, "allocation": [], "pool": {"expr": "tier(r, 1)"},
+                                  "tables": {"r": {"kind": "tier", "mode": "excess", "steps": [[100, "0.1"], [200, "0.2"]]}}})
+    assert not lint.tier_holes(pos, {"r": {"n": 5, "min": D("50"), "max": D("300"), "bands": {-1: 2, 0: 1, 1: 2}}})
+
+
+def test_unpivot_splits_name_and_share_and_records_the_remainder(tmp_path):
+    from bonus_core.data.table_detect import detect, split_name_share, unpivot_by
+    assert split_name_share("张三50%") == ("张三", Decimal("0.5"))
+    assert split_name_share("张三（30.5%）") == ("张三", Decimal("0.305"))
+    assert split_name_share("50%")[1] is None and split_name_share("B2")[1] is None and split_name_share("李四")[1] is None
+    p = tmp_path / "名单.xlsx"
+    _book(p, [["项目", "负责人", "执行人"], ["P1", "甲", "乙50%"], ["P2", "甲", None]], "名单")
+    st = next(s for s in detect(p) if s.sheet == "名单")
+    out = unpivot_by(st, {"columns": ["负责人", "执行人"], "value": "人员", "label": "角色", "share": "比例",
+                          "remainder": "{label}未分配"})
+    assert out.headers == ["项目", "人员", "角色", "比例"]
+    got = [tuple(v) for _, v in out.rows]
+    assert ("P1", "乙", "执行人", Decimal("0.5")) in got and ("P1", "执行人未分配", "执行人", Decimal("0.5")) in got
+    assert ("P1", "甲", "负责人", Decimal(1)) in got and len(got) == 4
+    plain = unpivot_by(st, {"columns": ["负责人", "执行人"], "value": "人员", "label": "角色", "share": "比例"})
+    assert ("P1", "乙", "执行人", Decimal("0.5")) in [tuple(v) for _, v in plain.rows] and len(plain.rows) == 3
+
+
+def test_define_dataset_unpivot_share_end_to_end(tmp_path):
+    p = tmp_path / "名单.xlsx"
+    _book(p, [["项目", "负责人", "执行人"], ["P1", "甲", "乙50%"], ["P2", "甲", None]], "名单")
+    w = Workspace(FakeLLM(["x"]), build_inventory(collect_files([tmp_path])))
+    out = w.define_dataset("参与", "名单.xlsx", "名单", {"part": {"column": "（行号）", "type": "id"},
+                                                    "pid": {"column": "项目", "type": "id"},
+                                                    "emp": {"column": "人员", "type": "text"},
+                                                    "share": {"column": "比例", "type": "ratio"}},
+                           key="part", unpivot={"columns": ["负责人", "执行人"], "value": "人员", "label": "角色",
+                                                "share": "比例", "remainder": "{label}未分配"})
+    assert "已保存" in out and "4 行" in out
+    assert sorted(w._values("参与", "emp")) == ["乙", "执行人未分配", "甲", "甲"]
+    with pytest.raises(ToolError, match="remainder"):
+        w.define_dataset("参与", "名单.xlsx", "名单", {"emp": {"column": "人员", "type": "text"}}, key="emp",
+                         unpivot={"columns": ["负责人", "执行人"], "value": "人员", "remainder": "x"})
+
+
+def test_name_percent_gate_stays_until_data_is_really_split():
+    from bonus_core.data.table import Row, StdTable
+    rs = RuleSet.model_validate({"name": "t", "version": "1", "pool": {"expr": "1"}, "allocation": [],
+                                 "datasets": {"名单": {"key": "emp", "fields": {"emp": {"type": "id"}}}}})
+    data = {"名单": StdTable("名单", [Row({"emp": e}) for e in ("甲", "乙", "丙50%")])}
+    from bonus_agent.extract_rules import Question
+    w = Workspace(FakeLLM(["x"]), build_inventory([]))
+    w.questions = [Question(id="q1", text="丙50%怎么拆？", options=[], answer="拆成丙，另一半未分配")]
+    rep = lint.check(rs, data, "")
+    assert w._open_gates(rep) and any("名称百分比" in g for g in w._open_gates(rep))
+    fixed = {"名单": StdTable("名单", [Row({"emp": e}) for e in ("甲", "乙", "丙", "未分配")])}
+    assert not lint.check(rs, fixed, "").keys
+
+
+def test_currency_or_rate_column_not_used_by_rules_is_asked(tmp_path):
+    from bonus_agent.extract_rules import Question
+    p = tmp_path / "销售.xlsx"
+    _book(p, [["项目", "币种", "汇率", "金额"], ["P1", "USD", 7.1, 100], ["P2", "CNY", 1, 200]], "销售")
+    w = Workspace(FakeLLM(["x"]), build_inventory(collect_files([tmp_path])))
+    w.define_dataset("销售", "销售.xlsx", "销售", {"pid": {"column": "项目", "type": "id"},
+                                              "amt": {"column": "金额", "type": "money"}}, key="pid")
+    rs = RuleSet.model_validate({"name": "t", "version": "1", "pool": {"expr": "sum(amt, of: \"销售\")"}, "allocation": [],
+                                 "datasets": {n: d.model_dump(mode="json") for n, d in w.datasets.items()}})
+    keys = [k for _, k in w._currency_gates(rs)]
+    assert keys == ["币种 币种", "币种 汇率"]
+    w.questions = [Question(id="q1", text="销售表里有「币种」「汇率」列，美元怎么折算？", options=[], answer="美元按汇率折算")]
+    assert w._currency_gates(rs) == []
+
+
+def test_ids_differing_only_in_case_or_spaces_are_matched_with_a_warning():
+    from bonus_core.data.table import from_records
+    from bonus_core.engine.run import compute
+    rs = _rs_yaml('''
+name: t
+version: v1
+datasets:
+  客户: {key: cust, fields: {cust: {type: id}, budget: {type: money}}}
+  销售: {link: cust, fields: {cust: {type: id}, amt: {type: money}}}
+pool: {scope: global, expr: "100"}
+allocation:
+  - {level: 客户, key: cust, weight: "sum(amt, of: \\"销售\\")"}
+''')
+    data = from_records(rs, {"客户": [{"cust": "Belvape", "budget": 10}, {"cust": "ACME", "budget": 5}],
+                             "销售": [{"cust": "BELVAPE", "amt": 30}, {"cust": " acme ", "amt": 10}, {"cust": "ｂelvape", "amt": 60}]})
+    res = compute(rs, data)
+    notes = [i for i in res.issues if i.code == "link_normalized"]
+    assert notes and "BELVAPE→Belvape" in notes[0].message
+    assert not [i for i in res.issues if i.severity == "blocking"], res.issues
+    assert {k: v.final for k, v in res.nodes.items() if k.startswith("客户:")} == {"客户:Belvape": "90.00", "客户:ACME": "10.00"}
+    assert data["销售"].rows[0].values["cust"] == "BELVAPE"          # 原数据不改
