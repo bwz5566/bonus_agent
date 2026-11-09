@@ -86,6 +86,14 @@ class Period:
     def months(self) -> int:
         return (self.end.year - self.start.year) * 12 + self.end.month - self.start.month + 1
 
+    def window(self, kind: str = "period") -> "Period":
+        """数据表取行的范围：period 本期；year_to_date 本期末所在年份的年初到本期末；to_date 本期末及以前。"""
+        if kind == "year_to_date":
+            return Period(date(self.end.year, 1, 1), self.end)
+        if kind == "to_date":
+            return Period(date(1, 1, 1), self.end)
+        return self
+
     def __str__(self) -> str:
         return self.label
 

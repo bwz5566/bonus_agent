@@ -152,3 +152,21 @@ def test_agent_dataset_period_and_template_reruns_other_month(tmp_path):
     assert Decimal(next(iter(res.values()))["R0"].pool) == Decimal("200.00")
     res, _ = tpl.run([m / "数据.xlsx"])               # 不选期间：用确认时的 9 月
     assert Decimal(next(iter(res.values()))["R0"].pool) == Decimal("400.00")
+
+
+def test_window_year_to_date_and_to_date(tmp_path):
+    """同一份明细：当期按本期取，累计（如按年内出货算月均）按 window 取年初到本期末，规则不写死月份。"""
+    q3 = Period.parse("2026-09")
+    assert q3.window("year_to_date") == Period(date(2026, 1, 1), date(2026, 9, 30))
+    assert q3.window("to_date").end == date(2026, 9, 30) and q3.window("period") == q3
+    f = book(tmp_path / "数据.xlsx", ROWS + [["E1", 202512, 500], ["E2", 202610, 700]])
+    for window, pool in (("period", "400.00"), ("year_to_date", "700.00"), ("to_date", "750.00")):
+        rules = {**RULES, "datasets": {**RULES["datasets"], "销售": {**RULES["datasets"]["销售"], "window": window}}}
+        rs = RuleSet.model_validate(rules)
+        mp = {k: DatasetMapping.model_validate(v) for k, v in MAPPING.items()}
+        data, issues = apply_mapping(rs, [f], mp, q3)
+        assert not [i for i in issues if i.severity == "blocking"]
+        assert Decimal(Engine(rs, data, {}, q3).compute().pool) == Decimal(pool), window
+    assert any("年初累计" in i.message for i in apply_mapping(
+        RuleSet.model_validate({**RULES, "datasets": {**RULES["datasets"], "销售": {**RULES["datasets"]["销售"], "window": "year_to_date"}}}),
+        [f], {k: DatasetMapping.model_validate(v) for k, v in MAPPING.items()}, q3)[1])

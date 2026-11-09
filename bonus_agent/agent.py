@@ -186,6 +186,10 @@ TOOLS: list[dict] = [
                          "period": {**_S, "description": "可选：记业务日期或月份的字段名。写了之后计算时只取落在本次核算期间里的行，"
                                     "同一版规则换任何月份、季度都能算。业务明细（销售、回款、出货等）有日期或月份列时都要写；"
                                     "名单、预算这类跨期的表不写，要取当期的值时在表达式里用 period_start() / period_end()"},
+                         "window": {"type": "string", "enum": ["period", "year_to_date", "to_date"], "description":
+                                    "可选，写了 period 才有用：取哪段时间的行。period（默认）只取本期；year_to_date 取本期末所在年份年初到本期末；"
+                                    "to_date 取本期末及以前全部行。规则要用累计或历史数据（如按年内累计算月均）时用；同一份明细既要当期又要累计，"
+                                    "就定义成两张表"},
                          "unpivot": {"type": "object", "description":
                                      '可选：几列放的是同一类值（如几个角色列各放一个人名）时展开成每个值一行：'
                                      '{"columns": ["列1", "列2"], "value": "展开后的列名", "label": "记原列名的列名，如 角色"}。'
@@ -1148,7 +1152,7 @@ class Workspace:
     def define_dataset(self, name: str, file: str, sheet: str, fields: dict | None = None, key: str | None = None,
                        link: str | None = None, desc: str = "", header_rows: list[int] | None = None,
                        filter: dict | None = None, distinct: bool = False, unpivot: dict | None = None,
-                       unmatched: str = "block", period: str | None = None) -> str:
+                       unmatched: str = "block", period: str | None = None, window: str = "period") -> str:
         reuse = ""
         if not fields:      # 重新定义时只改 key / link / filter：沿用上一次的字段（模型常只写要改的部分，反复因缺 fields 失败）
             fields = self._prev_fields.get(name)
@@ -1156,14 +1160,14 @@ class Workspace:
                 raise ToolError(f"缺少 fields（字段名 -> {{column, type}}）。「{name}」之前没有定义成功过，要写全字段")
             reuse = f"没写 fields，沿用上一次定义「{name}」时的 {len(fields)} 个字段"
         out = self._define_dataset(name, file, sheet, fields, key, link, desc, header_rows, filter, distinct, unpivot, unmatched,
-                                   period)
+                                   period, window)
         self._prev_fields[name] = fields
         return out + (f"\n{reuse}" if reuse else "")
 
     def _define_dataset(self, name: str, file: str, sheet: str, fields: dict, key: str | None = None,
                         link: str | None = None, desc: str = "", header_rows: list[int] | None = None,
                         filter: dict | None = None, distinct: bool = False, unpivot: dict | None = None,
-                        unmatched: str = "block", period: str | None = None) -> str:
+                        unmatched: str = "block", period: str | None = None, window: str = "period") -> str:
         f = self._file(file)
         try:
             st = table_at(f, sheet, header_rows) if header_rows else self.inv.sheet(f"{f.name}/{sheet}")
@@ -1224,6 +1228,11 @@ class Workspace:
             raise ToolError("未保存，请修正：\n" + "\n".join(f"- {e}" for e in fixed + errors))
         warnings = fixed + warnings
         period = str(period or "").strip() or None
+        window = str(window or "period").strip() or "period"
+        if window not in ("period", "year_to_date", "to_date"):
+            raise ToolError("未保存：window 只能写 period、year_to_date 或 to_date")
+        if window != "period" and not period:
+            raise ToolError("未保存：写 window 时要同时写 period（记日期或月份的字段）")
         if period:
             if period not in d.fields:
                 raise ToolError(f"未保存：period 要写这张表里记日期或月份的字段名（现有字段：{'、'.join(d.fields)}）")
@@ -1235,10 +1244,11 @@ class Workspace:
             if bad:
                 raise ToolError(f"未保存：period 字段 {period} 有 {len(bad)} 行认不出日期或月份（如 {bad[0]!r}）。"
                                 "写法要像 年-月、六位年月、年-月-日 或 Excel 日期；空值或其他写法先问财务")
-            d.period = period
+            d.period, d.window = period, window
             spans = sorted({probe.span_of(v) for v in vals})
             warnings.append(f"按 {period} 筛选核算期间：数据覆盖 {spans[0][0]} ~ {spans[-1][1]}"
-                            + (f"；本次核算期间 {self.period}，计算时只取期间里的行" if self.period else "；本次没有指定核算期间，全部行都参与"))
+                            + (f"；本次核算期间 {self.period}，计算时只取" + {"period": "期间里的行", "year_to_date": f"{self.period.window(window)} 年初累计的行",
+                               "to_date": f"{self.period.end} 及以前的行"}[window] if self.period else "；本次没有指定核算期间，全部行都参与"))
         if spec:
             m.unpivot = spec
         prev = (self.datasets.get(name), self.mapping.get(name))

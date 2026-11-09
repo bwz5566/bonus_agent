@@ -233,13 +233,15 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping, period
         if ds.period and period is not None and pcol is None:
             issues.append(Issue.block("period_unmapped", f"「{ds_name}」按期间筛选的字段 {ds.period} 没有对应的列", ds_name))
             continue
+        win = period.window(ds.window) if period is not None else None
+        win_text = "" if win is None else {"year_to_date": f"（年初累计 {win.start}~{win.end}）", "to_date": f"（截至 {win.end}）"}.get(ds.window, "")
         out_of, unclear = 0, []
         for excel_row, vals in st.rows:
             if not keep(vals):
                 continue
             src = RowRef(st.file, st.sheet, excel_row)
             if pcol is not None and period is not None:
-                inside = period.contains(vals[pcol] if pcol < len(vals) else None)
+                inside = win.contains(vals[pcol] if pcol < len(vals) else None)
                 if inside is False:
                     out_of += 1
                     continue
@@ -256,11 +258,11 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping, period
                     rv[f] = None
             t.rows.append(Row(rv, src))
         if unclear:
-            issues.append(Issue.block("period_unclear", f"「{ds_name}」有 {len(unclear)} 行的 {ds.period} 看不出是否属于核算期间 {period}"
+            issues.append(Issue.block("period_unclear", f"「{ds_name}」有 {len(unclear)} 行的 {ds.period} 看不出是否属于核算期间 {period}{win_text}"
                                       f"（如 {unclear[0][1]!r}）：空值、写法认不出，或只有一部分落在期间里",
                                       unclear[0][0]))
         if ds.period and period is not None:
-            issues.append(Issue.warn("period_filtered", f"「{ds_name}」按核算期间 {period} 筛选（{ds.period}）：取 {len(t.rows)} 行，"
+            issues.append(Issue.warn("period_filtered", f"「{ds_name}」按核算期间 {period}{win_text} 筛选（{ds.period}）：取 {len(t.rows)} 行，"
                                      f"期间外 {out_of} 行不参与计算", ds_name))
         if ds.distinct and ds.key:
             t.rows, clash = _distinct(t.rows, ds.key)

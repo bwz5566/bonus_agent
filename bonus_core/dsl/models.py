@@ -89,6 +89,9 @@ class DatasetDef(_Base):
     # 记业务日期或月份的字段：计算时只取落在这次核算期间里的行（期间在计算时选，规则里不写死月份）。
     # 名单、预算这类跨期主数据不写，按需要在表达式里用 period_start() / period_end() 取当期
     period: str | None = None
+    # 按期间取哪些行（写了 period 才有用）：period（默认，只取本期）；year_to_date（本期所在年份年初到本期末，如按年内累计出货算月均）；
+    # to_date（本期末及以前的全部行）。同一份明细既要当期又要累计时，定义成两张表
+    window: Literal["period", "year_to_date", "to_date"] = "period"
 
 
 class TierTable(RuleItem):
