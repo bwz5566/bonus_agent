@@ -37,6 +37,9 @@ def answer(llm, scenario, version, message, *, releases=None, result=None, max_s
 
     def describe_scenario():
         return {"scenario": scenario, "version": version, "periods": spec.periods,
+                "entities": spec.entities,
+                "period_windows": {p: w.model_dump(mode="json") for p,w in spec.period_windows.items()},
+                "period_contracts": {name: policy.model_dump(mode="json") for name,policy in spec.period_contracts.items()},
                 "publication": publication["fingerprint"], "approved_by": publication["approved_by"],
                 "rules": rs.model_dump(mode="json")}
 

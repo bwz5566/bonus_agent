@@ -69,6 +69,7 @@ def main(argv=None) -> int:
     for p in (run_parser, template_parser):
         p.add_argument("--rule-version", help="已发布固定规则版本")
         p.add_argument("--period", help="核算期间")
+        p.add_argument("--business-batch", help="统一登记库中的业务批次 key")
         p.add_argument("--release-dir")
         p.add_argument("--preview-migrated", action="store_true", help="仅开发迁入样例试算，不是财务正式结算")
     a = ap.parse_args(argv)
@@ -89,7 +90,7 @@ def main(argv=None) -> int:
                 raise ValueError("--template 必须是所选已发布版本的目录")
             target = Path(a.out)
             runs = (target.parent / (target.stem + "_runs")) if a.cmd == "run" else target / "runs"
-            run = run_fixed(a.scenario, a.rule_version, a.period, a.data, runs, releases=a.release_dir)
+            run = run_fixed(a.scenario, a.rule_version, a.period, a.data, runs, releases=a.release_dir, business_batch=a.business_batch)
             dest = target if a.cmd == "run" else target / "result.xlsx"
             atomic_write(dest, (run.directory / "result.xlsx").read_bytes())
             atomic_write(dest.with_suffix(".run.json"), (run.directory / "run.json").read_bytes())

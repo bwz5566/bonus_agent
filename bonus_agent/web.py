@@ -46,6 +46,7 @@ from bonus_agent.parsing.docs import PARSERS
 from bonus_agent.scenarios.releases import ReleaseError, load_release, root_dir, versions
 from bonus_agent.scenarios import scenario_metadata
 from bonus_agent.infra.storage import atomic_write, canonical
+from bonus_agent.scenarios.batches import Registry, BatchError
 
 ROLES = {"editor": "传材料、答复问题、运行、按模板计算", "approver": "确认结果"}
 COOKIE = "bonus_session"
@@ -132,14 +133,20 @@ class Store:
             raise KeyError(cid)
         return d
 
-    def create(self, name: str, by: str, scenario: str, rule_version: str = "", period: str = "") -> str:
+    def create(self, name: str, by: str, scenario: str, rule_version: str = "", period: str = "", *, business_batch="", registry=None) -> str:
         scenario_metadata(scenario)
         cid = secrets.token_hex(6)
         d = self.root / "cases" / cid
+        if registry is not None and rule_version:
+            record = registry.get(business_batch)
+            if record["scenario"] != scenario or record["period"] != period:
+                raise BatchError("batch_contract", "批次场景或期间与案卷不一致")
+            registry.bind(business_batch, d / "runs")
         for sub in ("materials", "expected", "out", "runs"):
             (d / sub).mkdir(parents=True)
         (d / "meta.json").write_text(json.dumps({"name": name, "scenario": scenario, "rule_version": rule_version,
-                                               "period": period, "created": now(), "created_by": by}, ensure_ascii=False),
+                                               "period": period, "business_batch": business_batch,
+                                               "created": now(), "created_by": by}, ensure_ascii=False),
                                      encoding="utf-8")
         self.audit(cid, by, "新建案卷", name=name)
         return cid
@@ -147,11 +154,11 @@ class Store:
     def meta(self, cid: str) -> dict:
         return json.loads((self.dir(cid) / "meta.json").read_text(encoding="utf-8"))
 
-    def invalidate_fixed(self, cid):
+    def invalidate_fixed(self, cid, status="INPUT_CHANGED"):
         p = self.dir(cid) / "out" / "fixed_run.json"
         if p.exists():
             record = json.loads(p.read_text(encoding="utf-8"))
-            record["status"] = "INPUT_CHANGED"
+            record["status"] = status
             atomic_write(p, canonical(record))
 
     def cases(self) -> list[tuple[str, dict, dict | None]]:
@@ -346,7 +353,8 @@ class Runner:
                         previous = json.loads(pointer.read_text(encoding="utf-8"))
                         if previous.get("status") == "OK" and re.fullmatch(r"[a-f0-9]{64}", previous.get("task_id", "")):
                             key, _ = task_key(meta["scenario"], meta["rule_version"], meta["period"],
-                                              sorted((d / "materials").iterdir()), releases=self.releases)
+                                              sorted((d / "materials").iterdir()), releases=self.releases,
+                                              business_batch=meta.get("business_batch"))
                             if key == previous["task_id"]:
                                 result = read_completed(d / "runs", key).result
                     reply = answer(self.llm_factory(), meta["scenario"], meta["rule_version"], message,
@@ -356,7 +364,7 @@ class Runner:
                     return
                 files = sorted((d / "materials").iterdir())
                 run = run_fixed(meta["scenario"], meta["rule_version"], meta["period"], files, d / "runs",
-                                releases=self.releases, should_stop=lambda: job.cancel)
+                                releases=self.releases, business_batch=meta.get("business_batch"), should_stop=lambda: job.cancel)
                 atomic_write(pointer, canonical({"status": "OK", "task_id": run.task_id, "at": now(),
                                                   "scenario": meta["scenario"], "version": meta["rule_version"],
                                                   "period": meta["period"], "cached": run.cached}))
@@ -514,7 +522,7 @@ def form(action: str, inner: str, csrf: str, upload: bool = False, inline: bool 
 
 def status_text(case: dict | None) -> str:
     if case and "fixed" in case:
-        label = {"OK": "固定计算完成", "FAILED": "固定流程已阻断", "INPUT_CHANGED": "材料已改变，待重新校验"}
+        label = {"OK": "固定计算完成", "FAILED": "固定流程已阻断", "INPUT_CHANGED": "材料已改变，待重新校验", "RULE_CHANGED": "规则版本已改变，待重新校验"}
         return e(label.get(case["fixed"].get("status"), "待处理"))
     if not case or not case.get("rounds"):
         return "<span class='mut'>还没有运行</span>"
@@ -684,20 +692,66 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
     def index(u: dict = Depends(user)):
         rows = "".join(f"<tr><td><a href='/cases/{cid}'>{e(m['name'])}</a></td><td>{status_text(c)}</td>"
                        f"<td class='mut'>{e(m['created_by'])} · {e(m['created'][:16])}</td></tr>" for cid, m, c in store.cases())
-        options = "".join(
-            f"<option value='{e(x)}'>{e(SCENARIO_NAMES.get(x, x))} ({e(scenario_metadata(x).status if exploration else ('有已发布版本' if versions(x, runner.releases) else '待财务配置'))})</option>"
-            for x in list_scenarios())
-        release_options = "".join(f"<option value='{e(s)}@{e(v)}'>{e(SCENARIO_NAMES.get(s, s))} / {e(v)}</option>"
-                                  for s in list_scenarios() for v in versions(s, runner.releases))
+        options, release_options, pack_errors = [], [], []
+        try:
+            registered = list_scenarios()
+        except (OSError, ValueError) as exc:
+            registered = []
+            pack_errors.append(f"场景目录读取失败：{exc}")
+        for scenario in registered:
+            try:
+                metadata = scenario_metadata(scenario)
+                if exploration:
+                    load_pack(scenario)
+                version_errors = []
+                available = versions(scenario, runner.releases, errors=version_errors)
+                if version_errors and not available:
+                    raise ReleaseError("；".join(version_errors))
+                pack_errors.extend(version_errors)
+                status = metadata.status if exploration else ("有已发布版本" if available else "待财务配置")
+                options.append(f"<option value='{e(scenario)}'>{e(SCENARIO_NAMES.get(scenario, scenario))} ({e(status)})</option>")
+                release_options += [f"<option value='{e(scenario)}@{e(v)}'>{e(SCENARIO_NAMES.get(scenario, scenario))} / {e(v)}</option>" for v in available]
+            except (ValueError, OSError, EngineError) as exc:
+                options.append(f"<option disabled>{e(SCENARIO_NAMES.get(scenario, scenario))}（配置异常，不可选择）</option>")
+                pack_errors.append(f"{scenario}：{exc}")
+        options, release_options = "".join(options), "".join(release_options)
+        registry = Registry(runner.releases)
+        batch_options = "".join(f"<option value='{e(b['key'])}'>{e(b['scenario'])} / {e(b['entity'])} / {e(b['period'])} / {e(b['batch_id'])}</option>"
+                                for b in registry.list()) if not exploration else ""
         new = form("/cases", "<input type='text' name='name' placeholder='如 2026 年 Q3 季度奖' required> "
                              "<select name='scenario' required><option value=''>请选择场景</option>" + options + "</select>"
                              + ("<select name='rule_version'><option value=''>尚未配置版本</option>" + release_options + "</select>"
                                 "<input name='period' placeholder='已批准的核算期间，如 2026-Q3'>" if not exploration else "")
+                             + ("<select name='business_batch'><option value=''>请选择已登记业务批次</option>" + batch_options + "</select>" if not exploration else "")
                              + "<p><button>新建案卷</button></p>", u["csrf"]) if "editor" in u["roles"] else ""
         body = (f"<h1>案卷</h1><section><div class='wrap'><table><tr><th>名称</th><th>状态</th><th>创建</th></tr>{rows}</table></div>"
                 + ("" if rows else "<p class='mut'>还没有案卷</p>") + "</section>"
                 + (f"<section><h2>新建</h2>{new}</section>" if new else ""))
+        if pack_errors:
+            import logging
+            for error in pack_errors:
+                logging.getLogger(__name__).error("Scenario catalog: %s", error)
+            body += "<section class='warn'><p>部分场景配置异常，已隔离；其他场景仍可使用。</p><pre>" + e("\n".join(pack_errors)) + "</pre></section>"
+        if not exploration and "approver" in u["roles"]:
+            body += "<section><h2>登记业务批次（审批人）</h2>" + form("/batches",
+                "<select name='binding' required>" + release_options + "</select>"
+                "<input name='entity' placeholder='规则包批准的核算主体' required>"
+                "<input name='period' placeholder='核算期间' required>"
+                "<input name='batch_id' placeholder='财务业务批次号，如 SALES-2026-Q3-001' required>"
+                "<button>登记批次</button>", u["csrf"]) + "</section>"
         return page("案卷", body, u)
+
+    @app.post("/batches")
+    async def register_batch(request: Request, u: dict = Depends(user)):
+        need(u, "approver")
+        f = await posted(request, u)
+        try:
+            scenario, version = str(f.get("binding", "")).split("@", 1)
+            Registry(runner.releases).register(scenario, version, str(f.get("period", "")),
+                str(f.get("entity", "")), str(f.get("batch_id", "")), u["display"])
+        except (ValueError, OSError, EngineError) as exc:
+            raise HTTPException(400, str(exc)) from None
+        return RedirectResponse("/", status_code=303)
 
     @app.post("/cases")
     async def create(request: Request, u: dict = Depends(user)):
@@ -716,7 +770,11 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
                 _, spec, _ = load_release(scenario, version, runner.releases)
                 if period not in spec.periods:
                     raise ReleaseError("期间不在此版本的批准范围")
-            cid = store.create(name, u["display"], scenario, version, period)
+                batch = Registry(runner.releases).get(str(f.get("business_batch", "")))
+                if batch["entity"] not in spec.entities:
+                    raise ReleaseError("批次核算主体未获规则版本批准")
+            cid = store.create(name, u["display"], scenario, version, period,
+                business_batch=str(f.get("business_batch", "")), registry=None if exploration else Registry(runner.releases))
         except (ScenarioError, ReleaseError) as exc:
             raise HTTPException(400, str(exc)) from None
         return back(cid)
@@ -905,18 +963,30 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         except ValueError:
             parts.append("<p class='warn'>未配置已发布规则，不能计算。财务需提供固定模板、规则和独立验收结果，验收发布后新建绑定版本的案卷。</p>")
         job = runner.jobs.get(cid)
+        batch_locked = False
+        if meta.get("business_batch"):
+            batch_record = Registry(runner.releases).get(meta["business_batch"])
+            batch_locked = bool(batch_record["confirmation"])
+            parts.append(f"<p>业务批次：{e(batch_record['batch_id'])}；核算主体：{e(batch_record['entity'])}</p>")
         parts.append(f"<p>状态：{e((job.message or '正在按固定步骤执行') if job else state.get('status', '待材料'))}</p>")
-        if state.get("status") == "INPUT_CHANGED":
-            parts.append("<p class='warn'>材料已改变，旧结果只作历史留档，需要重新校验计算。</p>")
+        if state.get("status") in {"INPUT_CHANGED", "RULE_CHANGED"}:
+            parts.append("<p class='warn'>材料或规则版本已改变，旧结果只作历史留档，需要重新校验计算。</p>")
         if editor and not busy:
-            parts.append(form(f"/cases/{cid}/materials", "<input type='file' name='files' multiple required><button>上传本批数据</button>", csrf, upload=True))
+            if not batch_locked:
+                parts.append(form(f"/cases/{cid}/materials", "<input type='file' name='files' multiple required><button>上传本批数据</button>", csrf, upload=True))
+                try:
+                    choices = "".join(f"<option value='{e(v)}'>{e(v)}</option>" for v in versions(meta["scenario"], runner.releases))
+                except (ValueError, OSError, EngineError):
+                    choices = ""
+                if meta.get("business_batch") and choices:
+                    parts.append(form(f"/cases/{cid}/rule-version", "<select name='version'>" + choices + "</select><button>选择已发布版本建立试算修订</button>", csrf))
             if configured:
                 parts.append(form(f"/cases/{cid}/run", "<button>按固定规则计算 / 恢复任务</button>", csrf))
                 parts.append(form(f"/cases/{cid}/chat", "<textarea name='text' placeholder='只读查询规则或结果；修改规则需财务发布新版本'></textarea><button>查询</button>", csrf))
         if editor and busy:
             parts.append(form(f"/cases/{cid}/stop", "<button>停止（保留检查点）</button>", csrf))
         parts.append(files_table(d / "materials", f"/cases/{cid}/dl/materials", csrf,
-                                 f"/cases/{cid}/materials/delete" if editor and not busy else None))
+                                 f"/cases/{cid}/materials/delete" if editor and not busy and not batch_locked else None))
         task_id = state.get("task_id", "")
         if state.get("status") == "OK" and re.fullmatch(r"[a-f0-9]{64}", task_id):
             task = d / "runs" / task_id
@@ -938,6 +1008,11 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
 
     async def _save(cid: str, u: dict, files: list, area: str, single: bool = False) -> list[str]:
         d = case_dir(cid)
+        if not exploration and area == "materials" and store.meta(cid).get("business_batch"):
+            try:
+                Registry(runner.releases).require_mutable(store.meta(cid)["business_batch"])
+            except BatchError as exc:
+                raise HTTPException(409, str(exc)) from None
         if not files:
             raise HTTPException(400, "没有选择文件")
         if single:
@@ -982,6 +1057,11 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         d = case_dir(cid)
         idle(cid)
         f = await posted(request, u)
+        if not exploration and area == "materials" and store.meta(cid).get("business_batch"):
+            try:
+                Registry(runner.releases).require_mutable(store.meta(cid)["business_batch"])
+            except BatchError as exc:
+                raise HTTPException(409, str(exc)) from None
         try:
             p = inside(d / area, str(f.get("name", "")))
         except KeyError:
@@ -1069,6 +1149,32 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             store.audit(cid, u["display"], "停止运行")
         return back(cid)
 
+    @app.post("/cases/{cid}/rule-version")
+    async def revise_rule_version(cid: str, request: Request, u: dict = Depends(user)):
+        need(u,"editor")
+        d=case_dir(cid)
+        idle(cid)
+        f=await posted(request,u)
+        if exploration:
+            raise HTTPException(409,"开发探索不使用财务固定版本修订")
+        meta=store.meta(cid)
+        try:
+            registry=Registry(runner.releases)
+            registry.require_mutable(meta.get("business_batch"))
+            batch=registry.get(meta.get("business_batch"))
+            version=str(f.get("version",""))
+            _,spec,_=load_release(meta["scenario"],version,runner.releases)
+            if meta["period"] not in spec.periods or batch["entity"] not in spec.entities:
+                raise ReleaseError("新规则版本不适用于本批次的期间或核算主体")
+            previous=meta["rule_version"]
+            meta["rule_version"]=version
+            atomic_write(d/"meta.json",canonical(meta))
+            store.invalidate_fixed(cid,"RULE_CHANGED")
+            store.audit(cid,u["display"],"选择发布版本建立试算修订",previous=previous,version=version)
+        except (ValueError,OSError,EngineError) as exc:
+            raise HTTPException(409,str(exc)) from None
+        return back(cid,"已选择发布版本，请重新校验计算；历史结果保留")
+
     @app.post("/cases/{cid}/confirm-fixed")
     async def confirm_fixed(cid: str, request: Request, u: dict = Depends(user)):
         from bonus_agent.scenarios.execution import task_key, read_completed
@@ -1091,17 +1197,15 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             if current != prior["identity"]["inputs"]:
                 raise ReleaseError("材料已改变，不能确认旧结果")
             key, _ = task_key(meta["scenario"], meta["rule_version"], meta["period"],
-                              sorted((d / "materials").iterdir()), releases=runner.releases)
+                              sorted((d / "materials").iterdir()), releases=runner.releases,
+                              business_batch=meta.get("business_batch"))
             if key != state["task_id"]:
                 raise ReleaseError("结果版本已失效，请重新计算后复核")
             run = read_completed(d / "runs", key)
             record = {"task_id": run.task_id, "by": u["display"], "at": now(), "result_sha256": sha(task / "result.xlsx")}
             destination = task / "confirmed.json"
-            try:
-                with destination.open("x", encoding="utf-8") as f:
-                    json.dump(record, f, ensure_ascii=False)
-            except FileExistsError:
-                return back(cid, "该结果快照已确认")
+            record = Registry(runner.releases).confirm(meta.get("business_batch"), d / "runs", run.task_id, record)
+            atomic_write(destination, canonical(record))
         except (ValueError, OSError) as exc:
             raise HTTPException(409, str(exc)) from None
         store.audit(cid, u["display"], "确认固定结果", task_id=run.task_id)

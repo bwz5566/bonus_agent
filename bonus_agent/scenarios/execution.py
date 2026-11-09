@@ -22,6 +22,8 @@ from bonus_core.engine.evaluator import Trace
 from bonus_core.engine.issues import Issue
 from bonus_core.engine.run import ENGINE_VERSION, Adjustment, Engine, NodeResult, PayoutResult, Result, RollupResult
 from bonus_core.report.excel import write_excel
+from bonus_agent.scenarios.periods import apply_period
+from bonus_agent.scenarios.batches import Registry
 
 
 class RunBusy(ReleaseError):
@@ -147,14 +149,18 @@ def _read_checkpoint(path):
     return value["payload"]
 
 
-def task_key(scenario, version, period, data_files, *, releases=None):
+def task_key(scenario, version, period, data_files, *, releases=None, business_batch=None):
     _, spec, publication = load_release(scenario, version, releases)
     if period not in spec.periods:
         raise ReleaseError("期间不在批准范围")
+    batch = Registry(releases).get(business_batch or "")
+    if batch["scenario"] != scenario or batch["period"] != period or batch["entity"] not in spec.entities:
+        raise ReleaseError("业务批次的场景、核算主体或期间与所选规则版本不一致")
     files = [Path(p) for p in data_files]
     if not files or len({p.name for p in files}) != len(files):
         raise ReleaseError("本批数据不能为空或包含重名文件")
     identity = {"scenario": scenario, "version": version, "period": period,
+                "business_batch": batch["key"], "batch_id": batch["batch_id"], "entity": batch["entity"], "scope": batch["scope"],
                 "publication": publication["fingerprint"], "inputs": {p.name: sha(p) for p in files},
                 "engine": ENGINE_VERSION, "code": engine_code(), "numeric_profile": "decimal-half-up-v1"}
     return fingerprint(identity), identity
@@ -176,7 +182,36 @@ def read_completed(runs, key):
     return FixedRun(key, task, result_load(_read_checkpoint(task / "computed.json")), True)
 
 
-def run_fixed(scenario, version, period, data_files, runs, *, releases=None, should_stop=lambda: False):
+def run_fixed(scenario, version, period, data_files, runs, *, releases=None, business_batch=None, should_stop=lambda: False):
+    files = list(data_files)
+    key, _ = task_key(scenario, version, period, files, releases=releases, business_batch=business_batch)
+    registry = Registry(releases)
+    token = registry.begin(business_batch, runs, key)
+    stop, lost = threading.Event(), threading.Event()
+    def heartbeat():
+        while not stop.wait(10):
+            try:
+                registry.heartbeat(business_batch, token)
+            except Exception:
+                lost.set()
+                return
+    thread = threading.Thread(target=heartbeat, daemon=True)
+    thread.start()
+    def cancelled():
+        if lost.is_set():
+            raise ReleaseError("业务批次租约已丢失")
+        return should_stop()
+    try:
+        result = _run_fixed(scenario, version, period, files, runs, releases=releases,
+                            business_batch=business_batch, should_stop=cancelled)
+        registry.heartbeat(business_batch, token)
+        return result
+    finally:
+        stop.set(); thread.join()
+        registry.release(business_batch, token)
+
+
+def _run_fixed(scenario, version, period, data_files, runs, *, releases=None, business_batch=None, should_stop=lambda: False):
     """`runs` belongs to ONE business case/batch. There is no cross-case cache."""
     directory, spec, publication = load_release(scenario, version, releases)
     if period not in spec.periods:
@@ -184,7 +219,7 @@ def run_fixed(scenario, version, period, data_files, runs, *, releases=None, sho
     files = [Path(p) for p in data_files]
     if not files or len({p.name for p in files}) != len(files):
         raise ReleaseError("本批数据不能为空或包含重名文件")
-    key, identity = task_key(scenario, version, period, files, releases=releases)
+    key, identity = task_key(scenario, version, period, files, releases=releases, business_batch=business_batch)
     inputs = identity["inputs"]
     ledger = Ledger(runs)
     token, done = ledger.claim(key)
@@ -239,7 +274,10 @@ def run_fixed(scenario, version, period, data_files, runs, *, releases=None, sho
         computed = task / "computed.json"
         if computed.exists():
             result = result_load(_read_checkpoint(computed))
+            period_report = decode(_read_checkpoint(task / "period.json"))
         else:
+            data, period_report = apply_period(spec, period, data)
+            _checkpoint(task / "period.json", encode(period_report))
             engine = Engine(rs, data)
             engine.issues += issues
             result = engine.compute()
@@ -250,10 +288,21 @@ def run_fixed(scenario, version, period, data_files, runs, *, releases=None, sho
         report = {"status": "passed", "object_count": len(result.payout_rows()),
                   "input_hash": result.input_hash, "identity": identity,
                   "checks": [i.to_dict() for i in result.issues], "task_id": key}
+        report["period_validation"] = period_report
         _checkpoint(task / "validated.json", report)
         output = task / "result.xlsx"
         staging = task / f".result-{token}.xlsx"
-        write_excel(rs, result, staging)
+        period_rows, excluded_rows = [], []
+        for name, item in period_report["tables"].items():
+            period_rows.append(["数据表：" + name, period, item["mode"], item["input_count"], item["kept_count"],
+                                item["excluded_count"], "说明：" + item["reason"]])
+            excluded_rows += [["数据表：" + name, "来源：" + r["source"], r["date"], "原因：" + r["reason"],
+                              json.dumps(r["values"],ensure_ascii=False)] for r in item["excluded"]]
+        write_excel(rs, result, staging, extra_sheets=[
+            ("业务批次", ["项目", "内容"], [["批次号", identity["batch_id"]], ["核算主体", identity["entity"]],
+             ["场景", scenario], ["期间", period], ["规则版本", version], ["任务编号", key]], {}),
+            ("期间校验", ["数据表", "期间", "契约", "输入行数", "纳入行数", "排除行数", "说明"], period_rows, {}),
+            ("跨期排除明细", ["数据表", "来源", "业务日期", "批准排除原因", "原始字段值"], excluded_rows, {})])
         guard()
         stop.set(); thread.join()
         guard()
@@ -262,7 +311,7 @@ def run_fixed(scenario, version, period, data_files, runs, *, releases=None, sho
             atomic_write(task / "run.json", canonical({**report, "approved_by": publication["approved_by"],
                                                        "approved_at": publication["approved_at"]}))
             return {"files": {name: sha(task / name) for name in
-                    ("mapped.json", "computed.json", "validated.json", "result.xlsx", "run.json")}}
+                    ("mapped.json", "period.json", "computed.json", "validated.json", "result.xlsx", "run.json")}}
         ledger.finish(key, token, publish_result)
         return FixedRun(key, task, result, False)
     except BaseException:

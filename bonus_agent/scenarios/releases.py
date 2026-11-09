@@ -27,6 +27,7 @@ from bonus_core.dsl.models import RuleSet
 from bonus_core.dsl.validator import validate
 from bonus_core.engine.issues import EngineError
 from bonus_core.engine.run import Adjustment, Engine, Result
+from bonus_agent.scenarios.periods import DateWindow, DatePolicy, PeriodError, apply_period, validate_contracts
 
 READ_TOOLS = frozenset({"describe_scenario", "explain_object", "list_issues"})
 ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\Z")
@@ -64,6 +65,7 @@ class Strict(BaseModel):
 
 class Acceptance(Strict):
     id: str
+    period: str
     data: list[str] = Field(min_length=1)
     expected: str | None = None
     error_code: str | None = None
@@ -80,6 +82,9 @@ class ReleaseSpec(Strict):
     scenario: str
     version: str
     periods: list[str] = Field(min_length=1)
+    period_windows: dict[str, DateWindow]
+    period_contracts: dict[str, DatePolicy]
+    entities: list[str] = Field(min_length=1)
     rules: str
     mapping: str
     cases: list[Acceptance] = Field(min_length=2)
@@ -94,6 +99,12 @@ class ReleaseSpec(Strict):
             raise ValueError("发布至少需要一个独立期望结果用例和一个异常阻断用例")
         if any(not p.strip() for p in self.periods) or len(set(self.periods)) != len(self.periods):
             raise ValueError("核算期间不能为空或重复")
+        if any(c.period not in self.periods for c in self.cases):
+            raise ValueError("验收用例必须选择获批期间")
+        if set(c.period for c in self.cases if c.expected) != set(self.periods):
+            raise ValueError("每个批准期间都必须有独立期望结果验收用例")
+        if any(not e.strip() or len(e) > 120 or e != e.strip() for e in self.entities) or len(set(self.entities)) != len(self.entities):
+            raise ValueError("核算主体不能为空、重复或包含首尾空格")
         if not set(self.allowed_tools) <= READ_TOOLS:
             raise ValueError("运行智能体只能使用只读工具")
         names = [self.rules, self.mapping, *[n for c in self.cases for n in c.data],
@@ -114,6 +125,7 @@ def read_spec(directory: Path) -> ReleaseSpec:
 
 def definitions(directory: Path, spec: ReleaseSpec):
     rs = RuleSet.load(inside(directory, spec.rules))
+    validate_contracts(rs, spec.periods, spec.period_windows, spec.period_contracts)
     issues = [i for i in validate(rs) if i.severity == "blocking"]
     if issues:
         raise EngineError(issues)
@@ -270,9 +282,10 @@ def publish(source, releases, approver):
         for case in spec.cases:
             try:
                 data, _ = map_fixed(rs, mapping, [inside(stage, n) for n in case.data])
+                data, period_report = apply_period(spec, case.period, data)
                 result = Engine(rs, data).compute()
                 reconcile(result)
-            except (EngineError, InputContractError) as exc:
+            except (EngineError, InputContractError, PeriodError) as exc:
                 codes = {i.code for i in exc.issues} if isinstance(exc, EngineError) else {exc.code}
                 if not case.error_code or case.error_code not in codes:
                     raise ReleaseError(f"验收用例 {case.id} 非预期失败：{exc}") from exc
@@ -281,7 +294,7 @@ def publish(source, releases, approver):
             if case.error_code:
                 raise ReleaseError(f"验收用例 {case.id} 未拦住指定异常 {case.error_code}")
             check_expected({"R0": result}, json.loads(inside(stage, case.expected).read_text(encoding="utf-8")))
-            checks.append({"id": case.id, "status": "passed"})
+            checks.append({"id": case.id, "period": case.period, "status": "passed", "period_validation": period_report})
         report = {"cases": checks, "status": "passed"}
         atomic_write(stage / "acceptance.json", canonical(report))
         names.add("acceptance.json")
@@ -334,11 +347,11 @@ def load_release(scenario, version, releases=None):
             raise ReleaseError("版本与发布记录不一致")
         definitions(directory, spec)
         return directory, spec, manifest
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, ValueError, KeyError, yaml.YAMLError, EngineError) as exc:
         raise ReleaseError(f"场景 {scenario}/{version} 未发布或已损坏：{exc}") from exc
 
 
-def versions(scenario, releases=None):
+def versions(scenario, releases=None, *, errors=None):
     directory = root_dir(releases) / safe_id(scenario)
     out = []
     for p in sorted(directory.iterdir()) if directory.is_dir() else []:
@@ -346,6 +359,7 @@ def versions(scenario, releases=None):
             try:
                 load_release(scenario, p.name, releases)
                 out.append(p.name)
-            except ReleaseError:
-                pass
+            except ReleaseError as exc:
+                if errors is not None:
+                    errors.append(f"{scenario}/{p.name}：{exc}")
     return out

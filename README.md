@@ -11,14 +11,19 @@
 # 由获授权的发布管理员执行：正向独立期望结果、异常阻断用例都通过后，发布不可覆盖的版本。
 bonus-agent publish-scenario --source 财务规则包目录 --release-dir /srv/bonus/releases --by 财务审批人
 
-# 场景、版本、期间必须明确；同一个 --out 是同一业务批次，重复提交复用，失败恢复不重算已完成步骤。
+# 获授权人员登记唯一业务批次，返回 key；网页由审批人登记。
+bonus-agent register-batch --scenario annual_bonus --rule-version v1 --period 2026 \
+  --entity 财务批准的核算主体 --batch-id ANNUAL-2026-001 --by 财务审批人 --release-dir /srv/bonus/releases
+
+# 场景、版本、期间、登记批次必须明确；重复提交复用，失败恢复不重算已完成步骤。
 bonus-agent auto --scenario annual_bonus --rule-version v1 --period 2026 \
-  --release-dir /srv/bonus/releases --out 本批案卷 本批数据.xlsx
+  --business-batch 登记返回的key --release-dir /srv/bonus/releases --out 本批案卷 本批数据.xlsx
 ```
 
 上述 `annual_bonus/v1/2026` 仅示意，必须先由财务规则包验收发布；项目不预置这套业务规则。
 网页使用服务数据目录的 `releases/`，也可以用 `BONUS_SCENARIO_RELEASES_DIR` 指定规则库。
-新建案卷时绑定版本与期间；规则改变需发布新版本并建立新案卷，不能在对话中修改。
+新建案卷时绑定版本与期间；规则改变需由财务发布新版本，不能在对话中修改。
+同一业务批次只绑定一个案卷，规则变化在原案卷建立未确认修订；已确认批次不得另建结算。期间日期范围和逐表日期契约必须由财务发布包明确，不能由模型猜测。
 
 规则包结构、发布和恢复方式见 [固定场景运行说明](docs/fixed_scenario_execution.md)。
 下文保留历史开发接口及模型研究说明。旧通用智能体必须显式使用 `--explore`，旧迁入样例计算必须使用

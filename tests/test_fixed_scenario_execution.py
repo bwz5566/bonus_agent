@@ -4,6 +4,7 @@ These are synthetic finance acceptance materials, not production bonus policies.
 """
 import json
 from pathlib import Path
+from datetime import date
 import threading
 import zipfile
 import xml.etree.ElementTree as ET
@@ -13,8 +14,23 @@ import pytest
 import yaml
 
 from bonus_agent.scenarios.releases import FormulaInputError, ReleaseError, publish, load_release, versions
-from bonus_agent.scenarios.execution import run_fixed, Ledger, RunBusy
+from bonus_agent.scenarios.execution import run_fixed as execute_fixed, Ledger, RunBusy
+from bonus_agent.scenarios.batches import Registry, BatchError
+from bonus_agent.infra.storage import fingerprint
 from bonus_core.engine.run import Engine
+
+
+def test_batch(releases, scenario, period, runs):
+    """These engine/recovery tests represent independently registered batches."""
+    return Registry(releases).register(scenario, "v1", period, "测试公司", fingerprint(str(runs))[:20], "test-finance")["key"]
+
+
+test_batch.__test__ = False
+
+
+def run_fixed(scenario, version, period, files, runs, *, releases=None, **kwargs):
+    batch = test_batch(releases, scenario, period, runs) if version == "v1" and period in {"2026-Q3", "2026-Q4"} else "missing"
+    return execute_fixed(scenario, version, period, files, runs, releases=releases, business_batch=batch, **kwargs)
 
 
 def fixture_package(root, scenario="annual_bonus", version="v1"):
@@ -23,14 +39,14 @@ def fixture_package(root, scenario="annual_bonus", version="v1"):
         "name": "synthetic-finance-policy", "version": version,
         "datasets": {
             "员工": {"key": "emp", "fields": {"emp": {"type": "id"}, "prepaid": {"type": "money"}, "ready": {"type": "bool"}}},
-            "销售": {"link": "emp", "fields": {"emp": {"type": "id"}, "amount": {"type": "money"}}}},
+            "销售": {"link": "emp", "fields": {"emp": {"type": "id"}, "amount": {"type": "money"}, "business_date": {"type": "date"}}}},
         "pool": {"scope": "个人", "expr": 'round(sum(amount, of: "销售") * 0.1, 2)'},
         "allocation": [{"level": "个人", "key": "emp"}],
         "payout": [{"id": "回访", "scope": "个人", "hold_ratio": "if(ready, 0, 0.25)"}],
         "offsets": [{"id": "预发", "scope": "个人", "expr": "prepaid"}]}
     mapping = {
         "员工": {"file": "valid.xlsx", "sheet": "员工", "header_rows": [1], "columns": {"emp": "工号", "prepaid": "预发", "ready": "回访"}},
-        "销售": {"file": "valid.xlsx", "sheet": "销售", "header_rows": [1], "columns": {"emp": "工号", "amount": "销售额"}}}
+        "销售": {"file": "valid.xlsx", "sheet": "销售", "header_rows": [1], "columns": {"emp": "工号", "amount": "销售额", "business_date": "业务日期"}}}
     for name, body in (("rules.yaml", rules), ("mapping.yaml", mapping)):
         (root / name).write_text(yaml.safe_dump(body, allow_unicode=True, sort_keys=False), encoding="utf-8")
     for name, duplicate in (("valid.xlsx", False), ("duplicate.xlsx", True)):
@@ -40,9 +56,13 @@ def fixture_package(root, scenario="annual_bonus", version="v1"):
         if duplicate:
             emp.append(["E1", 150, False])
         sales = wb.create_sheet("销售")
-        for row in [["工号", "销售额"], ["E1", 600], ["E1", 400], ["E2", 2000]]:
+        for row in [["工号", "销售额", "业务日期"], ["E1", 600, date(2026,7,1)], ["E1", 400,date(2026,9,30)], ["E2", 2000,date(2026,8,15)]]:
             sales.append(row)
         wb.save(root / name)
+    wb = openpyxl.load_workbook(root / "valid.xlsx")
+    for row in range(2,5):
+        wb["销售"].cell(row,3,date(2026,10,15))
+    wb.save(root / "valid-q4.xlsx")
     # Independently specified: E1 earned 100, held 25, cap 75, advance 150;
     # E2 earned 200, held 0, advance 50. Actual paid 0 + 150.
     def pay(final, held, cap, offset, deducted, paid, overpaid):
@@ -53,9 +73,15 @@ def fixture_package(root, scenario="annual_bonus", version="v1"):
                                    "个人:E2": pay(200, 0, 200, 50, 50, 150, 0)}, "rollups": {}}}
     (root / "expected.json").write_text(json.dumps(expected), encoding="utf-8")
     spec = {"scenario": scenario, "version": version, "periods": ["2026-Q3", "2026-Q4"],
+            "entities": ["测试公司"],
+            "period_windows": {"2026-Q3": {"start": "2026-07-01", "end_exclusive": "2026-10-01"},
+                               "2026-Q4": {"start": "2026-10-01", "end_exclusive": "2027-01-01"}},
+            "period_contracts": {"员工": {"mode": "none", "reason": "本批经财务确认的员工主数据"},
+                                 "销售": {"mode": "window", "field": "business_date"}},
             "rules": "rules.yaml", "mapping": "mapping.yaml", "cases": [
-                {"id": "money", "data": ["valid.xlsx"], "expected": "expected.json"},
-                {"id": "duplicate", "data": ["duplicate.xlsx"], "error_code": "key_dup"}]}
+                {"id": "money", "period": "2026-Q3", "data": ["valid.xlsx"], "expected": "expected.json"},
+                {"id": "money_q4", "period": "2026-Q4", "data": ["valid-q4.xlsx"], "expected": "expected.json"},
+                {"id": "duplicate", "period": "2026-Q3", "data": ["duplicate.xlsx"], "error_code": "key_dup"}]}
     (root / "release.yaml").write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")
     return root
 
@@ -125,7 +151,7 @@ def test_duplicate_execution_reuses_result_and_separates_period_and_batch(releas
     first = run_fixed("annual_bonus", "v1", "2026-Q3", [source / "valid.xlsx"], tmp_path / "batch-a", releases=releases)
     second = run_fixed("annual_bonus", "v1", "2026-Q3", [source / "valid.xlsx"], tmp_path / "batch-a", releases=releases)
     assert first.task_id == second.task_id and second.cached and len(calls) == 1
-    run_fixed("annual_bonus", "v1", "2026-Q4", [source / "valid.xlsx"], tmp_path / "batch-a", releases=releases)
+    run_fixed("annual_bonus", "v1", "2026-Q4", [source / "valid-q4.xlsx"], tmp_path / "batch-a", releases=releases)
     run_fixed("annual_bonus", "v1", "2026-Q3", [source / "valid.xlsx"], tmp_path / "batch-b", releases=releases)
     assert len(calls) == 3
     (first.directory / "result.xlsx").write_bytes(b"tamper")
@@ -184,7 +210,7 @@ def test_parallel_submission_computes_only_once(released, tmp_path, monkeypatch)
     thread = threading.Thread(target=first); thread.start()
     assert entered.wait(10)
     try:
-        with pytest.raises(RunBusy):
+        with pytest.raises((RunBusy, BatchError)):
             run_fixed(*args, releases=releases)
     finally:
         resume.set(); thread.join(10)
@@ -277,7 +303,7 @@ def test_publication_rejects_formula_acceptance_and_accepts_explicit_formula_neg
     (source / "valid.xlsx").write_bytes(original)
     (source / "formula.xlsx").write_bytes(replacement.read_bytes())
     spec = yaml.safe_load((source / "release.yaml").read_text())
-    spec["cases"].append({"id": "stale_formula", "data": ["formula.xlsx"], "error_code": "formula_input"})
+    spec["cases"].append({"id": "stale_formula", "period": "2026-Q3", "data": ["formula.xlsx"], "error_code": "formula_input"})
     (source / "release.yaml").write_text(yaml.safe_dump(spec))
     publish(source, releases, "finance")
 
@@ -358,7 +384,9 @@ def test_production_web_uses_fixed_rules_and_read_only_chat(released, tmp_path):
     def post(url, **data):
         return client.post(url, data={"csrf": csrf, **data}, follow_redirects=False)
     assert post("/cases", name="wrong", scenario="annual_bonus", rule_version="sales_commission@v1", period="2026-Q3").status_code == 400
-    response = post("/cases", name="batch", scenario="annual_bonus", rule_version="annual_bonus@v1", period="2026-Q3")
+    assert post("/batches", binding="annual_bonus@v1", entity="测试公司", period="2026-Q3", batch_id="ANNUAL-001").status_code == 303
+    batch = Registry(releases).list()[0]["key"]
+    response = post("/cases", name="batch", scenario="annual_bonus", rule_version="annual_bonus@v1", period="2026-Q3", business_batch=batch)
     cid = response.headers["location"].split("/")[-1]
     with (source / "valid.xlsx").open("rb") as handle:
         client.post(f"/cases/{cid}/materials", data={"csrf": csrf}, files={"files": ("valid.xlsx", handle)}, follow_redirects=False)
@@ -374,14 +402,20 @@ def test_production_web_uses_fixed_rules_and_read_only_chat(released, tmp_path):
     app.state.runner.jobs[cid].thread.join(20)
     assert "禁止工具 set_rules" in store.chat(cid)[-1]["text"]
     assert not (store.dir(cid) / "out/case.json").exists()
+    assert post(f"/cases/{cid}/materials/delete", name="valid.xlsx").status_code == 303
+    assert post(f"/cases/{cid}/confirm-fixed").status_code == 409
+    with (source / "valid.xlsx").open("rb") as handle:
+        client.post(f"/cases/{cid}/materials", data={"csrf": csrf}, files={"files": ("valid.xlsx", handle)}, follow_redirects=False)
+    assert post(f"/cases/{cid}/run").status_code == 303
+    app.state.runner.jobs[cid].thread.join(20)
     assert post(f"/cases/{cid}/confirm-fixed").status_code == 303
     assert (store.dir(cid) / "runs" / state["task_id"] / "confirmed.json").exists()
     assert post(f"/cases/{cid}/product-approval").status_code == 409
     assert post(f"/cases/{cid}/settle").status_code == 409
     assert post(f"/cases/{cid}/confirm").status_code == 409
     assert post(f"/cases/{cid}/template").status_code == 409
-    assert post(f"/cases/{cid}/materials/delete", name="valid.xlsx").status_code == 303
-    assert post(f"/cases/{cid}/confirm-fixed").status_code == 409
+    assert post(f"/cases/{cid}/materials/delete", name="valid.xlsx").status_code == 409
+    assert post(f"/cases/{cid}/confirm-fixed").status_code == 303
 
 
 def test_web_honors_release_directory_environment(released, tmp_path, monkeypatch):
@@ -398,6 +432,7 @@ def test_cli_fixed_computation_never_initializes_model(released, tmp_path, monke
     source, releases = released
     monkeypatch.setattr(LLM, "from_config", lambda *a, **k: pytest.fail("no model for fixed calculation"))
     args = ["auto", "--scenario", "annual_bonus", "--rule-version", "v1", "--period", "2026-Q3",
+            "--business-batch", test_batch(releases, "annual_bonus", "2026-Q3", tmp_path / "batch/runs"),
             "--release-dir", str(releases), "--out", str(tmp_path / "batch"), str(source / "valid.xlsx")]
     assert main(args) == main(args) == 0
     assert main(["auto", "--scenario", "annual_bonus", "--out", str(tmp_path / "pending"), str(source / "valid.xlsx")]) == 1

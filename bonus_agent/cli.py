@@ -51,6 +51,10 @@ def main(argv=None) -> int:
     p.add_argument("--source", required=True, help="含 release.yaml、规则、固定映射及正反验收数据的目录")
     p.add_argument("--release-dir", required=True)
     p.add_argument("--by", required=True, help="财务审批人；此命令应由有发布权限的管理员执行")
+    p = sub.add_parser("register-batch", help="获授权管理员登记业务批次；网页由审批人登记")
+    for flag in ("scenario", "rule-version", "period", "entity", "batch-id", "by"):
+        p.add_argument("--" + flag, required=True)
+    p.add_argument("--release-dir")
     p = sub.add_parser("models")
     p.add_argument("--remote", action="store_true", help="调用服务商 /models 接口，核对已配置模型能否调用")
     p = sub.add_parser("extract")
@@ -120,6 +124,7 @@ def main(argv=None) -> int:
     p.add_argument("--scenario", required=True)
     p.add_argument("--rule-version", help="明确选择已发布版本，不自动取最新版")
     p.add_argument("--period", help="此业务批次的核算期间")
+    p.add_argument("--business-batch", help="已登记业务批次的 key，不是案卷编号")
     p.add_argument("--release-dir")
     p.add_argument("--explore", action="store_true", help="仅开发迁移使用：旧通用智能体试算，不是正式结算")
     p.add_argument("--model")
@@ -151,6 +156,17 @@ def main(argv=None) -> int:
         print(f"已发布 {spec.scenario}/{spec.version}：{record['fingerprint']}")
         return 0
 
+    if a.cmd == "register-batch":
+        from bonus_agent.scenarios.batches import Registry
+        from bonus_core.engine.issues import EngineError
+        try:
+            record = Registry(a.release_dir).register(a.scenario, a.rule_version, a.period, a.entity, a.batch_id, a.by)
+        except (ValueError, OSError, EngineError) as exc:
+            print(f"批次登记被拒绝：{exc}")
+            return 1
+        print(record["key"])
+        return 0
+
     if a.cmd == "auto" and not a.explore:
         from bonus_agent.auto import collect_files
         from bonus_agent.scenarios.execution import run_fixed
@@ -163,7 +179,7 @@ def main(argv=None) -> int:
             return 1
         try:
             run = run_fixed(a.scenario, a.rule_version, a.period, collect_files(a.paths),
-                            Path(a.out) / "runs", releases=a.release_dir)
+                            Path(a.out) / "runs", releases=a.release_dir, business_batch=a.business_batch)
         except (ValueError, OSError, EngineError) as exc:
             print(f"固定计算被阻断：{exc}")
             return 1

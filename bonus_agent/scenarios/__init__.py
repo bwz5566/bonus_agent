@@ -37,7 +37,9 @@ _MIGRATED = {
 
 
 class ScenarioError(ValueError):
-    pass
+    def __init__(self, message, *, code=None):
+        self.code = code
+        super().__init__(message)
 
 
 def _read(path: Path) -> dict:
@@ -110,7 +112,7 @@ def require_settlement(scenario: str | None, approval=None, *, out=None) -> Scen
     try:
         record = resolve_product_approval(pack, approval, out=out)
     except BindingError as exc:
-        raise ScenarioError(str(exc)) from exc
+        raise ScenarioError(str(exc), code=getattr(exc,"code",None)) from exc
     if record is None:
         raise ScenarioError(
             f"{pack.metadata.scenario}: migrated_draft; product written approval required "

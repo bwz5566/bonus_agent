@@ -30,13 +30,21 @@ duplicate.xlsx       指定异常的反向验收数据
 scenario: annual_bonus
 version: v1
 periods: ['2026']
+entities: ['财务批准的核算主体']
+period_windows:
+  '2026': {start: '2026-01-01', end_exclusive: '2027-01-01'}
+period_contracts:
+  员工: {mode: none, reason: '财务确认的主数据；不按业务发生日期筛选'}
+  销售: {mode: window, field: business_date}
 rules: rules.yaml
 mapping: mapping.yaml
 cases:
   - id: finance_example
+    period: '2026'
     data: [valid.xlsx]
     expected: expected.json
   - id: duplicate_employee
+    period: '2026'
     data: [duplicate.xlsx]
     error_code: key_dup
 allowed_tools: [describe_scenario, explain_object, list_issues]
@@ -55,6 +63,11 @@ allowed_tools: [describe_scenario, explain_object, list_issues]
 7. 固定输入工作表不接受 Excel 公式，包括有缓存、没有缓存和看似已更新缓存的公式。程序在读取数值前用公式模式扫描，
    报出文件、工作表和单元格，错误代码为 `formula_input`。表头、隐藏行列也在检查范围内。
    输入应为财务确认的原始数值；跨表取数、汇总及其他衍生字段写入已发布计算规则。不能仅通过重新保存 Excel 证明缓存有效。
+8. `period_contracts` 必须逐表覆盖，日期字段必须存在且为 `date` 类型，不允许给空日期自动填默认值。
+   `window` 检查左闭右开区间；`as_of` 仅检查早于截止日，用于经批准的历史累计表；`none` 必须说明不适用原因。
+   累计起点等特殊范围可用表级 `windows` 覆盖，结构同 `period_windows`，必须覆盖全部批准期间。不能从季度/年度标签猜日期。
+   默认跨期阻断；只有显式 `action: filter` 且有批准的 `reason` 才排除，空日期始终阻断。
+   每个批准期间必须有独立期望结果的正向验收用例，日期校验在发布验收和每次计算时执行。
 
 完整的合成示例见 `tests/test_fixed_scenario_execution.py::fixture_package`，仅供开发和验收使用。
 
@@ -76,35 +89,54 @@ bonus-agent publish-scenario --source 财务规则包 --release-dir /srv/bonus/r
 ## 4. 执行与复核
 
 ```bash
+# 获授权管理员先登记；网页也可由 approver 角色登记。记录返回的批次 key。
+bonus-agent register-batch --scenario annual_bonus --rule-version v1 --period 2026 \
+  --entity 财务批准的核算主体 --batch-id ANNUAL-2026-001 --by 财务审批人 --release-dir /srv/bonus/releases
+
 bonus-agent auto --scenario annual_bonus --rule-version v1 --period 2026 \
-  --release-dir /srv/bonus/releases --out /srv/bonus/batches/2026-annual 本批数据.xlsx
+  --business-batch 登记返回的key --release-dir /srv/bonus/releases --out /srv/bonus/batches/2026-annual 本批数据.xlsx
 ```
 
 也可使用核心命令（计算过程相同）：
 
 ```bash
 bonus run --scenario annual_bonus --rule-version v1 --period 2026 \
-  --release-dir /srv/bonus/releases --from-pack --out result.xlsx 本批数据.xlsx
+  --business-batch 登记返回的key --release-dir /srv/bonus/releases --from-pack --out result.xlsx 本批数据.xlsx
 ```
 
 输入文件名可以按期更换，但必须能按固定工作表唯一绑定；所有上传文件都必须属于该版本的输入契约。
-输入快照保存后，程序执行“固定映射 → 计算 → 金额勾稽 → 导出”。中间值和行来源沿用现有引擎追踪链。
+输入快照保存后，程序执行“固定映射 → 期间契约校验/获批筛选 → 计算 → 金额勾稽 → 导出”。中间值和行来源沿用现有引擎追踪链。
+结果 Excel 增加“期间校验”和“跨期排除明细”，列出纳入/排除行数、来源、日期、原因和排除行字段值，不静默丢弃数据。
 
-任务目录包含 `inputs/、mapped.json、computed.json、validated.json、result.xlsx、run.json`。
+任务目录包含 `inputs/、mapped.json、period.json、computed.json、validated.json、result.xlsx、run.json`。
 失败时保留已完成的检查点，不发布可下载的正式结果。校验及计算成功后导出，最后提交完成状态。
 
-网页新建案卷绑定场景、发布版本及期间；未配置场景不能启动计算。
+网页新建案卷绑定场景、发布版本、期间和已登记业务批次；未配置场景不能启动计算。
 材料上传或删除后，当前结果标记失效。审批人复核金额和过程后，可确认具体任务快照；确认过程重新核对输入及输出指纹，不能确认已经变化的结果。
-确认不执行付款，不会把试算草稿转成业务规则。
+确认写入统一批次登记库，同批次只能有一份有效确认。确认后禁止替换/删除材料或换规则再次结算；
+本阶段不提供自动撤销确认，须先办理财务更正流程，不可通过新建案卷绕过。确认不执行付款，不会把试算草稿转成业务规则。
 
 ## 5. 重复提交和故障恢复
 
-- 一个案卷或命令行 `--out` 表示一个业务批次，不在不同批次间复用。
-- 任务标识包含场景、发布版本及指纹、期间、输入内容、程序版本和精度策略。
+- 业务批次唯一键为“组织作用域 + 核算主体 + 场景 + 期间 + 财务批次号”，不包含规则版本、文件名或案卷编号。
+  批次号由获授权人员登记，不能每次新建案卷时随机生成。规则版本还限定允许的核算主体。
+- 全部网页进程与 CLI 必须共用 `BONUS_BUSINESS_STATE_DIR`（默认发布库父目录下的 `business_state/`）及固定的
+  `BONUS_BUSINESS_SCOPE`（默认 `local`）。业务登记库是生产必需，与可选的旧 `BONUS_AGENT_STATE_DIR` 是不同存储。
+  服务账户须有业务状态目录写权限；发布库仍仅管理员可写。上述配置由部署管理员统一管理，不能按案卷改变。
+- 数据库唯一约束和事务把批次绑定到一个案卷的运行目录；其他案卷/CLI 输出路径重复绑定会被拒绝并给出原位置。
+  原案卷可有多次试算修订；规则或数据变更不创建第二个业务批次，确认时检查是否仍为当前修订。
+- 任务标识包含业务批次、场景、发布版本及指纹、期间、输入内容、程序版本和精度策略。
 - 相同输入重复提交返回已完成结果，且再次检查结果文件指纹。不同期间、输入或规则版本产生不同任务。
 - SQLite 事务领取同一任务的执行租约；同时提交时只有一个执行者计算。租约每 10 秒续期，失去租约的执行者不能覆盖新执行者状态。
 - 普通故障重试恢复映射、计算检查点；例如导出失败后不再次计算已保存金额。进程崩溃后的未续期租约最多等待 60 秒即可恢复。
 - 该实现面向同一服务器、本地持久化磁盘的多进程运行，不支持把 SQLite 任务库放到跨机器共享文件系统上作为分布式调度器。
+
+首页逐项加载场景与发布版本；坏包显示“配置异常，不可选择”，同时记录诊断日志，其他案卷和正常场景仍可使用。
+创建和运行入口仍严格校验，不能通过直接请求启用坏包。
+
+旧迁入规则启用 `BONUS_AGENT_STATE_DIR` 时，缺少匹配决定返回 `approval_decision_missing`，明确列出场景、作用域、规则指纹及
+“须先登记 structured decision”的要求。批准文件不自动导入状态库；规则指纹过期、文件与状态不一致、记录无效分别有独立错误码。
+产品审批仍不代表新固定场景的财务规则发布。
 
 ## 6. 只读智能体
 
