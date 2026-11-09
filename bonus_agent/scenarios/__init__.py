@@ -37,7 +37,9 @@ _MIGRATED = {
 
 
 class ScenarioError(ValueError):
-    pass
+    def __init__(self, message, *, code=None):
+        self.code = code
+        super().__init__(message)
 
 
 def _read(path: Path) -> dict:
@@ -81,6 +83,19 @@ def list_scenarios() -> list[str]:
     return sorted(p.name for p in PACKS.iterdir() if p.is_dir() and (p / "pack.yaml").is_file())
 
 
+def scenario_metadata(scenario):
+    """Registration only: published releases do not depend on migration fixtures."""
+    if not isinstance(scenario, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", scenario):
+        raise ScenarioError("Explicit registered scenario required")
+    try:
+        metadata = parse_pack_metadata(_read(PACKS / scenario / "pack.yaml"))
+        if metadata.scenario != scenario:
+            raise ScenarioError("Scenario registration mismatch")
+        return metadata
+    except (ValueError, OSError) as exc:
+        raise ScenarioError(f"Invalid scenario registration: {exc}") from exc
+
+
 def require_settlement(scenario: str | None, approval=None, *, out=None) -> ScenarioPack:
     """Formal settlement gate.
 
@@ -97,7 +112,7 @@ def require_settlement(scenario: str | None, approval=None, *, out=None) -> Scen
     try:
         record = resolve_product_approval(pack, approval, out=out)
     except BindingError as exc:
-        raise ScenarioError(str(exc)) from exc
+        raise ScenarioError(str(exc), code=getattr(exc,"code",None)) from exc
     if record is None:
         raise ScenarioError(
             f"{pack.metadata.scenario}: migrated_draft; product written approval required "

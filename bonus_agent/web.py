@@ -20,6 +20,7 @@ import hashlib
 import hmac
 import html
 import json
+import os
 import re
 import secrets
 import shutil
@@ -42,12 +43,17 @@ from bonus_agent import case as cs
 from bonus_agent import review as rv
 from bonus_agent.failure import explain as explain_failure, retryable, to_text
 from bonus_agent.parsing.docs import PARSERS
+from bonus_agent.scenarios.releases import ReleaseError, load_release, root_dir, versions
+from bonus_agent.scenarios import scenario_metadata
+from bonus_agent.infra.storage import atomic_write, canonical
+from bonus_agent.scenarios.batches import Registry, BatchError
 
 ROLES = {"editor": "传材料、答复问题、运行、按模板计算", "approver": "确认结果"}
 COOKIE = "bonus_session"
 SESSION_SECONDS = 8 * 3600       # 登录 8 小时后要重新登录
 MAX_FAILURES, LOCK_SECONDS = 5, 300   # 同一用户名 5 分钟内输错 5 次，暂停登录
 ROLE_NAMES = {"editor": "经办", "approver": "审批"}
+SCENARIO_NAMES = {"sales_commission": "提成奖金", "eng_dev_bonus": "开发奖金", "annual_bonus": "年度奖金"}
 DETAIL_NAMES = {"name": "名称", "file": "文件", "new": "从头开始", "round": "轮次", "status": "状态", "error": "错误",
                 "question": "问题", "answer": "答复", "note": "说明", "reason": "原因", "run": "批次", "pools": "奖金池",
                 "data": "数据", "sha256": "sha256", "size": "字节", "template": "模板",
@@ -127,13 +133,20 @@ class Store:
             raise KeyError(cid)
         return d
 
-    def create(self, name: str, by: str, scenario: str) -> str:
-        load_pack(scenario)
+    def create(self, name: str, by: str, scenario: str, rule_version: str = "", period: str = "", *, business_batch="", registry=None) -> str:
+        scenario_metadata(scenario)
         cid = secrets.token_hex(6)
         d = self.root / "cases" / cid
+        if registry is not None and rule_version:
+            record = registry.get(business_batch)
+            if record["scenario"] != scenario or record["period"] != period:
+                raise BatchError("batch_contract", "批次场景或期间与案卷不一致")
+            registry.bind(business_batch, d / "runs")
         for sub in ("materials", "expected", "out", "runs"):
             (d / sub).mkdir(parents=True)
-        (d / "meta.json").write_text(json.dumps({"name": name, "scenario": scenario, "created": now(), "created_by": by}, ensure_ascii=False),
+        (d / "meta.json").write_text(json.dumps({"name": name, "scenario": scenario, "rule_version": rule_version,
+                                               "period": period, "business_batch": business_batch,
+                                               "created": now(), "created_by": by}, ensure_ascii=False),
                                      encoding="utf-8")
         self.audit(cid, by, "新建案卷", name=name)
         return cid
@@ -141,11 +154,22 @@ class Store:
     def meta(self, cid: str) -> dict:
         return json.loads((self.dir(cid) / "meta.json").read_text(encoding="utf-8"))
 
+    def invalidate_fixed(self, cid, status="INPUT_CHANGED"):
+        p = self.dir(cid) / "out" / "fixed_run.json"
+        if p.exists():
+            record = json.loads(p.read_text(encoding="utf-8"))
+            record["status"] = status
+            atomic_write(p, canonical(record))
+
     def cases(self) -> list[tuple[str, dict, dict | None]]:
         out = []
         for d in sorted((self.root / "cases").iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
             if CID.match(d.name) and (d / "meta.json").exists():
-                out.append((d.name, self.meta(d.name), cs.load_case(d / "out")))
+                state = cs.load_case(d / "out")
+                fixed = d / "out" / "fixed_run.json"
+                if fixed.exists():
+                    state = {"fixed": json.loads(fixed.read_text(encoding="utf-8"))}
+                out.append((d.name, self.meta(d.name), state))
         return out
 
     def audit(self, cid: str, user: str, action: str, **detail) -> None:
@@ -210,13 +234,15 @@ class Runner:
     """每个案卷同时只跑一轮；全局最多同时跑 max_parallel 轮（大模型调用量大）。"""
 
     def __init__(self, store: Store, llm_factory: Callable[[], object], max_parallel: int = 2, max_steps: int = 150,
-                 max_tokens: int = 4_000_000, auto_continue: int = 2):
+                 max_tokens: int = 4_000_000, auto_continue: int = 2, *, exploration: bool = False, releases=None):
         self.store, self.llm_factory = store, llm_factory
         self.auto_continue = auto_continue      # 模型自己卡住时自动接着做的轮数上限（tokens 上限按这一次运行的合计算）
         self.jobs: dict[str, Job] = {}
         self.lock = threading.Lock()
         self.slots = threading.Semaphore(max_parallel)
         self.max_steps, self.max_tokens = max_steps, max_tokens
+        self.exploration, self.releases = exploration, root_dir(
+            releases or os.environ.get("BONUS_SCENARIO_RELEASES_DIR") or store.root / "releases")
 
     def running(self, cid: str) -> bool:
         j = self.jobs.get(cid)
@@ -225,7 +251,15 @@ class Runner:
     def start(self, cid: str, user: str, new: bool = False, message: str | None = None,
               instruction: str | None = None) -> Job:
         """message：对话（提问或修改）；instruction：随上传材料附的说明，按正常一轮处理。"""
-        load_pack(self.store.meta(cid).get("scenario"))
+        (load_pack if self.exploration else scenario_metadata)(self.store.meta(cid).get("scenario"))
+        if not self.exploration:
+            meta = self.store.meta(cid)
+            try:
+                _, spec, _ = load_release(meta["scenario"], meta.get("rule_version", ""), self.releases)
+                if meta.get("period") not in spec.periods:
+                    raise ReleaseError("请选择此版本批准的核算期间")
+            except ValueError as exc:
+                raise ScenarioError(f"场景尚未配置有效发布版本：{exc}") from exc
         with self.lock:
             if self.running(cid):
                 raise RuntimeError("这个案卷正在运行，请等本轮结束")
@@ -254,6 +288,9 @@ class Runner:
             pass
 
     def _run(self, job: Job, new: bool, message: str | None = None, instruction: str | None = None) -> None:
+        if not self.exploration:
+            self._fixed(job, message)
+            return
         from bonus_agent.agent import run_agent
         d = self.store.dir(job.cid)
         try:
@@ -302,6 +339,45 @@ class Runner:
             job.status, job.message = "failed", f"运行失败：{e}"
             self.store.chat_add(job.cid, "agent", "智能体", f"这一轮（{job.started[11:16]} 开始）中断了。\n{to_text(f'{type(e).__name__}: {e}')}")
             self.store.audit(job.cid, job.by, "本轮失败", error=str(e))
+
+    def _fixed(self, job, message):
+        from bonus_agent.scenarios.execution import run_fixed, task_key, read_completed
+        from bonus_agent.scenarios.assistant import answer
+        d, meta = self.store.dir(job.cid), self.store.meta(job.cid)
+        pointer = d / "out" / "fixed_run.json"
+        try:
+            with self.slots:
+                if message:
+                    result = None
+                    if pointer.exists():
+                        previous = json.loads(pointer.read_text(encoding="utf-8"))
+                        if previous.get("status") == "OK" and re.fullmatch(r"[a-f0-9]{64}", previous.get("task_id", "")):
+                            key, _ = task_key(meta["scenario"], meta["rule_version"], meta["period"],
+                                              sorted((d / "materials").iterdir()), releases=self.releases,
+                                              business_batch=meta.get("business_batch"))
+                            if key == previous["task_id"]:
+                                result = read_completed(d / "runs", key).result
+                    reply = answer(self.llm_factory(), meta["scenario"], meta["rule_version"], message,
+                                   releases=self.releases, result=result, should_stop=lambda: job.cancel)
+                    self.store.chat_add(job.cid, "agent", "只读助手", reply)
+                    job.status, job.result, job.message = "done", "", "已回复（规则和数据未改变）"
+                    return
+                files = sorted((d / "materials").iterdir())
+                run = run_fixed(meta["scenario"], meta["rule_version"], meta["period"], files, d / "runs",
+                                releases=self.releases, business_batch=meta.get("business_batch"), should_stop=lambda: job.cancel)
+                atomic_write(pointer, canonical({"status": "OK", "task_id": run.task_id, "at": now(),
+                                                  "scenario": meta["scenario"], "version": meta["rule_version"],
+                                                  "period": meta["period"], "cached": run.cached}))
+                job.status, job.result = "done", "OK"
+                job.message = "复用已完成结果，请复核" if run.cached else "固定计算完成，请复核"
+                self.store.chat_add(job.cid, "agent", "计算流程", job.message + f"（任务 {run.task_id[:12]}）")
+                self.store.audit(job.cid, job.by, "固定计算完成", task_id=run.task_id, cached=run.cached)
+        except Exception as exc:
+            job.status, job.result, job.message = "failed", "FAILED", f"固定流程阻断：{exc}"
+            if not message:
+                atomic_write(pointer, canonical({"status": "FAILED", "error": str(exc), "at": now()}))
+            self.store.chat_add(job.cid, "agent", "计算流程", job.message)
+            self.store.audit(job.cid, job.by, "固定流程阻断", error=str(exc))
 
 
 OUT_GROUPS = ("给财务核对", "留档：计算口径（确认后作为模板，每期复用）", "排查用（开发看）")
@@ -445,6 +521,9 @@ def form(action: str, inner: str, csrf: str, upload: bool = False, inline: bool 
 
 
 def status_text(case: dict | None) -> str:
+    if case and "fixed" in case:
+        label = {"OK": "固定计算完成", "FAILED": "固定流程已阻断", "INPUT_CHANGED": "材料已改变，待重新校验", "RULE_CHANGED": "规则版本已改变，待重新校验"}
+        return e(label.get(case["fixed"].get("status"), "待处理"))
     if not case or not case.get("rounds"):
         return "<span class='mut'>还没有运行</span>"
     r = case["rounds"][-1]
@@ -509,12 +588,12 @@ def review_section(cid: str, out: Path, csrf: str, can_mark: bool) -> str:
 
 
 def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_parallel: int = 2, model_name: str = "",
-               max_steps: int = 150, max_tokens: int = 4_000_000):
+               max_steps: int = 150, max_tokens: int = 4_000_000, exploration: bool = False, releases=None):
     from fastapi import Depends, FastAPI, HTTPException, Request
     from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 
     store = Store(Path(root))
-    runner = Runner(store, llm_factory, max_parallel, max_steps, max_tokens)
+    runner = Runner(store, llm_factory, max_parallel, max_steps, max_tokens, exploration=exploration, releases=releases)
     app = FastAPI(title="奖金计算", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store, app.state.runner = store, runner
     sessions: dict[str, tuple[str, float]] = {}            # 会话号 -> (用户名, 到期时间)；服务重启后要重新登录
@@ -613,15 +692,66 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
     def index(u: dict = Depends(user)):
         rows = "".join(f"<tr><td><a href='/cases/{cid}'>{e(m['name'])}</a></td><td>{status_text(c)}</td>"
                        f"<td class='mut'>{e(m['created_by'])} · {e(m['created'][:16])}</td></tr>" for cid, m, c in store.cases())
-        options = "".join(
-            f"<option value='{e(x)}'>{e(x)} ({e(load_pack(x).metadata.status)})</option>" for x in list_scenarios())
+        options, release_options, pack_errors = [], [], []
+        try:
+            registered = list_scenarios()
+        except (OSError, ValueError) as exc:
+            registered = []
+            pack_errors.append(f"场景目录读取失败：{exc}")
+        for scenario in registered:
+            try:
+                metadata = scenario_metadata(scenario)
+                if exploration:
+                    load_pack(scenario)
+                version_errors = []
+                available = versions(scenario, runner.releases, errors=version_errors)
+                if version_errors and not available:
+                    raise ReleaseError("；".join(version_errors))
+                pack_errors.extend(version_errors)
+                status = metadata.status if exploration else ("有已发布版本" if available else "待财务配置")
+                options.append(f"<option value='{e(scenario)}'>{e(SCENARIO_NAMES.get(scenario, scenario))} ({e(status)})</option>")
+                release_options += [f"<option value='{e(scenario)}@{e(v)}'>{e(SCENARIO_NAMES.get(scenario, scenario))} / {e(v)}</option>" for v in available]
+            except (ValueError, OSError, EngineError) as exc:
+                options.append(f"<option disabled>{e(SCENARIO_NAMES.get(scenario, scenario))}（配置异常，不可选择）</option>")
+                pack_errors.append(f"{scenario}：{exc}")
+        options, release_options = "".join(options), "".join(release_options)
+        registry = Registry(runner.releases)
+        batch_options = "".join(f"<option value='{e(b['key'])}'>{e(b['scenario'])} / {e(b['entity'])} / {e(b['period'])} / {e(b['batch_id'])}</option>"
+                                for b in registry.list()) if not exploration else ""
         new = form("/cases", "<input type='text' name='name' placeholder='如 2026 年 Q3 季度奖' required> "
                              "<select name='scenario' required><option value=''>请选择场景</option>" + options + "</select>"
-                             "<p><button>新建案卷</button></p>", u["csrf"]) if "editor" in u["roles"] else ""
+                             + ("<select name='rule_version'><option value=''>尚未配置版本</option>" + release_options + "</select>"
+                                "<input name='period' placeholder='已批准的核算期间，如 2026-Q3'>" if not exploration else "")
+                             + ("<select name='business_batch'><option value=''>请选择已登记业务批次</option>" + batch_options + "</select>" if not exploration else "")
+                             + "<p><button>新建案卷</button></p>", u["csrf"]) if "editor" in u["roles"] else ""
         body = (f"<h1>案卷</h1><section><div class='wrap'><table><tr><th>名称</th><th>状态</th><th>创建</th></tr>{rows}</table></div>"
                 + ("" if rows else "<p class='mut'>还没有案卷</p>") + "</section>"
                 + (f"<section><h2>新建</h2>{new}</section>" if new else ""))
+        if pack_errors:
+            import logging
+            for error in pack_errors:
+                logging.getLogger(__name__).error("Scenario catalog: %s", error)
+            body += "<section class='warn'><p>部分场景配置异常，已隔离；其他场景仍可使用。</p><pre>" + e("\n".join(pack_errors)) + "</pre></section>"
+        if not exploration and "approver" in u["roles"]:
+            body += "<section><h2>登记业务批次（审批人）</h2>" + form("/batches",
+                "<select name='binding' required>" + release_options + "</select>"
+                "<input name='entity' placeholder='规则包批准的核算主体' required>"
+                "<input name='period' placeholder='核算期间' required>"
+                "<input name='batch_id' placeholder='财务业务批次号，如 SALES-2026-Q3-001' required>"
+                "<button>登记批次</button>", u["csrf"]) + "</section>"
         return page("案卷", body, u)
+
+    @app.post("/batches")
+    async def register_batch(request: Request, u: dict = Depends(user)):
+        need(u, "approver")
+        f = await posted(request, u)
+        try:
+            scenario, version = str(f.get("binding", "")).split("@", 1)
+            Registry(runner.releases).register(scenario, version, str(f.get("period", "")),
+                str(f.get("entity", "")), str(f.get("batch_id", "")), u["display"])
+        except (ValueError, OSError, EngineError) as exc:
+            raise HTTPException(400, str(exc)) from None
+        return RedirectResponse("/", status_code=303)
 
     @app.post("/cases")
     async def create(request: Request, u: dict = Depends(user)):
@@ -631,8 +761,21 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         if not name:
             raise HTTPException(400, "请填写名称")
         try:
-            cid = store.create(name, u["display"], str(f.get("scenario", "")))
-        except ScenarioError as exc:
+            scenario, version, period = str(f.get("scenario", "")), str(f.get("rule_version", "")), str(f.get("period", ""))
+            if not exploration and "@" in version:
+                owner, version = version.split("@", 1)
+                if owner != scenario:
+                    raise ReleaseError("选择的规则版本不属于此奖金场景")
+            if not exploration and version:
+                _, spec, _ = load_release(scenario, version, runner.releases)
+                if period not in spec.periods:
+                    raise ReleaseError("期间不在此版本的批准范围")
+                batch = Registry(runner.releases).get(str(f.get("business_batch", "")))
+                if batch["entity"] not in spec.entities:
+                    raise ReleaseError("批次核算主体未获规则版本批准")
+            cid = store.create(name, u["display"], scenario, version, period,
+                business_batch=str(f.get("business_batch", "")), registry=None if exploration else Registry(runner.releases))
+        except (ScenarioError, ReleaseError) as exc:
             raise HTTPException(400, str(exc)) from None
         return back(cid)
 
@@ -640,6 +783,8 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
     def view(cid: str, request: Request, u: dict = Depends(user)):
         d = case_dir(cid)
         m, case, out = store.meta(cid), cs.load_case(d / "out"), d / "out"
+        if not exploration:
+            return fixed_view(cid, request, u)
         csrf, job = u["csrf"], runner.jobs.get(cid)
         editor, approver, busy = "editor" in u["roles"], "approver" in u["roles"], runner.running(cid)
         msg = request.query_params.get("msg", "")
@@ -795,6 +940,66 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         parts.append(f"<section><h2>操作记录</h2><div class='wrap'><table>{rows}</table></div></section>")
         return page(m["name"], "".join(parts), u, refresh=busy)
 
+    def fixed_view(cid, request, u):
+        d, meta = case_dir(cid), store.meta(cid)
+        csrf, busy = u["csrf"], runner.running(cid)
+        editor, approver = "editor" in u["roles"], "approver" in u["roles"]
+        state_file = d / "out" / "fixed_run.json"
+        state = json.loads(state_file.read_text(encoding="utf-8")) if state_file.exists() else {}
+        parts = [f"<h1>{e(meta['name'])}</h1>", f"<p>场景：{e(meta['scenario'])}；规则版本：{e(meta.get('rule_version') or '未配置')}；"
+                 f"期间：{e(meta.get('period') or '未配置')}</p>"]
+        if request.query_params.get("msg"):
+            parts.append(f"<p class='warn'>{e(request.query_params['msg'])}</p>")
+        configured = False
+        try:
+            _, spec, pub = load_release(meta["scenario"], meta.get("rule_version", ""), runner.releases)
+            configured = meta.get("period") in spec.periods
+            parts.append(f"<p>财务批准：{e(pub['approved_by'])}；版本指纹：{e(pub['fingerprint'][:12])}</p>")
+            from bonus_agent.scenarios.releases import definitions
+            _, mapping = definitions(runner.releases / meta["scenario"] / meta["rule_version"], spec)
+            parts.append("<details><summary>本版本固定数据格式</summary>" + "".join(
+                f"<p>{e(name)}：工作表 {e(m.sheet)}，第 {m.header_rows[0]} 行表头；列顺序：{e('、'.join(m.columns.values()))}</p>"
+                for name, m in mapping.items()) + "<p>输入表请提供经财务确认的原始数值；禁止 Excel 公式取缓存值，衍生字段由已发布规则计算。</p></details>")
+        except ValueError:
+            parts.append("<p class='warn'>未配置已发布规则，不能计算。财务需提供固定模板、规则和独立验收结果，验收发布后新建绑定版本的案卷。</p>")
+        job = runner.jobs.get(cid)
+        batch_locked = False
+        if meta.get("business_batch"):
+            batch_record = Registry(runner.releases).get(meta["business_batch"])
+            batch_locked = bool(batch_record["confirmation"])
+            parts.append(f"<p>业务批次：{e(batch_record['batch_id'])}；核算主体：{e(batch_record['entity'])}</p>")
+        parts.append(f"<p>状态：{e((job.message or '正在按固定步骤执行') if job else state.get('status', '待材料'))}</p>")
+        if state.get("status") in {"INPUT_CHANGED", "RULE_CHANGED"}:
+            parts.append("<p class='warn'>材料或规则版本已改变，旧结果只作历史留档，需要重新校验计算。</p>")
+        if editor and not busy:
+            if not batch_locked:
+                parts.append(form(f"/cases/{cid}/materials", "<input type='file' name='files' multiple required><button>上传本批数据</button>", csrf, upload=True))
+                try:
+                    choices = "".join(f"<option value='{e(v)}'>{e(v)}</option>" for v in versions(meta["scenario"], runner.releases))
+                except (ValueError, OSError, EngineError):
+                    choices = ""
+                if meta.get("business_batch") and choices:
+                    parts.append(form(f"/cases/{cid}/rule-version", "<select name='version'>" + choices + "</select><button>选择已发布版本建立试算修订</button>", csrf))
+            if configured:
+                parts.append(form(f"/cases/{cid}/run", "<button>按固定规则计算 / 恢复任务</button>", csrf))
+                parts.append(form(f"/cases/{cid}/chat", "<textarea name='text' placeholder='只读查询规则或结果；修改规则需财务发布新版本'></textarea><button>查询</button>", csrf))
+        if editor and busy:
+            parts.append(form(f"/cases/{cid}/stop", "<button>停止（保留检查点）</button>", csrf))
+        parts.append(files_table(d / "materials", f"/cases/{cid}/dl/materials", csrf,
+                                 f"/cases/{cid}/materials/delete" if editor and not busy and not batch_locked else None))
+        task_id = state.get("task_id", "")
+        if state.get("status") == "OK" and re.fullmatch(r"[a-f0-9]{64}", task_id):
+            task = d / "runs" / task_id
+            for name in ("result.xlsx", "run.json"):
+                parts.append(f"<p><a href='/cases/{cid}/dl/runs/{task_id}/{name}'>{e(name)}</a></p>")
+            if (task / "confirmed.json").exists():
+                parts.append("<p>此结果快照已确认。</p>")
+            elif approver and not busy:
+                parts.append(form(f"/cases/{cid}/confirm-fixed", "<button>确认本批结果快照</button>", csrf))
+        for message in store.chat(cid)[-12:]:
+            parts.append(f"<p><b>{e(message['user'])}</b></p><pre>{e(message['text'])}</pre>")
+        return page(meta["name"], "".join(parts), u, refresh=busy)
+
     async def _upload(request: Request, u: dict, cid: str, area: str, single: bool = False) -> list[str]:
         case_dir(cid)
         idle(cid)
@@ -803,6 +1008,11 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
 
     async def _save(cid: str, u: dict, files: list, area: str, single: bool = False) -> list[str]:
         d = case_dir(cid)
+        if not exploration and area == "materials" and store.meta(cid).get("business_batch"):
+            try:
+                Registry(runner.releases).require_mutable(store.meta(cid)["business_batch"])
+            except BatchError as exc:
+                raise HTTPException(409, str(exc)) from None
         if not files:
             raise HTTPException(400, "没有选择文件")
         if single:
@@ -826,6 +1036,8 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             saved.append(name)
             store.audit(cid, u["display"], "上传" + ("期望结果" if area == "expected" else "材料"), file=name,
                         sha256=hashlib.sha256(data).hexdigest(), size=len(data))
+        if area == "materials":
+            store.invalidate_fixed(cid)
         return saved
 
     @app.post("/cases/{cid}/materials")
@@ -845,11 +1057,18 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         d = case_dir(cid)
         idle(cid)
         f = await posted(request, u)
+        if not exploration and area == "materials" and store.meta(cid).get("business_batch"):
+            try:
+                Registry(runner.releases).require_mutable(store.meta(cid)["business_batch"])
+            except BatchError as exc:
+                raise HTTPException(409, str(exc)) from None
         try:
             p = inside(d / area, str(f.get("name", "")))
         except KeyError:
             raise HTTPException(404, "没有这个文件") from None
         p.unlink()
+        if area == "materials":
+            store.invalidate_fixed(cid)
         store.audit(cid, u["display"], "删除" + ("期望结果" if area == "expected" else "材料"), file=p.name)
         return back(cid)
 
@@ -905,7 +1124,9 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         f = await posted(request, u)
         if not any((d / "materials").iterdir()):
             return back(cid, "还没有材料，请先上传")
-        fix = rv.instruction(d / "out") if f.get("new") != "1" else ""
+        if not exploration and f.get("new") == "1":
+            raise HTTPException(400, "固定计算不能清空状态重建规则；相同输入自动恢复，不同输入创建新运行版本")
+        fix = rv.instruction(d / "out") if exploration and f.get("new") != "1" else ""
         try:
             if fix:                   # 口径单上标了有误：作为修改要求交给智能体，改完重新试算
                 store.chat_add(cid, "user", u["display"], fix)
@@ -928,6 +1149,68 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             store.audit(cid, u["display"], "停止运行")
         return back(cid)
 
+    @app.post("/cases/{cid}/rule-version")
+    async def revise_rule_version(cid: str, request: Request, u: dict = Depends(user)):
+        need(u,"editor")
+        d=case_dir(cid)
+        idle(cid)
+        f=await posted(request,u)
+        if exploration:
+            raise HTTPException(409,"开发探索不使用财务固定版本修订")
+        meta=store.meta(cid)
+        try:
+            registry=Registry(runner.releases)
+            registry.require_mutable(meta.get("business_batch"))
+            batch=registry.get(meta.get("business_batch"))
+            version=str(f.get("version",""))
+            _,spec,_=load_release(meta["scenario"],version,runner.releases)
+            if meta["period"] not in spec.periods or batch["entity"] not in spec.entities:
+                raise ReleaseError("新规则版本不适用于本批次的期间或核算主体")
+            previous=meta["rule_version"]
+            meta["rule_version"]=version
+            atomic_write(d/"meta.json",canonical(meta))
+            store.invalidate_fixed(cid,"RULE_CHANGED")
+            store.audit(cid,u["display"],"选择发布版本建立试算修订",previous=previous,version=version)
+        except (ValueError,OSError,EngineError) as exc:
+            raise HTTPException(409,str(exc)) from None
+        return back(cid,"已选择发布版本，请重新校验计算；历史结果保留")
+
+    @app.post("/cases/{cid}/confirm-fixed")
+    async def confirm_fixed(cid: str, request: Request, u: dict = Depends(user)):
+        from bonus_agent.scenarios.execution import task_key, read_completed
+        need(u, "approver")
+        d = case_dir(cid)
+        idle(cid)
+        await posted(request, u)
+        pointer = d / "out" / "fixed_run.json"
+        state = json.loads(pointer.read_text(encoding="utf-8")) if pointer.exists() else {}
+        if exploration or state.get("status") != "OK":
+            raise HTTPException(409, "没有当前材料的已校验固定计算结果")
+        meta = store.meta(cid)
+        try:
+            # A cache hit rechecks output hashes and input identity. Approval
+            # never starts a new computation for changed data.
+            from bonus_agent.scenarios.releases import sha
+            task = d / "runs" / state["task_id"]
+            prior = json.loads((task / "run.json").read_text(encoding="utf-8"))
+            current = {p.name: sha(p) for p in (d / "materials").iterdir()}
+            if current != prior["identity"]["inputs"]:
+                raise ReleaseError("材料已改变，不能确认旧结果")
+            key, _ = task_key(meta["scenario"], meta["rule_version"], meta["period"],
+                              sorted((d / "materials").iterdir()), releases=runner.releases,
+                              business_batch=meta.get("business_batch"))
+            if key != state["task_id"]:
+                raise ReleaseError("结果版本已失效，请重新计算后复核")
+            run = read_completed(d / "runs", key)
+            record = {"task_id": run.task_id, "by": u["display"], "at": now(), "result_sha256": sha(task / "result.xlsx")}
+            destination = task / "confirmed.json"
+            record = Registry(runner.releases).confirm(meta.get("business_batch"), d / "runs", run.task_id, record)
+            atomic_write(destination, canonical(record))
+        except (ValueError, OSError) as exc:
+            raise HTTPException(409, str(exc)) from None
+        store.audit(cid, u["display"], "确认固定结果", task_id=run.task_id)
+        return back(cid, "已确认本批固定计算结果快照")
+
     @app.post("/cases/{cid}/chat")
     async def chat(cid: str, request: Request, u: dict = Depends(user)):
         need(u, "editor")
@@ -938,6 +1221,14 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         if not text and not files:
             return back(cid)
         idle(cid)
+        if not exploration:
+            if files:
+                raise HTTPException(400, "对话为只读入口，请在数据上传区提交材料")
+            try:
+                runner.start(cid, u["display"], message=text)
+            except (RuntimeError, ScenarioError) as exc:
+                raise HTTPException(409, str(exc)) from None
+            return back(cid)
         try:
             if files and f.get("expected") == "1":       # 期望结果：只登记，不交给智能体
                 names = await _save(cid, u, files, "expected", single=True)
@@ -962,6 +1253,8 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         need(u, "approver")
         d = case_dir(cid)
         await posted(request, u)
+        if not exploration:
+            raise HTTPException(409, "产品批准不能代替财务规则发布；请使用已发布版本")
         try:
             record = record_product_approval(store.meta(cid).get("scenario"), u["display"], out=d / "out")
         except (ScenarioError, BindingError) as exc:
@@ -976,6 +1269,8 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         need(u, "approver")
         d = case_dir(cid)
         f = await posted(request, u)
+        if not exploration:
+            raise HTTPException(409, "请在案卷固定计算入口使用已绑定的财务发布版本")
         scenario = store.meta(cid).get("scenario")
         try:
             require_settlement(scenario, out=d / "out")
@@ -1014,6 +1309,8 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         d = case_dir(cid)
         idle(cid)
         f = await posted(request, u)
+        if not exploration:
+            raise HTTPException(409, "不能冻结智能体草稿；请确认固定计算结果快照")
         note = str(f.get("note", "")).strip()[:500]
         try:
             tpl = cs.confirm(d / "out", by=u["display"], note=note, scenario=store.meta(cid).get("scenario"))
@@ -1030,6 +1327,8 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         need(u, "editor")
         d = case_dir(cid)
         f = await posted(request, u)
+        if not exploration:
+            raise HTTPException(409, "固定场景使用已发布版本，不接受另一个模板覆盖")
         try:
             require_settlement(store.meta(cid).get("scenario"), out=d / "out")
         except ScenarioError as exc:
@@ -1087,8 +1386,9 @@ def serve(root: str, host: str = "127.0.0.1", port: int = 8080, model: str | Non
 
     from bonus_agent.llm import LLM, load_config
     cfg = load_config()
-    llm = LLM.from_config(model, cfg, checker)       # 启动时就核对模型配置
-    name = llm.name + (f"（交叉验证：{llm.checker_llm.name}）" if llm.checker_llm else "")
+    # Fixed calculations must remain available without a model/API key. Only
+    # read-only conversation initializes the configured model, lazily.
+    name = (model or cfg.get("default", "")) + "（仅用于只读解释）"
     users = Store(Path(root)).users.load()
     if not users:
         raise SystemExit(f"还没有用户，先运行：bonus-agent user add --data {root} 用户名 --roles editor,approver")

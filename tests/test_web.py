@@ -18,7 +18,7 @@ PW = "password-123"
 @pytest.fixture
 def env(tmp_path):
     scripts = []
-    app = create_app(tmp_path / "data", lambda: FakeLLM(scripts.pop(0)))
+    app = create_app(tmp_path / "data", lambda: FakeLLM(scripts.pop(0)), exploration=True)
     store = app.state.store
     store.users.add("alice", PW, ["editor"], "张会计")
     store.users.add("bob", PW, ["approver"], "李经理")

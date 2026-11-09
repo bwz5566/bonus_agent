@@ -47,6 +47,14 @@ from bonus_core.dsl.models import RuleSet
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="bonus-agent")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("publish-scenario", help="验收并发布财务提供的固定规则包，不调用模型")
+    p.add_argument("--source", required=True, help="含 release.yaml、规则、固定映射及正反验收数据的目录")
+    p.add_argument("--release-dir", required=True)
+    p.add_argument("--by", required=True, help="财务审批人；此命令应由有发布权限的管理员执行")
+    p = sub.add_parser("register-batch", help="获授权管理员登记业务批次；网页由审批人登记")
+    for flag in ("scenario", "rule-version", "period", "entity", "batch-id", "by"):
+        p.add_argument("--" + flag, required=True)
+    p.add_argument("--release-dir")
     p = sub.add_parser("models")
     p.add_argument("--remote", action="store_true", help="调用服务商 /models 接口，核对已配置模型能否调用")
     p = sub.add_parser("extract")
@@ -63,11 +71,13 @@ def main(argv=None) -> int:
     p.add_argument("--no-llm", action="store_true")
     p.add_argument("data", nargs="+")
     p = sub.add_parser("approve-settlement")
+    p.add_argument("--explore", action="store_true", help="仅开发迁移使用；不能发布财务正式版本")
     p.add_argument("--scenario", required=True)
     p.add_argument("--by", required=True, help="产品批准人。这不是财务签发")
     p.add_argument("--out", help="案卷目录：写入 product_approval.json")
     p.add_argument("--approval-out", help="批准记录的 JSON 路径")
     p = sub.add_parser("confirm")
+    p.add_argument("--explore", action="store_true", help="仅开发迁移使用；正式结果请在固定场景页面确认")
     p.add_argument("--scenario", required=True)
     p.add_argument("--out", required=True, help="案卷目录")
     p.add_argument("--by", required=True, help="确认人")
@@ -112,6 +122,11 @@ def main(argv=None) -> int:
     p.add_argument("--password-stdin", action="store_true", help="从标准输入读口令（脚本用）")
     p = sub.add_parser("auto")
     p.add_argument("--scenario", required=True)
+    p.add_argument("--rule-version", help="明确选择已发布版本，不自动取最新版")
+    p.add_argument("--period", help="此业务批次的核算期间")
+    p.add_argument("--business-batch", help="已登记业务批次的 key，不是案卷编号")
+    p.add_argument("--release-dir")
+    p.add_argument("--explore", action="store_true", help="仅开发迁移使用：旧通用智能体试算，不是正式结算")
     p.add_argument("--model")
     p.add_argument("--checker", help="交叉验证（独立复读、独立算式）用的另一个模型，如 qwen-a；不写就用主模型自己验证")
     p.add_argument("--answers", help="财务答复文件（默认读案卷目录里的 questions.yaml）")
@@ -125,6 +140,51 @@ def main(argv=None) -> int:
     p.add_argument("--pipeline", action="store_true", help="使用固定流程（规划 → 抽取 → 计算），不让模型自主调度")
     p.add_argument("paths", nargs="+", help="本批次的规则文档、Excel 数据，或只包含它们的文件夹")
     a = ap.parse_args(argv)
+
+    if a.cmd in {"approve-settlement", "confirm"} and not a.explore:
+        print("此旧草稿入口仅限 --explore 开发迁移；财务规则请 publish-scenario，正式结果请在固定场景页面确认")
+        return 1
+
+    if a.cmd == "publish-scenario":
+        from bonus_agent.scenarios.releases import publish
+        from bonus_core.engine.issues import EngineError
+        try:
+            _, spec, record = publish(a.source, a.release_dir, a.by)
+        except (ValueError, OSError, EngineError) as exc:
+            print(f"发布被拒绝：{exc}")
+            return 1
+        print(f"已发布 {spec.scenario}/{spec.version}：{record['fingerprint']}")
+        return 0
+
+    if a.cmd == "register-batch":
+        from bonus_agent.scenarios.batches import Registry
+        from bonus_core.engine.issues import EngineError
+        try:
+            record = Registry(a.release_dir).register(a.scenario, a.rule_version, a.period, a.entity, a.batch_id, a.by)
+        except (ValueError, OSError, EngineError) as exc:
+            print(f"批次登记被拒绝：{exc}")
+            return 1
+        print(record["key"])
+        return 0
+
+    if a.cmd == "auto" and not a.explore:
+        from bonus_agent.auto import collect_files
+        from bonus_agent.scenarios.execution import run_fixed
+        from bonus_core.engine.issues import EngineError
+        if not a.rule_version or not a.period:
+            print("固定计算必须提供 --rule-version 和 --period；未配置的场景不能交给模型临时建模")
+            return 1
+        if a.pipeline or a.answers or a.new or a.expected:
+            print("固定计算不接受临时口径、模型流水线或外部答案覆盖；规则变更请发布新版本")
+            return 1
+        try:
+            run = run_fixed(a.scenario, a.rule_version, a.period, collect_files(a.paths),
+                            Path(a.out) / "runs", releases=a.release_dir, business_batch=a.business_batch)
+        except (ValueError, OSError, EngineError) as exc:
+            print(f"固定计算被阻断：{exc}")
+            return 1
+        print(f"{'复用已完成结果' if run.cached else '固定计算完成'}：{run.directory / 'result.xlsx'}")
+        return 0
 
     if a.cmd in {"auto", "confirm"}:
         from bonus_agent.scenarios import ScenarioError, load_pack

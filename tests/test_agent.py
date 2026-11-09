@@ -112,7 +112,7 @@ def test_auto_end_to_end_and_rerun(tmp_path):
     assert qs and qs[0]["answer"] is None
     # 正式 CLI 复算必须通过场景包发布闸门
     out = tmp_path / "rerun.xlsx"
-    assert bonus_main(["run", "--scenario", "annual_bonus", "--rules", str(ar.outputs["rules"]), "--mapping", str(ar.outputs["mapping"]),
+    assert bonus_main(["run", "--preview-migrated", "--scenario", "annual_bonus", "--rules", str(ar.outputs["rules"]), "--mapping", str(ar.outputs["mapping"]),
                        "--out", str(out), str(ANNUAL / "年度数据.xlsx")]) == 1
     assert not out.exists()  # pending finance: no formal settlement
     # 带答复重跑：答复进入提示词

@@ -100,6 +100,6 @@ def test_web_requires_explicit_scenario_and_blocks_publication(tmp_path):
     cid = response.headers["location"].split("/")[-1]
     assert store.meta(cid)["scenario"] == "annual_bonus"
     response = post(f"/cases/{cid}/confirm")
-    assert "pending_finance" in c.get(response.headers["location"]).text
-    assert post(f"/cases/{cid}/template").status_code == 400
+    assert response.status_code == 409
+    assert post(f"/cases/{cid}/template").status_code == 409
     assert not (store.dir(cid) / "out" / "template").exists()
