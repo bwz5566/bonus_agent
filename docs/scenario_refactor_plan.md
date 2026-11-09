@@ -35,7 +35,7 @@
 - **规则分层（产品负责人确认）**：
   1. 仓内已有规则应归纳为与场景无关的共享规则/算子库。
   2. 财务后续交付规则时，再映射/绑定到对应场景包。
-  3. 冲突时以财务提交的逻辑为准（场景包覆盖通用库）。本阶段不臆造财务内容；占位包保持 `pending_finance`。
+  3. 冲突时以财务提交的逻辑为准（场景包覆盖通用库）。不臆造财务内容。没有可迁入实例的包保持 `pending_finance`。仓内已有季度实例的绑定方式见文末「仓内迁入」。
 
 
 
@@ -215,6 +215,16 @@ Skill / MCP：**可被所有场景看见目录，但执行时按当前 pack 的 
 ## Phase A 骨架交付说明
 
 已实现目录、严格占位 schema、显式场景入口及正式确认/结算阻断。详见
-[场景包契约](scenario_pack_contract.md)。全部 pack 仍为 `pending_finance / TODO`；
-第 0 节约束优先，真实契约、发布规则格式、业务校验与激活流程留待财务材料。
-本次不拆 agent.py，不新增金额计算逻辑；不自行开 PR。
+[场景包契约](scenario_pack_contract.md)。`eng_dev_bonus` 与 `annual_bonus` 仍为
+`pending_finance / TODO`。第 0 节约束仍然优先：不把未交付的财务口径写成 `published`。
+
+## 仓内迁入（sales_commission）
+
+季度提成沿用仓内已有实例，不新造第四个提成包，也不把过程奖绑进本包：
+
+- 状态是 `migrated_draft`（迁入草稿，不是财务签发，也不是 `pending_finance` 旁路字段）。
+- 只绑定 `syn_acceptance` 的 QUARTER 方案、共享库里季度用到的表/变量/校验，以及数据字典和映射的子集。字段必须来自现有 `datasets.yaml`。
+- 过程奖（`rules_PROCESS.yaml`、里程碑）留作以后单独的 `process_bonus`。年度实例留在 `annual_bonus`。
+- 共享 DSL 仍在 `bonus_core`。以后财务映射的规则与迁入实例冲突时，以财务规则为准。
+- 探索/试算不走结算闸门。正式结算要先有产品书面批准（结构化决定；设置了 `BONUS_AGENT_STATE_DIR` 时以状态库为准），再用 `bonus run --from-pack`。批准记录写明这不是财务签发，并钉住绑定指纹。
+- `eng_dev_bonus` 扫过仓库：没有可迁入的开发奖金规则实例，保持纯占位。

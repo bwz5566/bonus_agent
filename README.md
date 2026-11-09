@@ -277,6 +277,8 @@ vllm serve deepseek-ai/DeepSeek-V4-Flash --port 8000 --tensor-parallel-size 4 --
 
 See [the pack contract](docs/scenario_pack_contract.md). CLI `auto`, `confirm`,
 `bonus run`, and `bonus run-template` require `--scenario`. Web cases require an
-explicit scenario. All three supplied packs are `pending_finance / TODO`; formal
-settlement and publication are blocked until finance supplies real contracts,
-published rules and validation. Exploratory engine APIs remain available.
+explicit scenario. `eng_dev_bonus` and `annual_bonus` remain `pending_finance / TODO`.
+`sales_commission` is `migrated_draft`: it binds the in-repo quarter scheme and is
+not finance-signed. Trial runs stay open. Formal settlement needs a product
+written approval, then `bonus run --from-pack`. A later finance mapping replaces
+that binding on conflict.

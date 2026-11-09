@@ -149,7 +149,8 @@ def _pack(tools=(), mcp=()):
 @pytest.mark.parametrize("scenario", list_scenarios())
 def test_existing_packs_default_to_empty_allowlists(scenario):
     meta = load_pack(scenario).metadata
-    assert meta.allowed_tools == [] and meta.allowed_mcp == [] and meta.status == "pending_finance"
+    assert meta.allowed_tools == [] and meta.allowed_mcp == []
+    assert meta.status == ("migrated_draft" if scenario == "sales_commission" else "pending_finance")
 
 
 def test_pack_schema_still_forbids_unknown_fields():

@@ -1,2 +1,19 @@
-status: pending_finance
+status: migrated_draft
 todo: TODO
+finance_signed: false
+engine: bonus_core
+cases:
+  - id: syn_acceptance_quarter
+    data: evals/cases/syn_acceptance/inputs/03_业务输入.xlsx
+    mapping: evals/cases/syn_acceptance/mapping.yaml
+    reference: evals/cases/syn_acceptance/reference.json
+    reference_scheme: QUARTER
+    revisions: [R0, R1, R2]
+    expected_workbook: evals/cases/syn_acceptance/expected/05_期望奖金结果.xlsx
+unbound_sales_materials:
+  - path: examples/sales_q3/rules.yaml
+    reason: Illustrative quarter example with its own columns. Not merged into this contract.
+  - path: evals/cases/sales_q3/case.yaml
+    reason: Eval pointer at the illustrative example. Not a second scheme in this pack.
+  - path: evals/cases/acceptance_q3/rules_quarter.yaml
+    reason: Older partial quarter slice. Not bound; the syn_acceptance quarter instance is the migrated one.

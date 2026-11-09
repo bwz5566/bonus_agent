@@ -6,13 +6,22 @@ import pytest
 from bonus_agent.scenarios import PACKS, ScenarioError, list_scenarios, load_pack, require_settlement
 
 
-@pytest.mark.parametrize("scenario", ["sales_commission", "eng_dev_bonus", "annual_bonus"])
+@pytest.mark.parametrize("scenario", ["eng_dev_bonus", "annual_bonus"])
 def test_placeholder_schema_and_settlement_gate(scenario):
     pack = load_pack(scenario)
     assert pack.metadata.scenario == scenario
+    assert pack.metadata.status == "pending_finance"
     assert pack.rule_package.status == "pending_finance"
     with pytest.raises(ScenarioError, match="pending_finance.*published rules missing"):
         require_settlement(scenario)
+
+
+def test_sales_commission_stays_closed_without_product_approval():
+    pack = load_pack("sales_commission")
+    assert pack.metadata.status == "migrated_draft"
+    assert pack.metadata.finance_signed is False
+    with pytest.raises(ScenarioError, match="migrated_draft; product written approval required"):
+        require_settlement("sales_commission")
 
 
 @pytest.mark.parametrize("scenario", [None, "", "universal-auto", "../annual_bonus", "unknown"])
