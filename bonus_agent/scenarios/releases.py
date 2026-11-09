@@ -87,7 +87,7 @@ def run_acceptance(sc: Scenario, template_dir: Path) -> list[dict]:
             out.append({"id": case.id, "ok": False, "lines": ["文件不存在：" + "、".join(missing)]})
             continue
         try:
-            results, _ = Template.load(template_dir).run(files)
+            results, _ = Template.load(template_dir).run(files, case.period)
         except Exception as e:
             out.append({"id": case.id, "ok": False, "lines": [f"复算失败：{e}"]})
             continue
@@ -148,11 +148,13 @@ class Computed:
     results: dict
     warnings: list
     written: list[Path]
+    period: object = None
 
 
 def compute(reg: Registry, scenario_id: str, data_files: list[str | Path], out: str | Path,
-            version: str | None = None) -> Computed:
-    """计算模式：按已发布的规则版本算本期数据，不调用大模型。先按输入模板检查，有错误就不算。"""
+            version: str | None = None, period: str | None = None) -> Computed:
+    """计算模式：按已发布的规则版本算本期数据，不调用大模型。先按输入模板检查，有错误就不算。
+    period：核算期间（如 2026-10、2026Q4、2026-07~2026-09）；不写用发布时的期间。"""
     sc = reg.get(scenario_id)
     rel = get_release(reg, scenario_id, version)
     files = [Path(f) for f in data_files]
@@ -163,11 +165,12 @@ def compute(reg: Registry, scenario_id: str, data_files: list[str | Path], out: 
     if not rep.ok:
         raise InputError(rep)
     tpl = rel.template()
-    results, warnings = tpl.run(files)
+    results, warnings = tpl.run(files, period)
     written = [p for p, _ in tpl.write(results, out)]
     from bonus_core.template import sha256
     (out / "run.json").write_text(json.dumps({
         "scenario": scenario_id, "version": rel.version, "at": datetime.now().isoformat(timespec="seconds"),
+        "period": str(tpl.last_period) if tpl.last_period else None,
         "inputs": {p.name: sha256(p) for p in files}, "outputs": [p.name for p in written],
         "warnings": [str(w) for w in warnings]}, ensure_ascii=False, indent=1), encoding="utf-8")
-    return Computed(rel, rep, results, warnings, written)
+    return Computed(rel, rep, results, warnings, written, tpl.last_period)

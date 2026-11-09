@@ -57,6 +57,7 @@ class AcceptanceCase(_Strict):
     id: str
     data: list[str] = Field(min_length=1)
     expected: str
+    period: str | None = None          # 这个用例的核算期间（如 2026-09）；不写用确认时的期间
     note: str = ""
 
 

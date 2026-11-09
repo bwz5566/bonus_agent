@@ -74,6 +74,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("compute", help="计算模式：按场景已发布的规则版本算本期数据，不调用大模型")
     p.add_argument("--scenario", required=True)
     p.add_argument("--version", help="规则版本，如 v2；不写用最新发布的版本")
+    p.add_argument("--period", help="核算期间，如 2026-09、2026Q3、2026、2026-07~2026-09；不写用发布时的期间")
     p.add_argument("--out", required=True, help="结果目录")
     p.add_argument("--scenario-dir", action="append", default=[], **scen_dir)
     p.add_argument("data", nargs="+", help="本期数据文件")
@@ -123,6 +124,7 @@ def main(argv=None) -> int:
     p.add_argument("--scenario", help="场景（编制模式）：带上场景说明、输入模板检查和场景记忆；不写按通用流程")
     p.add_argument("--scenario-dir", action="append", default=[], **scen_dir)
     p.add_argument("--no-memory", action="store_true", help="不使用场景记忆（评测时用，避免沿用以前的答复）")
+    p.add_argument("--period", help="核算期间，如 2026-09、2026Q3、2026、2026-07~2026-09；不写沿用上一轮，都没有就不按期间筛选")
     p.add_argument("--model")
     p.add_argument("--checker", help="交叉验证（独立复读、独立算式）用的另一个模型，如 qwen-a；不写就用主模型自己验证")
     p.add_argument("--answers", help="财务答复文件（默认读案卷目录里的 questions.yaml）")
@@ -356,7 +358,7 @@ def _scenario_cmd(a) -> int:
             for x in rel.info["acceptance"]:
                 print(f"  验收「{x['id']}」通过：" + "；".join(x["lines"]))
             return 0
-        c = rl.compute(reg, a.scenario, [Path(x) for x in a.data], a.out, a.version)
+        c = rl.compute(reg, a.scenario, [Path(x) for x in a.data], a.out, a.version, a.period)
     except rl.InputError as e:
         print(f"不能计算：{e}\n（检查结果已写入 {Path(a.out) / '输入检查.txt'}）")
         return 1
@@ -366,7 +368,8 @@ def _scenario_cmd(a) -> int:
     except Exception as e:      # 计算引擎报的数据问题（如缺列、主键重复）
         print(f"计算失败：{e}")
         return 1
-    print(f"按 {c.release.scenario} 规则版本 {c.release.version} 算完（未调用大模型）：")
+    print(f"按 {c.release.scenario} 规则版本 {c.release.version} 算完（未调用大模型）"
+          + (f"，核算期间 {c.period}" if c.period else "") + "：")
     print(c.report.text())
     for w in c.warnings:
         print(f"  提醒：{w}")
@@ -414,7 +417,7 @@ def _agent(a, cfg) -> int:
         ar = run_agent(llm, a.paths, a.out, answers=answers, max_steps=a.max_steps, max_tokens=a.max_tokens,
                        exclude=[a.expected] if a.expected else [],
                        max_history_chars=hist, resume=not a.new,
-                       max_files=a.max_files, on_step=show, scenario=scenario)
+                       max_files=a.max_files, on_step=show, scenario=scenario, period=a.period)
     except ToolError as e:
         print(f"失败：{e}")
         return 1

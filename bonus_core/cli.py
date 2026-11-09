@@ -57,6 +57,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("run-template")
     p.add_argument("--template", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--period", help="核算期间，如 2026-10、2026Q4、2026、2026-07~2026-09；不写用确认时的期间")
     p.add_argument("data", nargs="+")
     a = ap.parse_args(argv)
 
@@ -115,8 +116,8 @@ def _run_template(a) -> int:
     from bonus_core.template import Template, TemplateError
     try:
         tpl = Template.load(a.template)
-        results, warnings = tpl.run(a.data)
-    except (TemplateError, EngineError, AdjustConflict) as e:
+        results, warnings = tpl.run(a.data, a.period)
+    except (TemplateError, EngineError, AdjustConflict, ValueError) as e:
         print(f"计算失败：{e}")
         return 1
     for i in warnings:

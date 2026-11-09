@@ -154,7 +154,8 @@ def rebind_files(mapping: Mapping, files: list[str | Path]) -> Mapping:
     return {k: m.model_copy(update={"file": to[m.file]}) if m.file in to else m for k, m in mapping.items()}
 
 
-def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping) -> tuple[Datasets, list[Issue]]:
+def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping, period=None) -> tuple[Datasets, list[Issue]]:
+    """period：本次核算期间（bonus_core.data.period.Period）。写了 period 字段的数据表只取落在期间里的行。"""
     sheets = [s for f in files for s in detect(f)]
     data: Datasets = {}
     issues: list[Issue] = []
@@ -228,10 +229,23 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping) -> tup
         if isinstance(keep, str):
             issues.append(Issue.block("filter_column", keep, ds_name))
             continue
+        pcol = idx.get(ds.period) if ds.period else None
+        if ds.period and period is not None and pcol is None:
+            issues.append(Issue.block("period_unmapped", f"「{ds_name}」按期间筛选的字段 {ds.period} 没有对应的列", ds_name))
+            continue
+        out_of, unclear = 0, []
         for excel_row, vals in st.rows:
             if not keep(vals):
                 continue
             src = RowRef(st.file, st.sheet, excel_row)
+            if pcol is not None and period is not None:
+                inside = period.contains(vals[pcol] if pcol < len(vals) else None)
+                if inside is False:
+                    out_of += 1
+                    continue
+                if inside is None:
+                    unclear.append((str(src), vals[pcol] if pcol < len(vals) else None))
+                    continue
             rv = {}
             for f, fd in ds.fields.items():
                 raw = vals[idx[f]] if f in idx else None
@@ -241,6 +255,13 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping) -> tup
                     issues.append(Issue.block("convert", f"{f}: {e}", str(src)))
                     rv[f] = None
             t.rows.append(Row(rv, src))
+        if unclear:
+            issues.append(Issue.block("period_unclear", f"「{ds_name}」有 {len(unclear)} 行的 {ds.period} 看不出是否属于核算期间 {period}"
+                                      f"（如 {unclear[0][1]!r}）：空值、写法认不出，或只有一部分落在期间里",
+                                      unclear[0][0]))
+        if ds.period and period is not None:
+            issues.append(Issue.warn("period_filtered", f"「{ds_name}」按核算期间 {period} 筛选（{ds.period}）：取 {len(t.rows)} 行，"
+                                     f"期间外 {out_of} 行不参与计算", ds_name))
         if ds.distinct and ds.key:
             t.rows, clash = _distinct(t.rows, ds.key)
             if clash:

@@ -86,8 +86,9 @@ def _merge(*vals: Val) -> tuple[frozenset, tuple]:
 
 
 class Evaluator:
-    def __init__(self, rs: RuleSet, root: Node, by_level: dict[str, list[Node]], refs: dict | None = None):
+    def __init__(self, rs: RuleSet, root: Node, by_level: dict[str, list[Node]], refs: dict | None = None, period=None):
         self.rs = rs
+        self.period = period            # 本次核算期间（period_start() / period_end() 用）
         self.refs = refs or {}          # "方案/修订" -> 同一批里已算出的其他方案结果（scheme_paid 用）
         self.root = root
         self.by_level = by_level
@@ -405,6 +406,11 @@ class Evaluator:
                 raise EvalError(f"方案 {key} 的结果里没有 {ctx.node.id} 的发放记录（只能在最末层或抵扣汇总到的实体上使用）", ctx.where)
             r = Decimal(p.paid)
             return Val(r, f"{key} 实发 {fmt(r)}", frozenset({f"{key}:{ctx.node.id}"}))
+        if fn in ("period_start", "period_end"):
+            if self.period is None:
+                raise EvalError(f"{fn}() 要用本次的核算期间，但这次计算没有指定期间（新建案卷或计算时选择期间）", ctx.where)
+            d = self.period.start if fn == "period_start" else self.period.end
+            return Val(d, f"{fn}()={d.isoformat()}", frozenset())
         if fn in ("year", "month", "quarter"):
             a = self.ev(c.args[0], ctx)
             d = self._date(a, ctx)

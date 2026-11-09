@@ -73,12 +73,23 @@ acceptance:                      # 发布规则版本前必须逐分对上
 命令行同样可用：
 
 ```bash
-bonus-agent auto --scenario sales_commission --scenario-dir D:\bonus_web\scenarios --out 案卷 材料文件夹
+bonus-agent auto --scenario sales_commission --period 2026-09 --scenario-dir D:\bonus_web\scenarios --out 案卷 材料文件夹
 bonus-agent confirm --out 案卷 --by 财务甲
 bonus-agent publish --scenario sales_commission --out 案卷 --by 财务甲 --scenario-dir D:\bonus_web\scenarios
-bonus-agent compute --scenario sales_commission --version v1 --out 结果 --scenario-dir D:\bonus_web\scenarios 本期数据.xlsx
+bonus-agent compute --scenario sales_commission --version v1 --period 2026-10 --out 结果 --scenario-dir D:\bonus_web\scenarios 本期数据.xlsx
 bonus-agent scenarios --scenario-dir D:\bonus_web\scenarios
 ```
+
+## 核算期间：任意月份、季度、年度
+
+规则里不写死月份。新建案卷时填核算期间（`2026-09`、`2026Q3`、`2026`、`2026-07~2026-09`、`2026-09-01~2026-09-15`），
+计算时每次另选：
+
+- 智能体定义数据表时，给有日期或月份列的业务明细（销售、回款、出货……）写 `period`，程序只取落在期间里的行，
+  试算结果里会提示每张表取了几行、期间外几行。名单、预算、系数表这类跨期的表不写 `period`。
+- 表达式要用“当期”时写 `period_start()` / `period_end()`，比如按当月取预算：`month(period_end())`。
+- 日期写法认不出、空值、或者一行只有一部分落在期间里（如按年记的数据算某个月），会拦下来说明，不会静默算进或丢掉。
+- 确认时记下当时的期间；发布后的规则版本换任何期间都能算（`bonus-agent compute --period 2026-10`，网页计算时填期间）。
 
 ## 全局能力和场景专属能力
 

@@ -39,6 +39,8 @@ FUNCTIONS: dict[str, FnSpec] = {
     "year": FnSpec(1, 1, doc="日期的年份"),
     "month": FnSpec(1, 1, doc="日期的月份"),
     "quarter": FnSpec(1, 1, doc="日期所在季度 1~4"),
+    "period_start": FnSpec(0, 0, doc="本次核算期间的第一天（日期）。期间在计算时选，规则里不要写死月份，如 month(period_end())"),
+    "period_end": FnSpec(0, 0, doc="本次核算期间的最后一天（日期）"),
     "scheme_paid": FnSpec(1, 2, doc='scheme_paid("方案名", "修订名") 同一批里另一个方案（某个修订，默认 R0）给本人的本次实发金额，用于跨方案抵扣'),
 }
 

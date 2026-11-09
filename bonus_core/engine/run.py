@@ -144,7 +144,7 @@ def run_hash(base: str, adjustments: list[Adjustment], refs: dict | None) -> str
 class Engine:
     """一次计算的上下文：建树、求权重和奖金池，然后按调整事件分配。"""
 
-    def __init__(self, rs: RuleSet, data: Datasets, refs: dict | None = None):
+    def __init__(self, rs: RuleSet, data: Datasets, refs: dict | None = None, period=None):
         issues = [i for i in validate(rs) if i.severity == "blocking"]
         if issues:
             raise EngineError(issues)
@@ -158,7 +158,8 @@ class Engine:
             raise EngineError(blocking)
         self.root, self.by_level, self.issues = root, by_level, issues
         self.refs = refs or {}
-        self.ev = Evaluator(rs, root, by_level, refs)
+        self.period = period
+        self.ev = Evaluator(rs, root, by_level, refs, period)
         self.nodes: dict[str, Node] = {n.id: n for n in root.walk()}
         try:
             self.issues += self._checks()
@@ -391,5 +392,5 @@ class Engine:
         return out
 
 
-def compute(rs: RuleSet, data: Datasets, adjustments: list[Adjustment] = (), actor_scopes=None, refs=None) -> Result:
-    return Engine(rs, data, refs).compute(adjustments, actor_scopes)
+def compute(rs: RuleSet, data: Datasets, adjustments: list[Adjustment] = (), actor_scopes=None, refs=None, period=None) -> Result:
+    return Engine(rs, data, refs, period).compute(adjustments, actor_scopes)

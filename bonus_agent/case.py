@@ -267,6 +267,7 @@ def confirm(out: Path, by: str, note: str = "", data: list[Path] | None = None, 
     at = datetime.now().isoformat(timespec="seconds")
     manifest = {
         "confirmed": {"by": by, "at": at, "round": rnd["n"], "note": note, "summary": rnd.get("summary", "")},
+        "period": rnd.get("period"),        # 确认时的核算期间；以后换期间计算时另选
         "mapping": outs["mapping"][0],
         "schemes": [{"name": n, "rules": names[n], "revisions": revs[n]} for n in order_schemes(rss)],
         "files": {f: sha256(tpl / f) for f in files},

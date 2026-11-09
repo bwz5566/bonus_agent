@@ -45,6 +45,7 @@ from bonus_agent.parsing.docs import PARSERS
 
 ROLES = {"editor": "传材料、答复问题、运行、按模板计算", "approver": "确认结果、发布规则版本"}
 MODES = {"author": "编制", "compute": "计算"}
+PH = "如 2026-09；季度 2026Q3；年 2026；起止 2026-07~2026-09"     # 核算期间的写法提示
 COOKIE = "bonus_session"
 SESSION_SECONDS = 8 * 3600       # 登录 8 小时后要重新登录
 MAX_FAILURES, LOCK_SECONDS = 5, 300   # 同一用户名 5 分钟内输错 5 次，暂停登录
@@ -52,7 +53,7 @@ ROLE_NAMES = {"editor": "经办", "approver": "审批"}
 DETAIL_NAMES = {"name": "名称", "file": "文件", "new": "从头开始", "round": "轮次", "status": "状态", "error": "错误",
                 "question": "问题", "answer": "答复", "note": "说明", "reason": "原因", "run": "批次", "pools": "奖金池",
                 "data": "数据", "sha256": "sha256", "size": "字节", "template": "模板",
-                "scenario": "场景", "mode": "模式", "version": "规则版本", "removed": "删除条数"}
+                "scenario": "场景", "mode": "模式", "version": "规则版本", "removed": "删除条数", "period": "核算期间"}
 MAX_UPLOAD = 50 * 1024 * 1024
 CID = re.compile(r"^[0-9a-f]{12}$")
 OTHER = "__other__"
@@ -128,7 +129,8 @@ class Store:
             raise KeyError(cid)
         return d
 
-    def create(self, name: str, by: str, scenario: str | None = None, mode: str = "author", memory: bool = True) -> str:
+    def create(self, name: str, by: str, scenario: str | None = None, mode: str = "author", memory: bool = True,
+               period: str | None = None) -> str:
         """scenario 为空：通用流程（不分场景）。mode：author 编制（智能体起草规则）/ compute 计算（按已发布的规则版本）。"""
         if mode not in MODES or (mode == "compute" and not scenario):
             raise ValueError("计算模式要选场景")
@@ -137,7 +139,8 @@ class Store:
         for sub in ("materials", "expected", "out", "runs"):
             (d / sub).mkdir(parents=True)
         meta = {"name": name, "created": now(), "created_by": by,
-                **({"scenario": scenario, "mode": mode, "memory": memory} if scenario else {})}
+                **({"scenario": scenario, "mode": mode, "memory": memory} if scenario else {}),
+                **({"period": period} if period else {})}
         (d / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
         self.audit(cid, by, "新建案卷", name=name, **({"scenario": scenario, "mode": MODES[mode]} if scenario else {}))
         return cid
@@ -278,7 +281,7 @@ class Runner:
                                max_tokens=self.max_tokens, message=message, by=job.by,
                                chat=self.store.chat(job.cid)[:-1] if message else self.store.chat(job.cid),
                                on_step=lambda n, s: self._step(job, d / "out", n, s), should_stop=lambda: job.cancel,
-                               instruction=instruction, scenario=scenario)
+                               instruction=instruction, scenario=scenario, period=meta.get("period"))
                 auto = 0
                 # 模型自己卡住（写法、原地打转等）而停下：程序自动接着做下一轮（带上停下的原因），有次数上限，不用财务手动点重试
                 while not message and not instruction and auto < self.auto_continue and retryable(ar.error) and not job.cancel:
@@ -291,7 +294,7 @@ class Runner:
                     ar = run_agent(llm, [d / "materials"], d / "out", resume=True, max_steps=self.max_steps,
                                    max_tokens=self.max_tokens, by=job.by, chat=self.store.chat(job.cid),
                                    on_step=lambda n, s: self._step(job, d / "out", n, s), should_stop=lambda: job.cancel,
-                                   scenario=scenario)
+                                   scenario=scenario, period=meta.get("period"))
                 expected = sorted((d / "expected").glob("*.xlsx"))
                 if expected and ar.results:
                     from bonus_agent.compare import compare_expected, report
@@ -405,6 +408,13 @@ def save_answers(out: Path, form: dict[str, str], user: str) -> list[str]:
         (out / "questions.yaml").write_text(QUESTIONS_HEAD + yaml.safe_dump(qs, allow_unicode=True, sort_keys=False),
                                             encoding="utf-8")
     return done
+
+
+def norm_period(text) -> str | None:
+    """表单里的核算期间 -> 规范写法（如 2026-09、2026Q3）；空返回 None，看不懂抛 ValueError。"""
+    from bonus_core.data.period import Period
+    p = Period.parse(str(text or ""))
+    return p.label if p else None
 
 
 # ---------------- 页面 ----------------
@@ -660,6 +670,8 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
                              "<p>场景 <select name='scenario'>" + options + "<option value=''>通用（不分场景）</option></select> "
                              "<label><input type='radio' name='mode' value='author' checked> 编制：智能体读材料起草规则</label> "
                              "<label><input type='radio' name='mode' value='compute'> 计算：按已发布的规则版本直接算</label></p>"
+                             f"<p>核算期间 <input type='text' name='period' placeholder='{PH}' style='max-width:22em'> "
+                             "<span class='mut'>编制时按期间筛选数据；计算时每次另选。不写则不按期间筛选</span></p>"
                              "<p><label class='mut'><input type='checkbox' name='memory' value='1' checked> 编制时参考场景记忆"
                              "（以前确认过的口径；评测时可取消）</label></p>"
                              "<p><button>新建案卷</button></p>", u["csrf"]) if "editor" in u["roles"] else ""
@@ -680,11 +692,12 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             raise HTTPException(400, "请填写名称")
         sid, mode = str(f.get("scenario", "")).strip() or None, str(f.get("mode", "author"))
         try:
+            period = norm_period(f.get("period"))
             if sid:
                 registry.get(sid)
                 if mode == "compute":
                     rl.get_release(registry, sid)
-            cid = store.create(name, u["display"], sid, mode, memory=f.get("memory") == "1")
+            cid = store.create(name, u["display"], sid, mode, memory=f.get("memory") == "1", period=period)
         except (ScenarioError, ValueError) as err:
             raise HTTPException(400, str(err)) from None
         return back(cid)
@@ -702,7 +715,9 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         if rels and "editor" in u["roles"]:
             opts = "".join(f"<option value='{e(r.version)}'{' selected' if r is rels[-1] else ''}>{e(r.summary)}</option>"
                            for r in reversed(rels))
-            head += form(f"/cases/{cid}/compute", f"<p>规则版本 <select name='version'>{opts}</select></p>"
+            head += form(f"/cases/{cid}/compute", f"<p>规则版本 <select name='version'>{opts}</select> "
+                                                  f"核算期间 <input type='text' name='period' value='{e(m.get('period') or '')}' "
+                                                  f"placeholder='{PH}' style='max-width:18em' required></p>"
                                                   "<p><input type='file' name='files' multiple required> <button>检查并计算</button></p>"
                                                   "<p class='mut'>先按输入模板检查本期数据（表、列、数字格式），有错误不计算；"
                                                   "通过后按所选版本计算，结果可下载。</p>", csrf, upload=True)
@@ -712,7 +727,8 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             info = json.loads((r / "run.json").read_text(encoding="utf-8")) if (r / "run.json").exists() else {}
             check = (r / "输入检查.txt").read_text(encoding="utf-8") if (r / "输入检查.txt").exists() else ""
             err = (r / "错误.txt").read_text(encoding="utf-8") if (r / "错误.txt").exists() else ""
-            state = (f"<span class='ok'>按 {e(info.get('version'))} 算完</span>" if info else "<span class='bad'>没有算出结果</span>")
+            state = (f"<span class='ok'>按 {e(info.get('version'))} 算完" + (f"，期间 {e(info['period'])}" if info.get("period") else "")
+                     + "</span>" if info else "<span class='bad'>没有算出结果</span>")
             body += (f"<details{' open' if r == runs[0] else ''}><summary>{e(r.name)} {state}</summary>"
                      + (f"<pre>{e(err)}</pre>" if err else "") + (f"<pre>{e(check)}</pre>" if check else "")
                      + files_table(r, f"/cases/{cid}/dl/runs/{r.name}") + "</details>")
@@ -738,6 +754,13 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         if m.get("scenario"):
             parts.append(f"<p class='mut'>场景：<a href='/scenarios/{e(m['scenario'])}'>{e(scenario_label(m))}</a>"
                          + ("" if m.get("memory", True) else "（不参考场景记忆）") + "</p>")
+        ptext = f"核算期间：{m['period']}" if m.get("period") else "核算期间：未指定（不按期间筛选）"
+        if editor and not busy:
+            parts.append(form(f"/cases/{cid}/period", f"<p class='mut'>{e(ptext)} <input type='text' name='period' "
+                                                       f"value='{e(m.get('period') or '')}' placeholder='{PH}' style='max-width:18em'> "
+                                                       "<button>改期间</button>（下一轮起生效）</p>", csrf, inline=True))
+        else:
+            parts.append(f"<p class='mut'>{e(ptext)}</p>")
         last = (case or {}).get("rounds", [{}])[-1] if case else {}
         info = f"<p>{status_text(case)}</p>"
         if last.get("summary"):
@@ -1086,6 +1109,25 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
                     pools={f"{n}/{r}": res.pool for _, (n, r, res) in written})
         return back(cid, f"已算出 {len(written)} 个结果，见“按模板计算”的 {run_dir.name}")
 
+    @app.post("/cases/{cid}/period")
+    async def set_period(cid: str, request: Request, u: dict = Depends(user)):
+        need(u, "editor")
+        case_dir(cid)
+        idle(cid)
+        f = await posted(request, u)
+        try:
+            period = norm_period(f.get("period"))
+        except ValueError as err:
+            return back(cid, str(err))
+        m = store.meta(cid)
+        if period:
+            m["period"] = period
+        else:
+            m.pop("period", None)
+        store.save_meta(cid, m)
+        store.audit(cid, u["display"], "修改核算期间", period=period or "不指定")
+        return back(cid, f"核算期间改为 {period or '不指定'}，下一轮起生效")
+
     @app.post("/cases/{cid}/publish")
     async def publish(cid: str, request: Request, u: dict = Depends(user)):
         need(u, "approver")
@@ -1124,12 +1166,13 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             return back(cid, "没有选择数据文件")
         version = str(f.get("version", "")).strip() or None
         try:
-            c = rl.compute(registry, m["scenario"], [run_dir / "data" / n for n, _ in saved], run_dir, version)
+            period = norm_period(f.get("period"))
+            c = rl.compute(registry, m["scenario"], [run_dir / "data" / n for n, _ in saved], run_dir, version, period)
         except Exception as err:   # 输入不符合模板、版本被改、数据缺列等，如实显示
             (run_dir / "错误.txt").write_text(str(err), encoding="utf-8")
             store.audit(cid, u["display"], "计算失败", version=version or "", run=run_dir.name, error=str(err)[:500])
             return back(cid, f"没有算出结果：{str(err).splitlines()[0]}")
-        store.audit(cid, u["display"], "按规则版本计算", version=c.release.version, run=run_dir.name, data=dict(saved),
+        store.audit(cid, u["display"], "按规则版本计算", version=c.release.version, period=str(c.period or ""), run=run_dir.name, data=dict(saved),
                     pools={f"{n}/{r}": res.pool for n, revs in c.results.items() for r, res in revs.items()})
         return back(cid, f"已按 {c.release.version} 算出 {len(c.written)} 个结果")
 

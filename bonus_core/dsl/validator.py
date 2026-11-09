@@ -66,6 +66,10 @@ def validate(rs: RuleSet) -> list[Issue]:
         for k in (d.key, d.link):
             if k and k not in d.fields:
                 issues.append(Issue.block("dataset_key_field", f"数据表「{n}」的字段列表里没有 {k}", f"datasets.{n}"))
+        if d.period and d.period not in d.fields:
+            issues.append(Issue.block("period_field", f"数据表「{n}」的 period 写的 {d.period} 不是它的字段", f"datasets.{n}"))
+        elif d.period and d.fields[d.period].type not in ("date", "text", "int", "id", "number"):
+            issues.append(Issue.block("period_field", f"数据表「{n}」的 period 字段 {d.period} 要记日期或月份", f"datasets.{n}"))
         if lay.parent[n][0] == "bad":
             issues.append(Issue.block("link_bad", f"「{n}」的 link={d.link} 既不是分配层级的主键，也不是关联实体表的主键", f"datasets.{n}"))
         if n in lay.aux and n in lay.index:

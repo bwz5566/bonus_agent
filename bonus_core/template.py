@@ -85,20 +85,30 @@ class Template:
         if bad:
             raise TemplateError("模板与确认时不一致，拒绝计算：" + "；".join(bad) + "。如需修改规则，请走一轮智能体处理并重新确认")
 
-    def run(self, data_files: list[str | Path]) -> tuple[dict[str, dict[str, Result]], list[Issue]]:
-        """按顺序计算每个方案的基准结果和各修订，被引用的方案结果传给引用它的方案。"""
+    def period(self, period=None):
+        """本次的核算期间：调用方给的优先，没给用确认时的期间（manifest 的 period）。"""
+        from bonus_core.data.period import Period
+        if period is None:
+            return Period.parse(self.manifest.get("period"))
+        return period if isinstance(period, Period) else Period.parse(period)
+
+    def run(self, data_files: list[str | Path], period=None) -> tuple[dict[str, dict[str, Result]], list[Issue]]:
+        """按顺序计算每个方案的基准结果和各修订，被引用的方案结果传给引用它的方案。
+        period：核算期间（如 "2026-10"），不给时用确认时的期间；写了 period 字段的数据表只取期间里的行。"""
+        period = self.period(period)
+        self.last_period = period
         mapping = rebind_files(load_mapping(self.dir / self.manifest["mapping"]), data_files)
         out: dict[str, dict[str, Result]] = {}
         refs: dict[str, Result] = {}
         warnings: list[Issue] = []
         for s in self.manifest["schemes"]:
             rs = RuleSet.load(self.dir / s["rules"])
-            data, issues = apply_mapping(rs, data_files, mapping)
+            data, issues = apply_mapping(rs, data_files, mapping, period)
             blocking = [i for i in issues if i.severity == "blocking"]
             if blocking:
                 raise EngineError(blocking)
             warnings += issues
-            eng = Engine(rs, data, refs)
+            eng = Engine(rs, data, refs, period)
             res = {"R0": eng.compute()}
             for rev in s.get("revisions") or []:
                 adj = yaml.safe_load((self.dir / rev["adjust"]).read_text(encoding="utf-8")) or []
@@ -113,7 +123,9 @@ class Template:
         from bonus_core.report.excel import write_excel
         c = self.manifest["confirmed"]
         info = [("确认信息", ["项目", "值"], [["确认人", c["by"]], ["确认时间", c["at"]], ["确认的轮次", f"第 {c['round']} 轮"],
-                                           ["说明", c.get("note", "")], ["模板目录", str(self.dir)]], {"项目": 14, "值": 70})]
+                                           ["说明", c.get("note", "")], ["模板目录", str(self.dir)],
+                                           ["核算期间", str(getattr(self, "last_period", None) or self.manifest.get("period") or "未指定")]],
+                 {"项目": 14, "值": 70})]
         out = Path(out)
         out.mkdir(parents=True, exist_ok=True)
         rules = {s["name"]: RuleSet.load(self.dir / s["rules"]) for s in self.manifest["schemes"]}

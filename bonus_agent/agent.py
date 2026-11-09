@@ -181,7 +181,11 @@ TOOLS: list[dict] = [
                                        "财务答复过“找不到的不参与 / 按默认值”后才可写 ignore，这些行不参与计算"},
                          "distinct": {"type": "boolean", "description": "可选：按 key 的不同取值各建一个对象（同一编号的多行合成一个，"
                                       "其余字段在同一编号下要一样）。没有单独的主表、又要按这个编号汇总时用，如从明细里得到每个客户一个“客户”"},
-                         "filter": {"type": "object", "description": '可选：只取这些行，{"列名": "取值"} 或 {"列名": ["取值1", "取值2"]}'},
+                         "filter": {"type": "object", "description": '可选：只取这些行，{"列名": "取值"} 或 {"列名": ["取值1", "取值2"]}。'
+                                    '不要用它筛月份或日期，按期间取数用 period'},
+                         "period": {**_S, "description": "可选：记业务日期或月份的字段名。写了之后计算时只取落在本次核算期间里的行，"
+                                    "同一版规则换任何月份、季度都能算。业务明细（销售、回款、出货等）有日期或月份列时都要写；"
+                                    "名单、预算这类跨期的表不写，要取当期的值时在表达式里用 period_start() / period_end()"},
                          "unpivot": {"type": "object", "description":
                                      '可选：几列放的是同一类值（如几个角色列各放一个人名）时展开成每个值一行：'
                                      '{"columns": ["列1", "列2"], "value": "展开后的列名", "label": "记原列名的列名，如 角色"}。'
@@ -648,6 +652,7 @@ class Workspace:
     notes: dict[str, str] = field(default_factory=dict)
     done: bool = False
     chat_by: str = ""                                       # 对话模式：发消息的财务；空表示普通的一轮处理
+    period: object = None                                   # 本次核算期间（bonus_core.data.period.Period）；None 表示没指定
     changed: bool = False                                   # 对话里改过规则、数据表、台账或问题
     reply_text: str = ""
     budget: str = ""
@@ -1143,21 +1148,22 @@ class Workspace:
     def define_dataset(self, name: str, file: str, sheet: str, fields: dict | None = None, key: str | None = None,
                        link: str | None = None, desc: str = "", header_rows: list[int] | None = None,
                        filter: dict | None = None, distinct: bool = False, unpivot: dict | None = None,
-                       unmatched: str = "block") -> str:
+                       unmatched: str = "block", period: str | None = None) -> str:
         reuse = ""
         if not fields:      # 重新定义时只改 key / link / filter：沿用上一次的字段（模型常只写要改的部分，反复因缺 fields 失败）
             fields = self._prev_fields.get(name)
             if not fields:
                 raise ToolError(f"缺少 fields（字段名 -> {{column, type}}）。「{name}」之前没有定义成功过，要写全字段")
             reuse = f"没写 fields，沿用上一次定义「{name}」时的 {len(fields)} 个字段"
-        out = self._define_dataset(name, file, sheet, fields, key, link, desc, header_rows, filter, distinct, unpivot, unmatched)
+        out = self._define_dataset(name, file, sheet, fields, key, link, desc, header_rows, filter, distinct, unpivot, unmatched,
+                                   period)
         self._prev_fields[name] = fields
         return out + (f"\n{reuse}" if reuse else "")
 
     def _define_dataset(self, name: str, file: str, sheet: str, fields: dict, key: str | None = None,
                         link: str | None = None, desc: str = "", header_rows: list[int] | None = None,
                         filter: dict | None = None, distinct: bool = False, unpivot: dict | None = None,
-                        unmatched: str = "block") -> str:
+                        unmatched: str = "block", period: str | None = None) -> str:
         f = self._file(file)
         try:
             st = table_at(f, sheet, header_rows) if header_rows else self.inv.sheet(f"{f.name}/{sheet}")
@@ -1217,6 +1223,22 @@ class Workspace:
                 errors.append(f"{key} 是「{owner}」的主键，这张表应写 link={key}（不写 key），每行挂到对应的{owner}上")
             raise ToolError("未保存，请修正：\n" + "\n".join(f"- {e}" for e in fixed + errors))
         warnings = fixed + warnings
+        period = str(period or "").strip() or None
+        if period:
+            if period not in d.fields:
+                raise ToolError(f"未保存：period 要写这张表里记日期或月份的字段名（现有字段：{'、'.join(d.fields)}）")
+            col = st.headers.index(m.columns[period]) if m.columns.get(period) in st.headers else None
+            vals = [v[col] for _, v in st.rows if col is not None and col < len(v)]
+            from bonus_core.data.period import Period
+            probe = Period.parse("1900-01~2999-12")
+            bad = [v for v in vals if probe.span_of(v) is None]
+            if bad:
+                raise ToolError(f"未保存：period 字段 {period} 有 {len(bad)} 行认不出日期或月份（如 {bad[0]!r}）。"
+                                "写法要像 年-月、六位年月、年-月-日 或 Excel 日期；空值或其他写法先问财务")
+            d.period = period
+            spans = sorted({probe.span_of(v) for v in vals})
+            warnings.append(f"按 {period} 筛选核算期间：数据覆盖 {spans[0][0]} ~ {spans[-1][1]}"
+                            + (f"；本次核算期间 {self.period}，计算时只取期间里的行" if self.period else "；本次没有指定核算期间，全部行都参与"))
         if spec:
             m.unpivot = spec
         prev = (self.datasets.get(name), self.mapping.get(name))
@@ -1514,7 +1536,7 @@ class Workspace:
                        version="agent-draft", datasets=self.datasets, **ext.model_dump(exclude={"questions"}))
 
     def _data(self, rs: RuleSet):
-        data, issues = apply_mapping(rs, self.data_files, self.mapping)
+        data, issues = apply_mapping(rs, self.data_files, self.mapping, self.period)
         blocking = [i for i in issues if i.severity == "blocking"]
         if blocking:
             raise ToolError("数据问题：\n" + "\n".join(f"- {i}" for i in blocking[:8]))
@@ -1598,7 +1620,7 @@ class Workspace:
         data, issues = self._data(rs)
         refs = self._refs(name, _path)
         try:
-            eng = Engine(rs, data, refs)
+            eng = Engine(rs, data, refs, self.period)
             res = {"R0": eng.compute()}
             done: list[Adjustment] = []
             for rev in _revisions(self._merged(name).get("revisions")):
@@ -1895,7 +1917,7 @@ class Workspace:
         nodes.update({n.id: n for tbl in (root.index or {}).values() for n in tbl.values()})
         if node not in nodes:
             raise ToolError(f"没有节点「{node}」，例：{list(nodes)[:5]}")
-        ev = Evaluator(rs, root, by_level, self._refs(name))
+        ev = Evaluator(rs, root, by_level, self._refs(name), self.period)
         ev.peer_scope = helpers is not None      # 独立验算：对本层或上层实体表求和按上一层范围取同级（见 Evaluator.peer_scope）
         try:
             v = ev._eval_traced(expr, nodes[node], "probe", "probe").v     # evaluate 也能看文字取值（如编号、状态）
@@ -1923,7 +1945,7 @@ class Workspace:
         blocking = [i for i in patched + issues if i.severity == "blocking"]
         if blocking:
             raise ToolError("建树失败：" + "；".join(str(i) for i in blocking[:3]))
-        ev = Evaluator(rs, root, by_level, self._refs(name))
+        ev = Evaluator(rs, root, by_level, self._refs(name), self.period)
         ev.peer_scope = True
         return rs, root, by_level, ev
 
@@ -1992,7 +2014,7 @@ class Workspace:
             hv = {k: v.model_copy(update={"scope": _helper_scope(rs, k, v.scope)}) for k, v in hv.items()}
             rs = rs.model_copy(update={"variables": hv})
             root, by_level, _ = build_tree(rs, data)
-            ev = Evaluator(rs, root, by_level, self._refs(name))
+            ev = Evaluator(rs, root, by_level, self._refs(name), self.period)
             ev.peer_scope = True
             names = list(hv)
         elif spec is not None:
@@ -2003,7 +2025,7 @@ class Workspace:
             data, _ = self._data(rs)
             data, _ = apply_patches(rs, data)
             root, by_level, _ = build_tree(rs, data)
-            ev = Evaluator(rs, root, by_level, self._refs(name))
+            ev = Evaluator(rs, root, by_level, self._refs(name), self.period)
             names = list(rs.variables)
         nodes = {n.id: n for n in root.walk()}
         nodes.update({n.id: n for tbl in (root.index or {}).values() for n in tbl.values()})
@@ -2761,7 +2783,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
               on_step: Callable[[int, Step], None] | None = None, resume: bool = True,
               should_stop: Callable[[], bool] | None = None, instruction: str | None = None,
               message: str | None = None, by: str = "", chat: list[dict] | None = None,
-              reflect: int = MAX_REFLECT, deep: int = DEEP_LIMIT, scenario=None) -> AgentResult:
+              reflect: int = MAX_REFLECT, deep: int = DEEP_LIMIT, scenario=None, period: str | None = None) -> AgentResult:
     """max_steps 和 max_tokens 都是安全上限：模型调用 finish 就结束，正常不会用满。
     reflect：卡住时在本轮内反思、换做法的次数上限（清掉打转的对话历史，带上卡在哪、试过什么，工作区保留），用完再停下。
     deep：按需深度思考的步数上限。平时不思考；上一步出错、被拦下、原样重复或停下来反思后，下一步先分析错在哪、
@@ -2769,7 +2791,13 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
 
     out_dir 是案卷目录：里面已有上一轮的 case.json 时（resume=True），从上一轮的工作区接着做，
     财务答复默认读取案卷里的 questions.yaml。
-    scenario：场景（scenarios.context.AgentScenario）。场景说明作为材料一起读，场景信息（输入模板检查、场景记忆）放进任务说明。"""
+    scenario：场景（scenarios.context.AgentScenario）。场景说明作为材料一起读，场景信息（输入模板检查、场景记忆）放进任务说明。
+    period：核算期间（如 "2026-09"、"2026Q3"、"2026-07~2026-09"）。不写时沿用上一轮的期间；都没有就不按期间筛选。"""
+    from bonus_core.data.period import Period, PeriodError
+    try:
+        period_obj = Period.parse(period)
+    except PeriodError as e:
+        raise ToolError(str(e)) from None
     if scenario is not None:
         paths = list(paths) + list(scenario.files)
     try:
@@ -2792,6 +2820,11 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     prints = cs.fingerprint(files)
     rnd = cs.new_round(case, prints)
     ws.round = rnd["n"]
+    if period_obj is None and case and case.get("rounds"):
+        period_obj = Period.parse(case["rounds"][-1].get("period"))
+    ws.period = period_obj
+    if period_obj is not None:
+        rnd["period"] = period_obj.label
     # 上一轮没存下工作区（如中途崩溃）时，财务在 questions.yaml 里填的答复也要带上，不能丢
     if answers is None and out is not None and (out / "questions.yaml").exists():
         answers = yaml.safe_load((out / "questions.yaml").read_text(encoding="utf-8")) or []
@@ -2834,6 +2867,11 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                  f"用 note 记下回答，topic 写「{ANSWER_NOTE}」，text 写给财务看的回答；然后接着完成这一轮。没有提问就不用记")
     if scenario is not None and scenario.brief:
         task += "\n\n" + scenario.brief
+    if period_obj is not None:
+        task += (f"\n\n【核算期间】本次算 {period_obj.label}（{period_obj.start} 至 {period_obj.end}）。期间在计算时选，规则里不要写死月份或日期："
+                 "业务明细表（销售、回款、出货等）有日期或月份列的，define_dataset 时写 period 指向那一列的字段，程序只取期间里的行；"
+                 "名单、预算、系数表这类跨期的表不写 period，要取当期的值时在表达式里用 period_start() / period_end()"
+                 "（如 month(period_end())）。材料里的口径要求按别的时间范围取数（如累计到当月）时照材料写，拿不准就提问")
     task += pack
     mode = llm.tool_mode
     sys = system_prompt()
@@ -3594,12 +3632,12 @@ def _recheck(ar: AgentResult, paths: dict[str, Path], name: str, rev: str) -> st
     want = ar.results[name][rev]
     try:
         rs = RuleSet.load(paths["rules" if ar.single else f"rules:{name}"])
-        data, _ = apply_mapping(rs, ar.ws.data_files, load_mapping(paths["mapping"]))
+        data, _ = apply_mapping(rs, ar.ws.data_files, load_mapping(paths["mapping"]), ar.ws.period)
         adj = []
         if rev != "R0":
             adj = [Adjustment(**a) for a in yaml.safe_load(paths[f"adjust:{name}:{rev}"].read_text(encoding="utf-8"))]
         refs = {f"{s}/{r}": res for s, revs in ar.results.items() for r, res in revs.items() if s != name}
-        again = compute(rs, data, adj, refs=refs)
+        again = compute(rs, data, adj, refs=refs, period=ar.ws.period)
     except Exception as e:  # 复算失败要如实写进结果，不能当作通过
         return f"{label}复算失败：{e}"
     diff = [i for i, n in want.nodes.items() if i not in again.nodes or again.nodes[i].final != n.final]

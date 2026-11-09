@@ -86,6 +86,9 @@ class DatasetDef(_Base):
     # 明细表 / 关联实体的 link 编号在上级里找不到时：block（默认，阻断并要求问财务）；ignore（财务确认过“查不到的不参与”，
     # 这些行不挂到任何对象上，试算结果里提示有几行）
     unmatched: Literal["block", "ignore"] = "block"
+    # 记业务日期或月份的字段：计算时只取落在这次核算期间里的行（期间在计算时选，规则里不写死月份）。
+    # 名单、预算这类跨期主数据不写，按需要在表达式里用 period_start() / period_end() 取当期
+    period: str | None = None
 
 
 class TierTable(RuleItem):
