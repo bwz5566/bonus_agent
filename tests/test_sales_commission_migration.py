@@ -99,13 +99,13 @@ def test_confirm_does_not_freeze_agent_drafts(tmp_path):
 def test_formal_run_uses_the_pack_binding(tmp_path):
     from bonus_core.cli import main
     out = tmp_path / "result.xlsx"
-    assert main(["run", "--scenario", "sales_commission", "--from-pack", "--out", str(out), str(DATA)]) == 1
+    assert main(["run", "--preview-migrated", "--scenario", "sales_commission", "--from-pack", "--out", str(out), str(DATA)]) == 1
     assert not out.exists()
     _approval(tmp_path)
-    assert main(["run", "--scenario", "sales_commission", "--from-pack", "--rules", "unused", "--mapping", "unused",
+    assert main(["run", "--preview-migrated", "--scenario", "sales_commission", "--from-pack", "--rules", "unused", "--mapping", "unused",
                  "--product-approval", str(tmp_path / "approval.json"), "--out", str(out), str(DATA)]) == 1
     assert not out.exists()
-    assert main(["run", "--scenario", "sales_commission", "--from-pack", "--product-approval",
+    assert main(["run", "--preview-migrated", "--scenario", "sales_commission", "--from-pack", "--product-approval",
                  str(tmp_path / "approval.json"), "--out", str(out), str(DATA)]) == 0
     assert out.exists() and (tmp_path / "result_R2.xlsx").exists()
 
@@ -126,7 +126,7 @@ def test_exploration_does_not_call_the_settlement_gate(tmp_path, monkeypatch):
     monkeypatch.setattr("bonus_agent.scenarios.require_settlement", lambda *args, **kwargs: called.append(args))
     monkeypatch.setattr("bonus_agent.cli._agent", lambda *args, **kwargs: 0)
     from bonus_agent.cli import main
-    assert main(["auto", "--scenario", "sales_commission", "--out", str(tmp_path), "notes.xlsx"]) == 0
+    assert main(["auto", "--explore", "--scenario", "sales_commission", "--out", str(tmp_path), "notes.xlsx"]) == 0
     assert called == []
 
 
@@ -147,7 +147,7 @@ def test_web_records_approval_and_settles_without_calling_the_model(tmp_path):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
     from bonus_agent.web import create_app
-    app = create_app(tmp_path, lambda: pytest.fail("must not call LLM"))
+    app = create_app(tmp_path, lambda: pytest.fail("must not call LLM"), exploration=True)
     store = app.state.store
     store.users.add("owner", "password-123", ["editor", "approver"], "product-owner")
     client = TestClient(app)

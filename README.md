@@ -1,5 +1,28 @@
 # 奖金计算智能体（bonus-agent）
 
+## 当前生产入口：按已发布场景固定计算
+
+生产流程已改为：**选择场景、财务发布版本和期间 → 固定模板校验 → 确定性计算 → 勾稽检查 → 人工确认结果快照**。
+计算期间不调用大模型，不接受临时公式、动态字段映射或人工调整覆盖。对话仅解释已发布规则和已完成结果。
+未收到财务规则的提成、开发、年度场景保持未配置；仓内验收样例不会自动升级为财务正式规则。
+
+```bash
+# 由获授权的发布管理员执行：正向独立期望结果、异常阻断用例都通过后，发布不可覆盖的版本。
+bonus-agent publish-scenario --source 财务规则包目录 --release-dir /srv/bonus/releases --by 财务审批人
+
+# 场景、版本、期间必须明确；同一个 --out 是同一业务批次，重复提交复用，失败恢复不重算已完成步骤。
+bonus-agent auto --scenario annual_bonus --rule-version v1 --period 2026 \
+  --release-dir /srv/bonus/releases --out 本批案卷 本批数据.xlsx
+```
+
+上述 `annual_bonus/v1/2026` 仅示意，必须先由财务规则包验收发布；项目不预置这套业务规则。
+网页使用服务数据目录的 `releases/`，也可以用 `BONUS_SCENARIO_RELEASES_DIR` 指定规则库。
+新建案卷时绑定版本与期间；规则改变需发布新版本并建立新案卷，不能在对话中修改。
+
+规则包结构、发布和恢复方式见 [固定场景运行说明](docs/fixed_scenario_execution.md)。
+下文保留历史开发接口及模型研究说明。旧通用智能体必须显式使用 `--explore`，旧迁入样例计算必须使用
+`--preview-migrated`；它们均不是默认生产入口，也不能代替财务规则发布。
+
 为财务部提供季度奖金、年度奖金、过程奖金等场景的计算服务。核心原则：**大模型只负责读懂规则、匹配表头，所有金额由确定性的计算引擎算出**，每一分钱都能追溯到规则原文和数据行。
 
 当前处于**模型选型阶段**：智能体通过百炼 API 调用千问 3.6 / 3.5 的开源多模态模型（最初计划的 Qwen3-VL 32B / 30B-A3B / 8B 已在百炼下线），用评测脚本对比效果，确定后再私有化部署（只改 `bonus_agent/config/models.yaml` 的 provider）。
@@ -35,12 +58,12 @@ pip install -r requirements-dev.txt    # 开发和跑测试时再装这个（包
 python -m pytest                       # 全部测试应通过
 ```
 
-## 零、全自动模式（推荐先试这个）
+## 零、历史通用模式（仅开发探索）
 
 把一个批次的规则文档（Word / PPT / 图片）和 Excel 数据放进一个文件夹，内容、格式、文件数量都不限：
 
 ```bash
-bonus-agent auto --out 输出目录 本批次文件夹
+bonus-agent auto --explore --scenario annual_bonus --out 开发试算目录 本批次文件夹
 # 例：python evals/cases/annual_2026/make_case.py && bonus-agent auto --out out/annual evals/cases/annual_2026
 ```
 

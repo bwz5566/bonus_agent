@@ -48,6 +48,7 @@ def main(argv=None) -> int:
     p.add_argument("--rules", required=True)
     p.add_argument("data", nargs="+")
     p = sub.add_parser("run")
+    run_parser = p
     p.add_argument("--scenario", required=True)
     p.add_argument("--from-pack", action="store_true",
                    help="正式结算迁入的规则绑定（金额只走 bonus_core）。不能同时再给规则或映射")
@@ -59,12 +60,46 @@ def main(argv=None) -> int:
     p.add_argument("--json", help="同时输出 JSON 结果")
     p.add_argument("data", nargs="+")
     p = sub.add_parser("run-template")
+    template_parser = p
     p.add_argument("--scenario", required=True)
     p.add_argument("--product-approval", help="产品书面批准记录。迁入草稿的模板还必须带同一份批准")
     p.add_argument("--template", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("data", nargs="+")
+    for p in (run_parser, template_parser):
+        p.add_argument("--rule-version", help="已发布固定规则版本")
+        p.add_argument("--period", help="核算期间")
+        p.add_argument("--release-dir")
+        p.add_argument("--preview-migrated", action="store_true", help="仅开发迁入样例试算，不是财务正式结算")
     a = ap.parse_args(argv)
+
+    if a.cmd in {"run", "run-template"} and not a.preview_migrated:
+        from bonus_agent.scenarios.execution import run_fixed
+        from bonus_agent.scenarios.releases import load_release
+        from bonus_agent.infra.storage import atomic_write
+        if not a.rule_version or not a.period:
+            print("固定计算必须指定 --rule-version 和 --period；迁入草稿不能作为正式版本")
+            return 1
+        if a.cmd == "run" and (a.rules or a.mapping or a.adjust):
+            print("固定计算不能传入替代规则、映射或人工调整；请发布新版本")
+            return 1
+        try:
+            release, _, _ = load_release(a.scenario, a.rule_version, a.release_dir)
+            if a.cmd == "run-template" and Path(a.template).resolve() != release:
+                raise ValueError("--template 必须是所选已发布版本的目录")
+            target = Path(a.out)
+            runs = (target.parent / (target.stem + "_runs")) if a.cmd == "run" else target / "runs"
+            run = run_fixed(a.scenario, a.rule_version, a.period, a.data, runs, releases=a.release_dir)
+            dest = target if a.cmd == "run" else target / "result.xlsx"
+            atomic_write(dest, (run.directory / "result.xlsx").read_bytes())
+            atomic_write(dest.with_suffix(".run.json"), (run.directory / "run.json").read_bytes())
+            if getattr(a, "json", None):
+                atomic_write(Path(a.json), json.dumps(run.result.to_dict(), ensure_ascii=False).encode())
+        except (ValueError, OSError, EngineError) as exc:
+            print(f"固定计算失败：{exc}")
+            return 1
+        print(f"{'复用结果' if run.cached else '计算完成'}：{dest}")
+        return 0
 
     if a.cmd == "run" and not a.from_pack and (not a.rules or not a.mapping):
         ap.error("--rules and --mapping are required unless --from-pack")

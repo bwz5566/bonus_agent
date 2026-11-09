@@ -246,7 +246,7 @@ def test_confirm_freezes_template_and_runs_without_llm(tmp_path, monkeypatch):
     shutil.copy(run_case.XLSX, nxt)
     results, _ = Template.load(tpl).run([nxt])
     assert run_case.diff_reference(results, ref) == []
-    assert bonus_main(["run-template", "--scenario", "annual_bonus", "--template", str(tpl), "--out", str(tmp_path / "下期"), str(run_case.XLSX)]) == 0
+    assert bonus_main(["run-template", "--preview-migrated", "--scenario", "annual_bonus", "--template", str(tpl), "--out", str(tmp_path / "下期"), str(run_case.XLSX)]) == 0
     wb = openpyxl.load_workbook(tmp_path / "下期" / "result_QUARTER_R2.xlsx")
     assert dict(wb["确认信息"].iter_rows(min_row=2, values_only=True))["确认人"] == "财务甲"
     with pytest.raises(ConfirmError, match="找不到"):          # 再次确认失败：已确认的模板不能被删掉
