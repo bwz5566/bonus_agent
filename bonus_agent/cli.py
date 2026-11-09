@@ -62,13 +62,22 @@ def main(argv=None) -> int:
     p.add_argument("--model")
     p.add_argument("--no-llm", action="store_true")
     p.add_argument("data", nargs="+")
-    p = sub.add_parser("approve-settlement")
+    scen_dir = dict(help="本机场景目录（放场景包、规则版本和场景记忆），可写多个；也可设环境变量 BONUS_SCENARIO_DIRS")
+    p = sub.add_parser("scenarios", help="列出场景和已发布的规则版本")
+    p.add_argument("--scenario-dir", action="append", default=[], **scen_dir)
+    p = sub.add_parser("publish", help="把已确认的编制案卷发布成场景的下一个规则版本")
     p.add_argument("--scenario", required=True)
-    p.add_argument("--by", required=True, help="产品批准人。这不是财务签发")
-    p.add_argument("--out", help="案卷目录：写入 product_approval.json")
-    p.add_argument("--approval-out", help="批准记录的 JSON 路径")
+    p.add_argument("--out", required=True, help="已确认的案卷目录（里面有 template/）")
+    p.add_argument("--by", required=True, help="发布人")
+    p.add_argument("--note", default="")
+    p.add_argument("--scenario-dir", action="append", default=[], **scen_dir)
+    p = sub.add_parser("compute", help="计算模式：按场景已发布的规则版本算本期数据，不调用大模型")
+    p.add_argument("--scenario", required=True)
+    p.add_argument("--version", help="规则版本，如 v2；不写用最新发布的版本")
+    p.add_argument("--out", required=True, help="结果目录")
+    p.add_argument("--scenario-dir", action="append", default=[], **scen_dir)
+    p.add_argument("data", nargs="+", help="本期数据文件")
     p = sub.add_parser("confirm")
-    p.add_argument("--scenario", required=True)
     p.add_argument("--out", required=True, help="案卷目录")
     p.add_argument("--by", required=True, help="确认人")
     p.add_argument("--note", default="", help="确认说明")
@@ -111,7 +120,9 @@ def main(argv=None) -> int:
     p.add_argument("--display", default="", help="显示的姓名（记入答复人、确认人）")
     p.add_argument("--password-stdin", action="store_true", help="从标准输入读口令（脚本用）")
     p = sub.add_parser("auto")
-    p.add_argument("--scenario", required=True)
+    p.add_argument("--scenario", help="场景（编制模式）：带上场景说明、输入模板检查和场景记忆；不写按通用流程")
+    p.add_argument("--scenario-dir", action="append", default=[], **scen_dir)
+    p.add_argument("--no-memory", action="store_true", help="不使用场景记忆（评测时用，避免沿用以前的答复）")
     p.add_argument("--model")
     p.add_argument("--checker", help="交叉验证（独立复读、独立算式）用的另一个模型，如 qwen-a；不写就用主模型自己验证")
     p.add_argument("--answers", help="财务答复文件（默认读案卷目录里的 questions.yaml）")
@@ -126,13 +137,8 @@ def main(argv=None) -> int:
     p.add_argument("paths", nargs="+", help="本批次的规则文档、Excel 数据，或只包含它们的文件夹")
     a = ap.parse_args(argv)
 
-    if a.cmd in {"auto", "confirm"}:
-        from bonus_agent.scenarios import ScenarioError, load_pack
-        try:
-            load_pack(a.scenario)
-        except ScenarioError as exc:
-            print(f"Scenario rejected: {exc}")
-            return 1
+    if a.cmd in {"scenarios", "publish", "compute"}:
+        return _scenario_cmd(a)
 
     if a.cmd == "user":
         import getpass
@@ -271,28 +277,16 @@ def main(argv=None) -> int:
         m = suggest(rs, [s for f in a.data for s in detect(f)], llm)
         print(yaml.safe_dump({k: v.model_dump(exclude_none=True) for k, v in m.items()}, allow_unicode=True, sort_keys=False))
         return 0
-    if a.cmd == "approve-settlement":
-        from bonus_agent.scenarios import ScenarioError, record_product_approval
-        from bonus_agent.scenarios.binding import BindingError
-        if not a.out and not a.approval_out:
-            print("要写 --out 案卷目录或 --approval-out 记录文件")
-            return 1
-        try:
-            record = record_product_approval(a.scenario, a.by, out=a.out, approval_out=a.approval_out)
-        except (ScenarioError, BindingError) as exc:
-            print(f"不能记录产品批准：{exc}")
-            return 1
-        print(f"已记录产品书面批准（不是财务签发）：{record['scenario']} {record['binding_fingerprint']}")
-        return 0
     if a.cmd == "confirm":
         from bonus_agent.case import ConfirmError, confirm
         try:
-            tpl = confirm(Path(a.out), a.by, a.note, [Path(x) for x in a.data] or None, review=not a.no_review, scenario=a.scenario)
+            tpl = confirm(Path(a.out), a.by, a.note, [Path(x) for x in a.data] or None, review=not a.no_review)
         except ConfirmError as e:
             print(f"不能确认：{e}")
             return 1
         print(f"已确认并冻结为模板：{tpl}（按模板复算，与该轮结果逐分一致）")
         print(f"以后每期：bonus run-template --template {tpl} --out 结果目录 数据文件...")
+        print("属于某个场景时，发布成场景的规则版本：bonus-agent publish --scenario 场景 --out 案卷目录 --by 发布人")
         return 0
     if a.cmd == "auto" and not a.pipeline:
         return _agent(a, cfg)
@@ -337,9 +331,62 @@ def main(argv=None) -> int:
     return 2
 
 
+def _scenario_cmd(a) -> int:
+    from bonus_agent.scenarios import Registry, ScenarioError
+    from bonus_agent.scenarios import releases as rl
+    reg = Registry(a.scenario_dir)
+    try:
+        if a.cmd == "scenarios":
+            for sc in reg.list():
+                rels = reg.releases(sc.id)
+                print(f"{sc.label}：" + ("；".join(r.summary for r in rels) if rels else "还没有发布的规则版本")
+                      + f"\n    场景包 {sc.dir}" + (f"\n    {sc.description.strip()}" if sc.description.strip() else ""))
+            print(f"\n规则版本和场景记忆保存在：{reg.home}")
+            return 0
+        if a.cmd == "publish":
+            from bonus_agent.case import load_case
+            out = Path(a.out)
+            case = load_case(out) or {}
+            if not case.get("confirmed"):
+                print(f"{out} 还没有确认（先 bonus-agent confirm）")
+                return 1
+            qs = yaml.safe_load((out / "questions.yaml").read_text(encoding="utf-8")) if (out / "questions.yaml").exists() else []
+            rel = rl.publish(reg, a.scenario, out / "template", a.by, a.note, source=str(out), questions=qs)
+            print(f"已发布 {reg.get(a.scenario).name} 规则版本 {rel.version}：{rel.dir}")
+            for x in rel.info["acceptance"]:
+                print(f"  验收「{x['id']}」通过：" + "；".join(x["lines"]))
+            return 0
+        c = rl.compute(reg, a.scenario, [Path(x) for x in a.data], a.out, a.version)
+    except rl.InputError as e:
+        print(f"不能计算：{e}\n（检查结果已写入 {Path(a.out) / '输入检查.txt'}）")
+        return 1
+    except ScenarioError as e:
+        print(f"失败：{e}")
+        return 1
+    except Exception as e:      # 计算引擎报的数据问题（如缺列、主键重复）
+        print(f"计算失败：{e}")
+        return 1
+    print(f"按 {c.release.scenario} 规则版本 {c.release.version} 算完（未调用大模型）：")
+    print(c.report.text())
+    for w in c.warnings:
+        print(f"  提醒：{w}")
+    for p in c.written:
+        print(f"  {p}")
+    return 0
+
+
 def _agent(a, cfg) -> int:
     from bonus_agent.agent import ToolError, run_agent
     answers = yaml.safe_load(Path(a.answers).read_text(encoding="utf-8")) if a.answers else None
+    scenario = None
+    if a.scenario:
+        from bonus_agent.scenarios import Registry, ScenarioError
+        from bonus_agent.scenarios.context import prepare
+        try:
+            scenario = prepare(Registry(a.scenario_dir), a.scenario, a.paths, use_memory=not a.no_memory)
+        except ScenarioError as e:
+            print(f"失败：{e}")
+            return 1
     llm = LLM.from_config(a.model, cfg, a.checker)
     hist = cfg["models"][llm.name].get("max_history_chars", 40000)
     print(f"使用模型 {llm.name}，智能体开始工作 ...", flush=True)
@@ -367,7 +414,7 @@ def _agent(a, cfg) -> int:
         ar = run_agent(llm, a.paths, a.out, answers=answers, max_steps=a.max_steps, max_tokens=a.max_tokens,
                        exclude=[a.expected] if a.expected else [],
                        max_history_chars=hist, resume=not a.new,
-                       max_files=a.max_files, on_step=show)
+                       max_files=a.max_files, on_step=show, scenario=scenario)
     except ToolError as e:
         print(f"失败：{e}")
         return 1

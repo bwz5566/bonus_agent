@@ -5,14 +5,19 @@
 数据目录：
   users.yaml                      用户（口令只存 PBKDF2 哈希）和角色
   secret.key                      表单防伪的密钥（首次启动自动生成）
-  cases/<编号>/meta.json          案卷名称、创建人
+  scenarios/<场景>/               本机场景包（scenario.yaml、guide.md 场景说明、输入模板、验收用例），
+                                  以及发布的规则版本 releases/v1…、场景记忆 memory.yaml
+  cases/<编号>/meta.json          案卷名称、创建人、场景和模式（编制 / 计算）
   cases/<编号>/materials/         本笔奖金的材料（规则文档、Excel 数据）
   cases/<编号>/expected/          期望结果（可选，只用来事后核对，不交给智能体）
   cases/<编号>/out/               案卷：case.json、questions.yaml、每轮结果和 history/、确认后的 template/
   cases/<编号>/runs/<时间>/        按模板计算的数据和结果
   cases/<编号>/audit.jsonl        操作记录：谁、什么时候、做了什么（含下载）
 
-角色：editor 传材料、答复问题、运行下一轮、按模板计算；approver 确认结果。所有登录用户都能查看。
+角色：editor 传材料、答复问题、运行下一轮、按模板计算；approver 确认结果、发布规则版本。所有登录用户都能查看。
+
+场景的三种用法：编制（智能体起草规则，财务答复、确认后发布成场景的规则版本）、计算（选已发布的规则版本，换本期数据直接算，
+不调用大模型）、对话（对结果提问）。没有场景的老案卷按通用流程照常使用。
 """
 
 # 不写 from __future__ import annotations：FastAPI 要在运行时解析 create_app 里局部导入的 Request 等类型
@@ -25,11 +30,6 @@ import secrets
 import shutil
 import threading
 import time
-from bonus_agent.scenarios import ScenarioError, list_scenarios, load_pack, require_settlement
-from bonus_agent.scenarios.approval import STATEMENT, record_product_approval, resolve_product_approval
-from bonus_agent.scenarios.binding import BindingError
-from bonus_core.engine.issues import EngineError
-
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -43,7 +43,8 @@ from bonus_agent import review as rv
 from bonus_agent.failure import explain as explain_failure, retryable, to_text
 from bonus_agent.parsing.docs import PARSERS
 
-ROLES = {"editor": "传材料、答复问题、运行、按模板计算", "approver": "确认结果"}
+ROLES = {"editor": "传材料、答复问题、运行、按模板计算", "approver": "确认结果、发布规则版本"}
+MODES = {"author": "编制", "compute": "计算"}
 COOKIE = "bonus_session"
 SESSION_SECONDS = 8 * 3600       # 登录 8 小时后要重新登录
 MAX_FAILURES, LOCK_SECONDS = 5, 300   # 同一用户名 5 分钟内输错 5 次，暂停登录
@@ -51,7 +52,7 @@ ROLE_NAMES = {"editor": "经办", "approver": "审批"}
 DETAIL_NAMES = {"name": "名称", "file": "文件", "new": "从头开始", "round": "轮次", "status": "状态", "error": "错误",
                 "question": "问题", "answer": "答复", "note": "说明", "reason": "原因", "run": "批次", "pools": "奖金池",
                 "data": "数据", "sha256": "sha256", "size": "字节", "template": "模板",
-                "fingerprint": "绑定指纹", "finance_signed": "财务签发"}
+                "scenario": "场景", "mode": "模式", "version": "规则版本", "removed": "删除条数"}
 MAX_UPLOAD = 50 * 1024 * 1024
 CID = re.compile(r"^[0-9a-f]{12}$")
 OTHER = "__other__"
@@ -127,16 +128,22 @@ class Store:
             raise KeyError(cid)
         return d
 
-    def create(self, name: str, by: str, scenario: str) -> str:
-        load_pack(scenario)
+    def create(self, name: str, by: str, scenario: str | None = None, mode: str = "author", memory: bool = True) -> str:
+        """scenario 为空：通用流程（不分场景）。mode：author 编制（智能体起草规则）/ compute 计算（按已发布的规则版本）。"""
+        if mode not in MODES or (mode == "compute" and not scenario):
+            raise ValueError("计算模式要选场景")
         cid = secrets.token_hex(6)
         d = self.root / "cases" / cid
         for sub in ("materials", "expected", "out", "runs"):
             (d / sub).mkdir(parents=True)
-        (d / "meta.json").write_text(json.dumps({"name": name, "scenario": scenario, "created": now(), "created_by": by}, ensure_ascii=False),
-                                     encoding="utf-8")
-        self.audit(cid, by, "新建案卷", name=name)
+        meta = {"name": name, "created": now(), "created_by": by,
+                **({"scenario": scenario, "mode": mode, "memory": memory} if scenario else {})}
+        (d / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        self.audit(cid, by, "新建案卷", name=name, **({"scenario": scenario, "mode": MODES[mode]} if scenario else {}))
         return cid
+
+    def save_meta(self, cid: str, meta: dict) -> None:
+        (self.dir(cid) / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
 
     def meta(self, cid: str) -> dict:
         return json.loads((self.dir(cid) / "meta.json").read_text(encoding="utf-8"))
@@ -210,8 +217,10 @@ class Runner:
     """每个案卷同时只跑一轮；全局最多同时跑 max_parallel 轮（大模型调用量大）。"""
 
     def __init__(self, store: Store, llm_factory: Callable[[], object], max_parallel: int = 2, max_steps: int = 150,
-                 max_tokens: int = 4_000_000, auto_continue: int = 2):
+                 max_tokens: int = 4_000_000, auto_continue: int = 2, registry=None):
+        from bonus_agent.scenarios import Registry
         self.store, self.llm_factory = store, llm_factory
+        self.registry = registry or Registry([store.root / "scenarios"])
         self.auto_continue = auto_continue      # 模型自己卡住时自动接着做的轮数上限（tokens 上限按这一次运行的合计算）
         self.jobs: dict[str, Job] = {}
         self.lock = threading.Lock()
@@ -225,7 +234,8 @@ class Runner:
     def start(self, cid: str, user: str, new: bool = False, message: str | None = None,
               instruction: str | None = None) -> Job:
         """message：对话（提问或修改）；instruction：随上传材料附的说明，按正常一轮处理。"""
-        load_pack(self.store.meta(cid).get("scenario"))
+        if self.store.meta(cid).get("mode") == "compute":
+            raise RuntimeError("计算模式的案卷按已发布的规则版本计算，不运行智能体")
         with self.lock:
             if self.running(cid):
                 raise RuntimeError("这个案卷正在运行，请等本轮结束")
@@ -257,13 +267,18 @@ class Runner:
         from bonus_agent.agent import run_agent
         d = self.store.dir(job.cid)
         try:
+            meta = self.store.meta(job.cid)
+            scenario = None
+            if meta.get("scenario"):          # 编制模式：带上场景说明、输入模板检查和场景记忆
+                from bonus_agent.scenarios.context import prepare
+                scenario = prepare(self.registry, meta["scenario"], [d / "materials"], use_memory=meta.get("memory", True))
             with self.slots:
                 llm = self.llm_factory()
                 ar = run_agent(llm, [d / "materials"], d / "out", resume=not new, max_steps=self.max_steps,
                                max_tokens=self.max_tokens, message=message, by=job.by,
                                chat=self.store.chat(job.cid)[:-1] if message else self.store.chat(job.cid),
                                on_step=lambda n, s: self._step(job, d / "out", n, s), should_stop=lambda: job.cancel,
-                               instruction=instruction)
+                               instruction=instruction, scenario=scenario)
                 auto = 0
                 # 模型自己卡住（写法、原地打转等）而停下：程序自动接着做下一轮（带上停下的原因），有次数上限，不用财务手动点重试
                 while not message and not instruction and auto < self.auto_continue and retryable(ar.error) and not job.cancel:
@@ -275,7 +290,8 @@ class Runner:
                     self.store.audit(job.cid, job.by, "自动接续", round=ar.round + 1)
                     ar = run_agent(llm, [d / "materials"], d / "out", resume=True, max_steps=self.max_steps,
                                    max_tokens=self.max_tokens, by=job.by, chat=self.store.chat(job.cid),
-                                   on_step=lambda n, s: self._step(job, d / "out", n, s), should_stop=lambda: job.cancel)
+                                   on_step=lambda n, s: self._step(job, d / "out", n, s), should_stop=lambda: job.cancel,
+                                   scenario=scenario)
                 expected = sorted((d / "expected").glob("*.xlsx"))
                 if expected and ar.results:
                     from bonus_agent.compare import compare_expected, report
@@ -509,14 +525,18 @@ def review_section(cid: str, out: Path, csrf: str, can_mark: bool) -> str:
 
 
 def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_parallel: int = 2, model_name: str = "",
-               max_steps: int = 150, max_tokens: int = 4_000_000):
+               max_steps: int = 150, max_tokens: int = 4_000_000, scenario_dirs: list[str | Path] | None = None):
+    """scenario_dirs：另外的场景目录（如财务维护的共享目录）；数据目录下的 scenarios/ 总会用上，规则版本和记忆默认写在那里。"""
     from fastapi import Depends, FastAPI, HTTPException, Request
     from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 
     store = Store(Path(root))
-    runner = Runner(store, llm_factory, max_parallel, max_steps, max_tokens)
+    from bonus_agent.scenarios import Registry, ScenarioError
+    from bonus_agent.scenarios import releases as rl
+    registry = Registry([store.root / "scenarios", *(scenario_dirs or [])])
+    runner = Runner(store, llm_factory, max_parallel, max_steps, max_tokens, registry=registry)
     app = FastAPI(title="奖金计算", docs_url=None, redoc_url=None, openapi_url=None)
-    app.state.store, app.state.runner = store, runner
+    app.state.store, app.state.runner, app.state.registry = store, runner, registry
     sessions: dict[str, tuple[str, float]] = {}            # 会话号 -> (用户名, 到期时间)；服务重启后要重新登录
     failures: dict[str, list[float]] = {}                   # 用户名 -> 最近登录失败的时间
     app.state.sessions = sessions
@@ -609,17 +629,45 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
     def back(cid: str, msg: str = "") -> RedirectResponse:
         return RedirectResponse(f"/cases/{cid}" + (f"?msg={msg}" if msg else ""), status_code=303)
 
+    def scenarios() -> tuple[list, str]:
+        try:
+            return registry.list(), ""
+        except ScenarioError as err:          # 某个场景包写错了：照样能打开案卷，页面上说明
+            return [], str(err)
+
+    def scenario_label(m: dict) -> str:
+        sid = m.get("scenario")
+        if not sid:
+            return "通用"
+        try:
+            name = registry.get(sid).name
+        except ScenarioError:
+            name = sid
+        return f"{name} · {MODES.get(m.get('mode', 'author'), '')}"
+
     @app.get("/", response_class=HTMLResponse)
     def index(u: dict = Depends(user)):
-        rows = "".join(f"<tr><td><a href='/cases/{cid}'>{e(m['name'])}</a></td><td>{status_text(c)}</td>"
+        rows = "".join(f"<tr><td><a href='/cases/{cid}'>{e(m['name'])}</a></td><td>{e(scenario_label(m))}</td>"
+                       f"<td>{status_text(c) if m.get('mode') != 'compute' else '<span class=mut>计算</span>'}</td>"
                        f"<td class='mut'>{e(m['created_by'])} · {e(m['created'][:16])}</td></tr>" for cid, m, c in store.cases())
-        options = "".join(
-            f"<option value='{e(x)}'>{e(x)} ({e(load_pack(x).metadata.status)})</option>" for x in list_scenarios())
-        new = form("/cases", "<input type='text' name='name' placeholder='如 2026 年 Q3 季度奖' required> "
-                             "<select name='scenario' required><option value=''>请选择场景</option>" + options + "</select>"
+        scs, bad = scenarios()
+        vers = {sc.id: registry.releases(sc.id) for sc in scs}
+        srows = "".join(f"<tr><td><a href='/scenarios/{e(sc.id)}'>{e(sc.name)}</a></td>"
+                        f"<td>{e(vers[sc.id][-1].version + f'（共 {len(vers[sc.id])} 个）') if vers[sc.id] else '<span class=mut>还没有发布</span>'}</td>"
+                        f"<td class='mut'>{e(sc.description)}</td></tr>" for sc in scs)
+        options = "".join(f"<option value='{e(sc.id)}'>{e(sc.name)}</option>" for sc in scs)
+        new = form("/cases", "<p><input type='text' name='name' placeholder='如 2026 年 9 月提成' required></p>"
+                             "<p>场景 <select name='scenario'>" + options + "<option value=''>通用（不分场景）</option></select> "
+                             "<label><input type='radio' name='mode' value='author' checked> 编制：智能体读材料起草规则</label> "
+                             "<label><input type='radio' name='mode' value='compute'> 计算：按已发布的规则版本直接算</label></p>"
+                             "<p><label class='mut'><input type='checkbox' name='memory' value='1' checked> 编制时参考场景记忆"
+                             "（以前确认过的口径；评测时可取消）</label></p>"
                              "<p><button>新建案卷</button></p>", u["csrf"]) if "editor" in u["roles"] else ""
-        body = (f"<h1>案卷</h1><section><div class='wrap'><table><tr><th>名称</th><th>状态</th><th>创建</th></tr>{rows}</table></div>"
+        body = (f"<h1>案卷</h1><section><div class='wrap'><table><tr><th>名称</th><th>场景</th><th>状态</th><th>创建</th></tr>{rows}</table></div>"
                 + ("" if rows else "<p class='mut'>还没有案卷</p>") + "</section>"
+                + f"<section><h2>场景</h2>" + (f"<p class='bad'>{e(bad)}</p>" if bad else "")
+                + f"<div class='wrap'><table><tr><th>场景</th><th>最新规则版本</th><th>说明</th></tr>{srows}</table></div>"
+                  f"<p class='mut'>场景包放在 {e(store.root / 'scenarios')}（每个场景一个文件夹：scenario.yaml、guide.md 场景说明）</p></section>"
                 + (f"<section><h2>新建</h2>{new}</section>" if new else ""))
         return page("案卷", body, u)
 
@@ -630,11 +678,50 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         name = str(f.get("name", "")).strip()[:100]
         if not name:
             raise HTTPException(400, "请填写名称")
+        sid, mode = str(f.get("scenario", "")).strip() or None, str(f.get("mode", "author"))
         try:
-            cid = store.create(name, u["display"], str(f.get("scenario", "")))
-        except ScenarioError as exc:
-            raise HTTPException(400, str(exc)) from None
+            if sid:
+                registry.get(sid)
+                if mode == "compute":
+                    rl.get_release(registry, sid)
+            cid = store.create(name, u["display"], sid, mode, memory=f.get("memory") == "1")
+        except (ScenarioError, ValueError) as err:
+            raise HTTPException(400, str(err)) from None
         return back(cid)
+
+    def compute_sections(cid: str, m: dict, u: dict) -> list[str]:
+        """计算模式的案卷：选规则版本、传本期数据、按输入模板检查后直接算（不调用大模型），历次计算的结果。"""
+        d, csrf = case_dir(cid), u["csrf"]
+        sid = m["scenario"]
+        try:
+            sc, rels = registry.get(sid), registry.releases(sid)
+        except ScenarioError as err:
+            return [f"<section class='warn'>{e(err)}</section>"]
+        head = (f"<p>场景：<a href='/scenarios/{e(sid)}'>{e(sc.name)}</a> · 计算模式（按已发布的规则版本直接算，不调用大模型）</p>"
+                + ("" if rels else "<p class='bad'>这个场景还没有发布的规则版本，先新建“编制”案卷起草并发布</p>"))
+        if rels and "editor" in u["roles"]:
+            opts = "".join(f"<option value='{e(r.version)}'{' selected' if r is rels[-1] else ''}>{e(r.summary)}</option>"
+                           for r in reversed(rels))
+            head += form(f"/cases/{cid}/compute", f"<p>规则版本 <select name='version'>{opts}</select></p>"
+                                                  "<p><input type='file' name='files' multiple required> <button>检查并计算</button></p>"
+                                                  "<p class='mut'>先按输入模板检查本期数据（表、列、数字格式），有错误不计算；"
+                                                  "通过后按所选版本计算，结果可下载。</p>", csrf, upload=True)
+        runs = sorted((d / "runs").glob("*"), reverse=True)
+        body = ""
+        for r in runs:
+            info = json.loads((r / "run.json").read_text(encoding="utf-8")) if (r / "run.json").exists() else {}
+            check = (r / "输入检查.txt").read_text(encoding="utf-8") if (r / "输入检查.txt").exists() else ""
+            err = (r / "错误.txt").read_text(encoding="utf-8") if (r / "错误.txt").exists() else ""
+            state = (f"<span class='ok'>按 {e(info.get('version'))} 算完</span>" if info else "<span class='bad'>没有算出结果</span>")
+            body += (f"<details{' open' if r == runs[0] else ''}><summary>{e(r.name)} {state}</summary>"
+                     + (f"<pre>{e(err)}</pre>" if err else "") + (f"<pre>{e(check)}</pre>" if check else "")
+                     + files_table(r, f"/cases/{cid}/dl/runs/{r.name}") + "</details>")
+        log = store.audit_log(cid)[-30:][::-1]
+        rows = "".join(f"<tr><td class='mut'>{e(a['at'][5:16].replace('T', ' '))}</td><td>{e(a['user'])}</td><td>{e(a['action'])}</td>"
+                       f"<td class='mut'>{e(detail(a))}</td></tr>" for a in log)
+        return [f"<section><h2>计算</h2>{head}</section>",
+                f"<section><h2>计算结果</h2>{body or '<p class=mut>还没有计算</p>'}</section>",
+                f"<section><h2>操作记录</h2><div class='wrap'><table>{rows}</table></div></section>"]
 
     @app.get("/cases/{cid}", response_class=HTMLResponse)
     def view(cid: str, request: Request, u: dict = Depends(user)):
@@ -646,6 +733,11 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         parts = [f"<h1>{e(m['name'])}</h1>"]
         if msg:
             parts.append(f"<section class='warn'>{e(msg)}</section>")
+        if m.get("mode") == "compute":
+            return page(m["name"], "".join(parts + compute_sections(cid, m, u)), u)
+        if m.get("scenario"):
+            parts.append(f"<p class='mut'>场景：<a href='/scenarios/{e(m['scenario'])}'>{e(scenario_label(m))}</a>"
+                         + ("" if m.get("memory", True) else "（不参考场景记忆）") + "</p>")
         last = (case or {}).get("rounds", [{}])[-1] if case else {}
         info = f"<p>{status_text(case)}</p>"
         if last.get("summary"):
@@ -745,35 +837,9 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         parts.append(f"<section><h2>本轮输出</h2>{res}</section>")
         # 确认
         conf = (case or {}).get("confirmed")
-        try:
-            scenario_status = load_pack(m.get("scenario")).metadata.status
-        except ScenarioError:
-            scenario_status = ""
-        if scenario_status == "migrated_draft":
-            try:
-                approval = resolve_product_approval(load_pack(m.get("scenario")), out=out)
-                approval_text = ("已记录产品书面批准，绑定指纹 "
-                                 + approval["binding_fingerprint"][:12]
-                                 + "。这不是财务签发。") if approval else "尚未记录产品书面批准。试算仍可进行，正式结算未开放。"
-            except BindingError as exc:
-                approval, approval_text = None, f"产品批准记录无效：{exc}"
-            migrated = (f"<p>{e(approval_text)}</p><p class='mut'>{e(STATEMENT)}</p>")
-            if approver and not busy and approval is None:
-                migrated += form(f"/cases/{cid}/product-approval",
-                                 "<p><button>记录产品书面批准</button></p>", csrf)
-            if approver and not busy and approval is not None:
-                migrated += form(f"/cases/{cid}/settle",
-                                 "<p><input type='file' name='files' multiple required> "
-                                 "<button>按迁入规则正式结算</button></p>"
-                                 "<p class='mut'>金额只由计算引擎产生。这不是财务签发。</p>",
-                                 csrf, upload=True)
-            parts.append(f"<section><h2>迁入规则</h2>{migrated}</section>")
-        cbody = (f"<p>场景 {e(m.get('scenario') or '')}（{e(scenario_status or '未登记')}）</p>"
-                 + ((f"<p class='ok'>已确认：第 {e(conf['round'])} 轮，{e(conf['by'])}，{e(conf['at'][:16])}"
-                     + (f"，{e(conf['note'])}" if conf.get("note") else "") + "</p>") if conf else "<p class='mut'>尚未确认</p>"))
-        if scenario_status == "migrated_draft":
-            cbody += "<p class='mut'>迁入草稿不能把智能体试算轮次冻结成正式规则。正式结算使用上面的产品书面批准。</p>"
-        elif approver and not busy and last.get("status") == "OK" and not last.get("confirmed"):
+        cbody = (f"<p class='ok'>已确认：第 {e(conf['round'])} 轮，{e(conf['by'])}，{e(conf['at'][:16])}"
+                 + (f"，{e(conf['note'])}" if conf.get("note") else "") + "</p>") if conf else "<p class='mut'>尚未确认</p>"
+        if approver and not busy and last.get("status") == "OK" and not last.get("confirmed"):
             cbody += form(f"/cases/{cid}/confirm", "<p><input type='text' name='note' placeholder='确认说明（可选）'></p>"
                                                    f"<p><button>确认第 {e(last['n'])} 轮结果并冻结为模板</button></p>", csrf)
         if (out / rv.FILE).exists():
@@ -782,6 +848,17 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
                       + (f"，{len(st['wrong'])} 行有误" if st["wrong"] else "") + "（全部确认后才能确认结果）</p>")
         cbody += "<p class='mut'>确认前会核对口径单已逐条确认、输出文件没被改过，并按模板复算、与该轮结果逐分一致。确认后每期换数据直接按模板计算，不再调用大模型。</p>"
         parts.append(f"<section><h2>确认</h2>{cbody}</section>")
+        if m.get("scenario") and conf and (out / "template" / "manifest.yaml").exists():
+            pub = [x for x in m.get("published") or [] if x.get("confirmed_at") == conf.get("at")]
+            if pub:
+                pbody = f"<p class='ok'>已发布为规则版本 {e(pub[-1]['version'])}（{e(pub[-1]['by'])}，{e(pub[-1]['at'][:16])}）</p>"
+            else:
+                pbody = "<p class='mut'>还没有发布。发布后，这个场景以后每期新建“计算”案卷、换数据直接按这个版本算；" \
+                        "本案卷里已答复的问题会记为场景记忆，下次编制时参考。</p>"
+                if approver and not busy:
+                    pbody += form(f"/cases/{cid}/publish", "<p><input type='text' name='note' placeholder='版本说明（可选，如 2026 年 9 月起适用）'></p>"
+                                                           "<p><button>发布为场景的新规则版本</button></p>", csrf)
+            parts.append(f"<section><h2>发布规则版本</h2>{pbody}</section>")
         if (out / "template" / "manifest.yaml").exists():
             tbody = form(f"/cases/{cid}/template", "<p><input type='file' name='files' multiple> <button>按模板计算</button></p>",
                          csrf, upload=True) if editor else ""
@@ -913,7 +990,7 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
                 rv.mark_sent(d / "out")
                 return back(cid)
             runner.start(cid, u["display"], new=f.get("new") == "1")
-        except (RuntimeError, ScenarioError) as err:
+        except RuntimeError as err:
             raise HTTPException(409, str(err)) from None
         return back(cid)
 
@@ -953,60 +1030,9 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
                 runner.start(cid, u["display"], instruction=text)
             else:
                 runner.start(cid, u["display"], message=text)
-        except (RuntimeError, ScenarioError) as err:
+        except RuntimeError as err:
             raise HTTPException(409, str(err)) from None
         return back(cid)
-
-    @app.post("/cases/{cid}/product-approval")
-    async def product_approval(cid: str, request: Request, u: dict = Depends(user)):
-        need(u, "approver")
-        d = case_dir(cid)
-        await posted(request, u)
-        try:
-            record = record_product_approval(store.meta(cid).get("scenario"), u["display"], out=d / "out")
-        except (ScenarioError, BindingError) as exc:
-            return back(cid, f"不能记录产品批准：{exc}")
-        store.audit(cid, u["display"], "记录产品书面批准", fingerprint=record["binding_fingerprint"],
-                    finance_signed=False)
-        return back(cid, "已记录产品书面批准（不是财务签发）")
-
-    @app.post("/cases/{cid}/settle")
-    async def settle(cid: str, request: Request, u: dict = Depends(user)):
-        from bonus_agent.scenarios.settle import SettlementError, settle_bound
-        need(u, "approver")
-        d = case_dir(cid)
-        f = await posted(request, u)
-        scenario = store.meta(cid).get("scenario")
-        try:
-            require_settlement(scenario, out=d / "out")
-        except ScenarioError as exc:
-            raise HTTPException(400, str(exc)) from None
-        run_dir = d / "runs" / (datetime.now().strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(2))
-        (run_dir / "data").mkdir(parents=True)
-        saved = []
-        for item in [item for item in f.getlist("files") if getattr(item, "filename", "")]:
-            try:
-                name = safe_name(item.filename)
-            except ValueError as err:
-                shutil.rmtree(run_dir)
-                raise HTTPException(400, str(err)) from None
-            payload = await item.read(MAX_UPLOAD + 1)
-            if len(payload) > MAX_UPLOAD:
-                shutil.rmtree(run_dir)
-                raise HTTPException(413, f"{name} 超过 {MAX_UPLOAD // 1024 // 1024} MB")
-            (run_dir / "data" / name).write_bytes(payload)
-            saved.append(run_dir / "data" / name)
-        if not saved:
-            shutil.rmtree(run_dir)
-            return back(cid, "没有选择数据文件")
-        try:
-            settle_bound(scenario, saved, run_dir / "result.xlsx", case_out=d / "out")
-        except (SettlementError, BindingError, EngineError, ValueError, OSError) as exc:
-            (run_dir / "错误.txt").write_text(str(exc), encoding="utf-8")
-            store.audit(cid, u["display"], "迁入规则结算失败", error=str(exc)[:500])
-            return back(cid, f"正式结算失败：{exc}")
-        store.audit(cid, u["display"], "按迁入规则正式结算", run=run_dir.name, finance_signed=False)
-        return back(cid, "已按迁入规则结算（不是财务签发）")
 
     @app.post("/cases/{cid}/confirm")
     async def confirm(cid: str, request: Request, u: dict = Depends(user)):
@@ -1016,7 +1042,7 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         f = await posted(request, u)
         note = str(f.get("note", "")).strip()[:500]
         try:
-            tpl = cs.confirm(d / "out", by=u["display"], note=note, scenario=store.meta(cid).get("scenario"))
+            tpl = cs.confirm(d / "out", by=u["display"], note=note)
         except cs.ConfirmError as err:
             store.audit(cid, u["display"], "确认被拒绝", reason=str(err))
             return back(cid, f"不能确认：{err}")
@@ -1029,13 +1055,9 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         from bonus_core.template import Template
         need(u, "editor")
         d = case_dir(cid)
-        f = await posted(request, u)
-        try:
-            require_settlement(store.meta(cid).get("scenario"), out=d / "out")
-        except ScenarioError as exc:
-            raise HTTPException(400, str(exc)) from None
         run_dir = d / "runs" / (datetime.now().strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(2))
         (run_dir / "data").mkdir(parents=True)
+        f = await posted(request, u)
         saved = []
         for x in [x for x in f.getlist("files") if getattr(x, "filename", "")]:
             try:
@@ -1063,6 +1085,114 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         store.audit(cid, u["display"], "按模板计算", run=run_dir.name, data=dict(saved),
                     pools={f"{n}/{r}": res.pool for _, (n, r, res) in written})
         return back(cid, f"已算出 {len(written)} 个结果，见“按模板计算”的 {run_dir.name}")
+
+    @app.post("/cases/{cid}/publish")
+    async def publish(cid: str, request: Request, u: dict = Depends(user)):
+        need(u, "approver")
+        d = case_dir(cid)
+        idle(cid)
+        f = await posted(request, u)
+        m, case = store.meta(cid), cs.load_case(d / "out") or {}
+        conf = case.get("confirmed")
+        if not m.get("scenario") or not conf:
+            return back(cid, "只有属于某个场景、已经确认的案卷才能发布")
+        if any(x.get("confirmed_at") == conf.get("at") for x in m.get("published") or []):
+            return back(cid, "这次确认的结果已经发布过了")
+        note = str(f.get("note", "")).strip()[:300]
+        try:
+            rel = rl.publish(registry, m["scenario"], d / "out" / "template", u["display"], note,
+                             source=f"案卷「{m['name']}」（{cid}）第 {conf['round']} 轮", questions=load_questions(d / "out"))
+        except ScenarioError as err:
+            store.audit(cid, u["display"], "发布被拒绝", reason=str(err)[:500])
+            return back(cid, f"不能发布：{err}")
+        m.setdefault("published", []).append({"version": rel.version, "by": u["display"], "at": now(), "confirmed_at": conf.get("at")})
+        store.save_meta(cid, m)
+        store.audit(cid, u["display"], "发布规则版本", scenario=m["scenario"], version=rel.version, note=note)
+        return back(cid, f"已发布为规则版本 {rel.version}")
+
+    @app.post("/cases/{cid}/compute")
+    async def compute(cid: str, request: Request, u: dict = Depends(user)):
+        need(u, "editor")
+        d = case_dir(cid)
+        m = store.meta(cid)
+        if m.get("mode") != "compute":
+            raise HTTPException(400, "只有计算模式的案卷能这样算")
+        f = await posted(request, u)
+        run_dir = d / "runs" / (datetime.now().strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(2))
+        saved = await _save_run(run_dir, f)
+        if not saved:
+            return back(cid, "没有选择数据文件")
+        version = str(f.get("version", "")).strip() or None
+        try:
+            c = rl.compute(registry, m["scenario"], [run_dir / "data" / n for n, _ in saved], run_dir, version)
+        except Exception as err:   # 输入不符合模板、版本被改、数据缺列等，如实显示
+            (run_dir / "错误.txt").write_text(str(err), encoding="utf-8")
+            store.audit(cid, u["display"], "计算失败", version=version or "", run=run_dir.name, error=str(err)[:500])
+            return back(cid, f"没有算出结果：{str(err).splitlines()[0]}")
+        store.audit(cid, u["display"], "按规则版本计算", version=c.release.version, run=run_dir.name, data=dict(saved),
+                    pools={f"{n}/{r}": res.pool for n, revs in c.results.items() for r, res in revs.items()})
+        return back(cid, f"已按 {c.release.version} 算出 {len(c.written)} 个结果")
+
+    async def _save_run(run_dir: Path, f) -> list[tuple[str, str]]:
+        (run_dir / "data").mkdir(parents=True)
+        saved = []
+        for x in [x for x in f.getlist("files") if getattr(x, "filename", "")]:
+            try:
+                name = safe_name(x.filename)
+            except ValueError as err:
+                shutil.rmtree(run_dir)
+                raise HTTPException(400, str(err)) from None
+            data = await x.read(MAX_UPLOAD + 1)
+            if len(data) > MAX_UPLOAD:
+                shutil.rmtree(run_dir)
+                raise HTTPException(413, f"{name} 超过 {MAX_UPLOAD // 1024 // 1024} MB")
+            (run_dir / "data" / name).write_bytes(data)
+            saved.append((name, hashlib.sha256(data).hexdigest()))
+        if not saved:
+            shutil.rmtree(run_dir)
+        return saved
+
+    @app.get("/scenarios/{sid}", response_class=HTMLResponse)
+    def scenario_page(sid: str, u: dict = Depends(user)):
+        from bonus_agent.scenarios.inputs import template_text
+        try:
+            sc = registry.get(sid)
+            guide = sc.guide_text()
+        except ScenarioError as err:
+            raise HTTPException(404, str(err)) from None
+        rels = registry.releases(sid)
+        vrows = "".join(
+            f"<tr><td>{e(r.version)}</td><td>{e(r.info.get('published_by', ''))}</td><td class='mut'>{e(str(r.info.get('published_at', ''))[:16])}</td>"
+            f"<td>{e(r.info.get('note', ''))}</td><td class='mut'>{e(r.info.get('source', ''))}</td>"
+            f"<td class='mut'>{e('；'.join(('通过 ' if a['ok'] else '未通过 ') + a['id'] for a in r.info.get('acceptance') or []) or '无验收用例')}</td></tr>"
+            for r in reversed(rels))
+        mem = registry.memory(sid).items()
+        approver = "approver" in u["roles"]
+        mrows = "".join(f"<div class='q'>" + (f"<label><input type='checkbox' name='del' value='{e(x['id'])}'> 删除</label> " if approver else "")
+                        + f"<b>问：</b>{e(x['question'])}<div><b>答：</b>{e(x['answer'])} "
+                        f"<span class='mut'>（{e(x.get('version', ''))}，{e(x.get('by', ''))}）</span></div></div>" for x in mem)
+        if mem and approver:
+            mrows = form(f"/scenarios/{sid}/memory/delete", mrows + "<p><button>删除选中的记忆</button></p>", u["csrf"])
+        body = (f"<h1>{e(sc.name)}</h1><section><p>{e(sc.description)}</p><p class='mut'>场景包：{e(sc.dir)}</p>"
+                f"<p class='mut'>规则版本和记忆：{e(registry.data_dir(sid))}</p></section>"
+                f"<section><h2>场景说明</h2>" + (f"<pre>{e(guide)}</pre>" if guide else "<p class='mut'>还没有场景说明（guide.md）</p>") + "</section>"
+                f"<section><h2>输入模板</h2>" + (f"<pre>{e(template_text(sc))}</pre>" if sc.inputs else "<p class='mut'>还没有输入模板，计算前不做格式检查</p>") + "</section>"
+                f"<section><h2>规则版本</h2>" + (f"<div class='wrap'><table><tr><th>版本</th><th>发布人</th><th>时间</th><th>说明</th><th>来源</th><th>验收</th></tr>{vrows}</table></div>"
+                                              if rels else "<p class='mut'>还没有发布</p>") + "</section>"
+                f"<section><h2>场景记忆</h2><p class='mut'>发布规则版本时记下的、财务确认过的口径，编制时交给智能体参考。</p>"
+                + (mrows or "<p class='mut'>还没有</p>") + "</section>")
+        return page(sc.name, body, u)
+
+    @app.post("/scenarios/{sid}/memory/delete")
+    async def memory_delete(sid: str, request: Request, u: dict = Depends(user)):
+        need(u, "approver")
+        f = await posted(request, u)
+        try:
+            registry.get(sid)
+        except ScenarioError as err:
+            raise HTTPException(404, str(err)) from None
+        registry.memory(sid).remove([str(x) for x in f.getlist("del")])
+        return RedirectResponse(f"/scenarios/{sid}", status_code=303)
 
     @app.get("/cases/{cid}/dl/{area}/{rel:path}")
     def download(cid: str, area: str, rel: str, u: dict = Depends(user)):

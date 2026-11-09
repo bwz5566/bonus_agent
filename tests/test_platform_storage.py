@@ -11,7 +11,7 @@ from bonus_agent.infra.storage import ObjectStore, SQLiteStateStore
 from bonus_agent.mcp import MCPClient
 from bonus_agent.memory import Memory
 from bonus_agent.memory.context_manifest import build_context_manifest
-from bonus_agent.scenarios import PackSchema, list_scenarios, load_pack
+from bonus_agent.scenarios import Registry, Scenario
 from bonus_agent.skills import SkillRegistry, allowed
 
 
@@ -141,35 +141,30 @@ def test_memory_layers_are_durable_and_scoped(tmp_path):
 # ---- skills / MCP allowlists -----------------------------------------------
 
 def _pack(tools=(), mcp=()):
-    base = load_pack("annual_bonus")
-    meta = base.metadata.model_copy(update={"allowed_tools": list(tools), "allowed_mcp": list(mcp)})
-    return base.model_copy(update={"metadata": meta})
+    return Scenario(id="demo", name="示例", tools=list(tools), mcp=list(mcp))
 
 
-@pytest.mark.parametrize("scenario", list_scenarios())
-def test_existing_packs_default_to_empty_allowlists(scenario):
-    meta = load_pack(scenario).metadata
-    assert meta.allowed_tools == [] and meta.allowed_mcp == []
-    assert meta.status == ("migrated_draft" if scenario == "sales_commission" else "pending_finance")
+def test_builtin_scenarios_default_to_empty_allowlists():
+    scs = Registry(builtin=True, home="/nonexistent").list()
+    assert scs and all(sc.tools == [] and sc.mcp == [] for sc in scs)
 
 
-def test_pack_schema_still_forbids_unknown_fields():
+def test_scenario_schema_forbids_unknown_fields():
     with pytest.raises(Exception):
-        PackSchema.model_validate({"schema_version": 1, "scenario": "x", "status": "pending_finance",
-                                   "todo": "TODO", "allow_everything": True})
+        Scenario.model_validate({"id": "x", "name": "x", "allow_everything": True})
 
 
 def test_skill_call_requires_pack_allowlist():
     reg = SkillRegistry()
     reg.register("profile_sheet", lambda path: f"profiled {path}")
     reg.register("list_files", lambda: ["a"])
-    for pack in (None, load_pack("annual_bonus"), _pack(tools=["other"])):
+    for pack in (None, _pack(), _pack(tools=["other"])):
         with pytest.raises(PermissionError):
             reg.call("profile_sheet", {"path": "x"}, pack=pack)
         assert reg.call("list_files", {}, pack=pack) == ["a"]      # global read-only probe
     assert reg.call("profile_sheet", {"path": "x"}, pack=_pack(tools=["profile_sheet"])) == "profiled x"
     assert [s.name for s in reg.available(_pack(tools=["profile_sheet"]))] == ["profile_sheet", "list_files"]
-    assert allowed("profile_sheet", _pack(tools=["profile_sheet"]).metadata)
+    assert allowed("profile_sheet", _pack(tools=["profile_sheet"]))
 
 
 def test_mcp_call_requires_exact_server_tool():
@@ -181,7 +176,7 @@ def test_mcp_call_requires_exact_server_tool():
             return "ok"
 
     client = MCPClient(Transport())
-    for pack in (None, load_pack("annual_bonus"), _pack(mcp=["files"]), _pack(tools=["files/read"])):
+    for pack in (None, _pack(), _pack(mcp=["files"]), _pack(tools=["files/read"])):
         with pytest.raises(PermissionError):
             client.call("files", "read", {}, pack=pack)
     with pytest.raises(PermissionError):

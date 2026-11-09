@@ -1,7 +1,0 @@
-status: migrated_draft
-todo: TODO
-finance_signed: false
-source: bonus_core.engine.run.Result
-levels: [部门, 小组, 个人]
-metrics: [final, cap, paid, held, offset, overpaid]
-revisions_from: scheme

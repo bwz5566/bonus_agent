@@ -2761,14 +2761,17 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
               on_step: Callable[[int, Step], None] | None = None, resume: bool = True,
               should_stop: Callable[[], bool] | None = None, instruction: str | None = None,
               message: str | None = None, by: str = "", chat: list[dict] | None = None,
-              reflect: int = MAX_REFLECT, deep: int = DEEP_LIMIT) -> AgentResult:
+              reflect: int = MAX_REFLECT, deep: int = DEEP_LIMIT, scenario=None) -> AgentResult:
     """max_steps 和 max_tokens 都是安全上限：模型调用 finish 就结束，正常不会用满。
     reflect：卡住时在本轮内反思、换做法的次数上限（清掉打转的对话历史，带上卡在哪、试过什么，工作区保留），用完再停下。
     deep：按需深度思考的步数上限。平时不思考；上一步出错、被拦下、原样重复或停下来反思后，下一步先分析错在哪、
     该怎么改（附一段分析提示，模型支持时同时打开思考），成功了就切回普通模式。0 表示不用。
 
     out_dir 是案卷目录：里面已有上一轮的 case.json 时（resume=True），从上一轮的工作区接着做，
-    财务答复默认读取案卷里的 questions.yaml。"""
+    财务答复默认读取案卷里的 questions.yaml。
+    scenario：场景（scenarios.context.AgentScenario）。场景说明作为材料一起读，场景信息（输入模板检查、场景记忆）放进任务说明。"""
+    if scenario is not None:
+        paths = list(paths) + list(scenario.files)
     try:
         files = collect_files(paths, exclude=([out_dir] if out_dir else []) + list(exclude), max_files=max_files)
     except (TooManyFiles, FileNotFoundError) as e:
@@ -2829,6 +2832,8 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         task += (f"\n\n财务附的说明（必须照做；不明确或与材料冲突时用 ask_question 提问）：{instruction}"
                  f"\n说明里如果有向你提的问题：先查清楚（金额和算式来自 explain / evaluate，不要自己算），"
                  f"用 note 记下回答，topic 写「{ANSWER_NOTE}」，text 写给财务看的回答；然后接着完成这一轮。没有提问就不用记")
+    if scenario is not None and scenario.brief:
+        task += "\n\n" + scenario.brief
     task += pack
     mode = llm.tool_mode
     sys = system_prompt()

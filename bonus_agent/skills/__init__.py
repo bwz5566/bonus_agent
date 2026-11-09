@@ -6,14 +6,13 @@ from typing import Callable
 GLOBAL_READ_ONLY = frozenset({"list_files"})
 
 
-def allowed(name, pack=None, *, mcp=False):
+def allowed(name, scenario=None, *, mcp=False):
+    """全局只读技能总是可用；其他技能和外部服务（MCP，写成 server/tool）要场景的 tools / mcp 里列出才能用。"""
     if not mcp and name in GLOBAL_READ_ONLY:
         return True
-    if pack is None:
+    if scenario is None:
         return False
-    field = "allowed_mcp" if mcp else "allowed_tools"
-    metadata = getattr(pack, "metadata", pack)       # accept ScenarioPack or bare PackSchema
-    return name in (getattr(metadata, field, None) or ())
+    return name in (getattr(scenario, "mcp" if mcp else "tools", None) or ())
 
 
 @dataclass(frozen=True)

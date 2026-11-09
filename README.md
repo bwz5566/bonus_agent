@@ -273,12 +273,8 @@ vllm serve deepseek-ai/DeepSeek-V4-Flash --port 8000 --tensor-parallel-size 4 --
 - 问题分工（按类型指定答复人）、更细的权限
 - LangGraph 状态机与人工确认节点
 
-## Scenario packs — Phase A
+## 场景
 
-See [the pack contract](docs/scenario_pack_contract.md). CLI `auto`, `confirm`,
-`bonus run`, and `bonus run-template` require `--scenario`. Web cases require an
-explicit scenario. `eng_dev_bonus` and `annual_bonus` remain `pending_finance / TODO`.
-`sales_commission` is `migrated_draft`: it binds the in-repo quarter scheme and is
-not finance-signed. Trial runs stay open. Formal settlement needs a product
-written approval, then `bonus run --from-pack`. A later finance mapping replaces
-that binding on conflict.
+每类奖金（提成、开发奖金、年度奖金……）是一个场景，有固定的输入模板和规则：编制模式下智能体按场景说明起草规则，
+财务确认后发布成规则版本；计算模式下按版本直接算，不调用大模型。详见 [docs/scenarios.md](docs/scenarios.md)。
+公司真实的场景说明和数据放在本机场景目录，不进仓库。
