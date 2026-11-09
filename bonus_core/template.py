@@ -85,10 +85,21 @@ class Template:
         if bad:
             raise TemplateError("模板与确认时不一致，拒绝计算：" + "；".join(bad) + "。如需修改规则，请走一轮智能体处理并重新确认")
 
+    def _authorize(self):
+        from bonus_agent.scenarios import ScenarioError, require_settlement
+        from bonus_agent.scenarios.binding import BindingError, assert_template_matches
+        from bonus_agent.scenarios.schema import MigratedPack
+        pack = require_settlement(self.manifest.get("scenario"), self.manifest.get("product_approval"))
+        if pack is not None and isinstance(pack.metadata, MigratedPack):
+            try:
+                assert_template_matches(self.dir, self.manifest, pack)
+            except BindingError as exc:
+                raise ScenarioError(str(exc)) from exc
+        return pack
+
     def run(self, data_files: list[str | Path]) -> tuple[dict[str, dict[str, Result]], list[Issue]]:
         """按顺序计算每个方案的基准结果和各修订，被引用的方案结果传给引用它的方案。"""
-        from bonus_agent.scenarios import require_settlement
-        require_settlement(self.manifest.get("scenario"))
+        self._authorize()
         mapping = rebind_files(load_mapping(self.dir / self.manifest["mapping"]), data_files)
         out: dict[str, dict[str, Result]] = {}
         refs: dict[str, Result] = {}
@@ -111,8 +122,7 @@ class Template:
 
     def write(self, results: dict[str, dict[str, Result]], out: str | Path) -> list[tuple[Path, tuple[str, str, Result]]]:
         """每个方案（修订）写一个结果 Excel，附「确认信息」。返回 [(文件, (方案, 修订, 结果))]。"""
-        from bonus_agent.scenarios import require_settlement
-        require_settlement(self.manifest.get("scenario"))
+        self._authorize()
         from bonus_core.engine.ledger import ledger_entries
         from bonus_core.report.excel import write_excel
         c = self.manifest["confirmed"]

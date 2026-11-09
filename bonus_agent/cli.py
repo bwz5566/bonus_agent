@@ -62,6 +62,11 @@ def main(argv=None) -> int:
     p.add_argument("--model")
     p.add_argument("--no-llm", action="store_true")
     p.add_argument("data", nargs="+")
+    p = sub.add_parser("approve-settlement")
+    p.add_argument("--scenario", required=True)
+    p.add_argument("--by", required=True, help="产品批准人。这不是财务签发")
+    p.add_argument("--out", help="案卷目录：写入 product_approval.json")
+    p.add_argument("--approval-out", help="批准记录的 JSON 路径")
     p = sub.add_parser("confirm")
     p.add_argument("--scenario", required=True)
     p.add_argument("--out", required=True, help="案卷目录")
@@ -265,6 +270,19 @@ def main(argv=None) -> int:
         llm = None if a.no_llm else LLM.from_config(a.model, cfg)
         m = suggest(rs, [s for f in a.data for s in detect(f)], llm)
         print(yaml.safe_dump({k: v.model_dump(exclude_none=True) for k, v in m.items()}, allow_unicode=True, sort_keys=False))
+        return 0
+    if a.cmd == "approve-settlement":
+        from bonus_agent.scenarios import ScenarioError, record_product_approval
+        from bonus_agent.scenarios.binding import BindingError
+        if not a.out and not a.approval_out:
+            print("要写 --out 案卷目录或 --approval-out 记录文件")
+            return 1
+        try:
+            record = record_product_approval(a.scenario, a.by, out=a.out, approval_out=a.approval_out)
+        except (ScenarioError, BindingError) as exc:
+            print(f"不能记录产品批准：{exc}")
+            return 1
+        print(f"已记录产品书面批准（不是财务签发）：{record['scenario']} {record['binding_fingerprint']}")
         return 0
     if a.cmd == "confirm":
         from bonus_agent.case import ConfirmError, confirm

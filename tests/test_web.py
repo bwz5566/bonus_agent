@@ -55,8 +55,8 @@ def wait(app, cid):
 
 def test_web_rounds_confirm_and_template(env, monkeypatch):
     # Exercise legacy freeze mechanics in isolation; production gate tested separately.
-    monkeypatch.setattr("bonus_agent.scenarios.require_settlement", lambda scenario: None)
-    monkeypatch.setattr("bonus_agent.web.require_settlement", lambda scenario: None)
+    monkeypatch.setattr("bonus_agent.scenarios.require_settlement", lambda *args, **kwargs: None)
+    monkeypatch.setattr("bonus_agent.web.require_settlement", lambda *args, **kwargs: None)
     app, store, scripts, c, m = env
     r = c.get("/cases/x", follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/login?next=/cases/x"     # 没登录先去登录页

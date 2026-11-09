@@ -49,26 +49,48 @@ def main(argv=None) -> int:
     p.add_argument("data", nargs="+")
     p = sub.add_parser("run")
     p.add_argument("--scenario", required=True)
-    p.add_argument("--rules", required=True)
-    p.add_argument("--mapping", required=True)
+    p.add_argument("--from-pack", action="store_true",
+                   help="正式结算迁入的规则绑定（金额只走 bonus_core）。不能同时再给规则或映射")
+    p.add_argument("--product-approval", help="产品书面批准记录。设置了状态目录时，目录里的决定才是权威")
+    p.add_argument("--rules")
+    p.add_argument("--mapping")
     p.add_argument("--out", required=True)
     p.add_argument("--adjust")
     p.add_argument("--json", help="同时输出 JSON 结果")
     p.add_argument("data", nargs="+")
     p = sub.add_parser("run-template")
     p.add_argument("--scenario", required=True)
+    p.add_argument("--product-approval", help="产品书面批准记录。迁入草稿的模板还必须带同一份批准")
     p.add_argument("--template", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("data", nargs="+")
     a = ap.parse_args(argv)
 
+    if a.cmd == "run" and not a.from_pack and (not a.rules or not a.mapping):
+        ap.error("--rules and --mapping are required unless --from-pack")
     if a.cmd in {"run", "run-template"}:
         from bonus_agent.scenarios import ScenarioError, require_settlement
         try:
-            require_settlement(a.scenario)
+            pack = require_settlement(a.scenario, getattr(a, "product_approval", None))
         except ScenarioError as exc:
             print(f"Settlement rejected: {exc}")
             return 1
+        if a.cmd == "run" and pack.metadata.status == "migrated_draft":
+            if not a.from_pack or a.rules or a.mapping or a.adjust:
+                print("Settlement rejected: migrated_draft formal settlement must use --from-pack "
+                      "without alternate rules, mapping, or adjustments.")
+                return 1
+            from bonus_agent.scenarios.settle import SettlementError, settle_bound
+            try:
+                results = settle_bound(a.scenario, a.data, a.out, a.product_approval)
+            except (SettlementError, EngineError, AdjustConflict) as exc:
+                print(f"Settlement rejected: {exc}")
+                return 1
+            print(f"migrated_draft settlement via bonus_core; finance_signed=false; wrote {a.out}")
+            if a.json:
+                payload = {name: result.to_dict() for name, result in results.items()}
+                Path(a.json).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            return 0
         if a.cmd == "run-template":
             return _run_template(a)
 
@@ -121,11 +143,21 @@ def main(argv=None) -> int:
 
 
 def _run_template(a) -> int:
+    from bonus_agent.scenarios import ScenarioError
     from bonus_core.template import Template, TemplateError
     try:
         tpl = Template.load(a.template)
+        if tpl.manifest.get("scenario") not in (None, a.scenario):
+            print("Settlement rejected: template scenario does not match --scenario")
+            return 1
+        supplied = getattr(a, "product_approval", None)
+        if supplied and tpl.manifest.get("product_approval"):
+            from bonus_agent.scenarios.approval import _body, _coerce
+            if _body(_coerce(supplied)) != _body(tpl.manifest["product_approval"]):
+                print("Settlement rejected: --product-approval does not match the template record")
+                return 1
         results, warnings = tpl.run(a.data)
-    except (TemplateError, EngineError, AdjustConflict) as e:
+    except (TemplateError, EngineError, AdjustConflict, ScenarioError) as e:
         print(f"计算失败：{e}")
         return 1
     for i in warnings:

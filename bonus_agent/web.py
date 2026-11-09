@@ -26,6 +26,9 @@ import shutil
 import threading
 import time
 from bonus_agent.scenarios import ScenarioError, list_scenarios, load_pack, require_settlement
+from bonus_agent.scenarios.approval import STATEMENT, record_product_approval, resolve_product_approval
+from bonus_agent.scenarios.binding import BindingError
+from bonus_core.engine.issues import EngineError
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -47,7 +50,8 @@ MAX_FAILURES, LOCK_SECONDS = 5, 300   # 同一用户名 5 分钟内输错 5 次�
 ROLE_NAMES = {"editor": "经办", "approver": "审批"}
 DETAIL_NAMES = {"name": "名称", "file": "文件", "new": "从头开始", "round": "轮次", "status": "状态", "error": "错误",
                 "question": "问题", "answer": "答复", "note": "说明", "reason": "原因", "run": "批次", "pools": "奖金池",
-                "data": "数据", "sha256": "sha256", "size": "字节", "template": "模板"}
+                "data": "数据", "sha256": "sha256", "size": "字节", "template": "模板",
+                "fingerprint": "绑定指纹", "finance_signed": "财务签发"}
 MAX_UPLOAD = 50 * 1024 * 1024
 CID = re.compile(r"^[0-9a-f]{12}$")
 OTHER = "__other__"
@@ -609,7 +613,8 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
     def index(u: dict = Depends(user)):
         rows = "".join(f"<tr><td><a href='/cases/{cid}'>{e(m['name'])}</a></td><td>{status_text(c)}</td>"
                        f"<td class='mut'>{e(m['created_by'])} · {e(m['created'][:16])}</td></tr>" for cid, m, c in store.cases())
-        options = "".join(f"<option value='{e(x)}'>{e(x)} (pending_finance)</option>" for x in list_scenarios())
+        options = "".join(
+            f"<option value='{e(x)}'>{e(x)} ({e(load_pack(x).metadata.status)})</option>" for x in list_scenarios())
         new = form("/cases", "<input type='text' name='name' placeholder='如 2026 年 Q3 季度奖' required> "
                              "<select name='scenario' required><option value=''>请选择场景</option>" + options + "</select>"
                              "<p><button>新建案卷</button></p>", u["csrf"]) if "editor" in u["roles"] else ""
@@ -740,9 +745,35 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         parts.append(f"<section><h2>本轮输出</h2>{res}</section>")
         # 确认
         conf = (case or {}).get("confirmed")
-        cbody = (f"<p class='ok'>已确认：第 {e(conf['round'])} 轮，{e(conf['by'])}，{e(conf['at'][:16])}"
-                 + (f"，{e(conf['note'])}" if conf.get("note") else "") + "</p>") if conf else "<p class='mut'>尚未确认</p>"
-        if approver and not busy and last.get("status") == "OK" and not last.get("confirmed"):
+        try:
+            scenario_status = load_pack(m.get("scenario")).metadata.status
+        except ScenarioError:
+            scenario_status = ""
+        if scenario_status == "migrated_draft":
+            try:
+                approval = resolve_product_approval(load_pack(m.get("scenario")), out=out)
+                approval_text = ("已记录产品书面批准，绑定指纹 "
+                                 + approval["binding_fingerprint"][:12]
+                                 + "。这不是财务签发。") if approval else "尚未记录产品书面批准。试算仍可进行，正式结算未开放。"
+            except BindingError as exc:
+                approval, approval_text = None, f"产品批准记录无效：{exc}"
+            migrated = (f"<p>{e(approval_text)}</p><p class='mut'>{e(STATEMENT)}</p>")
+            if approver and not busy and approval is None:
+                migrated += form(f"/cases/{cid}/product-approval",
+                                 "<p><button>记录产品书面批准</button></p>", csrf)
+            if approver and not busy and approval is not None:
+                migrated += form(f"/cases/{cid}/settle",
+                                 "<p><input type='file' name='files' multiple required> "
+                                 "<button>按迁入规则正式结算</button></p>"
+                                 "<p class='mut'>金额只由计算引擎产生。这不是财务签发。</p>",
+                                 csrf, upload=True)
+            parts.append(f"<section><h2>迁入规则</h2>{migrated}</section>")
+        cbody = (f"<p>场景 {e(m.get('scenario') or '')}（{e(scenario_status or '未登记')}）</p>"
+                 + ((f"<p class='ok'>已确认：第 {e(conf['round'])} 轮，{e(conf['by'])}，{e(conf['at'][:16])}"
+                     + (f"，{e(conf['note'])}" if conf.get("note") else "") + "</p>") if conf else "<p class='mut'>尚未确认</p>"))
+        if scenario_status == "migrated_draft":
+            cbody += "<p class='mut'>迁入草稿不能把智能体试算轮次冻结成正式规则。正式结算使用上面的产品书面批准。</p>"
+        elif approver and not busy and last.get("status") == "OK" and not last.get("confirmed"):
             cbody += form(f"/cases/{cid}/confirm", "<p><input type='text' name='note' placeholder='确认说明（可选）'></p>"
                                                    f"<p><button>确认第 {e(last['n'])} 轮结果并冻结为模板</button></p>", csrf)
         if (out / rv.FILE).exists():
@@ -926,6 +957,57 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             raise HTTPException(409, str(err)) from None
         return back(cid)
 
+    @app.post("/cases/{cid}/product-approval")
+    async def product_approval(cid: str, request: Request, u: dict = Depends(user)):
+        need(u, "approver")
+        d = case_dir(cid)
+        await posted(request, u)
+        try:
+            record = record_product_approval(store.meta(cid).get("scenario"), u["display"], out=d / "out")
+        except (ScenarioError, BindingError) as exc:
+            return back(cid, f"不能记录产品批准：{exc}")
+        store.audit(cid, u["display"], "记录产品书面批准", fingerprint=record["binding_fingerprint"],
+                    finance_signed=False)
+        return back(cid, "已记录产品书面批准（不是财务签发）")
+
+    @app.post("/cases/{cid}/settle")
+    async def settle(cid: str, request: Request, u: dict = Depends(user)):
+        from bonus_agent.scenarios.settle import SettlementError, settle_bound
+        need(u, "approver")
+        d = case_dir(cid)
+        f = await posted(request, u)
+        scenario = store.meta(cid).get("scenario")
+        try:
+            require_settlement(scenario, out=d / "out")
+        except ScenarioError as exc:
+            raise HTTPException(400, str(exc)) from None
+        run_dir = d / "runs" / (datetime.now().strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(2))
+        (run_dir / "data").mkdir(parents=True)
+        saved = []
+        for item in [item for item in f.getlist("files") if getattr(item, "filename", "")]:
+            try:
+                name = safe_name(item.filename)
+            except ValueError as err:
+                shutil.rmtree(run_dir)
+                raise HTTPException(400, str(err)) from None
+            payload = await item.read(MAX_UPLOAD + 1)
+            if len(payload) > MAX_UPLOAD:
+                shutil.rmtree(run_dir)
+                raise HTTPException(413, f"{name} 超过 {MAX_UPLOAD // 1024 // 1024} MB")
+            (run_dir / "data" / name).write_bytes(payload)
+            saved.append(run_dir / "data" / name)
+        if not saved:
+            shutil.rmtree(run_dir)
+            return back(cid, "没有选择数据文件")
+        try:
+            settle_bound(scenario, saved, run_dir / "result.xlsx", case_out=d / "out")
+        except (SettlementError, BindingError, EngineError, ValueError, OSError) as exc:
+            (run_dir / "错误.txt").write_text(str(exc), encoding="utf-8")
+            store.audit(cid, u["display"], "迁入规则结算失败", error=str(exc)[:500])
+            return back(cid, f"正式结算失败：{exc}")
+        store.audit(cid, u["display"], "按迁入规则正式结算", run=run_dir.name, finance_signed=False)
+        return back(cid, "已按迁入规则结算（不是财务签发）")
+
     @app.post("/cases/{cid}/confirm")
     async def confirm(cid: str, request: Request, u: dict = Depends(user)):
         need(u, "approver")
@@ -949,7 +1031,7 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         d = case_dir(cid)
         f = await posted(request, u)
         try:
-            require_settlement(store.meta(cid).get("scenario"))
+            require_settlement(store.meta(cid).get("scenario"), out=d / "out")
         except ScenarioError as exc:
             raise HTTPException(400, str(exc)) from None
         run_dir = d / "runs" / (datetime.now().strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(2))

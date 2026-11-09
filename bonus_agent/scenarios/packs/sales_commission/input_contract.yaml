@@ -1,2 +1,20 @@
-status: pending_finance
+status: migrated_draft
 todo: TODO
+finance_signed: false
+provenance: evals/cases/syn_acceptance/datasets.yaml
+mapping_provenance: evals/cases/syn_acceptance/mapping.yaml
+datasets:
+  部门: [dept_id, dept_name]
+  小组: [group_id, dept_id, group_name, perf_q3]
+  员工: [employee_id, group_id, employee_name, join_date]
+  项目: [project_id, group_id, region, contract_date, difficulty]
+  销售明细: [sales_id, project_id, recognition_date, sales_amount, cost_amount, expense_amount]
+  回款明细: [receipt_id, sales_id, receipt_date, receipt_amount]
+  项目参与: [employee_id, project_id, share]
+  绩效评分: [employee_id, period, contribution_score, output_score, approved]
+  部门目标: [dept_id, period, sales_target]
+  小组目标: [group_id, period, sales_target]
+  个人目标: [employee_id, period, sales_target]
+excluded_datasets: [里程碑, 历史已发]
+excluded_fields:
+  小组: [perf_fy]
