@@ -901,7 +901,7 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             _, mapping = definitions(runner.releases / meta["scenario"] / meta["rule_version"], spec)
             parts.append("<details><summary>本版本固定数据格式</summary>" + "".join(
                 f"<p>{e(name)}：工作表 {e(m.sheet)}，第 {m.header_rows[0]} 行表头；列顺序：{e('、'.join(m.columns.values()))}</p>"
-                for name, m in mapping.items()) + "</details>")
+                for name, m in mapping.items()) + "<p>输入表请提供经财务确认的原始数值；禁止 Excel 公式取缓存值，衍生字段由已发布规则计算。</p></details>")
         except ValueError:
             parts.append("<p class='warn'>未配置已发布规则，不能计算。财务需提供固定模板、规则和独立验收结果，验收发布后新建绑定版本的案卷。</p>")
         job = runner.jobs.get(cid)

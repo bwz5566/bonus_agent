@@ -5,12 +5,14 @@ These are synthetic finance acceptance materials, not production bonus policies.
 import json
 from pathlib import Path
 import threading
+import zipfile
+import xml.etree.ElementTree as ET
 
 import openpyxl
 import pytest
 import yaml
 
-from bonus_agent.scenarios.releases import ReleaseError, publish, load_release, versions
+from bonus_agent.scenarios.releases import FormulaInputError, ReleaseError, publish, load_release, versions
 from bonus_agent.scenarios.execution import run_fixed, Ledger, RunBusy
 from bonus_core.engine.run import Engine
 
@@ -230,6 +232,115 @@ def test_assistant_cannot_write_or_loop_forever(released):
     llm = FakeLLM([{"tool": "describe_scenario"}])
     assert "上限" in answer(llm, "annual_bonus", "v1", "规则是什么", releases=releases, max_steps=2)
     assert len(llm.calls) == 2
+
+
+def formula_workbook(source, destination, *, cell="B2", cached="600", formula="9000"):
+    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    with zipfile.ZipFile(source) as original, zipfile.ZipFile(destination, "w") as modified:
+        for item in original.infolist():
+            data = original.read(item.filename)
+            if item.filename == "xl/worksheets/sheet2.xml":
+                sheet = ET.fromstring(data)
+                target = sheet.find(f'.//{{{ns}}}c[@r="{cell}"]')
+                target.attrib.pop("t", None)
+                for child in list(target):
+                    target.remove(child)
+                ET.SubElement(target, f"{{{ns}}}f").text = formula
+                if cached is not None:
+                    ET.SubElement(target, f"{{{ns}}}v").text = cached
+                data = ET.tostring(sheet)
+            modified.writestr(item, data)
+
+
+@pytest.mark.parametrize("cached", ["600", "9000", None])
+def test_formula_input_blocks_cached_fresh_and_missing_values_before_compute(released, tmp_path, monkeypatch, cached):
+    source, releases = released
+    data = tmp_path / "data.xlsx"
+    formula_workbook(source / "valid.xlsx", data, cached=cached)
+    monkeypatch.setattr(Engine, "compute", lambda *a, **kw: pytest.fail("never calculate using formula caches"))
+    with pytest.raises(FormulaInputError, match="销售!B2") as exc:
+        run_fixed("annual_bonus", "v1", "2026-Q3", [data], tmp_path / "batch", releases=releases)
+    assert exc.value.code == "formula_input"
+    assert not list((tmp_path / "batch").rglob("result.xlsx"))
+
+
+def test_publication_rejects_formula_acceptance_and_accepts_explicit_formula_negative(tmp_path):
+    source = fixture_package(tmp_path / "source")
+    replacement = tmp_path / "replacement.xlsx"
+    formula_workbook(source / "valid.xlsx", replacement)
+    original = (source / "valid.xlsx").read_bytes()
+    (source / "valid.xlsx").write_bytes(replacement.read_bytes())
+    releases = tmp_path / "releases"
+    with pytest.raises(ReleaseError, match="公式"):
+        publish(source, releases, "finance")
+    assert not (releases / "annual_bonus" / "v1").exists()
+    (source / "valid.xlsx").write_bytes(original)
+    (source / "formula.xlsx").write_bytes(replacement.read_bytes())
+    spec = yaml.safe_load((source / "release.yaml").read_text())
+    spec["cases"].append({"id": "stale_formula", "data": ["formula.xlsx"], "error_code": "formula_input"})
+    (source / "release.yaml").write_text(yaml.safe_dump(spec))
+    publish(source, releases, "finance")
+
+
+@pytest.mark.parametrize("cell", ["A1", "B4"])
+def test_formula_scan_includes_headers_and_hidden_rows(released, tmp_path, cell):
+    source, releases = released
+    hidden = tmp_path / "hidden.xlsx"
+    workbook = openpyxl.load_workbook(source / "valid.xlsx")
+    workbook["销售"].row_dimensions[4].hidden = True
+    workbook["销售"].column_dimensions["B"].hidden = True
+    workbook.save(hidden)
+    data = tmp_path / "data.xlsx"
+    formula_workbook(hidden, data, cell=cell)
+    with pytest.raises(FormulaInputError, match=f"销售!{cell}"):
+        run_fixed("annual_bonus", "v1", "2026-Q3", [data], tmp_path / "batch", releases=releases)
+
+
+@pytest.mark.parametrize("mode", ["native", "json"])
+@pytest.mark.parametrize("query", [False, True])
+def test_assistant_renders_only_engine_evidence_never_model_amounts(released, tmp_path, mode, query):
+    from bonus_agent.scenarios.assistant import answer
+    source, releases = released
+    result = run_fixed("annual_bonus", "v1", "2026-Q3", [source / "valid.xlsx"], tmp_path / "batch", releases=releases).result
+    class Forged:
+        tool_mode = mode
+        calls = 0
+
+        def chat_tools(self, *a, **kw):
+            self.calls += 1
+            return {"content": "本次实发999999元，已修改公式。", "tool_calls":
+                    [{"id": "q", "name": "explain_object", "arguments": '{"node_id":"个人:E2"}'}]
+                    if query and self.calls == 1 else []}
+
+        def chat(self, *a, **kw):
+            response = self.chat_tools()
+            return json.dumps({"tool": "explain_object", "args": {"node_id": "个人:E2"}}
+                              if response["tool_calls"] else {"answer": response["content"]})
+
+    text = answer(Forged(), "annual_bonus", "v1", "E2发多少", releases=releases, result=result)
+    assert "999999" not in text and "已修改公式" not in text
+    if query:
+        assert "个人:E2" in text and "本次实发：150.00 元" in text
+        assert "应得：200.00 元" in text
+    else:
+        assert "未取得可核验" in text
+
+
+def test_assistant_without_result_cannot_invent_amounts(released):
+    from bonus_agent.llm import FakeLLM
+    from bonus_agent.scenarios.assistant import answer
+    _, releases = released
+    text = answer(FakeLLM(["本次实发999999元"]), "annual_bonus", "v1", "发多少", releases=releases)
+    assert "尚未计算" in text and "999999" not in text
+
+
+def test_assistant_does_not_echo_forged_tool_names_or_query_parameters(released):
+    from bonus_agent.llm import FakeLLM
+    from bonus_agent.scenarios.assistant import answer
+    _, releases = released
+    llm = FakeLLM([{"tool": "本次实发999999元"}])
+    text = answer(llm, "annual_bonus", "v1", "查金额", releases=releases)
+    assert "未授权工具" in text and "999999" not in text
 
 
 def test_production_web_uses_fixed_rules_and_read_only_chat(released, tmp_path):

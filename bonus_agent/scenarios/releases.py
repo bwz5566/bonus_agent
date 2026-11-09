@@ -18,6 +18,7 @@ import tempfile
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 import yaml
+import openpyxl
 
 from bonus_agent.infra.storage import atomic_write, canonical, fingerprint
 from bonus_core.data.mapping import DatasetMapping, apply_mapping, rebind_files
@@ -136,12 +137,47 @@ class InputContractError(ReleaseError):
     code = "input_contract"
 
 
+class FormulaInputError(InputContractError):
+    code = "formula_input"
+
+
+def reject_formulas(mapping, files):
+    """A cached Excel result cannot prove that a formula has been recalculated.
+
+    Inspect declared source sheets in formula mode before any cached-value read.
+    Derived fields must be calculated by the approved rules from raw values.
+    """
+    by_name = {p.name: p for p in files}
+    sheets = {}
+    for m in mapping.values():
+        if m.file in by_name:
+            sheets.setdefault(m.file, set()).add(m.sheet)
+    for filename, names in sheets.items():
+        workbook = openpyxl.load_workbook(by_name[filename], read_only=True, data_only=False)
+        try:
+            for name in sorted(names):
+                if name not in workbook.sheetnames:
+                    raise InputContractError(f"{filename} 缺少已发布模板工作表 {name}")
+                sheet = workbook[name]
+                # Do not trust producer-provided dimension metadata to hide cells.
+                sheet.reset_dimensions()
+                for row in sheet.iter_rows():
+                    for cell in row:
+                        if cell.data_type == "f":
+                            raise FormulaInputError(
+                                f"{filename}/{name}!{cell.coordinate} 含 Excel 公式，禁止读取可能过期的缓存值；"
+                                "请提供经财务确认的原始数值，衍生字段由已发布规则计算")
+        finally:
+            workbook.close()
+
+
 def map_fixed(rs, mapping, files):
     """Exact single-header contracts, then the existing typed/foreign-key checks."""
     files = [Path(p) for p in files]
     if not files or len({p.name for p in files}) != len(files):
         raise InputContractError("输入不能为空，且文件名不能重复")
     mapping = rebind_files(mapping, files)
+    reject_formulas(mapping, files)
     by_name = {p.name: p for p in files}
     used = set()
     for name, m in mapping.items():
