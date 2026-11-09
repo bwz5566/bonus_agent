@@ -212,7 +212,7 @@ def test_confirm_freezes_template_and_runs_without_llm(tmp_path, monkeypatch):
     from bonus_core.cli import main as bonus_main
     from bonus_core.template import Template, TemplateError
     # Isolate existing freeze/engine mechanics from the Phase A publication gate.
-    monkeypatch.setattr("bonus_agent.scenarios.require_settlement", lambda scenario: None)
+    monkeypatch.setattr("bonus_agent.scenarios.require_settlement", lambda *args, **kwargs: None)
     out = tmp_path / "案卷"
     pending = run_agent(FakeLLM(_script(blocking=True)), [run_case.XLSX], out)
     assert pending.status == "NEEDS_CONFIRMATION"

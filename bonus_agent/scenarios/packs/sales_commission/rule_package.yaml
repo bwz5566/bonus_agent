@@ -1,2 +1,38 @@
-status: pending_finance
+status: migrated_draft
 todo: TODO
+finance_signed: false
+primary_scheme: QUARTER
+override_policy: finance_mapped_rules_replace_migrated_instances
+finance_overlay: null
+scheme:
+  path: evals/cases/syn_acceptance/rules/rules_QUARTER.yaml
+shared_library:
+  path: evals/cases/syn_acceptance/rules/shared.yaml
+  tables: [R_REGION, R_MARGIN, R_COMPLETION]
+  variables:
+    - new_coef
+    - q_sales
+    - q_cost
+    - q_net
+    - q_recv
+    - q_eff
+    - d_eff_q
+    - d_sales_q
+    - d_net_q
+    - d_coef_q
+    - g_w_q
+    - avg_diff
+    - n_proj
+    - attrib_q
+    - attrib_recv_q
+    - e_w_q
+  checks: [share_sum, score_approved, score_range, target_dept, target_group, target_emp, receipt_le_sales]
+excluded_schemes:
+  - evals/cases/syn_acceptance/rules/rules_PROCESS.yaml
+  - evals/cases/syn_acceptance/rules/rules_ANNUAL.yaml
+separate_pack_todo:
+  - pack_id: process_bonus
+    origin: evals/cases/syn_acceptance/rules/rules_PROCESS.yaml
+    reason: >-
+      One pack binds one primary scheme. Process award stays out of
+      sales_commission and waits for its own pack. Do not bind it here.

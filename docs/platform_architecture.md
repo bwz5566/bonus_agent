@@ -85,8 +85,17 @@ V1 **不强制**：Kafka、向量库、微服务拆分；向量检索可后加�
 | 缓存 | `infra/cache/__init__.py` | 全指纹键 + scope；`authorized=False` 一律不命中；校验和不符不命中；缓存只存引用，不作结算依据 |
 | 记忆 | `memory/__init__.py` | working/episodic/long_term 三层，值进 ObjectStore，索引进 StateStore（`memory_items`），支持 TTL |
 | 上下文注入 | `memory/context_manifest.py` | 白名单投影：只含 ID、状态、轮次、待决问题 ID、检查点 id/run/step/fingerprint；不遍历明细行、金额、答复值、记忆值 |
-| 场景白名单 | `scenarios/__init__.py` | `PackSchema.allowed_tools` / `allowed_mcp`，默认空列表；现有三个 `pending_finance` 包无需改 yaml；仍 `extra=forbid` |
+| 场景白名单 | `scenarios/__init__.py` | `PackSchema.allowed_tools` / `allowed_mcp`，默认空列表；仍 `extra=forbid`。`eng_dev_bonus` 与 `annual_bonus` 保持 `pending_finance`。`sales_commission` 为 `migrated_draft` |
 | Skill / MCP | `skills/__init__.py`、`mcp/__init__.py` | 默认拒绝；无场景时只放行全局只读 `list_files`；MCP 需精确 `server/tool`，只写 server 不放行 |
 | 测试 | `tests/test_platform_storage.py` | 重启恢复/指纹不符、案卷接缝、缓存未授权不命中、manifest 不含明细、记忆隔离、Skill/MCP 拒绝 |
 
 仍未做：PostgreSQL / Redis 适配器（接口已按 `StateStore` 协议预留）；`RuleLibrary` 占位；agent 内部节点级（非轮次级）检查点与基于检查点的跳步续跑。
+
+## 7. 迁入草稿的产品书面批准
+
+`sales_commission` 的正式结算不把包标成 `published`。批准记录的 `kind` 是
+`product_settlement_approval`，`finance_signed` 固定为 false，并带当前绑定指纹。
+
+- 未设置 `BONUS_AGENT_STATE_DIR` 时，案卷输出目录里的 `product_approval.json` 是结构化记录。
+- 设置了该目录时，同一条记录追加进 `decisions`（`case_id` 为 `scenario:<pack>`）。状态库是权威；文件必须带上同一 `decision_id`，正文不一致就拒绝结算。
+- 聊天摘要和网页提示不是批准。试算不读这条记录。
