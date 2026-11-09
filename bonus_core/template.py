@@ -87,6 +87,8 @@ class Template:
 
     def run(self, data_files: list[str | Path]) -> tuple[dict[str, dict[str, Result]], list[Issue]]:
         """按顺序计算每个方案的基准结果和各修订，被引用的方案结果传给引用它的方案。"""
+        from bonus_agent.scenarios import require_settlement
+        require_settlement(self.manifest.get("scenario"))
         mapping = rebind_files(load_mapping(self.dir / self.manifest["mapping"]), data_files)
         out: dict[str, dict[str, Result]] = {}
         refs: dict[str, Result] = {}
@@ -109,6 +111,8 @@ class Template:
 
     def write(self, results: dict[str, dict[str, Result]], out: str | Path) -> list[tuple[Path, tuple[str, str, Result]]]:
         """每个方案（修订）写一个结果 Excel，附「确认信息」。返回 [(文件, (方案, 修订, 结果))]。"""
+        from bonus_agent.scenarios import require_settlement
+        require_settlement(self.manifest.get("scenario"))
         from bonus_core.engine.ledger import ledger_entries
         from bonus_core.report.excel import write_excel
         c = self.manifest["confirmed"]
