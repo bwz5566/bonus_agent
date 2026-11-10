@@ -58,14 +58,19 @@ def write_excel(rs: RuleSet, res: Result, path: str | Path, ledger: list[dict] |
         ["奖金池（保留到分）", float(_d(res.pool))],
         ["本期实发合计", float(total_paid)],
         ["本期挂起合计", float(total_held)],
+        *[[f"  其中 挂起：{c.id}", float(sum((_d(p.holds.get(c.id, 0)) for p in res.payouts.values()), Decimal(0)))]
+          for c in rs.payout],
+        *([["应得扣除挂起后（正常发放）", float(sum((_d(p.final) for p in res.payouts.values()), Decimal(0)) - total_held)]]
+          if res.payouts else []),
         ["调整次数", len([a for a in res.adjustments if not a.revoked])],
     ]
     for lv in res.levels:
         cnt = sum(1 for n in nodes.values() if n.level == lv)
         rows.append([f"「{lv}」节点数", cnt])
     ws = _sheet(wb, "汇总", ["项目", "值"], rows, widths={"项目": 22, "值": 30})
-    for r in (3, 4, 5, 6):
-        ws.cell(r, 2).number_format = MONEY
+    for r, row in enumerate(rows, start=2):
+        if isinstance(row[1], float):
+            ws.cell(r, 2).number_format = MONEY
     for title, headers, extra_rows, widths in extra_sheets or []:
         _sheet(wb, title, headers, extra_rows, widths=widths)
 

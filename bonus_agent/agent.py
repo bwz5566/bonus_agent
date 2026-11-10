@@ -30,7 +30,7 @@ from bonus_agent.extract_rules import Extraction, Question, check_quotes, prompt
 from bonus_agent.llm import LLM, LLMError, image_part, parse_json
 from bonus_core.data.mapping import DatasetMapping, apply_mapping
 from bonus_core.data.patches import apply_patches
-from bonus_core.data.table_detect import ROW_ID, add_row_ids, table_at, unpivot_by
+from bonus_core.data.table_detect import ROW_ID, add_row_ids, combine_columns, table_at, unpivot_by
 from bonus_core.dsl.functions import describe as describe_functions
 from bonus_core.dsl.models import DatasetDef, RuleSet, Variable
 from bonus_core.dsl.parser import SELF_COMPARE_HINT, Call, ExprError, Num, parse, self_compares, walk
@@ -190,6 +190,10 @@ TOOLS: list[dict] = [
                                     "可选，写了 period 才有用：取哪段时间的行。period（默认）只取本期；year_to_date 取本期末所在年份年初到本期末；"
                                     "to_date 取本期末及以前全部行。规则要用累计或历史数据（如按年内累计算月均）时用；同一份明细既要当期又要累计，"
                                     "就定义成两张表"},
+                         "combine": {"type": "object", "description":
+                                     '可选：几列合起来才能确定一个对象时（如 月份+客户编码+型号 才是一个项目），合成一个编号列：'
+                                     '{"新列名": ["列1", "列2", ...]}，各段用 | 连接；fields 里用新列名（类型 id），可作 key 或 link。'
+                                     '两张表要按同一组列关联时，两边都按同样的列顺序合成。不要只拿其中一列（如只按型号）去关联'},
                          "unpivot": {"type": "object", "description":
                                      '可选：几列放的是同一类值（如几个角色列各放一个人名）时展开成每个值一行：'
                                      '{"columns": ["列1", "列2"], "value": "展开后的列名", "label": "记原列名的列名，如 角色"}。'
@@ -912,7 +916,7 @@ class Workspace:
         for i, r in enumerate(ws.iter_rows(values_only=True), start=1):
             total = i
             if start_row <= i < start_row + rows:
-                cells = ["" if v is None else str(v).replace("\n", " ")[:30] for v in r]
+                cells = [_cell(v) for v in r]
                 while cells and cells[-1] == "":
                     cells.pop()
                 out.append(f"第{i}行 | " + " | ".join(cells))
@@ -1152,7 +1156,8 @@ class Workspace:
     def define_dataset(self, name: str, file: str, sheet: str, fields: dict | None = None, key: str | None = None,
                        link: str | None = None, desc: str = "", header_rows: list[int] | None = None,
                        filter: dict | None = None, distinct: bool = False, unpivot: dict | None = None,
-                       unmatched: str = "block", period: str | None = None, window: str = "period") -> str:
+                       unmatched: str = "block", period: str | None = None, window: str = "period",
+                       combine: dict | None = None) -> str:
         reuse = ""
         if not fields:      # 重新定义时只改 key / link / filter：沿用上一次的字段（模型常只写要改的部分，反复因缺 fields 失败）
             fields = self._prev_fields.get(name)
@@ -1160,14 +1165,15 @@ class Workspace:
                 raise ToolError(f"缺少 fields（字段名 -> {{column, type}}）。「{name}」之前没有定义成功过，要写全字段")
             reuse = f"没写 fields，沿用上一次定义「{name}」时的 {len(fields)} 个字段"
         out = self._define_dataset(name, file, sheet, fields, key, link, desc, header_rows, filter, distinct, unpivot, unmatched,
-                                   period, window)
+                                   period, window, combine)
         self._prev_fields[name] = fields
         return out + (f"\n{reuse}" if reuse else "")
 
     def _define_dataset(self, name: str, file: str, sheet: str, fields: dict, key: str | None = None,
                         link: str | None = None, desc: str = "", header_rows: list[int] | None = None,
                         filter: dict | None = None, distinct: bool = False, unpivot: dict | None = None,
-                        unmatched: str = "block", period: str | None = None, window: str = "period") -> str:
+                        unmatched: str = "block", period: str | None = None, window: str = "period",
+                       combine: dict | None = None) -> str:
         f = self._file(file)
         try:
             st = table_at(f, sheet, header_rows) if header_rows else self.inv.sheet(f"{f.name}/{sheet}")
@@ -1179,6 +1185,9 @@ class Workspace:
         spec = _unpivot_spec(unpivot, st) if unpivot else None
         if spec:
             st = unpivot_by(st, spec)
+        comb = _combine_spec(combine, st) if combine else None
+        if comb:
+            st = combine_columns(st, comb)
         if isinstance(fields, dict) and any(isinstance(d, dict) and d.get("column") == ROW_ID for d in fields.values()):
             st = add_row_ids(st)
         if getattr(raw, "unsure", None):      # 另一段表头对不上第一段、又没法按列名对回：用到这些列就不能保存
@@ -1251,6 +1260,8 @@ class Workspace:
                                "to_date": f"{self.period.end} 及以前的行"}[window] if self.period else "；本次没有指定核算期间，全部行都参与"))
         if spec:
             m.unpivot = spec
+        if comb:
+            m.combine = comb
         prev = (self.datasets.get(name), self.mapping.get(name))
         self.datasets[name], self.mapping[name] = d, m
         bad, loose = self._link_mismatch(name)
@@ -1359,6 +1370,8 @@ class Workspace:
             return []
         if m.unpivot:
             st = unpivot_by(st, m.unpivot)
+        if m.combine:
+            st = combine_columns(st, m.combine)
         if ROW_ID in m.columns.values():
             st = add_row_ids(st)
         st, _ = filter_sheet(st, m.filter or None)
@@ -2293,6 +2306,10 @@ class Workspace:
             found = self._answer_in_material(text, options or [])
             if found:
                 return found
+        own = self._own_numbers(text)
+        if own:
+            text = (text + f"\n（程序提示：问题里的 {'、'.join(own)} 是智能体在规则里自己写的数，材料和数据里都找不到；"
+                    "请按材料原文判断，不要只看推荐答案）")
         q = Question(id=_next_qid(self.questions), text=text, options=options or [], suggested=suggested,
                      related=related, blocking=blocking, round=self.round)
         self.questions.append(q)
@@ -2300,6 +2317,23 @@ class Workspace:
             return (f"已记录问题 {q.id}，等财务答复。不要自行选择口径或补出算法；"
                     "继续做不受影响的部分，全部问完后调用 finish 结束本轮")
         return f"已记录提示 {q.id}（不影响金额，不必等答复）"
+
+    def _own_numbers(self, text: str) -> list[str]:
+        """问题里出现、规则常数里有、但材料原文和数据里都没有的数（多半是智能体给空值或查不到时自己设的占位数）。
+        T2：给空毛利率填了 −99，又拿“最低 −9900%”当数据事实去问，财务照推荐项确认了。"""
+        consts = set()
+        for s in self.schemes:
+            try:
+                consts |= {lint._key(abs(n)) for n, _ in lint.constants(self._ruleset(s))}
+            except Exception:
+                continue
+        if not consts:
+            return []
+        base = "\n".join([*(l for f in self.inv.files if f.suffix.lower() not in DATA_SUFFIXES for l in self._lines(f.name)),
+                          *self.inv.sheet_text.values(), self.said])
+        known = lint.material_numbers(base)
+        asked = lint.material_numbers(text)
+        return sorted(k for k in asked & consts if k not in known and Decimal(k) not in lint.FREE)
 
     def _answer_in_material(self, text: str, options: list[str]) -> str:
         """提问前先查原文：让交叉验证模型只看材料（规则文档、财务答复、参数表，不含数据行）找能直接回答这个问题的原文。
@@ -2835,6 +2869,8 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     ws.period = period_obj
     if period_obj is not None:
         rnd["period"] = period_obj.label
+    rnd["model"] = getattr(llm, "name", "") or ""
+    rnd["code"] = _code_version()
     # 上一轮没存下工作区（如中途崩溃）时，财务在 questions.yaml 里填的答复也要带上，不能丢
     if answers is None and out is not None and (out / "questions.yaml").exists():
         answers = yaml.safe_load((out / "questions.yaml").read_text(encoding="utf-8")) or []
@@ -3332,6 +3368,34 @@ def _temp_wording(parts: dict, corpus) -> str:
     return ""
 
 
+CELL_CHARS = 120
+
+
+def _cell(v) -> str:
+    """读表时一个格子的文字。太长的截断，但要标出原长度，免得被当成数据本身就这样（T2：编号截断后看着像对不上）。"""
+    if v is None:
+        return ""
+    t = str(v).replace("\n", " ")
+    return t if len(t) <= CELL_CHARS else f"{t[:CELL_CHARS]}…（共{len(t)}字，已截断）"
+
+
+def _combine_spec(spec, st) -> dict[str, list[str]]:
+    """校验 define_dataset 的 combine：{"新列名": ["列1", "列2", ...]}，几列合成一个编号（如项目 = 月份+客户+型号）。"""
+    if not isinstance(spec, dict) or not spec or not all(isinstance(v, list) for v in spec.values()):
+        raise ToolError('combine 的格式是 {"新列名": ["列1", "列2"]}，几列合成一个编号列，fields 里用新列名')
+    out = {}
+    for name, cols in spec.items():
+        name, cols = str(name).strip(), [str(c).strip() for c in cols]
+        bad = [c for c in cols if c not in st.headers]
+        if len(cols) < 2 or bad:
+            raise ToolError((f"combine 的列「{'、'.join(bad)}」不在表头中，可选：{[h for h in st.headers if h]}" if bad
+                             else "combine 至少要写 2 列"))
+        if not name or name in st.headers:
+            raise ToolError(f"combine 的新列名「{name}」和表里已有的列重名，换一个")
+        out[name] = cols
+    return out
+
+
 def _unpivot_spec(spec, st) -> dict:
     """校验 define_dataset 的 unpivot：{"columns": [几列], "value": 展开后的列名, "label": 记原列名的列名（可选）}。"""
     if not isinstance(spec, dict) or not isinstance(spec.get("columns"), list) or not spec.get("value"):
@@ -3347,6 +3411,15 @@ def _unpivot_spec(spec, st) -> dict:
     share, remainder = str(spec.get("share") or "").strip(), str(spec.get("remainder") or "").strip()
     if remainder and not share:
         raise ToolError("unpivot 写了 remainder 就要同时写 share（记比例的列名）")
+    if share and not remainder:
+        # T2：名单里写了比例但不足 100%，余下的部分没单列，奖金池按覆盖比例缩小，这部分钱直接没了
+        from bonus_core.data.table_detect import split_name_share
+        idx = [st.headers.index(c) for c in cols]
+        short = [str(v[i]) for _, v in st.rows for i in idx if i < len(v) and v[i] not in (None, "")
+                 for _, pct in [split_name_share(v[i])] if pct is not None and pct < 1]
+        if short:
+            raise ToolError(f"unpivot 有 {len(short)} 格比例不足 100%（如「{short[0]}」），余下的部分不能丢：写 remainder"
+                            '（如 "{label}未分配"），余下的金额单列一行，结果里看得到、能核对。材料或财务说余下部分怎么处理，就按那个叫法写')
     rest = [h for h in st.headers if h not in cols]
     for n in (value, label, share):
         if n and n in rest:
@@ -3355,6 +3428,23 @@ def _unpivot_spec(spec, st) -> dict:
         raise ToolError("unpivot 的 value、label、share 要用不同的列名")
     return {"columns": cols, "value": value, **({"label": label} if label else {}), **({"share": share} if share else {}),
             **({"remainder": remainder} if remainder else {})}
+
+
+def _code_version() -> str:
+    """本次运行的代码版本（git 提交号；不是 git 目录时用安装包版本），记进案卷，事后能查是哪版代码算的。"""
+    import subprocess
+    root = Path(__file__).resolve().parent.parent
+    try:
+        out = subprocess.run(["git", "-C", str(root), "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=5)
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        from importlib.metadata import version
+        return version("bonus-agent")
+    except Exception:
+        return ""
 
 
 def _next_qid(questions) -> str:

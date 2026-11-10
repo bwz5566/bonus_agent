@@ -17,7 +17,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict
 
 from bonus_core.data.table import ConvertError, Datasets, Row, RowRef, StdTable, convert
-from bonus_core.data.table_detect import ROW_ID, SheetTable, add_row_ids, detect, table_at, unpivot_by
+from bonus_core.data.table_detect import ROW_ID, SheetTable, add_row_ids, combine_columns, detect, table_at, unpivot_by
 from bonus_core.dsl.models import RuleSet
 from bonus_core.dsl.parser import names, parse
 from bonus_core.engine.issues import Issue
@@ -46,6 +46,7 @@ class DatasetMapping(BaseModel):
     columns: dict[str, str]            # 标准字段 -> 列名
     filter: dict[str, list[str] | str] = {}  # 只取这些行：列名 -> 允许的取值（如 目标值表里 entity_type 为 group 的行）
     unpivot: dict | None = None        # 几列同一类的值展开成每个值一行：{"columns": [...], "value": 列名, "label": 列名}（先展开再筛选）
+    combine: dict[str, list[str]] | None = None   # 几列合成一个编号列：{"新列名": ["列1", "列2"]}（如项目 = 月份+客户+型号），展开之后再合成
     confidence: dict[str, float] = {}  # 推荐时填写
     confirmed_by: str | None = None
 
@@ -203,7 +204,8 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping, period
             where = "/".join(x for x in (m.file, m.sheet) if x) or "按表头查找"
             issues.append(Issue.block("sheet_missing", f"找不到「{ds_name}」对应的工作表（{where}）", ds_name))
             continue
-        used_cols = set(m.columns.values()) | set((m.unpivot or {}).get("columns") or [])
+        used_cols = set(m.columns.values()) | set((m.unpivot or {}).get("columns") or []) | {
+            c for cols in (m.combine or {}).values() for c in cols}
         unsure = sorted({st.headers[i] for _, cols in getattr(st, "unsure", []) for i in cols
                          if i < len(st.headers) and st.headers[i] in used_cols})
         if unsure:     # 另一段表头的列名对不上、又没法按列名对回去：用到的列读到的可能是别的数，不能算
@@ -216,6 +218,12 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping, period
                 issues.append(Issue.block("column_missing", f"unpivot 的列「{'、'.join(bad)}」不在 sheet「{st.sheet}」中", ds_name))
                 continue
             st = unpivot_by(st, m.unpivot)
+        if m.combine:
+            bad = [c for cols in m.combine.values() for c in cols if c not in st.headers]
+            if bad:
+                issues.append(Issue.block("column_missing", f"combine 的列「{'、'.join(bad)}」不在 sheet「{st.sheet}」中", ds_name))
+                continue
+            st = combine_columns(st, m.combine)
         if ROW_ID in m.columns.values():
             st = add_row_ids(st)
         for f in ds.fields:

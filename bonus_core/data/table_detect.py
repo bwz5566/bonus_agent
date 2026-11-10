@@ -254,6 +254,34 @@ def add_row_ids(st: SheetTable) -> SheetTable:
                       list(st.repeats), list(st.segments), list(st.remaps), list(st.unsure))
 
 
+def key_part(v) -> str:
+    """组合编号里的一段：日期写成 年-月-日，整数形式的小数去掉 .0，文字去掉首尾空白。"""
+    from datetime import date, datetime
+    if v is None:
+        return ""
+    if isinstance(v, datetime):
+        return v.date().isoformat() if (v.hour, v.minute, v.second) == (0, 0, 0) else v.isoformat()
+    if isinstance(v, date):
+        return v.isoformat()
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v).strip()
+
+
+def combine_columns(st: SheetTable, spec: dict[str, list[str]]) -> SheetTable:
+    """按几列合成一个编号列（如 月份+客户编码+客户简称+型号 合成项目编号），各段用 | 连接；某段为空的行编号也照样生成。"""
+    headers, rows = list(st.headers), [(j, list(v)) for j, v in st.rows]
+    for name, cols in spec.items():
+        if name in headers:
+            continue
+        idx = [headers.index(c) for c in cols]
+        headers.append(name)
+        for _, vals in rows:
+            vals.append("|".join(key_part(vals[i] if i < len(vals) else None) for i in idx))
+    return SheetTable(st.file, st.sheet, st.header_row, headers, rows, [], st.confidence,
+                      list(st.repeats), list(st.segments), list(st.remaps), list(st.unsure))
+
+
 def dedupe_headers(header: list[str]) -> list[str]:
     """同一张表里几列同名（如三列都叫“区域”）：第一列保持原名，后面的加上 Excel 列字母，如“区域(Z列)”，才能分别选用。"""
     from openpyxl.utils import get_column_letter

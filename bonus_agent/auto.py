@@ -115,7 +115,10 @@ def build_inventory(files: list[Path]) -> Inventory:
 
 
 def _fmt(v) -> str:
-    return "" if v is None else str(v).replace("\n", " ")[:30]
+    if v is None:
+        return ""
+    t = str(v).replace("\n", " ")
+    return t if len(t) <= 60 else f"{t[:60]}…（共{len(t)}字）"
 
 
 def render_inventory(inv: Inventory, preview_rows: int = 5, doc_chars: int = 1500) -> str:
