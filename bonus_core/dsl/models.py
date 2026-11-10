@@ -99,6 +99,10 @@ class TierTable(RuleItem):
     mode: Literal["whole", "excess"]          # 全额累进 / 超额累进
     steps: list[tuple[Decimal, Decimal]]       # (下限, 比例)
     lower_inclusive: bool = True               # 达到下限即适用
+    # 低于第一档下限的值怎么算：zero（默认，不计：比例 0、金额 0）；first（按第一档比例照算，如退货冲销的负数：
+    # 比例取第一档；超额累进的金额 =（值 − 第一档下限）× 第一档比例，为负）。不要用“把第一档下限写成很小的负数”代替：
+    # 超额累进会从那个负数起逐段累加，每个对象都凭空多出一大笔
+    below_first: Literal["zero", "first"] = "zero"
 
     @field_validator("steps", mode="before")
     @classmethod
@@ -133,6 +137,9 @@ class Variable(RuleItem):
 class Pool(RuleItem):
     expr: str
     scope: str = "global"      # 写分配层级名（如 部门）时，奖金池在该层每个对象上分别计算（四舍五入到分），上层为合计
+    # 奖金池（按层计算时是某个对象的金额）算出负数时：block（默认，阻断，要按材料处理或问财务）；
+    # allow（材料或财务明确负数照算，如退货冲销的项目提成为负、照样按比例分到人）
+    negative: Literal["block", "allow"] = "block"
 
 
 class Check(RuleItem):

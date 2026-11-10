@@ -169,7 +169,9 @@ def tier_text(t: dict) -> str:
     steps = [(Decimal(str(lo)), Decimal(str(r))) for lo, r in t.get("steps") or []]
     inc = t.get("lower_inclusive", True)
     parts = []
-    if steps and steps[0][0] > 0:
+    if steps and t.get("below_first") == "first":
+        parts.append(f"低于 {_num(steps[0][0])}：按第一档比例照算")
+    elif steps and steps[0][0] > 0:
         parts.append(f"{'不到' if inc else '不超过'} {_num(steps[0][0])}：0")
     for i, (lo, r) in enumerate(steps):
         hi = steps[i + 1][0] if i + 1 < len(steps) else None

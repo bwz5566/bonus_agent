@@ -357,7 +357,7 @@ def check_dataset(name: str, pd: PlanDataset, st: SheetTable, field_types: dict[
     if pd.distinct and not pd.key:
         return None, None, warnings, [f"「{name}」写了 distinct 却没写 key：distinct 是按 key 的不同取值建对象"]
     return (DatasetDef(desc=pd.desc, key=pd.key, link=pd.link, fields=fields, distinct=pd.distinct and bool(pd.key),
-                       unmatched="ignore" if pd.unmatched == "ignore" and pd.link and not pd.key else "block"),
+                       unmatched="ignore" if pd.unmatched == "ignore" and (pd.link or pd.key) else "block"),
             DatasetMapping(file=st.file, sheet=st.sheet, header_rows=header_rows, columns=cols, filter=flt or {}),
             warnings, [])
 

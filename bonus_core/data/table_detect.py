@@ -88,6 +88,14 @@ def detect_sheet(ws, file: str) -> SheetTable | None:
         if score > best_score:
             best, best_score = i, score
     if best is None:
+        # 只有一列的清单（如欠款客户清单：一个列名，下面每行一个值）：第一个有值的行当表头
+        used = [(i, [j for j, v in enumerate(r) if v not in (None, "")]) for i, r in enumerate(grid)]
+        used = [(i, js) for i, js in used if js]
+        if len(used) >= 2 and all(len(js) == 1 and js == used[0][1] for _, js in used) \
+                and _is_text(grid[used[0][0]][used[0][1][0]]):
+            t = _build(grid, file, ws.title, [used[0][0]])
+            t.confidence = 0.5
+            return t
         return None
     rows = [best]
     # 两行表头：上一行是分组标题（如「金额（万元）」跨两列），下一行是具体列名
@@ -207,11 +215,13 @@ def split_name_share(text) -> tuple[str, "Decimal | None"]:
     return m.group("name").strip(), Decimal(m.group("pct")) / 100
 
 
-def unpivot_sheet(st: SheetTable, columns: list[str], value: str, label: str = "", share: str = "", remainder: str = "") -> SheetTable:
+def unpivot_sheet(st: SheetTable, columns: list[str], value: str, label: str = "", share: str = "", remainder: str = "",
+                  blank: str = "") -> SheetTable:
     """把几列同一类的值（如销售负责人、执行人、客户经理各一列人名）展开成每个值一行：其余列照抄，
     展开的值放在 value 列，label 列记它原来在哪一列（如 角色）。空格子不展开；合计行不要。
     share 非空时：格子里“名字+百分比”（如 张三50%）拆开，名字放 value、比例放 share 列（小数，没写百分比的是 1）；
-    remainder 非空时：比例不足 1 的，余下的部分另记一行（名字用 remainder，其中 {label} 换成原列名，比例是余下的部分）。"""
+    remainder 非空时：比例不足 1 的，余下的部分另记一行（名字用 remainder，其中 {label} 换成原列名，比例是余下的部分）。
+    blank 非空时：空格子也记一行（名字用 blank，其中 {label} 换成原列名，比例是 1），如某个角色没有填人、这一份记为“××未分配”。"""
     from decimal import Decimal
     idx = [st.headers.index(c) for c in columns]
     keep = [i for i in range(len(st.headers)) if i not in idx]
@@ -221,6 +231,8 @@ def unpivot_sheet(st: SheetTable, columns: list[str], value: str, label: str = "
         base = [vals[i] for i in keep]
         for c, i in zip(columns, idx):
             if vals[i] in (None, "") or (isinstance(vals[i], str) and not vals[i].strip()):
+                if blank:
+                    rows.append((j, base + [blank.replace("{label}", c)] + ([c] if label else []) + ([Decimal(1)] if share else [])))
                 continue
             v, pct = split_name_share(vals[i]) if share else (vals[i], None)
             rows.append((j, base + [v] + ([c] if label else []) + ([pct if pct is not None else Decimal(1)] if share else [])))
@@ -233,7 +245,7 @@ def unpivot_sheet(st: SheetTable, columns: list[str], value: str, label: str = "
 def unpivot_by(st: SheetTable, spec: dict) -> SheetTable:
     """按 define_dataset / 映射里存的 unpivot 说明展开。"""
     return unpivot_sheet(st, spec["columns"], spec["value"], spec.get("label") or "", spec.get("share") or "",
-                         spec.get("remainder") or "")
+                         spec.get("remainder") or "", spec.get("blank") or "")
 
 
 ROW_ID = "（行号）"      # 虚拟列：每行的 Excel 行号（展开后同一行的几条加 -1、-2），给没有唯一编号列的明细表当编号

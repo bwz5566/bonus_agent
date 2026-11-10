@@ -174,7 +174,7 @@ class Engine:
                     n.weight = w
         except EvalError as e:
             raise EngineError([Issue.block("eval_error", str(e), e.where)]) from None
-        if self.pool_exact < 0:
+        if self.pool_exact < 0 and rs.pool.negative != "allow":
             raise EngineError([Issue.block("pool_negative", f"奖金池为负：{self.pool_exact}")])
         self.hash = input_hash(rs, data)
 
@@ -187,7 +187,7 @@ class Engine:
         at = levels.index(rs.pool.scope)
         for n in self.by_level[rs.pool.scope]:
             v = self.ev.evaluate(rs.pool.expr, n, f"{n.id}/奖金池", "pool")
-            if v < 0:
+            if v < 0 and rs.pool.negative != "allow":
                 raise EngineError([Issue.block("pool_negative", f"{n.id} 的奖金池为负：{v}", n.id)])
             n.fixed = round_pool(v)
         for lvl in reversed(levels[:at]):
@@ -380,10 +380,11 @@ class Engine:
                     raise EngineError([Issue.block("offset_negative", f"{o.id} 的已发金额为负：{v}", n.id)])
                 offset += v.quantize(CENT, ROUND_HALF_UP)
             held = n.final - remaining
-            paid, over = max(remaining - offset, Decimal(0)).quantize(CENT), max(offset - remaining, Decimal(0)).quantize(CENT)
+            ded = min(max(remaining, Decimal(0)), offset)   # 应得为负（规则允许负数照算）时没有可抵扣的，负数原样带到本次实发
+            paid, over = (remaining - ded).quantize(CENT), (offset - ded).quantize(CENT)
             out[n.id] = PayoutResult(n.id, str(n.final), str(held), str(paid), holds, ratios,
                                      cap=str(remaining), offset=str(offset), overpaid=str(over),
-                                     deducted=str(min(remaining, offset)))
+                                     deducted=str(ded))
         return out
 
     def _rollups(self, payouts: dict[str, PayoutResult]) -> dict[str, RollupResult]:

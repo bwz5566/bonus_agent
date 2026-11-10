@@ -114,8 +114,8 @@ def main(argv=None) -> int:
     p.add_argument("--checker", help="交叉验证（独立复读、独立算式）用的另一个模型，如 qwen-a；不写就用主模型自己验证")
     p.add_argument("--max-parallel", type=int, default=2, help="同时最多运行几个案卷")
     p.add_argument("--max-steps", type=int, default=150, help="每轮最多多少步（工具调用），默认 150")
-    p.add_argument("--max-tokens", type=int, default=4_000_000,
-                   help="每轮最多用多少 tokens，默认 400 万；材料多、模型绕路时可加大，如 8000000")
+    p.add_argument("--max-tokens", type=int, default=8_000_000,
+                   help="每轮最多用多少 tokens，默认 800 万（每步要重发约 3 万 tokens 的上下文，150 步约需 500 万）")
     p = sub.add_parser("user")
     p.add_argument("action", choices=["add"])
     p.add_argument("--data", required=True)

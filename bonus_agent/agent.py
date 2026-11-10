@@ -64,6 +64,9 @@ PHASES = (     # 工作分阶段：每个阶段的产出都存在工作区里（
 SOURCE_CHECKS = 5               # 每轮提问前查原文最多几次（每次一次交叉验证模型调用）
 IDLE_WARN = 6                  # 连续这么多次只查询（evaluate / explain）、没有任何改动：提醒根据已查到的做决定；两倍就算卡住
 QUERY_TOOLS = {"evaluate", "explain"}
+READ_TOOLS = {"read_document", "read_sheet", "view_image"}
+READ_WARN = 15                 # 连续这么多次只读材料、没有登记、定义或写规则：提醒先把读到的落下来
+READ_AGAIN = 10                # 之后每读这么多次再提醒一次（只提醒，不算卡住：材料多时开头确实要读很多）
 DEEP_LIMIT = 24                # 每一轮最多这么多步用深度思考（出错、卡住的那几步），防止一直思考把时间和 tokens 用完
 MAX_REFLECT = 2                # 卡住时先让智能体停下来反思、换做法接着做，最多这么多次；再卡住才停下，把原因报给财务
 KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保留全文
@@ -178,7 +181,11 @@ TOOLS: list[dict] = [
                          "key": _S, "link": _S, "desc": _S,
                          "unmatched": {"type": "string", "enum": ["block", "ignore"], "description":
                                        "可选：明细表的 link 编号在上级里找不到时怎么办。默认 block（试算阻断，要问财务）；"
-                                       "财务答复过“找不到的不参与 / 按默认值”后才可写 ignore，这些行不参与计算"},
+                                       "材料原文写明、或财务答复过“找不到的不参与 / 按默认值”后才可写 ignore，这些行不参与计算。"
+                                       "实体表作下一层分配对象（分配层级用 parent_key 挂到上一层）时也可以写"},
+                         "unmatched_basis": {**_obj({"file": _S, "quote": _S}, ["file", "quote"]), "description":
+                                             "写 unmatched: ignore 的依据在材料原文里时填：file 材料文件名，quote 逐字复制写明"
+                                             "“对不上的不参与”的那句原文；依据是财务答复时不用填"},
                          "distinct": {"type": "boolean", "description": "可选：按 key 的不同取值各建一个对象（同一编号的多行合成一个，"
                                       "其余字段在同一编号下要一样）。没有单独的主表、又要按这个编号汇总时用，如从明细里得到每个客户一个“客户”"},
                          "filter": {"type": "object", "description": '可选：只取这些行，{"列名": "取值"} 或 {"列名": ["取值1", "取值2"]}；'
@@ -202,7 +209,9 @@ TOOLS: list[dict] = [
                                      '空格子不展开；fields 和 filter 用展开后的列名。从这几列取全部对象时配合 key + distinct。'
                                      '格子里写成“名字+百分比”（如 张三50%）、财务答复了怎么拆之后：加 "share": "记比例的列名"，名字和比例就拆开'
                                      '（比例是小数，没写百分比的是 1，字段类型用 ratio，权重里乘上它）；财务说余下的部分记为“未分配”时再加 '
-                                     '"remainder": "{label}未分配"（{label} 换成原列名；余下的部分另记一行，比例是 1 − 写明的比例）'
+                                     '"remainder": "{label}未分配"（{label} 换成原列名；余下的部分另记一行，比例是 1 − 写明的比例）。'
+                                     '空格子默认不展开；材料或财务说空着的那一份也要单列（如某个角色没填人，记为“××未分配”）时加 '
+                                     '"blank": "{label}未分配"，空格子也记一行。'
                                      '展开后没有每行唯一的编号、又要当最末层时，加字段 {"column": "（行号）", "type": "id"} 作 key'},
                          "fields": {"type": "object", "additionalProperties": FIELD_SCHEMA,
                                     "description": "字段名（英文小写加下划线） -> 定义。重新定义同一张表、字段不变时可以不写（沿用上一次的）"}},
@@ -1172,7 +1181,7 @@ class Workspace:
                        link: str | None = None, desc: str = "", header_rows: list[int] | None = None,
                        filter: dict | None = None, distinct: bool = False, unpivot: dict | None = None,
                        unmatched: str = "block", period: str | None = None, window: str = "period",
-                       combine: dict | None = None) -> str:
+                       combine: dict | None = None, unmatched_basis: dict | None = None) -> str:
         reuse = ""
         if not fields:      # 重新定义时只改 key / link / filter：沿用上一次的字段（模型常只写要改的部分，反复因缺 fields 失败）
             fields = self._prev_fields.get(name)
@@ -1180,7 +1189,7 @@ class Workspace:
                 raise ToolError(f"缺少 fields（字段名 -> {{column, type}}）。「{name}」之前没有定义成功过，要写全字段")
             reuse = f"没写 fields，沿用上一次定义「{name}」时的 {len(fields)} 个字段"
         out = self._define_dataset(name, file, sheet, fields, key, link, desc, header_rows, filter, distinct, unpivot, unmatched,
-                                   period, window, combine)
+                                   period, window, combine, unmatched_basis)
         self._prev_fields[name] = fields
         return out + (f"\n{reuse}" if reuse else "")
 
@@ -1188,7 +1197,7 @@ class Workspace:
                         link: str | None = None, desc: str = "", header_rows: list[int] | None = None,
                         filter: dict | None = None, distinct: bool = False, unpivot: dict | None = None,
                         unmatched: str = "block", period: str | None = None, window: str = "period",
-                       combine: dict | None = None) -> str:
+                       combine: dict | None = None, unmatched_basis: dict | None = None) -> str:
         f = self._file(file)
         try:
             st = table_at(f, sheet, header_rows) if header_rows else self.inv.sheet(f"{f.name}/{sheet}")
@@ -1230,8 +1239,15 @@ class Workspace:
             told = "\n".join([self.said] + [f"{q.text} {q.answer}" for q in self.questions if str(q.answer or "").strip()])
             sh = "" if re.fullmatch(r"(?i)sheet\s*\d*|工作表\s*\d*", str(sheet or "").strip()) else sheet   # Sheet1 这类名字到处都有，不算
             if not any(x and x in told for x in (name, sh, Path(str(file)).stem)):
-                raise ToolError(f"未保存：unmatched: ignore 要有财务的答复依据。先用 ask_question 问财务「{name}」里在上级找不到的记录怎么处理"
-                                "（问题里写上表名、编号例子），财务答复“不参与 / 按默认值”后再写 ignore")
+                # 材料原文已经写明“对不上的不参与”时，逐字引用原文也算依据（T3：场景说明里写了，仍被要求再问一遍，
+                # 提问又因“原文已有答案”被退回，两头卡住）
+                why = self._quote_basis(unmatched_basis)
+                if why:
+                    raise ToolError(f"未保存：unmatched: ignore 要有依据。{why}两种依据都可以："
+                                    "① 材料原文写明了对不上的记录不参与：加参数 unmatched_basis，写 {\"file\": 材料文件名, \"quote\": 逐字复制的那句原文}；"
+                                    f"② 材料没写：先用 ask_question 问财务「{name}」里在上级找不到的记录怎么处理（问题里写上表名、编号例子），"
+                                    "财务答复“不参与 / 按默认值”后再写 ignore")
+                desc = (desc + "；" if desc else "") + f"对不上的记录不参与，依据《{unmatched_basis['file']}》：{str(unmatched_basis['quote']).strip()[:120]}"
         try:
             pd = PlanDataset(sheet=sheet, key=key or None, link=link or None, desc=desc, fields=fields,
                              distinct=bool(distinct), unmatched=unmatched)
@@ -2107,7 +2123,7 @@ class Workspace:
             raise ToolError("；".join(
                 f"分档表 {n} 有 {k} 个传入值不在任何一档里（第一档从 {lint._fmt(lo)} 起"
                 f"{'、不含下限' if not rs.tables[n].lower_inclusive else ''}，最小传入值 {lint._fmt(low)}），比例按 0 算了。"
-                f"按材料补上这一段：材料规定这些值按第一档算，就把第一档的下限写得更小（如低于可能的最小值）；规定不发就加一档比例 0"
+                f"按材料补上这一段：材料规定这些值按第一档算，就在表上写 \"below_first\": \"first\"；规定不发就加一档比例 0"
                 for n, lo, k, low in holes))
 
     def _independent_pay(self, name: str, spec: dict, strict: bool = False) -> dict[str, Decimal]:
@@ -2425,6 +2441,17 @@ class Workspace:
             return (f"已记录问题 {q.id}，等财务答复{note}。不要自行选择口径或补出算法；"
                     "继续做不受影响的部分，全部问完后调用 finish 结束本轮")
         return f"已记录提示 {q.id}（不影响金额，不必等答复）{note}"
+
+    def _quote_basis(self, basis) -> str:
+        """材料原文作依据：file、quote 逐字核对得上、且这句话确实在说“不参与 / 不计算 / 不影响”才算。返回不通过的原因，通过返回空。"""
+        if not isinstance(basis, dict) or not str(basis.get("quote") or "").strip():
+            return "还没有给出依据。"
+        ev, bad = self._evidence([basis])
+        if bad or not ev:
+            return f"unmatched_basis 的原文在《{basis.get('file', '')}》里找不到，要逐字复制。"
+        if len(fx.norm(ev[0]["quote"])) < 8 or not _EXCLUDE.search(ev[0]["quote"]) and "不影响" not in ev[0]["quote"]:
+            return "unmatched_basis 引用的原文没有说明对不上的记录不参与（要引用写明“不参与 / 不计算 / 不影响”的那一句）。"
+        return ""
 
     def _evidence(self, evidence) -> tuple[list[dict], list[str]]:
         """提问的依据逐字核对原文：核对上的标 ok，核对不上的也保留（标出来给财务看），返回 (依据, 核对不上的说明)。"""
@@ -2773,6 +2800,8 @@ def _tier_text(name: str, t: dict) -> str:
         num = lambda x: f"{x:,.0f}" if x == x.to_integral_value() else f"{x.normalize():f}"   # noqa: E731  比例档（0.15）不能显示成 0
         rng = f"{num(lo)} 至 {num(hi)}" if hi is not None else f"{num(lo)} 以上"
         parts.append(f"{rng}{'的部分' if excess else '时全部金额'}按 {(r * 100).normalize():f}%")
+    if t.get("below_first") == "first" and steps:
+        parts.insert(0, f"低于 {num(steps[0][0])} 的按第一档比例 {(steps[0][1] * 100).normalize():f}% 照算")
     return f"{name}（{'超额累进' if excess else '全额累进'}）：" + "；".join(parts)
 
 
@@ -3119,6 +3148,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     same_block, prev_full, long_block, prev_block = 0, set(), 0, set()
     reflected = 0
     idle = 0                           # 连续只查询、没有改动工作区的次数（参数每次不同，上面的重复检测发现不了）
+    reads = 0                          # 连续只读材料（读表、读文档、看图）、没有落下任何东西的次数
     reached = ws.phase()               # 本轮到过的最远阶段：往前推进到新阶段时清空对话历史；改规则退回前面的阶段再回来不清
     deep_why, deep_used = "", 0        # 下一步要深度思考的原因（空：普通模式）；本轮已用的深度思考步数
     for turn in range(max_steps):
@@ -3330,6 +3360,17 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                     step.result = result
             elif c["name"] not in READ_ONLY and ok:
                 idle = 0
+            if c["name"] in READ_TOOLS:
+                reads += 1
+                if reads >= READ_WARN and (reads - READ_WARN) % READ_AGAIN == 0:
+                    # T4：换了更强的模型后整轮都在逐页读表（120 步里读了 68 次），一条规则没写就把这一轮用完了
+                    result += (f"\n注意：已经连续读了 {reads} 次材料，还没有登记参数、定义数据表或写规则，读到的内容不落下来，"
+                               "对话变长后会被整理掉。现在先把已经读到的落下来：规则文档里的参数用 record_facts 登记，"
+                               "看过表头的数据表用 define_dataset 定义（大表不用逐页读完：定义后用 evaluate 统计行数、取值和合计）。"
+                               f"下一步（程序判断）：{ws.next_hint()}")
+                    step.result = result
+            elif c["name"] not in READ_ONLY and ok:
+                reads = 0
             steps.append(step)
             if on_step:
                 on_step(len(steps), step)
@@ -3651,6 +3692,10 @@ def _unpivot_spec(spec, st) -> dict:
         raise ToolError("unpivot 的列名重复，或表头里有同名的几列，没法区分；先用 header_rows 指定表头或换列")
     value, label = str(spec["value"]).strip(), str(spec.get("label") or "").strip()
     share, remainder = str(spec.get("share") or "").strip(), str(spec.get("remainder") or "").strip()
+    blank = str(spec.get("blank") or "").strip()
+    unknown = sorted(set(spec) - {"columns", "value", "label", "share", "remainder", "blank"})
+    if unknown:
+        raise ToolError(f"unpivot 不认识 {unknown}，可以写的是 columns、value、label、share、remainder、blank")
     if remainder and not share:
         raise ToolError("unpivot 写了 remainder 就要同时写 share（记比例的列名）")
     if share and not remainder:
@@ -3669,7 +3714,7 @@ def _unpivot_spec(spec, st) -> dict:
     if len({n for n in (value, label, share) if n}) != len([n for n in (value, label, share) if n]):
         raise ToolError("unpivot 的 value、label、share 要用不同的列名")
     return {"columns": cols, "value": value, **({"label": label} if label else {}), **({"share": share} if share else {}),
-            **({"remainder": remainder} if remainder else {})}
+            **({"remainder": remainder} if remainder else {}), **({"blank": blank} if blank else {})}
 
 
 def _code_version() -> str:

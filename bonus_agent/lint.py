@@ -569,8 +569,18 @@ def _coverage(rs: RuleSet, tiers: dict, coverage: list) -> tuple[list[tuple[str,
             gates.append((name, f"分档表 {name} 的第一档从 {_fmt(lo)} 起（比例 {_fmt(t.steps[0][1])}"
                                 f"{'，不含 ' + _fmt(lo) + ' 本身' if not t.lower_inclusive else ''}），实际有 {below} 个传入值"
                                 f"不在任何一档里（最小 {_fmt(low)}），这些对象按规则拿到的比例是 0。核对材料对这些值的规定："
-                                f"不发就在最前面加一档写明（下限写到比可能的最小值还小，比例 0），按第一档发就把第一档的下限往下放；"
-                                "材料没说就问财务"))
+                                f"不发就在最前面加一档写明（下限写到比可能的最小值还小，比例 0）；按第一档比例照算（如负数照算）"
+                                "就在这张表上写 \"below_first\": \"first\"（不要把第一档下限改成很小的负数：超额累进会从那个负数起"
+                                "逐段累加，每个对象都多出一大笔）；材料没说就问财务"))
+    # 超额累进直接算金额，第一档下限却是负数：从这个负数到 0 的整段也按第一档比例累加进了每个对象
+    for name, how in sorted(_tier_amount_tables(rs, False).items()):
+        t = rs.tables.get(name)
+        if how == "tier" and isinstance(t, TierTable) and t.mode == "excess" and t.steps and Decimal(t.steps[0][0]) < 0 \
+                and name not in {g for g, _ in gates}:
+            lo, r = Decimal(t.steps[0][0]), Decimal(t.steps[0][1])
+            gates.append((name, f"分档表 {name} 是超额累进、直接算金额，第一档下限却写成了 {_fmt(lo)}：每个对象都会把 {_fmt(lo)} 到 0 这一段"
+                                f"也按 {_fmt(r)} 累加进去（多出 {_fmt(-lo * r)}）。第一档下限照材料写（通常是 0）；"
+                                "负数要按第一档比例照算时，在表上写 \"below_first\": \"first\""))
     # 查找表部分取值落到默认值：没对上的键和表里某个键写法相近（全角半角、空格、多了后缀），多半是写法不一致
     misses: dict[str, dict[str, int]] = {}
     for c in coverage:
@@ -610,7 +620,7 @@ def tier_holes(rs: RuleSet, tiers: dict) -> list[tuple[str, Decimal, int, Decima
         below = st.get("bands", {}).get(-1, 0)
         # 超额累进直接算金额（tier）：起征点是正数时，低于它不发是正常的；起征点是 0（或负数）而传入值是负数（如退货、冲销），
         # 负数落不进任何一档，金额悄悄成了 0，而不是按第一档比例得出负数。这种也要问
-        if (isinstance(t, TierTable) and t.steps and below and Decimal(t.steps[0][1]) != 0
+        if (isinstance(t, TierTable) and t.steps and below and Decimal(t.steps[0][1]) != 0 and t.below_first != "first"
                 and (t.mode == "whole" or st.get("rate") or Decimal(t.steps[0][0]) <= 0)):
             out.append((name, Decimal(t.steps[0][0]), below, Decimal(str(st["min"]))))
     return out

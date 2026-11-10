@@ -99,6 +99,8 @@ class Params:
             else:
                 mode = "超额累进：各档分段累加" if t.mode == "excess" else "全额累进：整体按所在档"
                 bound = "达到下限即适用" if t.lower_inclusive else "超过下限才适用"
+                if getattr(t, "below_first", "zero") == "first":
+                    bound += "，低于第一档下限按第一档比例"
                 self.rows.append([f"{name}（阶梯表，{mode}，{bound}）{desc}", "下限", "比例 / 系数"])
                 items = list(t.steps)
             refs = []
@@ -174,7 +176,8 @@ class Formula:
             return out
         steps = list(zip(t.steps, refs))
         op = ">=" if t.lower_inclusive else ">"
-        rate = "0"
+        first = getattr(t, "below_first", "zero") == "first" and steps
+        rate = steps[0][1][1] if first else "0"
         for (lo, _), (lc, rc) in steps:
             rate = f"IF({x}{op}{lc},{rc},{rate})"
         if c.fn == "tier_rate":
@@ -186,6 +189,9 @@ class Formula:
             hi = steps[i + 1][1][0] if i + 1 < len(steps) else None
             top = x if hi is None else f"MIN({x},{hi})"
             parts.append(f"MAX({top}-{lc},0)*{rc}")
+        if first:      # 低于第一档下限按第一档比例照算（为负）
+            lc0, rc0 = steps[0][1]
+            return f"IF({x}{op}{lc0}," + "(" + "+".join(parts) + f"),({x}-{lc0})*{rc0})"
         return "(" + "+".join(parts) + ")"
 
 

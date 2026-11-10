@@ -27,6 +27,7 @@ METRICS = {
     "已发抵扣": ("已发抵扣", "预发", "已发金额", "offset"),
     "实际抵扣": ("实际抵扣", "本次抵扣", "抵扣", "deducted"),
     "超发待核对": ("超发", "超预发", "overpaid"),
+    "汇总核算": ("汇总金额", "核算金额", "总金额"),
 }
 PRIORITY = (("期望", "标准", "答案", "expected", "golden"), ("应得", "应发"))   # 列名优先级，靠前的优先
 EXCLUDE = ("差异", "差额", "diff", "权重", "weight", "比例", "ratio", "快照", "上限", "目标", "target", "销售", "sales",
@@ -71,6 +72,11 @@ def _num(v) -> Decimal | None:
 def _figures(res: Result) -> dict[str, dict[str, Decimal]]:
     """每个指标：对象编号 -> 金额。发放类指标在最末层，上级为下级合计。"""
     out = {"应得": {n.key: Decimal(n.final) for n in res.nodes.values() if n.key}}
+    # 分配人员金额（report.people 按人名合计）：期望结果按人列金额时，按人名核对
+    for p in getattr(res, "people", None) or []:
+        out["应得"].setdefault(str(p["name"]), Decimal(p["final"]))
+    if getattr(res, "totals", None):        # 汇总核算：期望结果里有同名的汇总行时核对
+        out["汇总核算"] = {str(n): Decimal(v) for n, v in res.totals}
     if not res.payouts:
         return out
     for r in res.rollups.values():          # 按关联实体汇总后再抵扣：发放类指标以实体为准
@@ -78,6 +84,9 @@ def _figures(res: Result) -> dict[str, dict[str, Decimal]]:
     for m, attr in (("本次可发", "paid"), ("暂缓", "held"), ("已发抵扣", "offset"), ("实际抵扣", "deducted"),
                     ("超发待核对", "overpaid")):
         acc: dict[str, Decimal] = {}
+        if attr in ("paid", "held"):
+            for p in getattr(res, "people", None) or []:
+                acc[str(p["name"])] = Decimal(p[attr])
         if res.rollups and attr != "held":
             out[m] = {r.key: Decimal(getattr(r, attr)) for r in res.rollups.values()}
             continue

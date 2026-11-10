@@ -516,6 +516,10 @@ class Evaluator:
             if c.fn == "count_distinct":
                 r = Decimal(len(set(vals)))
             else:
+                from datetime import date as _date
+                if c.fn in ("min", "max") and vals and all(isinstance(v, _date) for v in vals):
+                    r = min(vals) if c.fn == "min" else max(vals)       # 日期取最早 / 最晚（如明细里的首发日期、最后回款日）
+                    return Val(r, fmt(r), frozenset(deps), tuple(rows))
                 text = next((v for v in vals if isinstance(v, str)), None)
                 if text is not None:
                     raise EvalError(f"{c.fn} 要对数字求值，这里取到的是 {fmt(text)}（{ds} 的行）。数行数用 count(of: \"{ds}\", where: 条件)，"
@@ -628,7 +632,7 @@ def tier_band(t: TierTable, x: Decimal) -> int:
 
 
 def tier_rate(t: TierTable, x: Decimal) -> Decimal:
-    rate = Decimal(0)
+    rate = t.steps[0][1] if t.below_first == "first" and t.steps else Decimal(0)
     for lo, r in t.steps:
         if x > lo or (t.lower_inclusive and x == lo):
             rate = r
@@ -640,6 +644,8 @@ def tier_amount(t: TierTable, x: Decimal) -> Decimal:
         return x * tier_rate(t, x)
     total = Decimal(0)
     steps = list(t.steps)
+    if steps and t.below_first == "first" and tier_band(t, x) < 0:
+        return (x - steps[0][0]) * steps[0][1]
     for i, (lo, r) in enumerate(steps):
         hi = steps[i + 1][0] if i + 1 < len(steps) else None
         top = x if hi is None else min(x, hi)

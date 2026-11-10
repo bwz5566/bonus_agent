@@ -102,7 +102,7 @@ def test_unmatched_ignore_rejected_on_entity_table(tmp_path):
     _book(tmp_path / "客户.xlsx", [["客户", "毛利"], ["C1", 100]], "客户")
     w = Workspace(FakeLLM(["x"]), build_inventory(collect_files([tmp_path])))
     # 实体表写了 key 可以 ignore（下一层挂不上上级的记录），但要先有财务的答复依据
-    with pytest.raises(ToolError, match="答复依据"):
+    with pytest.raises(ToolError, match="要有依据"):
         w.define_dataset("客户", "客户.xlsx", "客户", {"cust": {"column": "客户", "type": "id"}}, key="cust",
                          unmatched="ignore")
     with pytest.raises(ToolError, match="只用于"):

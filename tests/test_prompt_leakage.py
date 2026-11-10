@@ -40,9 +40,16 @@ DATE = re.compile(r"2026[-/.年]")
 ID = re.compile(r"[A-Z]{1,3}\d{2,}")
 
 
+def _skip(p):
+    """syn_commission 是按通用业务词造的样例（销售金额、客户编码等），词本身不是某份真实材料的专有说法"""
+    return "syn_commission" in Path(p).parts
+
+
 def _case_words():
     words = set(CURATED)
     for p in glob.glob(str(ROOT / "evals/cases/**/*.xlsx"), recursive=True):
+        if _skip(p):
+            continue
         wb = openpyxl.load_workbook(p, read_only=True)
         for ws in wb.worksheets:
             words.add(ws.title)
@@ -52,6 +59,8 @@ def _case_words():
                     words.update(cells)
                 words.update(c for c in cells if ID.fullmatch(c))
     for p in glob.glob(str(ROOT / "evals/cases/**/*.json"), recursive=True):
+        if _skip(p):
+            continue
         def walk_json(x):
             if isinstance(x, dict):
                 for k, v in x.items():
@@ -64,6 +73,8 @@ def _case_words():
                 words.add(x)
         walk_json(json.load(open(p, encoding="utf-8")))
     for p in glob.glob(str(ROOT / "evals/cases/**/*.yaml"), recursive=True):
+        if _skip(p):
+            continue
         def walk(x):
             if isinstance(x, dict):
                 for k, v in x.items():

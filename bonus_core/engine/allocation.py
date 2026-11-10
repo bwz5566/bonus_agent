@@ -36,7 +36,8 @@ def allocate(node: Node, target: Decimal, exact: Decimal | None = None) -> None:
     locked = [c for c in node.children if c.locked]
     free = [c for c in node.children if not c.locked]
     rest = target - sum((c.lock for c in locked), Decimal(0))
-    if rest < 0:
+    if rest < 0 and (target >= 0 or any(c.lock is not None and not getattr(c, "fixed", None) for c in locked)):
+        # 本节点金额为负（规则允许奖金池为负）且下级没有人工锁定时照常按权重分；其余情况是锁定超额
         raise AdjustConflict(node.id, f"已锁定的下级合计超过本节点金额 {target}，剩余为 {rest}")
     if not free and rest != 0:
         raise AdjustConflict(node.id, "同级已全部锁定，差额无人吸收，请先撤销其中一个调整")
@@ -45,10 +46,10 @@ def allocate(node: Node, target: Decimal, exact: Decimal | None = None) -> None:
         raise AdjustConflict(node.id, "未锁定成员的权重之和为 0，无法分配剩余金额")
     exacts = [rest * c.weight / wsum if wsum else Decimal(0) for c in free]
     floor = [e.quantize(CENT, ROUND_DOWN) for e in exacts]
-    n = int((rest - sum(floor, Decimal(0))) / CENT)
-    order = sorted(range(len(free)), key=lambda i: (-(exacts[i] - floor[i]), free[i].id))
-    for i in order[:n]:
-        floor[i] += CENT
+    n = int((rest - sum(floor, Decimal(0))) / CENT)       # 金额为负时向零取整，余下的分是负的，同样按余数大小逐个补
+    order = sorted(range(len(free)), key=lambda i: (-abs(exacts[i] - floor[i]), free[i].id))
+    for i in order[:abs(n)]:
+        floor[i] += CENT if n > 0 else -CENT
     for c in locked:
         allocate(c, c.lock)  # 锁定值本身就是分的整数倍
     for c, f, e in zip(free, floor, exacts):
