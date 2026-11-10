@@ -138,7 +138,10 @@ def build_tree(rs: RuleSet, data: Datasets) -> tuple[Node, dict[str, list[Node]]
     # 2. 自下而上连父节点；没有实体表的上层由下层的 parent_key 推导出来
     for i in range(len(levels) - 1, 0, -1):
         lv, up = levels[i], levels[i - 1]
-        for k, n in nodes[lv.level].items():
+        ent = rs.entity_dataset(lv.key)
+        skip = bool(ent and ent[1].unmatched == "ignore")       # 财务确认过“上级里找不到的不参与”
+        unknown: list[tuple[str, str, str]] = []
+        for k, n in list(nodes[lv.level].items()):
             pk = n.attrs.get(lv.parent_key) if lv.parent_key else None
             if pk is None:
                 issues.append(Issue.block(
@@ -146,13 +149,25 @@ def build_tree(rs: RuleSet, data: Datasets) -> tuple[Node, dict[str, list[Node]]
                     where=str(n.attr_src)))
                 continue
             if up.level in listed and str(pk) not in nodes[up.level]:
-                issues.append(Issue.block(
-                    "parent_unknown", f"{n.id} 的上级 {lv.parent_key}={pk} 在「{up.level}」的实体表里不存在",
-                    where=str(n.attr_src)))
+                unknown.append((k, str(pk), str(n.attr_src)))
+                if skip:
+                    del nodes[lv.level][k]
                 continue
             p = get(up.level, str(pk))
             n.parent = p
             p.children.append(n)
+        if unknown:
+            ex = "；".join(f"{lv.level}:{k} 的 {lv.parent_key}={pk}（{src}）" for k, pk, src in unknown[:5])
+            have = list(nodes[up.level])[:3]
+            if skip:
+                issues.append(Issue.warn("parent_unknown_skipped", f"「{lv.level}」有 {len(unknown)} 个对象在「{up.level}」里找不到上级，"
+                                         f"按 unmatched: ignore 不参与分配：{ex}", where=unknown[0][2]))
+            else:
+                issues.append(Issue.block(
+                    "parent_unknown", f"「{lv.level}」有 {len(unknown)} 个对象的上级在「{up.level}」的实体表里不存在，如 {ex}。"
+                    f"「{up.level}」的编号如 {have}。先查两边编号的拼法是否一致（合成编号的列、同名列用的是哪一列）、"
+                    "期间是否一致（这张表要不要也写 period 只取本期）；确实是材料或数据里就对不上的，把这几行列出来 ask_question 问财务，"
+                    "财务答复不参与后在这张实体表写 unmatched: ignore", where=unknown[0][2]))
     for n in nodes[levels[0].level].values():
         n.parent = root
         root.children.append(n)

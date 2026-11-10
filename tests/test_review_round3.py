@@ -52,7 +52,7 @@ def test_segment_that_cannot_be_matched_by_name_blocks(tmp_path):
     w = Workspace(FakeLLM(["x"]), build_inventory(collect_files([tmp_path])))
     with pytest.raises(ToolError, match="没法按列名对回第一段"):
         w.define_dataset("明细", "a.xlsx", "明细", {"id": {"column": "编号", "type": "id"},
-                                                 "amt": {"column": "金额", "type": "money"}}, key="id")
+                                                 "amt": {"column": "金额(B列)", "type": "money"}}, key="id")
 
 
 def test_compare_reports_people_missing_from_results():

@@ -182,3 +182,93 @@ def test_report_sheet_totals_and_people(tmp_path):
     assert head[2].startswith("cust") or "cust" in head[2]                 # 原始字段排在计算列前面
     bad = dict(rules, report={"totals": [{"name": "x", "level": "没有", "expr": "1"}]})
     assert "report_level" in {i.code for i in validate(RuleSet.model_validate(bad))}
+
+
+def test_duplicate_headers_must_name_the_column(tmp_path):
+    """T3：两列都叫“客户简称”，只写原名时默认取了第一列；现在必须写明是哪一列。"""
+    p = tmp_path / "数据.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "销售"
+    ws.append(["月份", "客户简称", "金额", "客户简称"])
+    ws.append([202609, "A01", 100, "B02"])
+    wb.save(p)
+    w = Workspace(FakeLLM(["x"]), build_inventory(collect_files([tmp_path])))
+    with pytest.raises(ToolError, match="2 列都叫「客户简称」.*客户简称\\(B列\\).*客户简称\\(D列\\)"):
+        w.define_dataset("销售", "数据.xlsx", "销售", {"c": {"column": "客户简称", "type": "text"}})
+    with pytest.raises(ToolError, match="都叫「客户简称」"):
+        w.define_dataset("销售", "数据.xlsx", "销售", {"k": {"column": "k", "type": "id"}}, combine={"k": ["月份", "客户简称"]})
+    assert "已保存" in w.define_dataset("销售", "数据.xlsx", "销售", {"c": {"column": "客户简称(D列)", "type": "text"}})
+    assert w._values("销售", "c") == ["B02"]
+    assert "已保存" in w.define_dataset("销售", "数据.xlsx", "销售", {"c": {"column": "客户简称(B列)", "type": "text"}})
+    assert w._values("销售", "c") == ["A01"]
+
+
+def _two_levels(tmp_path, ignore):
+    from bonus_core.data.mapping import DatasetMapping
+    from bonus_core.engine.run import compute
+    p = tmp_path / "d.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "项目"
+    ws.append(["项目", "金额"])
+    ws.append(["P1", 100])
+    s = wb.create_sheet("名单")
+    s.append(["行", "项目", "人员"])
+    s.append(["1", "P1", "甲"])
+    s.append(["2", "P9", "乙"])
+    wb.save(p)
+    rules = {"name": "t", "version": "1",
+             "datasets": {"项目": {"key": "pid", "fields": {"pid": {"type": "id"}, "amt": {"type": "money", "unit": "元"}}},
+                          "名单": {"key": "rid", "unmatched": "ignore" if ignore else "block",
+                                 "fields": {"rid": {"type": "id"}, "pid": {"type": "id"}, "emp": {"type": "text"}}}},
+             "pool": {"scope": "项目", "expr": "amt"},
+             "allocation": [{"level": "项目", "key": "pid"}, {"level": "个人", "key": "rid", "parent_key": "pid", "weight": "1"}]}
+    rs = RuleSet.model_validate(rules)
+    mp = {"项目": DatasetMapping.model_validate({"sheet": "项目", "columns": {"pid": "项目", "amt": "金额"}}),
+          "名单": DatasetMapping.model_validate({"sheet": "名单", "columns": {"rid": "行", "pid": "项目", "emp": "人员"}})}
+    data, _ = apply_mapping(rs, [p], mp)
+    return compute(rs, data)
+
+
+def test_leaf_rows_without_parent_block_with_guidance_or_skip_when_confirmed(tmp_path):
+    from bonus_core.engine.issues import EngineError
+    with pytest.raises(EngineError, match="1 个对象的上级.*P9.*ask_question"):
+        _two_levels(tmp_path, ignore=False)
+    res = _two_levels(tmp_path, ignore=True)
+    assert Decimal(res.pool) == Decimal("100.00") and len([n for n in res.nodes.values() if n.level == "个人"]) == 1
+    assert any(i.code == "parent_unknown_skipped" for i in res.issues)
+
+
+def test_trial_run_warns_on_pool_jump(tmp_path):
+    w = _ws(tmp_path)
+    w.define_dataset("销售", "数据.xlsx", "销售", {"rid": {"column": "（行号）", "type": "id"},
+                                                "amt": {"column": "金额", "type": "money", "unit": "元"}}, key="rid")
+    w.set_rules(pool={"expr": "sum(amt) * 0.1"}, allocation=[{"level": "行", "key": "rid", "weight": "amt"}])
+    assert "差了" not in w.trial_run()
+    w.set_rules(pool={"expr": "sum(amt) * 100"})
+    assert "差了 1000.0 倍" in w.trial_run()
+
+
+def test_failed_round_keeps_draft_of_last_successful_trial(tmp_path):
+    import json
+    from bonus_agent.agent import run_agent
+    m = tmp_path / "材料"
+    m.mkdir()
+    _book(m)
+    script = [
+        {"tool": "define_dataset", "args": {"name": "销售", "file": "数据.xlsx", "sheet": "销售", "key": "rid",
+                                            "fields": {"rid": {"column": "（行号）", "type": "id"},
+                                                       "amt": {"column": "金额", "type": "money", "unit": "元"}}}},
+        {"tool": "set_rules", "args": {"pool": {"expr": "sum(amt) * 0.1"},
+                                       "allocation": [{"level": "行", "key": "rid", "weight": "amt"}]}},
+        {"tool": "trial_run", "args": {}},
+    ]
+    llm = FakeLLM([json.dumps(s) for s in script])
+    llm.tool_mode = "json"
+    out = tmp_path / "案卷"
+    ar = run_agent(llm, [m], out, max_steps=len(script))
+    assert ar.status == "FAILED"
+    assert (out / "草稿结果（未完成）.xlsx").exists() and not (out / "result.xlsx").exists()
+    book = openpyxl.load_workbook(out / "草稿结果（未完成）.xlsx")
+    assert "说明" in book.sheetnames and book.sheetnames[0] == "汇总核算"

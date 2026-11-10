@@ -1189,6 +1189,7 @@ class Workspace:
         if st is None:
             raise ToolError(f"{f.name}/{sheet} 没有自动识别出表格，请先 read_sheet 查看，再用 header_rows 指定表头行")
         raw = st
+        fields, combine, unpivot, filter = _resolve_dup_columns(st, fields, combine, unpivot, filter)
         spec = _unpivot_spec(unpivot, st) if unpivot else None
         if spec:
             st = unpivot_by(st, spec)
@@ -1214,8 +1215,9 @@ class Workspace:
                     key, link = (hit[0], link) if which == "key" else (key, hit[0])
         unmatched = str(unmatched or "block").strip().lower()
         if unmatched == "ignore":
-            if not link or key:
-                raise ToolError("unmatched: ignore 只用于写了 link、没写 key 的明细表")
+            if not link and not key:
+                raise ToolError("unmatched: ignore 只用于写了 link 的明细表，或作为下一层分配对象的实体表（写了 key，"
+                                "分配层级用 parent_key 挂到上一层）")
             # 财务说过的话，或财务答复过的问题（问题里写了表名、答复说怎么处理）：问题原文这里也算，表名多半只出现在问题里
             told = "\n".join([self.said] + [f"{q.text} {q.answer}" for q in self.questions if str(q.answer or "").strip()])
             sh = "" if re.fullmatch(r"(?i)sheet\s*\d*|工作表\s*\d*", str(sheet or "").strip()) else sheet   # Sheet1 这类名字到处都有，不算
@@ -1662,12 +1664,18 @@ class Workspace:
                             + self._unmatched_text(e.issues)) from None
         except (EvalError, AdjustConflict, ValueError) as e:
             raise ToolError(f"方案「{name}」试算失败：{e}") from None
+        prev = self.results.get(name, {}).get("R0")
         self.results[name] = res
         self.read_nums[name] = fx.data_numbers(rs, data)
         self.untested.discard(name)
         self.untested |= {s for s in self.schemes if s != name and name in {d for d, _ in self._deps(s)}}  # 引用本方案的要重算
         base = res["R0"]
         lines = [f"方案「{name}」试算成功。奖金池 {fmt(Decimal(base.pool))} 元（精确值 {base.pool_exact}）"]
+        if prev is not None and Decimal(prev.pool) != 0 and Decimal(base.pool) != 0:
+            k = abs(Decimal(base.pool) / Decimal(prev.pool))
+            if k >= 10 or k <= Decimal("0.1"):       # T3：改了分档表，奖金池从十几万变成一千多亿，没人发现
+                lines.append(f"⚠ 奖金池从上次试算的 {fmt(Decimal(prev.pool))} 变成 {fmt(Decimal(base.pool))}，差了 {k:.1f} 倍。"
+                             "多半是刚改的部分写错了（百分号、单位、分档表的上下限、表达式）；先核对刚改的地方，不要在这个结果上继续")
         if base.totals:
             lines.append("汇总核算：" + "；".join(f"{n} {fmt(Decimal(v))}" for n, v in base.totals))
         if base.people:
@@ -2412,8 +2420,11 @@ class Workspace:
             bare = [s for s in self.schemes if not (self._merged(s).get("report") or {}).get("totals")
                     or not (self._merged(s).get("report") or {}).get("people")]
             if bare:
-                raise ToolError(f"方案 {bare} 还没有写 report。场景有输出要求（见任务说明的【输出要求】），用 set_rules 的 report 写明"
-                                "汇总核算的各类金额（totals）和按人汇总用的字段（people），然后再 trial_run")
+                raise ToolError(f"方案 {bare} 还没有写完 report。场景有输出要求（见任务说明的【输出要求】），用 set_rules 的 report 写明"
+                                "汇总核算的各类金额（totals）和按人汇总用的字段（people），然后再 trial_run。"
+                                "people 要写最末一层上表示人的字段：分配到人时，最末层用逐条的分配记录（如名单展开后每行一条，"
+                                "key 用行号，parent_key 写上一层的编号，权重写比例），people 写记录里的人名字段；"
+                                "不要为了写 people 另建一层“人员”，也不要改动已经试算成功的金额部分")
         gates = [f"方案「{s}」：{g}" for s in self.schemes if s in self.lint for g in self._open_gates(self.lint[s])]
         if gates:
             raise ToolError("程序检查还有没处理的（逐条改规则；需要财务确认的用 ask_question；确实无关的写进 ignored，"
@@ -3399,6 +3410,44 @@ def _cell(v) -> str:
     return t if len(t) <= CELL_CHARS else f"{t[:CELL_CHARS]}…（共{len(t)}字，已截断）"
 
 
+def _dup_names(headers: list[str]) -> dict[str, str]:
+    """同名列：原名 -> 第一列的 Excel 列字母（后面几列已由读表改名为“原名(X列)”）。"""
+    from openpyxl.utils import get_column_letter
+    out = {}
+    for i, h in enumerate(headers):
+        if h and any(x.startswith(f"{h}(") and x.endswith("列)") and x[len(h) + 1:-2].isalpha() for x in headers):
+            out.setdefault(h, get_column_letter(i + 1))
+    return out
+
+
+def _resolve_dup_columns(st, fields, combine, unpivot, filter):
+    """表里有几列同名时（如两列都叫“客户简称”），只写原名分不清是哪一列，必须写明列：第一列写“原名(N列)”，后面的写“原名(AE列)”。
+    T3：只写了“客户简称”，程序默认取了第一列，材料和其他表用的却是最后一列，项目全挂不上。"""
+    dup = _dup_names(st.headers)
+    if not dup:
+        return fields, combine, unpivot, filter
+    alias = {f"{h}({c}列)": h for h, c in dup.items()}
+
+    def fix(col):
+        c = str(col).strip()
+        if c in dup:
+            others = [x for x in st.headers if x.startswith(f"{c}(") and x.endswith("列)")]
+            raise ToolError(f"未保存：表里有 {1 + len(others)} 列都叫「{c}」：{c}({dup[c]}列)、{'、'.join(others)}。只写「{c}」分不清用哪一列。"
+                            "先看材料怎么叫、哪一列的取值和其他表对得上（read_sheet 比一比），再写明列，如"
+                            f"「{c}({dup[c]}列)」或「{others[0]}」；拿不准就 ask_question，问题里列出两列不同的取值")
+        return alias.get(c, col)
+    if isinstance(fields, dict):
+        fields = {k: ({**d, "column": fix(d["column"])} if isinstance(d, dict) and d.get("column") is not None else d)
+                  for k, d in fields.items()}
+    if isinstance(combine, dict):
+        combine = {k: [fix(c) for c in v] if isinstance(v, list) else v for k, v in combine.items()}
+    if isinstance(unpivot, dict) and isinstance(unpivot.get("columns"), list):
+        unpivot = {**unpivot, "columns": [fix(c) for c in unpivot["columns"]]}
+    if isinstance(filter, dict):
+        filter = {fix(k): v for k, v in filter.items()}
+    return fields, combine, unpivot, filter
+
+
 def _combine_spec(spec, st) -> dict[str, list[str]]:
     """校验 define_dataset 的 combine：{"新列名": ["列1", "列2", ...]}，几列合成一个编号（如项目 = 月份+客户+型号）。"""
     if not isinstance(spec, dict) or not spec or not all(isinstance(v, list) for v in spec.values()):
@@ -3620,7 +3669,7 @@ def _lessons(error: str) -> list[str]:
 def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None = None) -> dict[str, Path]:
     out.mkdir(parents=True, exist_ok=True)
     from bonus_agent import review as rv
-    for old in [*out.glob("result*.xlsx"), *out.glob("rules*.yaml"), *out.glob("adjust_*.yaml"),
+    for old in [*out.glob("result*.xlsx"), *out.glob("草稿结果*.xlsx"), *out.glob("rules*.yaml"), *out.glob("adjust_*.yaml"),
                 out / "待确认问题.xlsx", out / "expected_check.txt", out / rv.FILE]:
         old.unlink(missing_ok=True)       # 上一轮的输出已存档在 history/，不能留在顶层被误用
     ws, paths = ar.ws, {}
@@ -3654,7 +3703,19 @@ def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None =
     paths["log"].write_text(json.dumps({"summary": ws.summary, "error": ar.error, "transcripts": ws.transcripts,
                                         "triage": ws.triage, "usage": ar.usage, "steps": [vars(s) for s in ar.steps]}, ensure_ascii=False, indent=2),
                             encoding="utf-8")
-    if ar.status == "FAILED":       # 没做完（没通过检查或独立验算）：不出结果文件，免得被当成结果用；过程在 agent_log 里
+    if ar.status == "FAILED":       # 没做完（没通过检查或独立验算）：不出正式结果文件，免得被当成结果用；过程在 agent_log 里
+        # 本轮有过成功的试算（如做到一半 tokens 用完）：另存一份草稿，标明未完成，财务能看到做到哪了，重试时接着做
+        for name, revs in ar.results.items():
+            if "R0" not in revs:
+                continue
+            k = f"draft:{name}"
+            paths[k] = out / (f"草稿结果（未完成）_{_safe(name)}.xlsx" if len(ar.results) > 1 else "草稿结果（未完成）.xlsx")
+            note = [("说明", ["项目", "值"], [["状态", "本轮没有完成，这是最近一次成功试算的草稿，没有通过程序检查和独立验算，不能作为结果使用"],
+                                             ["原因", ar.error[:500]]], {"项目": 10, "值": 100})]
+            try:
+                write_excel(ar.rulesets[name], revs["R0"], paths[k], extra_sheets=note)
+            except Exception:
+                paths.pop(k, None)
         return paths
     if not ar.results:
         if ar.pending or ws.questions:     # 本轮不出结果：把问题、规划和工作记录给财务看

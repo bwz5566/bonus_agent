@@ -20,7 +20,7 @@
                                            汇总写入 目录/summary.json（完成率、正确率、算错没拦住、卡住原因）
                                            --baseline 上次的输出目录：跑完后逐场景对比，标出变差的场景
   regress-compare 上次目录 这次目录         对比两次回归（不调用模型）：每次修复后看有没有别的场景变差
-  serve --data 数据目录 [--host 127.0.0.1] [--port 8080] [--model M] [--checker M2]
+  serve --data 数据目录 [--host 127.0.0.1] [--port 8080] [--model M] [--checker M2] [--max-tokens N] [--max-steps N]
                                            --checker：独立复读、独立算式改用另一个模型交叉验证（连不上时退回主模型）
                                            内网网页服务：看问题、填答复、传材料、运行下一轮、确认、按模板计算
   user add --data 数据目录 用户名 --roles editor,approver [--display 姓名]
@@ -113,6 +113,9 @@ def main(argv=None) -> int:
     p.add_argument("--model")
     p.add_argument("--checker", help="交叉验证（独立复读、独立算式）用的另一个模型，如 qwen-a；不写就用主模型自己验证")
     p.add_argument("--max-parallel", type=int, default=2, help="同时最多运行几个案卷")
+    p.add_argument("--max-steps", type=int, default=150, help="每轮最多多少步（工具调用），默认 150")
+    p.add_argument("--max-tokens", type=int, default=4_000_000,
+                   help="每轮最多用多少 tokens，默认 400 万；材料多、模型绕路时可加大，如 8000000")
     p = sub.add_parser("user")
     p.add_argument("action", choices=["add"])
     p.add_argument("--data", required=True)
@@ -215,7 +218,8 @@ def main(argv=None) -> int:
         return 0 if all(r.blocked for r in res) else 3
     if a.cmd == "serve":
         from bonus_agent.web import serve
-        serve(a.data, a.host, a.port, a.model, max_parallel=a.max_parallel, checker=a.checker)
+        serve(a.data, a.host, a.port, a.model, max_parallel=a.max_parallel, checker=a.checker,
+              max_steps=a.max_steps, max_tokens=a.max_tokens)
         return 0
     cfg = load_config()
     if a.cmd == "models":

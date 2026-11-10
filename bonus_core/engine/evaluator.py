@@ -172,7 +172,9 @@ class Evaluator:
                     return n
         if scope in self.layout.aux:
             raise EvalError(f"变量 {name} 属于关联实体「{scope}」，这里取不到对应的{scope}（当前行没有它的编号 "
-                            f"{self.rs.datasets[scope].key}）", node.id)
+                            f"{self.rs.datasets[scope].key}）。在「{node.level}」层要用{scope}的数，这一层的行上要有{scope}的编号；"
+                            f"一个对象对应多个{scope}时（如一个人参与多个项目），不要让它单独成一层：最末层用逐条记录的表"
+                            f"（如分配名单每行一条，key 用行号，parent_key 写上一层的编号），按人汇总写在 report.people 里", node.id)
         raise EvalError(f"变量 {name} 属于「{scope}」层级，不能在「{node.level}」层直接引用（需要聚合）", node.id)
 
     def _node_refs(self, node: Node):
