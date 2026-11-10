@@ -1,4 +1,5 @@
 """内网网页服务：登录、角色、防伪码、上传、答复、多轮运行、确认、按模板计算、下载和操作记录。"""
+import os
 import json
 from pathlib import Path
 
@@ -167,7 +168,8 @@ def test_safe_name_and_passwords(tmp_path):
         u.add("a", PW, ["root"])
     u.add("李经理", PW, ["approver"])                       # 中文用户名也可以
     assert u.check("李经理", PW)["roles"] == ["approver"]
-    assert oct(Path(tmp_path / "users.yaml").stat().st_mode)[-3:] == "600"
+    if os.name != "nt":                   # Windows 没有 Unix 权限位
+        assert oct(Path(tmp_path / "users.yaml").stat().st_mode)[-3:] == "600"
 
 
 def test_login_logout_and_lockout(env):
