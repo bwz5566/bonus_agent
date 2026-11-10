@@ -503,6 +503,7 @@ class Rules:
         data = _data_sheets(ws)
         for ds, m in ws.mapping.items():
             for v in m.filter.values():
+                v = v.get("not", []) if isinstance(v, dict) else v
                 for s in (v if isinstance(v, list) else [v]):
                     self.strs.add(str(s).strip())
                     for d in _DATE.findall(str(s)):

@@ -115,7 +115,9 @@ def fake_agent_script(case: Case) -> list:
     for c in case.spec["checks"]:
         if c["type"] == "question":
             script.append({"tool": "ask_question", "args": {"text": "请确认：" + "、".join(map(str, c["keywords"])),
-                                                           "options": ["全额累进", "超额累进"], "suggested": 0}})
+                                                           "options": ["全额累进", "超额累进"], "suggested": 0,
+                                                           "evidence": [{"file": Path(case.spec["docs"][0]).name,
+                                                                         "quote": "、".join(map(str, c["keywords"]))}]}})
     covered = {f["file"] for f in facts}
     ignored = [{"ref": Path(d).name, "reason": "演练脚本未登记参数"} for d in case.spec["docs"] if Path(d).name not in covered]
     ignored += [{"ref": f["name"], "reason": i} for f in facts if (i := f.get("ignore"))]

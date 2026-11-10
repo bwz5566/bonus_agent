@@ -231,6 +231,10 @@ def _why(src: str, e: Exception) -> str:
         why = "右括号多了，没有对应的左括号"
     elif pos >= len(src) or tok in ("", "$END"):
         why = "式子没写完" + ("：少了右括号" if depth > 0 else "")
+        if depth > 0 and stack:          # 指出哪几个左括号没闭合，长式子建议拆开
+            opened = "；".join(f"第 {k + 1} 个字符「…{src[max(0, k - 25):k + 1]}」" for k, _ in stack[-3:])
+            why += (f"。没闭合的左括号（最里面的 3 个以内，从外往里）：{opened}。在它对应的那一段末尾补上右括号；"
+                    "式子很长、嵌套很多层时，拆成几个中间变量（每个变量只写一两层函数）再组合，不要整段反复重写")
     else:
         why = f"▲处的「{tok}」写法不对"
     return f"{why}。{total}出错位置（▲处）：{near}"

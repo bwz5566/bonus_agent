@@ -832,6 +832,14 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
                 sug = q.get("suggested")
                 hint = (f"<div class='mut'>智能体建议（仅供参考，不会被采用）：{e(q['options'][sug])}</div>"
                         if isinstance(sug, int) and 0 <= sug < len(q.get("options") or []) else "")
+                ev = q.get("evidence") or []
+                if ev:
+                    hint += ("<div class='mut'>依据（逐字核对原文；没核对上的请以材料为准）：<ul>" + "".join(
+                        f"<li>《{e(x.get('file', ''))}》「{e(x.get('quote', ''))}」"
+                        + ("" if x.get("ok") else " <span class='warn'>原文里没核对上</span>") + "</li>" for x in ev)
+                        + "</ul></div>")
+                elif hint:
+                    hint += "<div class='warn'>智能体没有给出建议的依据，请对照材料判断</div>"
                 items.append(f"<div class='q'><b>{e(q['id'])}</b> <span class='mut'>第 {e(q.get('round', 1))} 轮</span> {state}"
                              f"<div>{e(q['text'])}</div>{hint}{opts}</div>")
             body = "".join(items)

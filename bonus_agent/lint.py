@@ -852,3 +852,40 @@ def _opposite(v: str, lits) -> bool:
                 if v.startswith(x) and lit.startswith(y) and v[len(x):] == lit[len(y):]:
                     return True
     return False
+
+
+def idle_parts(rs: RuleSet) -> tuple[list[str], list[str]]:
+    """没用上的数据表和变量（试错时建的临时表、改结构后留下的旧变量）。用上 = 从奖金池、权重、发放、抵扣、校验、
+    汇总核算（report）出发能到达。返回 (数据表, 变量)。"""
+    def names(src: str) -> set[str]:
+        try:
+            return {x.id for x in walk(parse(src)) if isinstance(x, Name)}
+        except ExprError:
+            return set()
+    roots = [e for w, e in _exprs(rs) if not w.startswith("variables.")]
+    if rs.report:
+        roots += [t.expr for t in rs.report.totals]
+    todo = [n for e in roots for n in names(e)]
+    seen: set[str] = set()
+    while todo:
+        n = todo.pop()
+        if n in seen or n not in rs.variables:
+            continue
+        seen.add(n)
+        todo += list(names(rs.variables[n].expr))
+    live_exprs = roots + [rs.variables[n].expr for n in seen]
+    used_names = set().union(*(names(e) for e in live_exprs)) if live_exprs else set()
+    text = " ".join(live_exprs)
+    scopes = {rs.variables[n].scope for n in seen} | {rs.pool.scope}
+    if rs.report:
+        used_names |= {rs.report.people or ""} | {t.level for t in rs.report.totals}
+    level_keys = {lv.key for lv in rs.allocation} | {lv.parent_key for lv in rs.allocation if lv.parent_key}
+    patched = {x for p in rs.patches for x in (getattr(p, "source", None), getattr(p, "into", None)) if x}
+    idle_ds = []
+    for ds, d in rs.datasets.items():
+        own = {f for f in d.fields or {} if f not in (d.key, d.link)}
+        if (own & used_names or f'"{ds}"' in text or f"'{ds}'" in text or ds in scopes or ds in patched
+                or (d.key and d.key in level_keys)):
+            continue
+        idle_ds.append(ds)
+    return idle_ds, [n for n in rs.variables if n not in seen]

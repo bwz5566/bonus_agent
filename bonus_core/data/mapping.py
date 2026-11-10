@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import difflib
 import statistics
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import yaml
@@ -44,7 +44,7 @@ class DatasetMapping(BaseModel):
     sheet: str | None = None
     header_rows: list[int] | None = None  # 自动识别的表头不对时，指定 Excel 表头行号
     columns: dict[str, str]            # 标准字段 -> 列名
-    filter: dict[str, list[str] | str] = {}  # 只取这些行：列名 -> 允许的取值（如 目标值表里 entity_type 为 group 的行）
+    filter: dict[str, list[str] | str | dict[str, list[str]]] = {}  # 只取这些行：列名 -> 允许的取值；{"not": [...]} 为去掉这些取值的行
     unpivot: dict | None = None        # 几列同一类的值展开成每个值一行：{"columns": [...], "value": 列名, "label": 列名}（先展开再筛选）
     combine: dict[str, list[str]] | None = None   # 几列合成一个编号列：{"新列名": ["列1", "列2"]}（如项目 = 月份+客户+型号），展开之后再合成
     confidence: dict[str, float] = {}  # 推荐时填写
@@ -306,16 +306,41 @@ def cell_text(v) -> str:
     return "" if v is None else str(v).strip()
 
 
+def _num(t: str):
+    try:
+        return Decimal(t.replace(",", ""))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _in(text: str, vals: set[str], nums: set) -> bool:
+    """取值在列表里：按文字比，数字再按数值比（0、0.0、"0.00" 都算 0）。"""
+    if text in vals:
+        return True
+    if nums:
+        n = _num(text)
+        return n is not None and n in nums
+    return False
+
+
 def row_filter(headers: list[str], flt: dict[str, list[str]]):
-    """返回行筛选函数；列名不存在时返回错误信息。"""
+    """返回行筛选函数；列名不存在时返回错误信息。
+    取值写列表（或一个值）：只取这些行；写 {"not": [...]}：去掉这些行（如 {"not": ["剔除"]}、金额列 {"not": ["0"]}）。"""
     if not flt:
         return lambda vals: True
-    idx = {}
+    idx = []
     for col, allowed in flt.items():
         if col not in headers:
             return f"筛选条件的列「{col}」不在表头中：{[h for h in headers if h]}"
-        idx[headers.index(col)] = {cell_text(a) for a in ([allowed] if isinstance(allowed, str) else allowed)}
-    return lambda vals: all(cell_text(vals[i] if i < len(vals) else None) in ok for i, ok in idx.items())
+        neg = isinstance(allowed, dict)
+        if neg:
+            if set(allowed) != {"not"}:
+                return f"筛选条件「{col}」写列表（只取这些值）或 {{\"not\": [...]}}（去掉这些值），不认识 {sorted(allowed)}"
+            allowed = allowed["not"]
+        vals = {cell_text(a) for a in ([allowed] if isinstance(allowed, (str, int, float)) else allowed)}
+        nums = {n for n in (_num(v) for v in vals) if n is not None}
+        idx.append((headers.index(col), vals, nums, neg))
+    return lambda row: all(_in(cell_text(row[i] if i < len(row) else None), ok, nums) != neg for i, ok, nums, neg in idx)
 
 
 def _reconcile(st: SheetTable, idx, ds, t: StdTable) -> list[Issue]:

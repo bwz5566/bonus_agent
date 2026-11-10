@@ -45,6 +45,7 @@ class Question(BaseModel):
     withdrawn: str = ""        # 程序撤回的原因（如冲突所依据的材料已修改）
     answered_by: str = ""      # 答复人（网页答复时记录）
     answered_at: str = ""
+    evidence: list[dict] = []  # 选项和建议的依据：[{file, quote, ok}]，ok 为程序逐字核对过原文（答复页上给财务对照）
 
 
 class Extraction(BaseModel):

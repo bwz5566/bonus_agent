@@ -181,7 +181,9 @@ TOOLS: list[dict] = [
                                        "财务答复过“找不到的不参与 / 按默认值”后才可写 ignore，这些行不参与计算"},
                          "distinct": {"type": "boolean", "description": "可选：按 key 的不同取值各建一个对象（同一编号的多行合成一个，"
                                       "其余字段在同一编号下要一样）。没有单独的主表、又要按这个编号汇总时用，如从明细里得到每个客户一个“客户”"},
-                         "filter": {"type": "object", "description": '可选：只取这些行，{"列名": "取值"} 或 {"列名": ["取值1", "取值2"]}。'
+                         "filter": {"type": "object", "description": '可选：只取这些行，{"列名": "取值"} 或 {"列名": ["取值1", "取值2"]}；'
+                                    '去掉某些行写 {"列名": {"not": ["取值"]}}（如材料说“剔除的不计算”“金额为 0 的不计算”：'
+                                    '{"状态": {"not": ["剔除"]}}、{"销售金额": {"not": ["0"]}}，数字按数值比）。'
                                     '不要用它筛月份或日期，按期间取数用 period'},
                          "period": {**_S, "description": "可选：记业务日期或月份的字段名。写了之后计算时只取落在本次核算期间里的行，"
                                     "同一版规则换任何月份、季度都能算。业务明细（销售、回款、出货等）有日期或月份列时都要写；"
@@ -251,7 +253,11 @@ TOOLS: list[dict] = [
                     "财务答复后下一轮接着做。options 列出可选的理解，suggested 是你的建议（只供财务参考，不会被采用）。"
                     "related 写受影响的方案或规则（如 方案名.offsets）；回应程序检查或复读的某一条时写它给的编号。blocking=false 只用于不影响任何金额的提示。",
      "parameters": _obj({"text": _S, "options": {"type": "array", "items": _S}, "suggested": _I, "related": _S,
-                         "blocking": {"type": "boolean"}}, ["text", "options"])},
+                         "blocking": {"type": "boolean"},
+                         "evidence": {"type": "array", "description": "问题和建议的依据，显示在答复页上给财务对照：每条 file 写材料文件名"
+                                      "（财务在对话里说的写「财务对话」），quote 逐字复制原文或数据行里的取值（一句、一行）。"
+                                      "写了 suggested 就必须写，至少一条支持建议的原文；有冲突时各方的原文都列上",
+                                      "items": _obj({"file": _S, "quote": _S}, ["file", "quote"])}}, ["text", "options"])},
     {"name": "reply",
      "description": "对话时用：回复财务这条消息并结束本次对话。改过规则、数据表或台账时，程序会先自动试算全部方案并做完成前检查，"
                     "不通过会把原因返回给你修正。回复里的金额要来自 evaluate / explain / 试算结果，不要自己算。",
@@ -693,6 +699,8 @@ class Workspace:
     lint: dict = field(default_factory=dict)                # 方案 -> 程序检查结果（lint.Report），finish 前要处理其中的 gates
     said: str = ""                                          # 财务在对话里发过的文字：和材料一样可以引用（file 写「财务对话」）
     doc_reads: dict = field(default_factory=dict)           # 本轮每份文档已读的字数（不存进案卷，每轮从 0 起）
+    _corrections: list = field(default_factory=list)        # 本次对话里财务更正过的答复：(编号, 原答复, 新答复, 更正时规则的指纹)
+    _tidy_shown: bool = False                               # finish 前清理没用上的数据表、变量的提醒已给过
 
     @property
     def data_files(self) -> list[Path]:
@@ -1230,10 +1238,17 @@ class Workspace:
         except ValidationError as e:
             raise ToolError(f"参数格式不对：{e}") from None
         types = {fn: (fd.type, n) for n, d in self.datasets.items() if n != name for fn, fd in d.fields.items()}
-        if filter is not None and not (isinstance(filter, dict) and all(isinstance(v, (str, int, float, list))
+        def _neg(v):
+            return isinstance(v, dict) and set(v) == {"not"} and isinstance(v["not"], (str, int, float, list))
+        if filter is not None and not (isinstance(filter, dict) and all(isinstance(v, (str, int, float, list)) or _neg(v)
                                                                          for v in filter.values())):
-            raise ToolError('filter 的格式是 {"列名": "取值"} 或 {"列名": ["取值1", "取值2"]}')
-        flt = {str(k): ([str(x) for x in v] if isinstance(v, list) else str(v)) for k, v in (filter or {}).items()}
+            raise ToolError('filter 的格式是 {"列名": "取值"}、{"列名": ["取值1", "取值2"]}（只取这些行），'
+                            '或 {"列名": {"not": ["取值"]}}（去掉这些行）')
+
+        def _vals(v):
+            return [str(x) for x in v] if isinstance(v, list) else str(v)
+        flt = {str(k): ({"not": _vals(v["not"]) if isinstance(v["not"], list) else [str(v["not"])]} if _neg(v) else _vals(v))
+               for k, v in (filter or {}).items()}
         held = self._filter_drops_pending(st, flt)
         if held:
             raise ToolError("未保存：filter 排除了还在等财务答复的问题里问到的记录（" + "；".join(held) + "）。"
@@ -1367,6 +1382,65 @@ class Workspace:
                             "（折算用哪个汇率、有没有扣减、折算后的金额算不算计提基数）。材料没写清的，用 ask_question 问财务："
                             "问题里写列名和例子；答复后把这一列映射成字段，在规则里按答复折算",
                             f"币种 {h}"))
+        return out
+
+    def _exclusion_gates(self, rs) -> list[tuple[str, str]]:
+        """材料或财务说某类行不参与（如“销售金额为 0 的不计算”“判断为‘剔除’的行不参与”），数据表筛完后却还有这样的行，
+        规则里也没按这一列比较：这些行会被算进对象个数、出货月份、合计里。"""
+        from bonus_core.data.mapping import _in, _num, cell_text
+        from bonus_agent.auto import filter_sheet
+        text = "\n".join([*(l for f in self.inv.files if f.suffix.lower() not in DATA_SUFFIXES for l in self._lines(f.name)),
+                          self.said, *(str(q.answer or "") for q in self.questions)])
+        clauses = [c.strip() for c in re.split(r"[。；;\n]", unicodedata.normalize("NFKC", text)) if _EXCLUDE.search(c)]
+        if not clauses:
+            return []
+        exprs = " ".join(e for _, e in lint._exprs(rs))
+        read = set(lint._read(rs, lint._names(rs)))
+        out, seen = [], set()
+        for name, m in self.mapping.items():
+            if name not in read:
+                continue
+            try:
+                st = table_at(Path(m.file) if Path(m.file).exists() else self._file(Path(m.file).name), m.sheet, m.header_rows) \
+                    if m.header_rows else self.inv.sheet(f"{Path(m.file).name}/{m.sheet}")
+            except Exception:
+                continue
+            if st is None:
+                continue
+            kept, err = filter_sheet(st, m.filter or None)
+            if err:
+                continue
+            fld_of = {c: f for f, c in m.columns.items()}
+            for c in clauses:
+                cn = re.sub(r"\s+", "", c)
+                pairs = []
+                for i, h in enumerate(st.headers):          # 「列名 为/等于/= 值」
+                    if not h or len(h) < 2:
+                        continue
+                    mm = re.search(re.escape(re.sub(r"\s+", "", h)) + r"(?:为|是|等于|=|==)(零|空|[-\d.]+)", cn)
+                    if mm:
+                        v = {"零": "0", "空": ""}.get(mm.group(1), mm.group(1))
+                        pairs.append((i, h, v))
+                for v in re.findall(r"[「“\"‘']([^「」“”\"‘’']{1,20})[」”\"’']", c):   # 引号里的取值出现在某一列
+                    for i, h in enumerate(st.headers):
+                        if h and any(cell_text(r[i] if i < len(r) else None) == v for _, r in st.rows[:5000]):
+                            pairs.append((i, h, v))
+                for i, h, v in pairs:
+                    if (name, h) in seen:
+                        continue
+                    f = fld_of.get(h)
+                    if f and re.search(rf"(?<![\w.]){re.escape(f)}\s*(==|!=|<>|>=|<=|>|<)|(==|!=|<>|>=|<=|>|<)\s*{re.escape(f)}(?![\w])", exprs):
+                        continue                    # 规则里按这个字段比较过（如 where 里排除），交给验算核对
+                    nums = {n for n in [_num(v)] if n is not None}
+                    left = sum(1 for _, r in kept.rows if _in(cell_text(r[i] if i < len(r) else None), {v}, nums))
+                    if not left:
+                        continue
+                    seen.add((name, h))
+                    out.append((f"材料写了「{c[:80]}」，但数据表「{name}」筛选后还有 {left} 行「{h}」是「{v or '空'}」，"
+                                "这些行会被算进对象个数、月份数和合计。按材料在 define_dataset 的 filter 里去掉它们"
+                                f"（如 {{\"{h}\": {{\"not\": [\"{v}\"]}}}}），或在规则里按这个字段排除；"
+                                "这句和这张表无关的写进 ignored 说明原因",
+                                f"排除条款 {name}.{h}"))
         return out
 
     def _values(self, name: str, fld: str) -> list[str]:
@@ -1509,6 +1583,10 @@ class Workspace:
                 if isinstance(v, dict) and ("expr" in v or "kind" in v):
                     hint += f"\n{k} 要写成 {{名字: {{...}}}}，每一项以名字为键，如 {{\"emp_sales\": {{\"expr\": \"...\", \"scope\": \"个人\"}}}}"
             raise ToolError(f"规则格式不对，未保存：{str(e)[:2500]}{hint}") from None
+        broken = _broken_exprs(rss.values())
+        if broken:       # 式子解析不了就不保存：存进去之后试算、查询都会报同一个错，又不知道是哪一条
+            raise ToolError("未保存：这些式子解析不了，改好后再一起提交（其余部分也没保存）：\n"
+                            + "\n".join(f"- {w}：{m}" for w, m in broken[:6]))
         self.drafts[name] = draft
         self.untested |= set(targets) - {SHARED}
         out = [f"已保存{'共用部分' if name == SHARED else f'方案「{name}」'}。"]
@@ -1746,9 +1824,12 @@ class Workspace:
                                            headers=heads, tiers=base.tier_stats, used_elsewhere=others,
                                            coverage=base.coverage, reached_elsewhere=elsewhere,
                                            said=self._finance_said())
-        for g, k in self._currency_gates(rs):
+        for g, k in [*self._currency_gates(rs), *self._exclusion_gates(rs)]:
             rep.gates.append(g)
             rep.keys.append(k)
+        tidy = self._tidy_text()
+        if tidy:
+            rep.warns.append(tidy + "；试错时建的临时表、旧变量请删掉")
         if rep.warns:
             lines.append("程序检查提示：\n" + "\n".join(f"- {w}" for w in rep.warns[:8]))
         gates = self._open_gates(rep)
@@ -2317,12 +2398,16 @@ class Workspace:
 
     # ---- 问题与完成 ----
     def ask_question(self, text: str, options: list[str] | None = None, suggested: int | None = None, related: str = "",
-                     blocking: bool = True) -> str:
+                     blocking: bool = True, evidence: list[dict] | None = None) -> str:
         same = next((q for q in self.questions if q.text.strip() == text.strip()), None)
         if same is not None:
             if same.answer:
                 return f"这个问题（{same.id}）财务已答复：{same.answer}。请按答复处理"
             return f"这个问题已经问过（{same.id}），还在等财务答复"
+        ev, bad = self._evidence(evidence)
+        if suggested is not None and not ev:
+            raise ToolError("写了 suggested（建议）就要在 evidence 里给出依据：file 写材料文件名，quote 逐字复制支持这个建议的原文或数据取值。"
+                            "财务会对照原文判断，没有依据的建议容易误导财务；找不到依据就不要写 suggested")
         if blocking:
             found = self._answer_in_material(text, options or [])
             if found:
@@ -2332,12 +2417,33 @@ class Workspace:
             text = (text + f"\n（程序提示：问题里的 {'、'.join(own)} 是智能体在规则里自己写的数，材料和数据里都找不到；"
                     "请按材料原文判断，不要只看推荐答案）")
         q = Question(id=_next_qid(self.questions), text=text, options=options or [], suggested=suggested,
-                     related=related, blocking=blocking, round=self.round)
+                     related=related, blocking=blocking, round=self.round, evidence=ev)
         self.questions.append(q)
+        note = (f"（依据里有 {len(bad)} 条在原文里找不到，答复页上会标出“没核对上”：{'；'.join(bad[:3])}）" if bad else "")
         if blocking:
-            return (f"已记录问题 {q.id}，等财务答复。不要自行选择口径或补出算法；"
+            return (f"已记录问题 {q.id}，等财务答复{note}。不要自行选择口径或补出算法；"
                     "继续做不受影响的部分，全部问完后调用 finish 结束本轮")
-        return f"已记录提示 {q.id}（不影响金额，不必等答复）"
+        return f"已记录提示 {q.id}（不影响金额，不必等答复）{note}"
+
+    def _evidence(self, evidence) -> tuple[list[dict], list[str]]:
+        """提问的依据逐字核对原文：核对上的标 ok，核对不上的也保留（标出来给财务看），返回 (依据, 核对不上的说明)。"""
+        if not evidence:
+            return [], []
+        corpus, out, bad = self._corpus(), [], []
+        for e in evidence if isinstance(evidence, list) else [evidence]:
+            if not isinstance(e, dict):
+                continue
+            file, quote = str(e.get("file") or "").strip(), str(e.get("quote") or "").strip()
+            if not quote:
+                continue
+            name = next((n for n in corpus if n == file or Path(n).stem == Path(file).stem), file)
+            q = fx.norm(quote)
+            ok = bool(q) and name in corpus and (q in corpus[name] or all(
+                fx.norm(x) in corpus[name] for x in quote.splitlines() if fx.norm(x)))
+            out.append({"file": name, "quote": quote[:300], "ok": ok})
+            if not ok:
+                bad.append(f"《{file}》{quote[:40]}")
+        return out, bad
 
     def _own_numbers(self, text: str) -> list[str]:
         """问题里出现、规则常数里有、但材料原文和数据里都没有的数（多半是智能体给空值或查不到时自己设的占位数）。
@@ -2455,12 +2561,52 @@ class Workspace:
             if stale:
                 raise ToolError(f"结束前自查：这 {len(stale)} 条条款对应的规则在核对之后改过（或还没核对过），请逐条对照后再 finish"
                                 "（没有问题就直接再调用 finish）：\n" + self._side_by_side(stale))
+            tidy = self._tidy_text()
+            if tidy and not self._tidy_shown:
+                self._tidy_shown = True
+                raise ToolError("结束前清理：" + tidy + "。试错时建的临时表、改结构后留下的旧变量会让结果文件和口径单难以核对："
+                                "用 remove_dataset 删掉没用的数据表，用 set_rules 删掉没用的变量（删完要再 trial_run）；"
+                                "要保留的（如只是展示用）直接再调用 finish")
         self.summary, self.ignored, self.done = summary, ignored, True
         return "已完成"
+
+    def _tidy_text(self) -> str:
+        """所有方案都没用上的数据表，和各方案里没用上的变量。"""
+        idle_ds: set[str] | None = None
+        idle_vars = []
+        for s in self.schemes:
+            try:
+                ds, vs = lint.idle_parts(self._ruleset(s))
+            except Exception:
+                return ""
+            idle_ds = set(ds) if idle_ds is None else idle_ds & set(ds)
+            idle_vars += [f"{s}.{v}" if len(self.schemes) > 1 else v for v in vs]
+        parts = []
+        if idle_ds:
+            parts.append(f"数据表 {'、'.join(sorted(idle_ds))} 没有被任何方案用到")
+        if idle_vars:
+            parts.append(f"变量 {'、'.join(idle_vars[:15])}{' 等' if len(idle_vars) > 15 else ''} 没有接进奖金池、分配、发放或汇总核算")
+        return "；".join(parts)
+
+    def _rules_print(self) -> str:
+        """规则草稿和数据表定义的指纹：用来判断某个时点之后有没有改过。"""
+        import hashlib
+        body = json.dumps({"drafts": self.drafts, "datasets": {n: d.model_dump(mode="json") for n, d in self.datasets.items()},
+                           "mapping": {n: m.model_dump(mode="json") for n, m in self.mapping.items()}},
+                          ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha1(body.encode("utf-8")).hexdigest()
 
     def reply(self, text: str, ignored: list[dict] | None = None) -> str:
         if not self.chat_by:
             raise ToolError("现在不是对话，请用 finish 结束")
+        refs = {str(i.get("ref", "")) for i in [*self.ignored, *(ignored or [])] if isinstance(i, dict)}
+        now = self._rules_print()
+        stale = [(qid, a, b) for qid, a, b, fp in self._corrections if fp == now and f"更正 {qid}" not in refs]
+        if stale:
+            raise ToolError("财务更正了之前的答复，但更正之后规则和数据表都没有改过：\n"
+                            + "\n".join(f"- {qid}：原来「{a[:80]}」，现在「{b[:80]}」" for qid, a, b in stale)
+                            + "\n按最新的说法逐项找出受影响的数据表、筛选、变量和参数，改过来再试算核对；"
+                              "确实不影响规则（如只是措辞不同），在 reply 的 ignored 里写 ref「更正 编号」并说明原因")
         if self.changed and self.schemes:
             if any(s in self.untested or s not in self.results for s in self.schemes):
                 out = self.trial_run()
@@ -2497,6 +2643,9 @@ class Workspace:
             raise ToolError(f"没有待答复的问题 {id}")
         from datetime import datetime
         if self.chat_by:
+            old = str(q.answer or "").strip()
+            if old and old != answer.strip():      # 财务更正了之前的答复：之后规则和数据表要跟着改
+                self._corrections.append((q.id, old, answer.strip(), self._rules_print()))
             q.answer, q.answered_by = answer.strip(), f"{self.chat_by}（对话）"
         else:
             bad = fx.check_fact(fx.Fact(name=f"问题 {id} 的答复", value=quote, file=file, quote=quote),
@@ -3081,6 +3230,10 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 result, ok = f"错误：参数不是合法 JSON：{e}", False
             except TypeError as e:
                 result, ok = f"错误：参数不对：{_missing_args(c['name'], e)}", False
+            except ExprError as e:            # 规则里存着解析不了的式子（如老案卷）：指出是哪一条
+                broken = _broken_exprs([ws._ruleset(s) for s in ws.schemes]) if ws.schemes else []
+                result, ok = ("错误：规则里有式子解析不了，先用 set_rules 改好这一条，其他工具才能用：\n"
+                              + ("\n".join(f"- {w}：{m}" for w, m in broken[:6]) if broken else str(e)[:800])), False
             except (AttributeError, KeyError, IndexError, ValueError) as e:     # 参数结构和工具说明不一致（如对象写成了列表）
                 result, ok = (f"错误：参数结构不对（{type(e).__name__}: {e}）。请按工具说明的格式重写："
                               "要求对象 {...} 的地方不要写成列表 [...]，反之亦然"), False
@@ -3420,6 +3573,25 @@ def _dup_names(headers: list[str]) -> dict[str, str]:
     return out
 
 
+_EXCLUDE = re.compile(r"不参与|不计算|不计入|不纳入|不核算|不计提|不算作|不统计|剔除|排除")
+
+
+def _broken_exprs(rss) -> list[tuple[str, str]]:
+    """解析不了的式子：(位置, 原因)。位置写到变量名、汇总行名，方便直接定位。"""
+    out, seen = [], set()
+    for rs in rss:
+        items = list(lint._exprs(rs)) + [(f"report.totals.{t.name}", t.expr) for t in (rs.report.totals if rs.report else [])]
+        for where, src in items:
+            if not str(src or "").strip() or where in seen:
+                continue
+            try:
+                parse(src)
+            except ExprError as e:
+                seen.add(where)
+                out.append((where, str(e)[:600]))
+    return out
+
+
 def _resolve_dup_columns(st, fields, combine, unpivot, filter):
     """表里有几列同名时（如两列都叫“客户简称”），只写原名分不清是哪一列，必须写明列：第一列写“原名(N列)”，后面的写“原名(AE列)”。
     T3：只写了“客户简称”，程序默认取了第一列，材料和其他表用的却是最后一列，项目全挂不上。"""
@@ -3692,6 +3864,7 @@ def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None =
     qrows = [{"id": q.id, "round": q.round, "text": q.text, "options": q.options, "suggested": q.suggested,
               "related": q.related, "blocking": q.blocking, "answer": q.answer,
               **({"withdrawn": q.withdrawn} if q.withdrawn else {}),
+              **({"evidence": q.evidence} if q.evidence else {}),
               **({"answered_by": q.answered_by, "answered_at": q.answered_at} if q.answered_by else {})}
              for q in ws.questions]
     paths["questions"] = out / "questions.yaml"
@@ -3854,12 +4027,14 @@ def _sheets(ar: AgentResult, qrows: list[dict]):
     q = [[r["id"], r.get("round", 1), r["text"], " / ".join(r.get("options") or []),
           (r["options"][r["suggested"]] if isinstance(r.get("suggested"), int)
            and 0 <= r["suggested"] < len(r.get("options") or []) else ""),
-          f"（已撤回：{r['withdrawn']}）" if r.get("withdrawn") else "" if r.get("answer") is None else str(r["answer"])]
+          f"（已撤回：{r['withdrawn']}）" if r.get("withdrawn") else "" if r.get("answer") is None else str(r["answer"]),
+          "\n".join(f"《{x.get('file', '')}》{x.get('quote', '')}" + ("" if x.get("ok") else "（原文里没核对上）")
+                    for x in r.get("evidence") or [])]
          for r in qrows]
     log = [[i, s.tool, json.dumps(s.args, ensure_ascii=False)[:300], ("" if s.ok else "失败：") + s.result[:500]]
            for i, s in enumerate(ar.steps, start=1)]
-    out = [("待确认问题", ["编号", "提出轮次", "问题", "选项", "智能体建议（未采用）", "财务答复"], q,
-            {"问题": 60, "选项": 40, "智能体建议（未采用）": 20})]
+    out = [("待确认问题", ["编号", "提出轮次", "问题", "选项", "智能体建议（未采用）", "财务答复", "依据原文"], q,
+            {"问题": 60, "选项": 40, "智能体建议（未采用）": 20, "依据原文": 60})]
     if ws.facts:
         conflicted = {c.name: c.question for c in ws.conflicts.values()}
         out.append(("参数台账", ["参数", "原文取值", "换算", "文件", "原文", "登记轮次", "冲突问题"],

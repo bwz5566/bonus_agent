@@ -80,9 +80,9 @@ def test_question_flags_own_placeholder_numbers(tmp_path):
     w.define_dataset("销售", "数据.xlsx", "销售", {"amt": {"column": "金额", "type": "money", "unit": "元"},
                                                 "m": {"column": "月份", "type": "text"}})
     w.set_rules(pool={"expr": "sum(if(amt > 0, amt, -77))"}, allocation=[])
-    w.ask_question("部分金额最低到 -77，是否按 0 算？", ["按 0", "照算"], 0)
+    w.ask_question("部分金额最低到 -77，是否按 0 算？", ["按 0", "照算"], 0, evidence=[{"file": "数据.xlsx", "quote": "C2 | M1 | 70"}])
     assert "程序提示：问题里的 77" in w.questions[-1].text
-    w.ask_question("金额 70 的项目怎么算？", ["a", "b"], 0)
+    w.ask_question("金额 70 的项目怎么算？", ["a", "b"], 0, evidence=[{"file": "数据.xlsx", "quote": "C2 | M1 | 70"}])
     assert "程序提示" not in w.questions[-1].text      # 数据里有的数不提示
 
 
