@@ -100,6 +100,8 @@ class Result:
     data_hash: str = ""         # 只含规则和数据；input_hash 另含人工调整和引用的其他方案结果
     rollups: dict[str, RollupResult] = field(default_factory=dict)
     inputs: dict[str, dict[str, object]] = field(default_factory=dict)   # 过程复核表的取数：节点 -> {字段或变量: 引擎值}
+    totals: list[tuple[str, str]] = field(default_factory=list)          # 汇总核算：(名称, 金额)，按 report.totals 的顺序
+    people: list[dict] = field(default_factory=list)                     # 分配人员金额：{name, final, held, paid, holds{条件: 金额}}
     tier_stats: dict[str, dict] = field(default_factory=dict)            # 分档表实际取值分布（程序检查用，不进输出）
     coverage: list[dict] = field(default_factory=list)                   # 条件分支、查找表的命中分布（程序检查用，不进输出）
 
@@ -271,8 +273,48 @@ class Engine:
             levels=[lv.level for lv in self.rs.allocation], nodes=nodes, payouts=payouts,
             traces=dict(self.ev.traces), adjustments=adjustments, issues=list(self.issues), rollups=rollups,
             inputs=self._sheet_inputs(), tier_stats=dict(self.ev.tier_stats),
+            totals=self._report_totals(), people=self._report_people(payouts),
             coverage=self.ev.coverage(),
         )
+
+    def _report_totals(self) -> list[tuple[str, str]]:
+        """汇总核算：每一行在指定层的每个对象上算一遍再合计，保留到分。"""
+        rep = self.rs.report
+        out = []
+        for t in (rep.totals if rep else []):
+            nodes = [self.root] if t.level == "global" else self.by_level.get(t.level, [])
+            total = Decimal(0)
+            for n in nodes:
+                try:
+                    total += self.ev.evaluate(t.expr, n, f"{n.id}/汇总/{t.name}", "report.totals")
+                except EvalError as e:
+                    raise EngineError([Issue.block("eval_error", f"汇总核算「{t.name}」：{e}", e.where)]) from None
+            out.append((t.name, str(total.quantize(CENT, ROUND_HALF_UP))))
+        return out
+
+    def _report_people(self, payouts: dict[str, PayoutResult]) -> list[dict]:
+        """分配人员金额：最末层每个对象按 report.people 的取值（人名）合计应得、暂缓、本次实发。"""
+        rep = self.rs.report
+        if not rep or not rep.people:
+            return []
+        out: dict[str, dict] = {}
+        for n in self.by_level[self.rs.leaf.level]:
+            try:
+                who = self.ev._name(rep.people, Ctx(n, where=f"{n.id}/{rep.people}")).v
+            except EvalError as e:
+                raise EngineError([Issue.block("eval_error", f"分配人员金额按 {rep.people} 汇总：{e}", e.where)]) from None
+            who = "（空）" if who in (None, "") else str(who)
+            p = payouts.get(n.id)
+            o = out.setdefault(who, {"name": who, "final": Decimal(0), "held": Decimal(0), "paid": Decimal(0), "holds": {}, "count": 0})
+            o["final"] += n.final
+            o["count"] += 1
+            if p is not None:
+                o["held"] += Decimal(p.held)
+                o["paid"] += Decimal(p.paid)
+                for c, h in p.holds.items():
+                    o["holds"][c] = o["holds"].get(c, Decimal(0)) + Decimal(h)
+        return [{**o, "final": str(o["final"]), "held": str(o["held"]), "paid": str(o["paid"]),
+                 "holds": {c: str(v) for c, v in o["holds"].items()}} for o in out.values()]
 
     def _sheet_inputs(self) -> dict[str, dict[str, object]]:
         """「过程复核」表里直接取数的列：每个对象的字段值和不能用公式复算的变量值。取不到的留空。"""

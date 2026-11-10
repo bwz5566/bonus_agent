@@ -30,14 +30,14 @@ def test_per_person_review_sheet(tmp_path):
     p = _mod("test_per_person")
     ar = run_agent(FakeLLM(p.script()), [p.make(tmp_path / "m")], tmp_path / "out")
     assert ar.status == "OK", ar.error
-    ws = openpyxl.load_workbook(tmp_path / "out" / "result.xlsx")["个人过程复核"]
+    ws = openpyxl.load_workbook(tmp_path / "out" / "result.xlsx")["个人核算底稿"]
     heads = [c.value for c in ws[2]]
     assert heads[:2] == ["编号", "名称"] and heads[-3:] == ["应得（Excel 公式复算）", "应得（引擎结果）", "核对"]
     amount = heads.index("amount")
     assert ws.cell(3, amount + 1).value == "=ROUND(MAX(((C3+(D3*12.5))-E3),0),2)"
     assert ws.cell(1, amount + 1).value == "公式" and ws.cell(1, 3).value == "取数（引擎）"
     if shutil.which("soffice"):
-        calc = _recalc(tmp_path / "out" / "result.xlsx", tmp_path / "calc")["个人过程复核"]
+        calc = _recalc(tmp_path / "out" / "result.xlsx", tmp_path / "calc")["个人核算底稿"]
         assert [r[-1] for r in calc.iter_rows(min_row=3, max_row=5, values_only=True)] == ["一致"] * 3
 
 
@@ -49,7 +49,7 @@ def test_tier_lookup_formulas_match_engine(tmp_path):
     assert ar.status == "OK", ar.error
     for f in sorted((tmp_path / "out").glob("result_*.xlsx")):
         wb = _recalc(f, tmp_path / "calc")
-        for ws in [w for w in wb.worksheets if w.title.endswith("过程复核")]:
+        for ws in [w for w in wb.worksheets if w.title.endswith("核算底稿")]:
             heads = [c.value for c in ws[2]]
             rows = [r for r in ws.iter_rows(min_row=3, values_only=True) if r[0] and r[0] not in ("复核未通过的个数", "公式出错的单元格")]
             assert rows and all(r[heads.index("核对")] in ("一致", "人工调整") for r in rows), (f.name, ws.title)

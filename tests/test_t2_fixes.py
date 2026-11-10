@@ -129,3 +129,56 @@ def test_round_records_model_and_code(tmp_path):
     run_agent(llm, [m], out, max_steps=3)
     rnd = load_case(out)["rounds"][-1]
     assert rnd["model"] == "甲模型" and "code" in rnd
+
+
+def test_report_sheet_totals_and_people(tmp_path):
+    """固定输出：第一张「汇总核算」（按核算类型的金额 + 分配人员金额），各层「核算底稿」原始字段在前。"""
+    from bonus_core.data.mapping import DatasetMapping
+    from bonus_core.dsl.validator import validate
+    from bonus_core.engine.run import compute
+    from bonus_core.report.excel import write_excel
+    p = tmp_path / "d.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "项目"
+    ws.append(["项目", "客户", "销售额", "冻结比例"])
+    ws.append(["P1", "C1", 1000, 0.2])
+    ws.append(["P2", "C2", 500, 0])
+    s = wb.create_sheet("名单")
+    s.append(["行", "项目", "人员", "比例"])
+    for r in (["1", "P1", "甲", 0.5], ["2", "P1", "乙", 0.5], ["3", "P2", "甲", 1]):
+        s.append(r)
+    wb.save(p)
+    rules = {"name": "t", "version": "1",
+             "datasets": {"项目": {"key": "pid", "fields": {"pid": {"type": "id"}, "cust": {"type": "text"},
+                                                         "amt": {"type": "money", "unit": "元"}, "fr": {"type": "ratio"}}},
+                          "名单": {"key": "rid", "fields": {"rid": {"type": "id"}, "pid": {"type": "id"},
+                                                          "emp": {"type": "text"}, "sh": {"type": "ratio"}}}},
+             "variables": {"提成": {"scope": "项目", "expr": "amt * 0.1"},
+                           "冻结": {"scope": "项目", "expr": "提成 * fr"},
+                           "可分配": {"scope": "项目", "expr": "提成 - 冻结"}},
+             "pool": {"scope": "项目", "expr": "可分配"},
+             "allocation": [{"level": "项目", "key": "pid"},
+                            {"level": "个人", "key": "rid", "parent_key": "pid", "weight": "sh"}],
+             "report": {"totals": [{"name": "正常分配", "level": "项目", "expr": "可分配"},
+                                   {"name": "暂扣", "level": "项目", "expr": "冻结"},
+                                   {"name": "合计", "level": "项目", "expr": "提成"}],
+                        "people": "emp"}}
+    rs = RuleSet.model_validate(rules)
+    assert not [i for i in validate(rs) if i.severity == "blocking"], validate(rs)
+    mp = {"项目": DatasetMapping.model_validate({"sheet": "项目", "columns": {"pid": "项目", "cust": "客户", "amt": "销售额", "fr": "冻结比例"}}),
+          "名单": DatasetMapping.model_validate({"sheet": "名单", "columns": {"rid": "行", "pid": "项目", "emp": "人员", "sh": "比例"}})}
+    data, issues = apply_mapping(rs, [p], mp)
+    assert not [i for i in issues if i.severity == "blocking"], issues
+    res = compute(rs, data)
+    assert res.totals == [("正常分配", "130.00"), ("暂扣", "20.00"), ("合计", "150.00")]
+    assert {o["name"]: o["final"] for o in res.people} == {"甲": "90.00", "乙": "40.00"}
+    out = write_excel(rs, res, tmp_path / "r.xlsx")
+    book = openpyxl.load_workbook(out)
+    assert book.sheetnames[0] == "汇总核算"
+    rows = [r for r in book["汇总核算"].iter_rows(values_only=True)]
+    assert ("正常分配", 130.0) == rows[2][:2] and any(r[0] == "甲" and r[2] == 90.0 for r in rows)
+    head = [c.value for c in book["项目核算底稿"][2]]
+    assert head[2].startswith("cust") or "cust" in head[2]                 # 原始字段排在计算列前面
+    bad = dict(rules, report={"totals": [{"name": "x", "level": "没有", "expr": "1"}]})
+    assert "report_level" in {i.code for i in validate(RuleSet.model_validate(bad))}

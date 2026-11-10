@@ -219,6 +219,19 @@ def validate(rs: RuleSet) -> list[Issue]:
     ]
     for where in unconfirmed:
         issues.append(Issue.warn("no_source", "智能体生成的规则元素缺少原文出处", where))
+    # ---- 结果文件的汇总核算 ----
+    if rs.report is not None:
+        for t in rs.report.totals:
+            if t.level != "global" and t.level not in levels:
+                issues.append(Issue.block("report_level", f"汇总核算「{t.name}」的 level {t.level} 不是分配层级（可选：{'、'.join(levels)}、global）",
+                                          "report.totals"))
+            try:
+                parse(t.expr)
+            except ExprError as e:
+                issues.append(Issue.block("report_expr", f"汇总核算「{t.name}」的表达式不对：{e}", "report.totals"))
+        names_ = [t.name for t in rs.report.totals]
+        if len(set(names_)) != len(names_):
+            issues.append(Issue.block("report_dup", "汇总核算的名称有重复", "report.totals"))
     return issues
 
 

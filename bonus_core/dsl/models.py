@@ -205,6 +205,20 @@ class GoldenCase(_Base):
     expect: dict[str, str]     # 节点 id（或 "pool"）-> 期望金额（保留到分）
 
 
+class ReportTotal(RuleItem):
+    """汇总核算里的一行：在某一层每个对象上算 expr 再合计（如 正常分配 = 各项目可分配之和）。level 写层级名，或 global（只算一次）。"""
+    name: str
+    level: str
+    expr: str
+
+
+class Report(RuleItem):
+    """结果文件的固定输出：汇总核算（按核算类型的总金额）和分配人员金额。
+    totals：按顺序列出的各类总金额；people：最末层上表示“人”的字段或变量，按它把每人参与的各项合计成一行。"""
+    totals: list[ReportTotal] = []
+    people: str | None = None
+
+
 class RuleSet(_Base):
     name: str
     version: str
@@ -220,6 +234,7 @@ class RuleSet(_Base):
     checks: list[Check] = []
     patches: list[DataPatch] = []        # 数据修订：计算前按顺序作用在数据上（只影响本方案）
     tests: list[GoldenCase] = []
+    report: Report | None = None         # 结果文件的汇总核算和分配人员金额
 
     # ---- 便捷方法 ----
     @classmethod

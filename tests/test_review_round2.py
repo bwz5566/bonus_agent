@@ -115,7 +115,7 @@ def test_excel_review_keeps_short_circuit_and_text_keys(tmp_path):
     assert keys == ["001", "1"]
     if not shutil.which("soffice"):
         pytest.skip("需要 LibreOffice 重算公式")
-    ws = _recalc(path, tmp_path / "calc")["个人过程复核"]
+    ws = _recalc(path, tmp_path / "calc")["个人核算底稿"]
     rows = {r[0]: r for r in ws.iter_rows(min_row=3, values_only=True) if r[0] in ("E1", "E2")}
     assert rows["E1"][-1] == "一致" and rows["E2"][-1] == "一致", rows
     summary = {r[0]: r[1] for r in ws.iter_rows(values_only=True) if r[0] in ("复核未通过的个数", "公式出错的单元格")}
@@ -131,11 +131,11 @@ def test_excel_review_counts_formula_errors(tmp_path):
         pytest.skip("需要 LibreOffice 重算公式")
     path = _review_book(tmp_path)
     wb = openpyxl.load_workbook(path)
-    ws = wb["个人过程复核"]
+    ws = wb["个人核算底稿"]
     heads = [c.value for c in ws[2]]
     ws.cell(3, heads.index("a") + 1).value = "=1/0"          # 模拟公式出错
     wb.save(path)
-    calc = _recalc(path, tmp_path / "calc")["个人过程复核"]
+    calc = _recalc(path, tmp_path / "calc")["个人核算底稿"]
     e1 = next(r for r in calc.iter_rows(min_row=3, values_only=True) if r[0] == "E1")
     assert e1[-1] == "公式出错"
     summary = {r[0]: r[1] for r in calc.iter_rows(values_only=True) if r[0] in ("复核未通过的个数", "公式出错的单元格")}
@@ -223,7 +223,7 @@ def test_numeric_lookup_key_has_no_thousands_separator(tmp_path):
         {"个人:E1": "3.00", "个人:E2": "2.00", "个人:E3": "5.00"}
     if not shutil.which("soffice"):
         pytest.skip("需要 LibreOffice 重算公式")
-    ws = _recalc(write_excel(rs, res, tmp_path / "r.xlsx"), tmp_path / "calc")["个人过程复核"]
+    ws = _recalc(write_excel(rs, res, tmp_path / "r.xlsx"), tmp_path / "calc")["个人核算底稿"]
     assert [r[-1] for r in ws.iter_rows(min_row=3, values_only=True) if r[0] in ("E1", "E2", "E3")] == ["一致"] * 3
 
 
@@ -250,7 +250,7 @@ def test_excel_review_date_and_yes_no_literals(tmp_path):
     assert "base" in p["computed"] and "ok" in p["computed"] and "extra" not in p["computed"]
     if not shutil.which("soffice"):
         pytest.skip("需要 LibreOffice 重算公式")
-    ws = _recalc(write_excel(rs, res, tmp_path / "r.xlsx"), tmp_path / "calc")["个人过程复核"]
+    ws = _recalc(write_excel(rs, res, tmp_path / "r.xlsx"), tmp_path / "calc")["个人核算底稿"]
     assert [r[-1] for r in ws.iter_rows(min_row=3, values_only=True) if r[0] in ("E1", "E2", "E3")] == ["一致"] * 3
 
 

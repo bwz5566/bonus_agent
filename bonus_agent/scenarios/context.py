@@ -49,6 +49,7 @@ class AgentScenario:
     id: str
     brief: str
     files: list[Path] = field(default_factory=list)
+    outputs: str = ""          # 场景的输出要求：有的话，规则里要写 report（汇总核算、分配人员金额）
 
 
 def expand(paths: list[str | Path]) -> list[Path]:
@@ -61,4 +62,5 @@ def expand(paths: list[str | Path]) -> list[Path]:
 def prepare(reg: Registry, scenario_id: str, materials: list[str | Path], *, use_memory: bool = True) -> AgentScenario:
     sc = reg.get(scenario_id)
     guide = guide_file(reg, sc)
-    return AgentScenario(sc.id, agent_brief(reg, sc, expand(materials), use_memory=use_memory), [guide] if guide else [])
+    return AgentScenario(sc.id, agent_brief(reg, sc, expand(materials), use_memory=use_memory), [guide] if guide else [],
+                         sc.outputs.strip())

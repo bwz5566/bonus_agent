@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from bonus_agent.llm import LLM, LLMError, Usage, image_part, parse_json
 from bonus_agent.parsing.docs import Block, ParsedDoc, parse_any
 from bonus_core.dsl.functions import describe as describe_functions
-from bonus_core.dsl.models import (AllocationLevel, Check, DataPatch, DatasetDef, Offset, PayoutCondition, Pool, RuleSet, Table,
+from bonus_core.dsl.models import (AllocationLevel, Check, DataPatch, DatasetDef, Offset, PayoutCondition, Pool, Report, RuleSet, Table,
                                    Variable)
 from bonus_core.dsl.validator import validate
 from bonus_core.engine.issues import Issue
@@ -58,6 +58,7 @@ class Extraction(BaseModel):
     offsets: list[Offset] = []
     checks: list[Check] = []
     patches: list[DataPatch] = []
+    report: Report | None = None
     questions: list[Question] = []
 
 

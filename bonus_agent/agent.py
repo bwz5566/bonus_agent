@@ -222,6 +222,12 @@ TOOLS: list[dict] = [
                                      "description": '已发抵扣：[{"id": "prior", "scope": "个人", "expr": "已发金额表达式"}]，'
                                                     '可用 scheme_paid("方案名", "修订名") 引用另一个方案某修订的本次实发'},
                          "checks": {"type": "array", "items": {"type": "object"}},
+                         "report": {"type": "object", "description":
+                                    '结果文件的固定输出（汇总核算 + 分配人员金额），按材料或场景的输出要求写：'
+                                    '{"totals": [{"name": "核算类型名称", "level": "层级名或 global", "expr": "在该层每个对象上算、再合计的表达式"}], '
+                                    '"people": "最末层上表示人的字段或变量"}。totals 按要求的顺序列出各类金额（如各类暂扣、正常发放、合计）；'
+                                    'people 写了之后每人参与的各条合计成一行（未分配的行按它们的名称各成一行）。'
+                                    '各层的计算过程会自动写成「核算底稿」：每个对象一行，原始字段在前，能翻译的变量写成 Excel 公式'},
                          "patches": {"type": "array", "items": {"type": "object"},
                                      "description": '数据修订（只影响本方案）：并入补充表 {"kind": "append", "source": "补充表", "into": "原表", '
                                                     '"unique": "单号字段", "values": {"flag_field": {"补充表写法": "原表写法"}}}；'
@@ -660,6 +666,7 @@ class Workspace:
     notes: dict[str, str] = field(default_factory=dict)
     done: bool = False
     chat_by: str = ""                                       # 对话模式：发消息的财务；空表示普通的一轮处理
+    report_required: bool = False                           # 场景写了输出要求：finish 前规则要有 report
     period: object = None                                   # 本次核算期间（bonus_core.data.period.Period）；None 表示没指定
     changed: bool = False                                   # 对话里改过规则、数据表、台账或问题
     reply_text: str = ""
@@ -1483,7 +1490,7 @@ class Workspace:
                     draft.setdefault(k, {}).pop(n, None)
                 else:
                     draft.setdefault(k, {})[n] = v
-        for k in ("pool", "allocation", "payout", "offsets", "checks", "patches", "revisions"):
+        for k in ("pool", "allocation", "payout", "offsets", "checks", "patches", "revisions", "report"):
             if parts.get(k) is not None:
                 draft[k] = parts[k]
         for lv in draft.get("allocation") or []:       # 最上层不需要权重，模型常写成 null
@@ -1661,6 +1668,12 @@ class Workspace:
         self.untested |= {s for s in self.schemes if s != name and name in {d for d, _ in self._deps(s)}}  # 引用本方案的要重算
         base = res["R0"]
         lines = [f"方案「{name}」试算成功。奖金池 {fmt(Decimal(base.pool))} 元（精确值 {base.pool_exact}）"]
+        if base.totals:
+            lines.append("汇总核算：" + "；".join(f"{n} {fmt(Decimal(v))}" for n, v in base.totals))
+        if base.people:
+            top = sorted(base.people, key=lambda o: -Decimal(o["final"]))
+            lines.append(f"分配人员 {len(top)} 行：" + "；".join(f"{o['name']} {fmt(Decimal(o['final']))}" for o in top[:12])
+                         + ("……" if len(top) > 12 else ""))
         for lv in base.levels:
             ns = sorted((n for n in base.nodes.values() if n.level == lv), key=lambda n: -float(n.final))
             if not ns:
@@ -2395,6 +2408,12 @@ class Workspace:
         if miss:
             raise ToolError(f"台账里这些参数的数值在规则里没有出现：{'、'.join(miss)}。请核对规则是否漏了或写错；"
                             "确实不参与计算的写进 ignored（ref 写参数名，说明原因）")
+        if self.report_required:
+            bare = [s for s in self.schemes if not (self._merged(s).get("report") or {}).get("totals")
+                    or not (self._merged(s).get("report") or {}).get("people")]
+            if bare:
+                raise ToolError(f"方案 {bare} 还没有写 report。场景有输出要求（见任务说明的【输出要求】），用 set_rules 的 report 写明"
+                                "汇总核算的各类金额（totals）和按人汇总用的字段（people），然后再 trial_run")
         gates = [f"方案「{s}」：{g}" for s in self.schemes if s in self.lint for g in self._open_gates(self.lint[s])]
         if gates:
             raise ToolError("程序检查还有没处理的（逐条改规则；需要财务确认的用 ask_question；确实无关的写进 ignored，"
@@ -2867,6 +2886,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     if period_obj is None and case and case.get("rounds"):
         period_obj = Period.parse(case["rounds"][-1].get("period"))
     ws.period = period_obj
+    ws.report_required = bool(scenario is not None and getattr(scenario, "outputs", ""))
     if period_obj is not None:
         rnd["period"] = period_obj.label
     rnd["model"] = getattr(llm, "name", "") or ""

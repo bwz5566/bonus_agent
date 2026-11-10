@@ -140,11 +140,60 @@ def write_excel(rs: RuleSet, res: Result, path: str | Path, ledger: list[dict] |
         ["数据哈希（规则+数据）", res.data_hash],
     ], widths={"项目": 14, "值": 70})
 
+    _summary_sheet(wb, rs, res)
     wb.calculation.fullCalcOnLoad = True       # Excel 打开时整本重算
     wb.save(path)
     xlcalc.fill_cached(path)                   # 公式单元格写入计算值：不重算的程序读到的也不是空白
     _self_check(path, res)
     return path
+
+
+def _summary_sheet(wb, rs: RuleSet, res: Result) -> None:
+    """固定的第一张表「汇总核算」：上面是按核算类型的总金额（规则 report.totals），下面是分配人员金额（按 report.people 合计）。
+    规则没写 report 时，用奖金池、各发放条件的暂缓和正常发放代替上半部分。"""
+    ws = wb.create_sheet("汇总核算", 0)
+    bold = Font(bold=True)
+    ws.append(["一、核算汇总"])
+    ws["A1"].font = bold
+    ws.append(["核算类型", "金额"])
+    totals = [(n, float(_d(v))) for n, v in res.totals]
+    if not totals:
+        held = {c.id: sum((_d(p.holds.get(c.id, 0)) for p in res.payouts.values()), Decimal(0)) for c in rs.payout}
+        totals = [("奖金池（应得合计）", float(_d(res.pool)))] + [(f"挂起：{c}", float(v)) for c, v in held.items()]
+        if res.payouts:
+            totals.append(("正常发放（应得扣除挂起）", float(_d(res.pool) - sum(held.values(), Decimal(0)))))
+    for n, v in totals:
+        ws.append([n, v])
+    top = ws.max_row
+    for r in range(3, top + 1):
+        ws.cell(r, 2).number_format = MONEY
+    ws.append([])
+    ws.append(["二、分配人员金额"])
+    ws.cell(ws.max_row, 1).font = bold
+    conds = [c.id for c in rs.payout]
+    head = ["人员", "参与条数", "应得"] + [f"挂起：{c}" for c in conds] + ["本次实发"]
+    ws.append(head)
+    hr = ws.max_row
+    people = res.people or [{"name": res.nodes[nid].label, "count": 1, "final": p.final, "held": p.held, "paid": p.paid,
+                             "holds": p.holds} for nid, p in res.payouts.items()]
+    for o in people:
+        ws.append([o["name"], o["count"], float(_d(o["final"]))] + [float(_d(o["holds"].get(c, 0))) for c in conds]
+                  + [float(_d(o["paid"]))])
+    last = ws.max_row
+    if last > hr:
+        ws.append(["合计", f"=SUM(B{hr + 1}:B{last})"] + [f"=SUM({get_column_letter(i)}{hr + 1}:{get_column_letter(i)}{last})"
+                                                      for i in range(3, len(head) + 1)])
+        ws.cell(ws.max_row, 1).font = bold
+    for r in range(hr + 1, ws.max_row + 1):
+        for i in range(3, len(head) + 1):
+            ws.cell(r, i).number_format = MONEY
+    for r in (2, hr):
+        for c in ws[r]:
+            if c.value is not None:
+                c.font, c.fill = bold, HEAD_FILL
+    ws.column_dimensions["A"].width = 30
+    for i in range(2, len(head) + 1):
+        ws.column_dimensions[get_column_letter(i)].width = 16
 
 
 GREY = PatternFill("solid", fgColor="EDEDED")
@@ -194,7 +243,7 @@ def _review_sheets(wb, rs: RuleSet, res: Result) -> None:
         if target:
             cols += ["@复算", "@引擎", "@核对"]
         letter = {c: get_column_letter(i) for i, c in enumerate(cols, start=1)}
-        ws = wb.create_sheet(f"{lv}过程复核"[:31])
+        ws = wb.create_sheet(f"{lv}核算底稿"[:31])
         kinds = ["", ""] + ["取数（引擎）"] * len(p["inputs"]) + ["公式"] * len(p["computed"])
         heads = ["编号", "名称"] + [_label(rs, c) for c in p["inputs"] + p["computed"]]
         if target:

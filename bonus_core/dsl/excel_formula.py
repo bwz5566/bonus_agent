@@ -226,5 +226,7 @@ def plan(rs: RuleSet) -> dict[str, dict]:
                 if m not in computed and m not in inputs:
                     inputs.append(m)
         inputs += [n for n in own if n not in computed and n not in inputs]
-        out[lv.level] = {"computed": computed, "inputs": inputs, **targets}
+        ent = rs.entity_dataset(lv.key)          # 这一层对象自己的原始字段（如项目的月份、客户、型号）排在最前面，底稿上一眼看到是哪个对象
+        raw = [f for f in (ent[1].fields if ent else {}) if f != lv.key and f not in inputs and f not in computed]
+        out[lv.level] = {"computed": computed, "inputs": raw + inputs, **targets}
     return out
