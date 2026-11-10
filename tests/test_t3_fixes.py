@@ -122,3 +122,40 @@ def test_broken_expression_is_not_saved_and_named(tmp_path):
         w.set_rules(pool={"expr": "sum(amt) * 0.1"}, allocation=[{"level": "行", "key": "rid", "weight": "amt"}],
                     variables={"big": {"scope": "行", "expr": "max(min(amt, round(amt * (1 + 2), 2), 0"}})
     assert not w.drafts
+
+
+def test_numeric_filter_does_not_merge_codes_with_leading_zeros():
+    keep = row_filter(["编码"], {"编码": ["12"]})
+    assert keep([12]) and keep(["12.0"]) and not keep(["0012"])
+    assert row_filter(["编码"], {"编码": ["0012"]})(["0012"])
+
+
+def test_people_variable_in_report_is_not_idle():
+    rs = RuleSet.model_validate({
+        "name": "t", "version": "1",
+        "datasets": {"销售": {"key": "rid", "fields": {"rid": {"type": "id"}, "amt": {"type": "money"}, "who": {"type": "text"}}}},
+        "variables": {"person": {"scope": "行", "expr": "who"}},
+        "pool": {"expr": "sum(amt)"}, "allocation": [{"level": "行", "key": "rid", "weight": "amt"}],
+        "report": {"totals": [{"name": "合计", "level": "行", "expr": "amt"}], "people": "person"}})
+    assert lint.idle_parts(rs) == ([], [])
+
+
+def test_duplicate_column_that_moved_is_found_again_next_period(tmp_path):
+    """发布后的映射按位置记同名列（如「简称(C列)」）；下一期前面多了一列，位置变成 D，仍要认得出来并提示。"""
+    from bonus_core.data.mapping import DatasetMapping, apply_mapping
+    p = tmp_path / "下期.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "销售"
+    ws.append(["行", "简称", "新加的列", "简称", "金额"])
+    ws.append([1, "甲全称", "x", "甲", 100])
+    wb.save(p)
+    rs = RuleSet.model_validate({"name": "t", "version": "1", "pool": {"expr": "sum(amt)"},
+                                 "allocation": [{"level": "行", "key": "rid", "weight": "amt"}],
+                                 "datasets": {"销售": {"key": "rid", "fields": {"rid": {"type": "id"}, "short": {"type": "text"},
+                                                                             "amt": {"type": "money"}}}}})
+    mp = {"销售": DatasetMapping(sheet="销售", columns={"rid": "行", "short": "简称(C列)", "amt": "金额"})}
+    data, issues = apply_mapping(rs, [p], mp)
+    assert not [i for i in issues if i.severity == "blocking"], issues
+    assert data["销售"].rows[0].values["short"] == "甲"
+    assert any(i.code == "dup_column_moved" for i in issues)

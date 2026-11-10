@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import difflib
+import re
 import statistics
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -204,6 +205,9 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping, period
             where = "/".join(x for x in (m.file, m.sheet) if x) or "按表头查找"
             issues.append(Issue.block("sheet_missing", f"找不到「{ds_name}」对应的工作表（{where}）", ds_name))
             continue
+        m, moved = rebind_dup_columns(m, st.headers)
+        for note in moved:
+            issues.append(Issue.warn("dup_column_moved", f"「{ds_name}」{note}，请核对这一列的取值", ds_name))
         used_cols = set(m.columns.values()) | set((m.unpivot or {}).get("columns") or []) | {
             c for cols in (m.combine or {}).values() for c in cols}
         unsure = sorted({st.headers[i] for _, cols in getattr(st, "unsure", []) for i in cols
@@ -306,11 +310,46 @@ def cell_text(v) -> str:
     return "" if v is None else str(v).strip()
 
 
+_PLAIN_NUM = re.compile(r"-?(0|[1-9]\d*)(\.\d+)?\Z")
+
+
 def _num(t: str):
+    """写法规范的数（不带前导 0）才按数值比：编号 0012 和 12 不是一回事。"""
+    t = t.replace(",", "")
+    if not _PLAIN_NUM.match(t):
+        return None
     try:
-        return Decimal(t.replace(",", ""))
+        return Decimal(t)
     except (InvalidOperation, ValueError):
         return None
+
+
+_DUP_COL = re.compile(r"(.+)\(([A-Z]{1,3})列\)\Z")
+
+
+def rebind_dup_columns(m: "DatasetMapping", headers: list[str]) -> tuple["DatasetMapping", list[str]]:
+    """映射里按位置写的同名列（如「客户简称(AE列)」）在本期表里换了位置（前面插了列、删了列）：
+    同名的后几列里只有一列时，改认那一列并提示；有几列分不清的不改，照常报列不存在。返回 (映射, 提示)。"""
+    notes: dict[str, str] = {}
+
+    def fix(col):
+        c = str(col)
+        mm = _DUP_COL.match(c)
+        if c in headers or not mm or mm.group(1) not in headers:
+            return col
+        cands = [h for h in headers if (x := _DUP_COL.match(h)) and x.group(1) == mm.group(1)]
+        if len(cands) != 1:
+            return col
+        notes[c] = cands[0]
+        return cands[0]
+    cols = {f: fix(c) for f, c in m.columns.items()}
+    unp = {**m.unpivot, "columns": [fix(c) for c in m.unpivot.get("columns") or []]} if m.unpivot else m.unpivot
+    comb = {k: [fix(c) for c in v] for k, v in m.combine.items()} if m.combine else m.combine
+    flt = {fix(k): v for k, v in m.filter.items()}
+    if not notes:
+        return m, []
+    return (m.model_copy(update={"columns": cols, "unpivot": unp, "combine": comb, "filter": flt}),
+            [f"「{a}」这一列在本期表里不在原来的位置，改用同名的「{b}」" for a, b in notes.items()])
 
 
 def _in(text: str, vals: set[str], nums: set) -> bool:

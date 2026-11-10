@@ -864,7 +864,7 @@ def idle_parts(rs: RuleSet) -> tuple[list[str], list[str]]:
             return set()
     roots = [e for w, e in _exprs(rs) if not w.startswith("variables.")]
     if rs.report:
-        roots += [t.expr for t in rs.report.totals]
+        roots += [t.expr for t in rs.report.totals] + ([rs.report.people] if rs.report.people else [])
     todo = [n for e in roots for n in names(e)]
     seen: set[str] = set()
     while todo:

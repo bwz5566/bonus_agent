@@ -1411,6 +1411,7 @@ class Workspace:
             if err:
                 continue
             fld_of = {c: f for f, c in m.columns.items()}
+            col_vals = [{cell_text(r[i] if i < len(r) else None) for _, r in st.rows} for i in range(len(st.headers))]
             for c in clauses:
                 cn = re.sub(r"\s+", "", c)
                 pairs = []
@@ -1423,7 +1424,7 @@ class Workspace:
                         pairs.append((i, h, v))
                 for v in re.findall(r"[「“\"‘']([^「」“”\"‘’']{1,20})[」”\"’']", c):   # 引号里的取值出现在某一列
                     for i, h in enumerate(st.headers):
-                        if h and any(cell_text(r[i] if i < len(r) else None) == v for _, r in st.rows[:5000]):
+                        if h and v in col_vals[i]:
                             pairs.append((i, h, v))
                 for i, h, v in pairs:
                     if (name, h) in seen:
