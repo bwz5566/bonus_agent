@@ -60,3 +60,16 @@ def test_unmatched_ignore_needs_real_quote():
         w.define_dataset(**args, unmatched_basis={"file": "guide.md", "quote": "这句话材料里根本没有，不参与"})
     out = w.define_dataset(**args, unmatched_basis=reference.B)
     assert "已保存" in out
+
+
+def test_unmatched_hint_points_to_missing_period():
+    """明细表有日期字段却没写 period，其他期间的行挂不上按期间取数的上级：提示先查 period，不让模型去问财务或改编号"""
+    from bonus_core.engine.issues import Issue
+    ref, _ = _case()
+    w = ref.build()
+    w.datasets["名单"].period = None
+    iss = [Issue.block("link_unmatched", "「名单」中 pid=202601|C001|甲|M1 在「项目」中找不到")]
+    out = w._unmatched_text(iss)
+    assert "没有写 period" in out and 'period: "n_month"' in out
+    w2 = ref.build()
+    assert "没有写 period" not in w2._unmatched_text(iss)

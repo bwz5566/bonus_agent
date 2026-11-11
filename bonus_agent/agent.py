@@ -1890,6 +1890,15 @@ class Workspace:
             again |= seen[sig] >= 2
             lines.append(f"「{tbl}」有 {len(keys)} 行的 {fld} 在「{level}」里找不到（{len(uniq)} 个编号，如 {'、'.join(uniq[:6])}）")
         out = "\n汇总：" + "；".join(lines) + "。"
+        for (tbl, fld, level), keys in groups.items():       # 上级表按期间取数、这张表跨期：多半是漏写了 period，别当成编号问题
+            d = self.datasets.get(tbl)
+            dates = [n for n, f in (d.fields.items() if d else []) if f.type == "date"]
+            if d is not None and self.period is not None and not d.period and dates \
+                    and any(x.period for n, x in self.datasets.items() if n != tbl):
+                out += (f"\n先排除一种常见原因：「{tbl}」有日期字段 {'、'.join(dates)}，却没有写 period，所以其他期间的行也进来了，"
+                        f"而「{level}」只取本次核算期间（{self.period.label}）的行。材料说这张表只取核算期间的行（或它本来按期间记录）时，"
+                        f"重新 define_dataset 并写 period: \"{dates[0]}\"，不用问财务")
+                break
         if again:
             out += ("\n同一批编号已经第 2 次对不上了。不要再换着改规则或映射绕开，也不要自己决定排除或补录："
                     "编号写法不同（空格、大小写、前导 0）才改映射；否则现在就用 ask_question 问财务这些记录怎么处理"
