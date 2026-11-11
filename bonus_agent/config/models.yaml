@@ -40,6 +40,8 @@ default: qwen-a
 #   think_max_tokens: 16384       思考那一步的输出上限（思考内容也算在里面）
 #   think_timeout: 900            思考那一步的超时（秒）
 #   think_echo: true | false      下一步把思考内容带回去；DeepSeek（thinking 参数）默认带回，其他默认不带
+#   think_model: 模型名           深度思考的那一步改用这个（更强的）模型，平时仍用本模型，省成本。
+#                                 如 deepseek-flash 平时干活，出错、卡住时那一步交给 deepseek-v4-pro 思考
 # 千问 3.5 及以后的模型默认可能开启思考模式，抽取时统一关闭（enable_thinking: false），
 # 否则耗时和 tokens 会明显增加，且部分模型思考模式下不支持 JSON 输出。
 models:
@@ -109,6 +111,12 @@ models:
     model: deepseek-flash
     json_mode: json_object
     extra_body: {thinking: {type: disabled}}     # 默认开思考且 effort=high，一步就能把 8192 个输出 tokens 用完
+  deepseek-flash-pro:           # 平时用 flash（低成本），出错、卡住需要深度思考的那一步交给 pro
+    provider: deepseek
+    model: deepseek-flash
+    json_mode: json_object
+    extra_body: {thinking: {type: disabled}}
+    think_model: deepseek-v4-pro
   deepseek-v4-pro:              # DeepSeek-V4-Pro，只有文本，图片交给 deepseek-flash 转写
     provider: deepseek
     model: deepseek-v4-pro

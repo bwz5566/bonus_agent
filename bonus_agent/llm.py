@@ -226,6 +226,7 @@ class LLM:
     think_max_tokens: int = 16384     # 思考也占输出 tokens，思考的那一步放宽
     think_timeout: float = 900        # 本地模型思考一步可能要几分钟
     think_echo: bool = False          # 下一步把这一步的思考内容带回去（DeepSeek 思考模式下工具调用要求带回）
+    think_llm: "LLM | None" = None    # 深度思考的那一步改用的另一个（更强的）模型；平时仍用自己，省钱
     last_reasoning: str = ""          # 最近一次思考调用的思考内容
     usage: Usage = field(default_factory=Usage)
 
@@ -251,6 +252,13 @@ class LLM:
         llm.think_max_tokens = int(m.get("think_max_tokens", llm.think_max_tokens))
         llm.think_timeout = float(m.get("think_timeout", max(llm.think_timeout, llm.timeout)))
         llm.think_echo = bool(m.get("think_echo", "thinking" in (llm.think_body or {})))
+        tm = m.get("think_model")       # 深度思考那一步换成这个模型（如平时 flash、卡住时 pro）
+        if tm and tm != name:
+            if tm not in cfg["models"]:
+                raise LLMError(f"深度思考模型 {tm} 没有配置，可选：{', '.join(cfg['models'])}")
+            llm.think_llm = cls.from_config(tm, cfg)
+            llm.think_llm.usage = llm.usage            # 用量记在同一处
+            llm.think_echo = llm.think_echo or llm.think_llm.think_echo
         v = m.get("vision", True)       # true：自己看图；false：不能看图；模型名：用那个模型转写图片
         if isinstance(v, str):
             if v == name or cfg["models"].get(v, {}).get("vision", True) is not True:
@@ -282,7 +290,7 @@ class LLM:
 
     @property
     def can_think(self) -> bool:
-        return self.think_body is not None
+        return self.think_body is not None or self.think_llm is not None
 
     def _prepare(self, messages: list[dict]) -> list[dict]:
         """去掉内部用的 _cache 标记；开启显式缓存时，把标记换成 cache_control（缓存到该消息为止的前缀）。
@@ -326,6 +334,11 @@ class LLM:
              temperature: float = 0.1, max_tokens: int = 8192, think: bool = False) -> str:
         """think：这一次打开思考（JSON 协议的智能体出错后用）。思考时不加 response_format：
         部分服务思考模式下不支持 JSON 输出，结果仍按容错方式解析。思考内容放在 last_reasoning。"""
+        if think and self.think_llm is not None:
+            out = self.think_llm.chat(messages, schema=schema, json_out=json_out, temperature=temperature,
+                                      max_tokens=max_tokens, think=True)
+            self.last_reasoning = self.think_llm.last_reasoning
+            return out
         think, body, max_tokens = self._think(think, dict(self.extra_body or {}), max_tokens)
         kwargs = dict(model=self.model, messages=self._prepare(messages), temperature=temperature, max_tokens=max_tokens)
         if body:
@@ -350,7 +363,9 @@ class LLM:
     def chat_tools(self, messages: list[dict], tools: list[dict], *, temperature: float = 0.1,
                    max_tokens: int = 8192, think: bool = False) -> dict:
         """工具调用。返回 {"content": 文本, "tool_calls": [{"id", "name", "arguments"(JSON 字符串)}], "reasoning": 思考内容}。
-        think：这一步打开思考（模型不能切换时照常调用，reasoning 为空）。"""
+        think：这一步打开思考（模型不能切换时照常调用，reasoning 为空）；配了 think_model 时这一步交给那个模型。"""
+        if think and self.think_llm is not None:
+            return self.think_llm.chat_tools(messages, tools, temperature=temperature, max_tokens=max_tokens, think=True)
         think, body, max_tokens = self._think(think, _merge(self.extra_body, self.tools_extra_body), max_tokens)
         kwargs = dict(model=self.model, messages=self._prepare(messages), tools=tools, temperature=temperature,
                       max_tokens=max_tokens)

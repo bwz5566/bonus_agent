@@ -66,6 +66,27 @@ def test_think_only_on_request_and_reasoning_echo(monkeypatch):
     assert "extra_body" not in seen[-1] and seen[-1]["max_tokens"] == 8192
 
 
+def test_think_model_handles_only_the_deep_steps(monkeypatch):
+    """平时用便宜的模型，深度思考的那一步交给配置的 think_model（如 flash 平时干活、卡住时交给 pro），用量记在一处。"""
+    seen = []
+    monkeypatch.setattr(L, "openai_client", lambda base_url, key, timeout: _Client(seen))
+    cfg = load_config(L.DEFAULT_CONFIG)
+    llm = LLM.from_config("deepseek-flash-pro", cfg)
+    assert llm.think_llm is not None and llm.think_llm.model == "deepseek-v4-pro" and llm.think_llm.usage is llm.usage
+    llm.chat_tools([{"role": "user", "content": "a"}], [])
+    assert seen[-1]["model"] == "deepseek-flash" and seen[-1]["extra_body"] == {"thinking": {"type": "disabled"}}
+    out = llm.chat_tools([{"role": "user", "content": "a"}], [], think=True)
+    assert seen[-1]["model"] == "deepseek-v4-pro" and seen[-1]["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert out["reasoning"] == "想清楚了"
+    llm.chat([{"role": "user", "content": "a"}], json_out=True, think=True)
+    assert seen[-1]["model"] == "deepseek-v4-pro" and llm.last_reasoning == "想清楚了"
+    llm.chat([{"role": "user", "content": "a"}], json_out=True)
+    assert seen[-1]["model"] == "deepseek-flash"
+    cfg["models"]["deepseek-flash-pro"]["think_model"] = "nope"
+    with pytest.raises(L.LLMError):
+        LLM.from_config("deepseek-flash-pro", cfg)
+
+
 class _Recorder(FakeLLM):
     def __init__(self, script):
         super().__init__(script)
