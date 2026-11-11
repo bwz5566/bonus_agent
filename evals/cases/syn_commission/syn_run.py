@@ -22,17 +22,17 @@ ANSWER = "按场景说明（guide.md）和管理办法的原文执行；两份�
 TOL = D("0.05")
 
 
-def expected():
-    wb = openpyxl.load_workbook(HERE / "expected" / "期望结果_202609.xlsx", data_only=True)
+def expected(case: Path = HERE):
+    wb = openpyxl.load_workbook(case / "expected" / "期望结果_202609.xlsx", data_only=True)
     people = {r[0]: D(str(r[1])) for r in list(wb["分配人员"].iter_rows(values_only=True))[1:]}
     totals = {r[0]: D(str(r[1])) for r in list(wb["汇总"].iter_rows(values_only=True))[1:]}
     proj = {r[0]: D(str(r[-1])) for r in list(wb["项目"].iter_rows(values_only=True))[1:]}
     return people, totals, proj
 
 
-def check(res) -> tuple[bool, list[str]]:
+def check(res, case: Path = HERE) -> tuple[bool, list[str]]:
     """res：方案的基准结果（bonus_core.engine.run.Result）。"""
-    people, totals, proj = expected()
+    people, totals, proj = expected(case)
     lines, ok = [], True
     use_paid = bool(res.payouts)
     got = {p["name"]: D(p["paid"] if use_paid else p["final"]) for p in res.people}
@@ -62,6 +62,7 @@ def check(res) -> tuple[bool, list[str]]:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
+    ap.add_argument("--case", default="syn_commission", help="样例目录名（evals/cases 下）")
     ap.add_argument("--checker")
     ap.add_argument("--out", required=True)
     ap.add_argument("--max-tokens", type=int, default=8_000_000)
@@ -73,11 +74,13 @@ def main():
     from bonus_agent.llm import LLM, load_config
     from bonus_agent.scenarios import Registry
     from bonus_agent.scenarios.context import prepare
+    case = HERE.parent / a.case
+    answer = (case / "answer.txt").read_text(encoding="utf-8") if (case / "answer.txt").exists() else ANSWER
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    reg = Registry([HERE / "scenario"], home=out / "_home", builtin=False)
-    files = [HERE / "inputs"]
-    scn = prepare(reg, "syn_commission", files, use_memory=False)
+    reg = Registry([case / "scenario"], home=out / "_home", builtin=False)
+    files = [case / "inputs"]
+    scn = prepare(reg, a.case, files, use_memory=False)
     llm = LLM.from_config(a.model, load_config(), a.checker)
     t0, new, answered, retried, rounds = time.time(), True, 0, 0, []
     while True:
@@ -93,7 +96,7 @@ def main():
             qs = yaml.safe_load(p.read_text(encoding="utf-8")) or []
             for q in qs:
                 if q.get("answer") in (None, "") and not q.get("withdrawn"):
-                    q["answer"], q["answered_by"] = ANSWER, "样例脚本"
+                    q["answer"], q["answered_by"] = answer, "样例脚本"
             p.write_text(yaml.safe_dump(qs, allow_unicode=True, sort_keys=False), encoding="utf-8")
             answered += 1
             continue
@@ -104,7 +107,7 @@ def main():
     ok, lines = False, ["没有出结果"]
     res = next((revs.get("R0") for revs in (ar.results or {}).values()), None)
     if ar.status == "OK" and res is not None:
-        ok, lines = check(res)
+        ok, lines = check(res, case)
     u = llm.usage
     summary = {"model": a.model, "status": ar.status, "correct": ok, "rounds": rounds, "minutes": round((time.time() - t0) / 60, 1),
                "calls": u.calls, "prompt_tokens": u.prompt_tokens, "completion_tokens": u.completion_tokens, "check": lines}

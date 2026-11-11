@@ -212,6 +212,10 @@ TOOLS: list[dict] = [
                                      '"remainder": "{label}未分配"（{label} 换成原列名；余下的部分另记一行，比例是 1 − 写明的比例）。'
                                      '空格子默认不展开；材料或财务说空着的那一份也要单列（如某个角色没填人，记为“××未分配”）时加 '
                                      '"blank": "{label}未分配"，空格子也记一行。'
+                                     '几个人的比例集中写在表里另一列的文字里（如“甲60%，乙40%”）、人名格子里只有名字时：加 "share_from": "那一列的列名"，'
+                                     '按名字到那一列取比例（该列为空表示只有一个人、比例 1；格子里自己写了百分比的用格子里的）；要同时写 share。'
+                                     '这一列的比例只管其中几列（如两个技术支持列）时，用 "share_from_columns": ["列名"] 指明，其余列只认格子里自己写的比例。'
+                                     '写了 blank 时，某几列空着就是没有这个人（如第二个人那列）、不该记未分配的，把它们列进 "blank_except": ["列名"]。'
                                      '展开后没有每行唯一的编号、又要当最末层时，加字段 {"column": "（行号）", "type": "id"} 作 key'},
                          "fields": {"type": "object", "additionalProperties": FIELD_SCHEMA,
                                     "description": "字段名（英文小写加下划线） -> 定义。重新定义同一张表、字段不变时可以不写（沿用上一次的）"}},
@@ -3702,9 +3706,35 @@ def _unpivot_spec(spec, st) -> dict:
     value, label = str(spec["value"]).strip(), str(spec.get("label") or "").strip()
     share, remainder = str(spec.get("share") or "").strip(), str(spec.get("remainder") or "").strip()
     blank = str(spec.get("blank") or "").strip()
-    unknown = sorted(set(spec) - {"columns", "value", "label", "share", "remainder", "blank"})
+    share_from = str(spec.get("share_from") or "").strip()
+    unknown = sorted(set(spec) - {"columns", "value", "label", "share", "remainder", "blank", "share_from", "blank_except", "share_from_columns"})
     if unknown:
-        raise ToolError(f"unpivot 不认识 {unknown}，可以写的是 columns、value、label、share、remainder、blank")
+        raise ToolError(f"unpivot 不认识 {unknown}，可以写的是 columns、value、label、share、remainder、blank、share_from、blank_except、share_from_columns")
+    if share_from:
+        from bonus_core.data.table_detect import parse_shares, split_name_share
+        if share_from not in st.headers or share_from in cols:
+            raise ToolError(f"unpivot 的 share_from「{share_from}」要是表里另一列的列名，可选：{[h for h in st.headers if h and h not in cols]}")
+        if not share:
+            raise ToolError("unpivot 写了 share_from 就要同时写 share（记比例的列名）")
+        sfc = [str(c) for c in (spec.get("share_from_columns") or cols)]
+        if [c for c in sfc if c not in cols]:
+            raise ToolError("unpivot 的 share_from_columns 要是 columns 里的列")
+        idx = [st.headers.index(c) for c in sfc]
+        sf = st.headers.index(share_from)
+        bad = []
+        for _, v in st.rows:
+            txt = v[sf] if sf < len(v) else None
+            if txt in (None, "") or (isinstance(txt, str) and not txt.strip()):
+                continue
+            shares = parse_shares(txt)
+            for i in idx:
+                if i < len(v) and v[i] not in (None, ""):
+                    nm, own = split_name_share(v[i])
+                    if own is None and str(nm).strip() not in shares:
+                        bad.append(f"「{str(nm).strip()}」对「{str(txt).strip()}」")
+        if bad:
+            raise ToolError(f"unpivot 有 {len(bad)} 格在「{share_from}」里找不到这个人的比例（如 {bad[0]}）。先看这一列怎么写的、"
+                            "名字写法是否和人名格子一致；材料没说的写法用 ask_question 问财务，不要自己猜比例")
     if remainder and not share:
         raise ToolError("unpivot 写了 remainder 就要同时写 share（记比例的列名）")
     if share and not remainder:
@@ -3723,7 +3753,10 @@ def _unpivot_spec(spec, st) -> dict:
     if len({n for n in (value, label, share) if n}) != len([n for n in (value, label, share) if n]):
         raise ToolError("unpivot 的 value、label、share 要用不同的列名")
     return {"columns": cols, "value": value, **({"label": label} if label else {}), **({"share": share} if share else {}),
-            **({"remainder": remainder} if remainder else {}), **({"blank": blank} if blank else {})}
+            **({"remainder": remainder} if remainder else {}), **({"blank": blank} if blank else {}),
+            **({"share_from": share_from} if share_from else {}),
+            **({"blank_except": [str(c) for c in spec["blank_except"]]} if spec.get("blank_except") else {}),
+            **({"share_from_columns": [str(c) for c in spec["share_from_columns"]]} if spec.get("share_from_columns") else {})}
 
 
 def _code_version() -> str:

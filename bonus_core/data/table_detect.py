@@ -69,11 +69,16 @@ def _is_total(row) -> bool:
     return any(isinstance(v, str) and any(w in v for w in TOTAL_WORDS) for v in row[:3])
 
 
+def text_only_row(row) -> bool:
+    return all(_is_text(v) for v in row if v not in (None, ""))
+
+
 def detect_sheet(ws, file: str) -> SheetTable | None:
     grid = _grid(ws)
     if not grid:
         return None
     best, best_score = None, 0.0
+    pure: list[tuple[int, float]] = []
     for i, row in enumerate(grid[:SCAN_ROWS]):
         n = _filled(row)
         # 合并单元格展开的标题行（如跨整表的表名、说明）所有格子是同一个值，不是表头
@@ -85,8 +90,15 @@ def detect_sheet(ws, file: str) -> SheetTable | None:
         if nxt:
             data_like = sum(1 for v in nxt if v not in (None, "") and not _is_text(v)) / max(_filled(nxt), 1)
         score = text * n * (0.5 + data_like)
+        if text == 1.0:
+            pure.append((i, score))
         if score > best_score:
             best, best_score = i, score
+    # 数据行下一行恰好有几个数字时，得分可能略高于真正的表头：取比它靠前、全是文字、得分接近的行（表头在数据前面）
+    if best is not None:
+        early = [i for i, sc in pure if i < best and sc >= 0.8 * best_score]
+        if early and not (text_only_row(grid[best])):
+            best = early[0]
     if best is None:
         # 只有一列的清单（如欠款客户清单：一个列名，下面每行一个值）：第一个有值的行当表头
         used = [(i, [j for j, v in enumerate(r) if v not in (None, "")]) for i, r in enumerate(grid)]
@@ -215,15 +227,33 @@ def split_name_share(text) -> tuple[str, "Decimal | None"]:
     return m.group("name").strip(), Decimal(m.group("pct")) / 100
 
 
+def parse_shares(text) -> dict:
+    """“吴晨晨80%，张荣20%”拆成 {吴晨晨: 0.8, 张荣: 0.2}（逗号、顿号、分号隔开）；写法不对的段落跳过。"""
+    if not isinstance(text, str):
+        return {}
+    out = {}
+    for part in re.split(r"[,，、;；\n]+", text):
+        name, pct = split_name_share(part)
+        if pct is not None:
+            out[str(name)] = pct
+    return out
+
+
 def unpivot_sheet(st: SheetTable, columns: list[str], value: str, label: str = "", share: str = "", remainder: str = "",
-                  blank: str = "") -> SheetTable:
+                  blank: str = "", share_from: str = "", blank_except: list | None = None,
+                  share_from_columns: list | None = None) -> SheetTable:
     """把几列同一类的值（如销售负责人、执行人、客户经理各一列人名）展开成每个值一行：其余列照抄，
     展开的值放在 value 列，label 列记它原来在哪一列（如 角色）。空格子不展开；合计行不要。
     share 非空时：格子里“名字+百分比”（如 张三50%）拆开，名字放 value、比例放 share 列（小数，没写百分比的是 1）；
     remainder 非空时：比例不足 1 的，余下的部分另记一行（名字用 remainder，其中 {label} 换成原列名，比例是余下的部分）。
-    blank 非空时：空格子也记一行（名字用 blank，其中 {label} 换成原列名，比例是 1），如某个角色没有填人、这一份记为“××未分配”。"""
+    blank 非空时：空格子也记一行（名字用 blank，其中 {label} 换成原列名，比例是 1），如某个角色没有填人、这一份记为“××未分配”。
+    share_from 非空时：各人的比例写在表里另一列的文字中（如“吴晨晨80%，张荣20%”），格子里只有名字：按名字到这一列的文字里取比例，
+    文字是空的（只有一个人）比例是 1；格子里自己写了百分比的，用格子里的。
+    share_from_columns：只有这几列的比例写在 share_from 那一列里（不写是全部列）；其余列只认格子里自己写的百分比。
+    blank_except：这几列的空格子不记（如“第二个人”那一列空着就是没有第二个人）。"""
     from decimal import Decimal
     idx = [st.headers.index(c) for c in columns]
+    sf = st.headers.index(share_from) if share_from else None
     keep = [i for i in range(len(st.headers)) if i not in idx]
     headers = [st.headers[i] for i in keep] + [value] + ([label] if label else []) + ([share] if share else [])
     rows = []
@@ -231,12 +261,20 @@ def unpivot_sheet(st: SheetTable, columns: list[str], value: str, label: str = "
         base = [vals[i] for i in keep]
         for c, i in zip(columns, idx):
             if vals[i] in (None, "") or (isinstance(vals[i], str) and not vals[i].strip()):
-                if blank:
+                if blank and c not in (blank_except or []):
                     rows.append((j, base + [blank.replace("{label}", c)] + ([c] if label else []) + ([Decimal(1)] if share else [])))
                 continue
-            v, pct = split_name_share(vals[i]) if share else (vals[i], None)
+            from_text = False                 # 比例是另一列文字里各人分摊的：几个人合起来是 100%，不存在“余下的部分”
+            if sf is not None:
+                v, pct = split_name_share(vals[i])
+                v = str(v).strip()
+                if pct is None and (share_from_columns is None or c in share_from_columns):
+                    pct = parse_shares(vals[sf] if sf < len(vals) else None).get(v)
+                    from_text = True
+            else:
+                v, pct = split_name_share(vals[i]) if share else (vals[i], None)
             rows.append((j, base + [v] + ([c] if label else []) + ([pct if pct is not None else Decimal(1)] if share else [])))
-            if share and remainder and pct is not None and pct < 1:
+            if share and remainder and pct is not None and pct < 1 and not from_text:
                 rows.append((j, base + [remainder.replace("{label}", c)] + ([c] if label else []) + [Decimal(1) - pct]))
     return SheetTable(st.file, st.sheet, st.header_row, headers, rows, [], st.confidence, list(st.repeats), list(st.segments),
                       list(st.remaps), list(st.unsure))
@@ -245,7 +283,8 @@ def unpivot_sheet(st: SheetTable, columns: list[str], value: str, label: str = "
 def unpivot_by(st: SheetTable, spec: dict) -> SheetTable:
     """按 define_dataset / 映射里存的 unpivot 说明展开。"""
     return unpivot_sheet(st, spec["columns"], spec["value"], spec.get("label") or "", spec.get("share") or "",
-                         spec.get("remainder") or "", spec.get("blank") or "")
+                         spec.get("remainder") or "", spec.get("blank") or "", spec.get("share_from") or "", spec.get("blank_except") or None,
+                         spec.get("share_from_columns") or None)
 
 
 ROW_ID = "（行号）"      # 虚拟列：每行的 Excel 行号（展开后同一行的几条加 -1、-2），给没有唯一编号列的明细表当编号

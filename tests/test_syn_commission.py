@@ -73,3 +73,30 @@ def test_unmatched_hint_points_to_missing_period():
     assert "没有写 period" in out and 'period: "n_month"' in out
     w2 = ref.build()
     assert "没有写 period" not in w2._unmatched_text(iss)
+
+
+def test_unpivot_share_from_text_column():
+    """几个人的比例集中写在另一列文字里（“甲60%，乙40%”），人名格子里只有名字：按名字取比例"""
+    from decimal import Decimal as D
+    from bonus_core.data.table_detect import SheetTable, parse_shares, unpivot_by
+    assert parse_shares("吴晨晨80%，张荣20%") == {"吴晨晨": D("0.8"), "张荣": D("0.2")}
+    st = SheetTable("f.xlsx", "s", 1, ["项目", "经理1", "经理2", "比例"],
+                    [(2, ["P1", "吴晨晨", "张荣", "吴晨晨80%，张荣20%"]), (3, ["P2", "吴晨晨", None, None])], [], 1.0, [], [], [], [])
+    out = unpivot_by(st, {"columns": ["经理1", "经理2"], "value": "人", "label": "角色", "share": "占比", "share_from": "比例"})
+    h = out.headers
+    got = [(v[0], v[h.index("人")], v[h.index("占比")]) for _, v in out.rows]
+    assert got == [("P1", "吴晨晨", D("0.8")), ("P1", "张荣", D("0.2")), ("P2", "吴晨晨", D(1))]
+
+
+def test_reference_rules_match_expected_v2():
+    """第二套：规则在 PPT 里、销售单有标题行和合计行、名单跨月且夹着重复表头、技术支持比例写在另一列文字里、毛利率有空值"""
+    c2 = CASE.parent / "syn_commission2"
+    sys.path[:0] = [str(c2), str(CASE)]
+    try:
+        import syn2_ref
+        import syn_run
+    finally:
+        del sys.path[:2]
+    w = syn2_ref.build()
+    ok, lines = syn_run.check(w.result, c2)
+    assert ok, "\n".join(lines)

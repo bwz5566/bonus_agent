@@ -306,7 +306,7 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
             rep.gates.append(f"数据里「{fld}」有 {len(mixed)} 种取值把名称和百分比写在一格里（如 {'、'.join(mixed[:4])}），"
                              "现在会被当成一个单独的对象、按整行参与计算，百分比没起作用。用 ask_question 问财务这些格子怎么拆"
                              "（是谁、各占多少、余下的怎么处理），问题里列出这些写法；财务答复后必须在数据里真的拆开（这列是 unpivot 展开的角色列时，"
-                             "用 unpivot 的 share / remainder 参数），不能只在回复里写“已拆分”：数据里还是这些写法，这一项就一直会拦")
+                             "用 unpivot 的 share / remainder 参数；比例集中写在另一列文字里时用 share_from），不能只在回复里写“已拆分”：数据里还是这些写法，这一项就一直会拦")
             rep.keys.append(f"名称百分比 {mixed[0]}")
     # 4. 读了数据表却漏用了表里的金额字段
     for ds, fld in _unused_money(rs, used_elsewhere or set()):

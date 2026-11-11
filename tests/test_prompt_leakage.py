@@ -42,7 +42,7 @@ ID = re.compile(r"[A-Z]{1,3}\d{2,}")
 
 def _skip(p):
     """syn_commission 是按通用业务词造的样例（销售金额、客户编码等），词本身不是某份真实材料的专有说法"""
-    return "syn_commission" in Path(p).parts
+    return any(x.startswith("syn_commission") for x in Path(p).parts)
 
 
 def _case_words():

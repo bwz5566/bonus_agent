@@ -208,7 +208,7 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping, period
         m, moved = rebind_dup_columns(m, st.headers)
         for note in moved:
             issues.append(Issue.warn("dup_column_moved", f"「{ds_name}」{note}，请核对这一列的取值", ds_name))
-        used_cols = set(m.columns.values()) | set((m.unpivot or {}).get("columns") or []) | {
+        used_cols = set(m.columns.values()) | set((m.unpivot or {}).get("columns") or []) | ({m.unpivot["share_from"]} if (m.unpivot or {}).get("share_from") else set()) | {
             c for cols in (m.combine or {}).values() for c in cols}
         unsure = sorted({st.headers[i] for _, cols in getattr(st, "unsure", []) for i in cols
                          if i < len(st.headers) and st.headers[i] in used_cols})
@@ -343,7 +343,8 @@ def rebind_dup_columns(m: "DatasetMapping", headers: list[str]) -> tuple["Datase
         notes[c] = cands[0]
         return cands[0]
     cols = {f: fix(c) for f, c in m.columns.items()}
-    unp = {**m.unpivot, "columns": [fix(c) for c in m.unpivot.get("columns") or []]} if m.unpivot else m.unpivot
+    unp = {**m.unpivot, "columns": [fix(c) for c in m.unpivot.get("columns") or []],
+            **({"share_from": fix(m.unpivot["share_from"])} if m.unpivot.get("share_from") else {})} if m.unpivot else m.unpivot
     comb = {k: [fix(c) for c in v] for k, v in m.combine.items()} if m.combine else m.combine
     flt = {fix(k): v for k, v in m.filter.items()}
     if not notes:
