@@ -100,3 +100,14 @@ def test_reference_rules_match_expected_v2():
     w = syn2_ref.build()
     ok, lines = syn_run.check(w.result, c2)
     assert ok, "\n".join(lines)
+
+
+def test_dup_column_choice_checked_against_reference_tables():
+    """两列同名都写明了列号也会选错：用的那一列和其他表对不上、另一列对得上更多时不保存，并列出例子"""
+    import pytest
+    from bonus_agent.agent import ToolError
+    ref, _ = _case()
+    w = ref.build()
+    with pytest.raises(ToolError, match="安禾集团→安禾"):
+        w.define_dataset("客户X", ref.X, "销售单", {"cust": {"column": "客户简称(D列)", "type": "id"}}, key="cust", distinct=True)
+    assert "已保存" in w.define_dataset("客户Y", ref.X, "销售单", {"cust": {"column": "客户简称(K列)", "type": "id"}}, key="cust", distinct=True)

@@ -1211,6 +1211,7 @@ class Workspace:
             raise ToolError(f"{f.name}/{sheet} 没有自动识别出表格，请先 read_sheet 查看，再用 header_rows 指定表头行")
         raw = st
         fields, combine, unpivot, filter = _resolve_dup_columns(st, fields, combine, unpivot, filter)
+        self._dup_choice_check(st, fields, combine, unpivot, filter)
         spec = _unpivot_spec(unpivot, st) if unpivot else None
         if spec:
             st = unpivot_by(st, spec)
@@ -2454,6 +2455,51 @@ class Workspace:
             return (f"已记录问题 {q.id}，等财务答复{note}。不要自行选择口径或补出算法；"
                     "继续做不受影响的部分，全部问完后调用 finish 结束本轮")
         return f"已记录提示 {q.id}（不影响金额，不必等答复）{note}"
+
+    def _dup_choice_check(self, st, fields, combine, unpivot, filter) -> None:
+        """表里有几列同名（如两列都叫“客户简称”）时，用的那一列的取值要和其他表里同名的列对得上：另一列对得上得更多就不保存。
+        两列都明确写了列号也会选错（项目和参考表用的是另一列，对不上的客户整批被当成“参考表里多出来的”悄悄丢掉）。"""
+        dup = _dup_names(st.headers)
+        if not dup:
+            return
+        used = set()
+        for d in (fields or {}).values():
+            if isinstance(d, dict) and d.get("column"):
+                used.add(str(d["column"]))
+        for v in (combine or {}).values():
+            used |= {str(c) for c in v} if isinstance(v, list) else set()
+        used |= {str(c) for c in ((unpivot or {}).get("columns") or [])} | {str(k) for k in (filter or {})}
+        for base in sorted(b for b in dup if b in used or any(u.startswith(f"{b}(") and u.endswith("列)") for u in used)):
+            sibs = [base] + [h for h in st.headers if h.startswith(f"{base}(") and h.endswith("列)")]
+            ref = set()
+            for o in self.inv.sheets:
+                if o is st or (o.file, o.sheet) == (st.file, st.sheet) or base not in o.headers:
+                    continue
+                j = o.headers.index(base)
+                ref |= {str(v[j]).strip() for _, v in o.rows if j < len(v) and v[j] not in (None, "")}
+            if not ref:
+                continue
+            idx = {h: st.headers.index(h) for h in sibs}
+            vals = {h: {str(v[i]).strip() for _, v in st.rows if i < len(v) and v[i] not in (None, "")} for h, i in idx.items()}
+            hits = {h: len(vals[h] & ref) for h in sibs}
+            chosen = [h for h in sibs if h in used]
+            best = max(sibs, key=lambda h: hits[h])
+            show = lambda h: f"{h}({dup[base]}列)" if h == base else h
+            for c in chosen:
+                if hits[best] > hits[c]:
+                    ci, bi = idx[c], idx[best]
+                    pairs = []
+                    for _, v in st.rows:
+                        a, b2 = (str(v[ci]).strip() if ci < len(v) and v[ci] is not None else ""), \
+                                (str(v[bi]).strip() if bi < len(v) and v[bi] is not None else "")
+                        if a not in ref and b2 in ref and (a, b2) not in pairs:
+                            pairs.append((a, b2))
+                    eg = "、".join(f"{a}→{b2}" for a, b2 in pairs[:4])
+                    raise ToolError(
+                        f"未保存：「{show(c)}」的取值和其他表里的「{base}」对得上 {hits[c]} 种，同表另一列「{show(best)}」对得上 {hits[best]} 种"
+                        f"（参考表共 {len(ref)} 种）。只有另一列才对得上的例子（「{show(c)}」→「{show(best)}」）：{eg}。"
+                        f"项目、关联用的客户必须和参考表是同一种写法，否则这些客户的项目会整批对不上参考表、被悄悄丢掉。"
+                        f"改用「{show(best)}」；如果材料明确说要用「{show(c)}」，用 ask_question 问财务并列出这几个例子，不要自己决定")
 
     def _quote_basis(self, basis) -> str:
         """材料原文作依据：file、quote 逐字核对得上、且这句话确实在说“不参与 / 不计算 / 不影响”才算。返回不通过的原因，通过返回空。"""
