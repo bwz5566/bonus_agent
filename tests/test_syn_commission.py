@@ -111,3 +111,23 @@ def test_dup_column_choice_checked_against_reference_tables():
     with pytest.raises(ToolError, match="安禾集团→安禾"):
         w.define_dataset("客户X", ref.X, "销售单", {"cust": {"column": "客户简称(D列)", "type": "id"}}, key="cust", distinct=True)
     assert "已保存" in w.define_dataset("客户Y", ref.X, "销售单", {"cust": {"column": "客户简称(K列)", "type": "id"}}, key="cust", distinct=True)
+
+
+def test_fact_from_wrong_page_is_flagged_once():
+    """参数名写了区域，引用的原文却在另一页（那一页没有这个区域）：先拦一次提示抄错页，原样再提交才登记"""
+    import pytest
+    from bonus_agent.agent import ToolError, Workspace
+    from bonus_agent.auto import build_inventory
+    from bonus_agent.llm import FakeLLM
+    from bonus_agent.parsing.docs import Block, ParsedDoc
+    from bonus_agent.auto import Inventory
+    d = ParsedDoc("规则.pptx", [Block("规则.pptx", 1, "text", "欧洲区阶梯 200万以下 0.30%"),
+                                 Block("规则.pptx", 2, "text", "南方国家区阶梯 200万以下 0.50%"),
+                                 Block("规则.pptx", 3, "text", "美洲区阶梯同欧洲区")])
+    w = Workspace(FakeLLM(["x"]), Inventory([Path("规则.pptx")], [d], [], {}))
+    bad = {"name": "美洲区阶梯-第1档", "value": "0.50%", "file": "规则.pptx", "quote": "南方国家区阶梯 200万以下 0.50%"}
+    with pytest.raises(ToolError, match="抄错了页"):
+        w.record_facts([bad])
+    assert "已登记 1 条" in w.record_facts([bad])            # 原样再提交：登记
+    ok = {"name": "南方国家区阶梯-第1档", "value": "0.50%", "file": "规则.pptx", "quote": "南方国家区阶梯 200万以下 0.50%"}
+    assert "已登记 1 条" in w.record_facts([ok])

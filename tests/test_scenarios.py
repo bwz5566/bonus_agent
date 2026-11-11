@@ -199,7 +199,10 @@ def test_publish_runs_acceptance_then_compute_reuses_version(tmp_path, reg):
     assert rel.version == "v1" and rel.info["acceptance"][0]["ok"]
     assert (reg.data_dir("demo_quarter") / "releases" / "v1" / "release.yaml").exists()
     assert reg.memory("demo_quarter").items()[0]["answer"] == "是"
-    assert rl.publish(reg, "demo_quarter", out / "template", "财务乙").version == "v2"     # 只增不覆盖
+    v2 = rl.publish(reg, "demo_quarter", out / "template", "财务乙")
+    assert v2.version == "v2"     # 只增不覆盖
+    imp = v2.info["impact"][0]     # 和上一版比：同一套规则，验收数据上一分钱都不变
+    assert imp["against"] == "v1" and imp["人员"]["changed"] == 0 and imp["对象"]["changed"] == 0 and imp["对象"]["total"] > 0
     assert [r.version for r in reg.releases("demo_quarter")] == ["v1", "v2"]
     # 计算：换了文件名的本期数据，按 v1 算（不调用大模型），与参考实现一致
     nxt = tmp_path / "本期" / "业务输入_10月.xlsx"

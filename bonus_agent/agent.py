@@ -695,6 +695,7 @@ class Workspace:
     _source_calls: int = 0                                  # 本轮提问前查原文的次数
     _source_skip: bool = False                              # 刚查到原文退回过：下一次提问直接记录
     round: int = 1                                          # 第几轮（同一案卷和财务来回的次数）
+    _page_warned: set = field(default_factory=set)          # 已提示过“可能抄错页”的参数（再提交就登记）
     facts: list[fx.Fact] = field(default_factory=list)      # 参数台账：从材料里登记的参数和口径
     clauses: list[cl.Clause] = field(default_factory=list)  # 条款清单：每份规则文档的计算条款，及落在规则的哪里
     conflicts: dict[str, fx.Conflict] = field(default_factory=dict)   # 已提问的参数冲突
@@ -1041,6 +1042,68 @@ class Workspace:
         return (d.full_text() + "\n" + "\n".join(t for k, t in self.transcripts.items()
                                                    if k.rsplit("#", 1)[0] == f.name)).splitlines()
 
+    def _page_texts(self, name: str) -> dict[int, str]:
+        """多页文档（PPT、PDF）每一页规范化后的文字，含这一页图片的转写。"""
+        d = next((d for d in self.inv.docs if d.name == name), None)
+        if d is None:
+            return {}
+        out: dict[int, list[str]] = {}
+        k = 0
+        for b in d.blocks:
+            if b.kind == "image":
+                k += 1
+                t = self.transcripts.get(f"{d.name}#{k}", "")
+            else:
+                t = b.text
+            if b.page is not None and t:
+                out.setdefault(b.page, []).append(t)
+        return {p: fx.norm("\n".join(ts)) for p, ts in out.items()}
+
+    _GENERIC_WORDS = ("新项目", "老项目", "项目", "提成", "比例", "系数", "阶梯", "金额", "上限", "下限", "以上", "以下", "参数",
+                      "规则", "标准", "奖金", "计算", "基数", "取值", "档位", "档", "第", "万元", "万", "元")
+
+    def _generic_only(self, t: str) -> bool:
+        """去掉通用词（提成、比例、阶梯、第几档……）和数字后不剩两个字：不是区分区域、产品线的词。"""
+        rest = re.sub(r"[\d.%一二三四五六七八九十]", "", t)
+        for w in sorted(self._GENERIC_WORDS, key=len, reverse=True):
+            rest = rest.replace(w, "")
+        return len(rest) < 2
+
+    def _wrong_page(self, f) -> str:
+        """参数名里写了区分用的词（如区域、产品线），引用的原文却在另一页、那一页没有这个词：多半是抄错了页（如把南方国家区的阶梯当成美洲的）。"""
+        pages = self._page_texts(f.file)
+        if len(pages) < 2:
+            return ""
+        q = fx.norm(f.quote)
+        parts = [fx.norm(x) for x in str(f.quote).splitlines() if fx.norm(x)]
+        hit = [p for p, t in pages.items() if q in t or (len(parts) > 1 and all(x in t for x in parts))]
+        if not hit:
+            return ""
+        # 参数名里能在材料某几页找到、却不在引用所在页的词（取最长的）：参数名常写成一整串（如 海外美洲新项目阶梯），逐段找
+        name = fx.norm(f.name)
+        for w in sorted(self._GENERIC_WORDS, key=len, reverse=True):     # 先按通用词切开，只在剩下的段里找（不会切出“成比”这种半个词）
+            name = name.replace(w, "|")
+        name = re.sub(r"[\d.%-]+", "|", name)
+        cands = []
+        for seg in [x for x in name.split("|") if len(x) >= 2]:
+          for i in range(len(seg)):
+            for j in range(min(len(seg), i + 8), i + 1, -1):
+                t = seg[i:j]
+                if t.isdigit() or self._generic_only(t) or any(t in c for c in cands):
+                    continue
+                on = [p for p, txt in pages.items() if t in txt]
+                if on and len(on) <= max(1, len(pages) // 2) and not any(t in pages[p] for p in hit):
+                    cands.append(t)
+                    break
+        for t in sorted(cands, key=len, reverse=True)[:1]:
+            term = t
+            elsewhere = sorted(p for p, txt in pages.items() if t in txt)
+            if len(t) >= 2:
+                return (f"参数名里的「{term}」不在引用原文所在的第 {'、'.join(map(str, hit))} 页，而在第 {'、'.join(map(str, elsewhere[:6]))} 页。"
+                        "这一条可能抄错了页（不同区域、产品线的表很像）。回到写着「" + term + "」的那一页核对取值再登记；"
+                        "如果确实是这一页（页标题在图片里没转写出来），原样再提交一次即可")
+        return ""
+
     def _corpus(self) -> dict[str, str]:
         """每个文件规范化后的全文，用来核对引用。"""
         out = {f.name: fx.norm("".join(self._lines(f.name))) for f in self.inv.files}
@@ -1067,6 +1130,11 @@ class Workspace:
                 continue
             if any((g.name, g.file, fx.norm(g.quote)) == (f.name, f.file, fx.norm(f.quote)) for g in self.facts):
                 dup += 1
+                continue
+            wrong = self._wrong_page(f)
+            if wrong and (f.name, fx.norm(f.quote)) not in self._page_warned:
+                self._page_warned.add((f.name, fx.norm(f.quote)))
+                lines.append(f"第 {i} 条「{f.name}」未登记：{wrong}")
                 continue
             self.facts.append(f)
             added += 1

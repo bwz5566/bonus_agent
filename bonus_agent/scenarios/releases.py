@@ -10,6 +10,7 @@ import json
 import re
 import shutil
 from dataclasses import dataclass
+from decimal import Decimal
 from datetime import datetime
 from pathlib import Path
 
@@ -127,11 +128,20 @@ def publish(reg: Registry, scenario_id: str, template_dir: str | Path, by: str, 
     for name in ["manifest.yaml", *(tpl.manifest.get("files") or {})]:
         (tmp / name).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src / name, tmp / name)
+    imp = []          # 和上一个版本比：验收用例的数据按两版各算一遍，变化记进版本信息，发布页能看到改了规则影响到哪些人
+    if have:
+        for case in sc.acceptance:
+            try:
+                imp.append({"id": case.id, "against": have[-1].version,
+                            **impact(have[-1].dir, src, [sc.file(x) for x in case.data], case.period)})
+            except Exception as e:
+                imp.append({"id": case.id, "against": have[-1].version, "error": str(e)[:300]})
     info = {
         "scenario": scenario_id, "version": version, "name": sc.name,
         "published_by": by, "published_at": datetime.now().isoformat(timespec="seconds"),
         "note": note, "source": source, "confirmed": tpl.manifest.get("confirmed"),
         "acceptance": acc,
+        **({"impact": imp} if imp else {}),
     }
     (tmp / RELEASE_FILE).write_text(yaml.safe_dump(info, allow_unicode=True, sort_keys=False), encoding="utf-8")
     Template.load(tmp)          # 复制后的文件指纹仍一致
@@ -174,3 +184,48 @@ def compute(reg: Registry, scenario_id: str, data_files: list[str | Path], out: 
         "inputs": {p.name: sha256(p) for p in files}, "outputs": [p.name for p in written],
         "warnings": [str(w) for w in warnings]}, ensure_ascii=False, indent=1), encoding="utf-8")
     return Computed(rel, rep, results, warnings, written, tpl.last_period)
+
+
+def _figures(results: dict) -> dict[str, dict[str, Decimal]]:
+    """一次计算里可比的金额：汇总行、每个人、每个对象（各方案的基准结果）。"""
+    out = {"汇总": {}, "人员": {}, "对象": {}}
+    for scheme, revs in (results or {}).items():
+        res = revs.get("R0") if isinstance(revs, dict) else None
+        if res is None:
+            continue
+        pre = f"{scheme}/" if len(results) > 1 else ""
+        for name, v in res.totals or []:
+            out["汇总"][pre + str(name)] = Decimal(str(v))
+        for p in res.people or []:
+            out["人员"][pre + str(p["name"])] = Decimal(str(p.get("paid") or p.get("final") or 0))
+        for nid, n in (res.nodes or {}).items():
+            if getattr(n, "level", None) not in (None, "全部"):
+                out["对象"][pre + nid] = Decimal(str(n.final))
+    return out
+
+
+def impact(old_dir: str | Path, new_dir: str | Path, files: list[str | Path], period=None, limit: int = 30) -> dict:
+    """同一份数据分别按旧规则版本和新规则算，列出汇总、每个人、每个对象的变化。
+    改规则后用它核对：只改了一处，变化就只该出现在这一处影响到的对象上；其余对象一分钱都不该变。"""
+    from bonus_core.template import Template
+    old, _ = Template.load(old_dir).run(files, period)
+    new, _ = Template.load(new_dir).run(files, period)
+    a, b = _figures(old), _figures(new)
+    out = {}
+    for part in ("汇总", "人员", "对象"):
+        keys = sorted(set(a[part]) | set(b[part]))
+        ch = [(k, a[part].get(k), b[part].get(k)) for k in keys if a[part].get(k) != b[part].get(k)]
+        out[part] = {"total": len(keys), "changed": len(ch),
+                     "items": [{"name": k, "old": str(x) if x is not None else None, "new": str(y) if y is not None else None,
+                                "diff": str((y or 0) - (x or 0))} for k, x, y in ch[:limit]]}
+    return out
+
+
+def impact_lines(imp: dict) -> list[str]:
+    lines = []
+    for part in ("汇总", "人员", "对象"):
+        p = imp.get(part) or {}
+        lines.append(f"{part}：{p.get('total', 0)} 项里变了 {p.get('changed', 0)} 项")
+        for it in p.get("items", [])[:10]:
+            lines.append(f"  {it['name']}：{it['old']} → {it['new']}（{it['diff']}）")
+    return lines

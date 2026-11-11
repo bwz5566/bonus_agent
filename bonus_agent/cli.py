@@ -78,6 +78,13 @@ def main(argv=None) -> int:
     p.add_argument("--out", required=True, help="结果目录")
     p.add_argument("--scenario-dir", action="append", default=[], **scen_dir)
     p.add_argument("data", nargs="+", help="本期数据文件")
+    p = sub.add_parser("impact", help="改规则前后对比：同一份数据按已发布版本和新模板各算一遍，列出汇总、每个人、每个对象的变化（不调用大模型）")
+    p.add_argument("--scenario", required=True)
+    p.add_argument("--version", help="对比的已发布版本，不写用最新")
+    p.add_argument("--out", required=True, help="新规则所在的案卷目录（里面有 template/），或模板目录")
+    p.add_argument("--period", help="核算期间")
+    p.add_argument("--scenario-dir", action="append", default=[], **scen_dir)
+    p.add_argument("data", nargs="+", help="用来对比的数据文件（通常是上一期的）")
     p = sub.add_parser("confirm")
     p.add_argument("--out", required=True, help="案卷目录")
     p.add_argument("--by", required=True, help="确认人")
@@ -142,7 +149,7 @@ def main(argv=None) -> int:
     p.add_argument("paths", nargs="+", help="本批次的规则文档、Excel 数据，或只包含它们的文件夹")
     a = ap.parse_args(argv)
 
-    if a.cmd in {"scenarios", "publish", "compute"}:
+    if a.cmd in {"scenarios", "publish", "compute", "impact"}:
         return _scenario_cmd(a)
 
     if a.cmd == "user":
@@ -361,6 +368,13 @@ def _scenario_cmd(a) -> int:
             print(f"已发布 {reg.get(a.scenario).name} 规则版本 {rel.version}：{rel.dir}")
             for x in rel.info["acceptance"]:
                 print(f"  验收「{x['id']}」通过：" + "；".join(x["lines"]))
+            return 0
+        if a.cmd == "impact":
+            rel = rl.get_release(reg, a.scenario, a.version)
+            new = Path(a.out) / "template" if (Path(a.out) / "template").is_dir() else Path(a.out)
+            imp = rl.impact(rel.dir, new, [Path(x) for x in a.data], a.period)
+            print(f"和已发布版本 {rel.version} 比：")
+            print("\n".join(rl.impact_lines(imp)))
             return 0
         c = rl.compute(reg, a.scenario, [Path(x) for x in a.data], a.out, a.version, a.period)
     except rl.InputError as e:
