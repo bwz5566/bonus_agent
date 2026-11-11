@@ -230,3 +230,31 @@ def test_hint_when_same_table_with_more_months_exists(tmp_path):
     assert "另有「d.xlsx/累计」" in out and "year_to_date" in out
     out = w.define_dataset("累计", "d.xlsx", "累计", {**fields, "m": {"column": "月份", "type": "text"}}, link="cust")
     assert "另有" not in out
+
+
+def test_link_to_wrong_table_suggests_better_owner(tmp_path):
+    """两张参考表互相挂（逾期挂到呆滞上），有客户对不上；明细表的客户字段能全部对上：提示挂错了表、该挂到哪"""
+    import openpyxl
+    from bonus_agent.agent import Workspace
+    from bonus_agent.auto import build_inventory, collect_files
+    from bonus_agent.llm import FakeLLM
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "销售"
+    for r in [["单号", "客户", "金额"], ["S1", "A", 100], ["S2", "B", 200], ["S3", "C", 300], ["S4", "D", 50]]:
+        ws.append(r)
+    s = wb.create_sheet("呆滞")
+    for r in [["客户", "呆滞金额"], ["A", 10], ["B", 20]]:
+        s.append(r)
+    s = wb.create_sheet("逾期")
+    for r in [["客户", "逾期金额"], ["A", 5], ["C", 6], ["D", 7]]:
+        s.append(r)
+    wb.save(tmp_path / "d.xlsx")
+    w = Workspace(FakeLLM(["x"]), build_inventory(collect_files([tmp_path])))
+    w.define_dataset("销售单", "d.xlsx", "销售", {"no": {"column": "单号", "type": "id"}, "cust": {"column": "客户", "type": "id"},
+                                                   "amt": {"column": "金额", "type": "money", "unit": "元"}}, key="no")
+    w.define_dataset("呆滞", "d.xlsx", "呆滞", {"cust": {"column": "客户", "type": "id"},
+                                               "dz": {"column": "呆滞金额", "type": "money", "unit": "元"}}, key="cust")
+    out = w.define_dataset("逾期", "d.xlsx", "逾期", {"cust": {"column": "客户", "type": "id"},
+                                                    "yq": {"column": "逾期金额", "type": "money", "unit": "元"}}, link="cust")
+    assert "多半挂错了表" in out and "「销售单」的字段 cust 能对上 3/3" in out

@@ -1668,9 +1668,39 @@ class Workspace:
                 elif hit < len(vals) / 2:
                     loose.append(f"「{child}」的 {fld} 只有 {hit}/{len(vals)} 个取值能在「{owner}」里找到（对不上的如 {miss}），"
                                  f"对不上的行挂不到任何{owner}上；确认列和编号写法（空格、大小写、前导 0）")
+                if hit < len(vals):
+                    better = self._better_owner(child, fld, vals, hit, owner)
+                    if better:
+                        (bad if hit == 0 and child == name else loose).append(better)
         except Exception:      # 取值失败不影响保存
             pass
         return bad, loose
+
+    def _better_owner(self, child: str, fld: str, vals: set, hit: int, owner: str) -> str:
+        """挂到「owner」上有取值对不上，而另一张表的某个字段能对上更多（全部或明显更多）：多半挂错了表
+        （如两张参考表互相挂，其实都该按客户挂到明细的客户上）。按数据找出对得最好的表和字段，告诉模型。"""
+        best = None
+        for n, o in self.datasets.items():
+            if n in (child, owner):
+                continue
+            for f, fd in o.fields.items():
+                if fd.type not in ("id", "text"):
+                    continue
+                try:
+                    got = len(vals & set(self._values(n, f)))
+                except Exception:
+                    continue
+                if got > hit and (best is None or got > best[2]):
+                    best = (n, f, got)
+        if not best or best[2] < max(hit + 1, len(vals) * 0.8):
+            return ""
+        n, f, got = best
+        o = self.datasets[n]
+        how = (f"把这张表的 {fld} 对应到「{n}」的主键，写 link={f}（字段名改成 {f}，column 不变）" if o.key == f else
+               f"「{n}」的 {f} 不是主键：把 {f} 定义成一个实体（每个 {f} 一行的表，key={f}，或在「{n}」所在层级之上加一层），"
+               f"这张表和「{n}」都按 {f} 挂上去，不要两张参考表互相挂")
+        return (f"「{child}」的 {fld} 挂在「{owner}」上只对上 {hit}/{len(vals)} 个，而「{n}」的字段 {f} 能对上 {got}/{len(vals)} 个："
+                f"多半挂错了表。{how}；对不上的少数编号再按材料核对或问财务")
 
     def _relation_hints(self, name: str) -> list[str]:
         """程序按数据判断的关联问题：编号列取值是别的表的主键却没同名、link 找不到被关联的表、该写 key 的没写。"""
@@ -2060,6 +2090,15 @@ class Workspace:
                         f"而「{level}」只取本次核算期间（{self.period.label}）的行。材料说这张表只取核算期间的行（或它本来按期间记录）时，"
                         f"重新 define_dataset 并写 period: \"{dates[0]}\"，不用问财务")
                 break
+        for (tbl, fld, level), keys in groups.items():       # 别的表能对上更多：多半挂错了表，先改挂法
+            try:
+                vals = set(self._values(tbl, fld))
+                hit = len(vals & set(self._values(level, fld))) if level in self.datasets else len(vals - set(keys))
+            except Exception:
+                continue
+            better = self._better_owner(tbl, fld, vals, hit, level)
+            if better:
+                out += "\n" + better
         if again:
             out += ("\n同一批编号已经第 2 次对不上了。不要再换着改规则或映射绕开，也不要自己决定排除或补录："
                     "编号写法不同（空格、大小写、前导 0）才改映射；否则现在就用 ask_question 问财务这些记录怎么处理"

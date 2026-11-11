@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError,
 
 SCENARIO_FILE = "scenario.yaml"
 GUIDE_FILE = "guide.md"
+PLAYBOOK_FILE = "playbook.md"
 BUILTIN = Path(__file__).parent / "packs"
 ID = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 
@@ -66,6 +67,8 @@ class Scenario(_Strict):
     name: str
     description: str = ""
     guide: str | None = None          # 场景说明文件名，默认 guide.md（有就用）
+    playbook: str | None = None       # 做法说明文件名，默认 playbook.md（有就用）：这类奖金固定的做法（步骤、表怎么连、
+                                      # 每步自查什么），不写参数和金额；智能体按它的步骤做，数从材料里读
     inputs: list[InputTable] = Field(default_factory=list)
     outputs: str = ""                 # 输出要求（给智能体和财务看的说明）
     tools: list[str] = Field(default_factory=list)      # 场景专用技能；全局技能（读表格、读文档、计算……）总是可用
@@ -91,6 +94,17 @@ class Scenario(_Strict):
         if not p.is_file():
             if self.guide:
                 raise ScenarioError(f"场景 {self.id} 的说明文件不存在：{p}")
+            return ""
+        return p.read_text(encoding="utf-8").strip()
+
+    def playbook_text(self) -> str:
+        name = self.playbook or PLAYBOOK_FILE
+        p = self.dir / name
+        if not p.is_file() and not self.playbook:      # 本机场景包没写做法：用仓库自带同名场景的通用做法（不含任何公司的参数）
+            p = BUILTIN / self.id / PLAYBOOK_FILE
+        if not p.is_file():
+            if self.playbook:
+                raise ScenarioError(f"场景 {self.id} 的做法说明文件不存在：{p}")
             return ""
         return p.read_text(encoding="utf-8").strip()
 

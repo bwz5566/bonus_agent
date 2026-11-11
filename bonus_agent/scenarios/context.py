@@ -28,6 +28,12 @@ def agent_brief(reg: Registry, sc: Scenario, files: list[str | Path], *, use_mem
     if guide:
         parts.append(f"【场景说明】材料里的「{guide.name}」是财务为这个场景定的规则和口径，与其他材料同等效力；"
                      "与其他材料冲突、或说明里没写清楚的，用 ask_question 提问，不要自己选。")
+    play = sc.playbook_text()
+    if play:
+        parts.append("【做法】这类奖金固定的做法：按下面的步骤做，表和表照这里写的关系连，每一步做完按这里的自查项核对后再往下走。"
+                     "做法只管怎么做，不给参数和金额：参数、比例、名单、口径一律从材料原文读，并照常登记台账、摘条款。"
+                     "本次材料和做法对不上（如多了一类表、少了一步、关系不一样）时以材料为准，用 ask_question 说明哪里不一样再继续：\n"
+                     + play)
     tpl = template_text(sc)
     if tpl:
         rep = check_inputs(sc, files)

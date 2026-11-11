@@ -164,6 +164,21 @@ def test_prepare_stages_guide_as_material_and_briefs_agent(tmp_path, reg):
     assert "【场景记忆】" not in prepare(reg, "demo_quarter", [m], use_memory=False).brief
 
 
+def test_playbook_goes_into_brief(tmp_path, reg):
+    """场景目录里有 playbook.md（这类奖金固定的做法）：写进【做法】，并说明参数从材料读、和材料对不上以材料为准"""
+    m = tmp_path / "材料"
+    m.mkdir()
+    shutil.copy(run_case.XLSX, m / "业务输入.xlsx")
+    assert "【做法】" not in prepare(reg, "demo_quarter", [m]).brief
+    sc = reg.get("demo_quarter")
+    (sc.dir / "playbook.md").write_text("1. 明细汇总成对象\n2. 参考表按编号挂到对象上", encoding="utf-8")
+    try:
+        b = prepare(reg, "demo_quarter", [m]).brief
+        assert "【做法】" in b and "参考表按编号挂到对象上" in b and "以材料为准" in b
+    finally:
+        (sc.dir / "playbook.md").unlink()
+
+
 def test_agent_reads_scenario_guide_and_brief(tmp_path, reg):
     from bonus_agent.agent import run_agent
     from bonus_agent.llm import FakeLLM
