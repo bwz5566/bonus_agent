@@ -123,3 +123,16 @@ def test_deep_budget_and_off():
     llm = _Recorder(bad)
     run_agent(llm, [ANNUAL], max_steps=3, deep=0)
     assert llm.flags == [False, False, False]
+
+
+def test_deep_step_with_only_analysis_hands_back():
+    """深度思考那一步（如换成更强的模型）只回了分析、没调用工具：不算失败，分析留在历史里，下一步不思考、按分析动手"""
+    from bonus_agent.agent import run_agent
+    cols = {"a": {"column": "b", "type": "id"}}
+    bad = {"tool": "define_dataset", "args": {"name": "x", "file": "无.xlsx", "sheet": "a", "fields": cols}}
+    script = [bad] + ["错在文件名，应该先 list_files 看清文件"] * 1 + [{"tool": "list_files"}] * 6
+    llm = _Recorder(script)
+    ar = run_agent(llm, [ANNUAL], max_steps=6)
+    assert llm.flags[:3] == [False, True, False]
+    assert any("深度思考得出的分析" in str(c) and "错在文件名" in str(c) for c in llm.calls)
+    assert "没有调用工具" not in (ar.error or "")

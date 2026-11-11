@@ -3473,6 +3473,13 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                             **({"tool_calls": [{"id": c["id"], "type": "function",
                                                 "function": {"name": c["name"], "arguments": _short_thought(c["arguments"])}}
                                                for c in calls]} if calls else {})})
+            if not calls and think and (reply.get("content") or reasoning).strip():
+                # 深度思考的那一步（可能换了更强的模型）只写了分析、没动手：分析留在历史里，下一步回到平时的模型按分析调用工具，
+                # 不算“没调用工具”（否则换模型思考反而让整轮失败）
+                history[-1] = {"role": "assistant", "content": (reply.get("content") or "").strip() or reasoning.strip()[:6000]}
+                history.append({"role": "user", "content": "上面是深度思考得出的分析。现在按这个分析调用工具动手改；全部完成后调用 finish。"})
+                deep_why = ""
+                continue
             if not calls:
                 nudges += 1
                 if nudges > 3:
