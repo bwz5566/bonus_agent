@@ -118,7 +118,8 @@ _I = {"type": "integer"}
 FIELD_SCHEMA = _obj({"column": {**_S, "description": "Excel 表头原文"},
                      "type": {"type": "string", "enum": ["money", "number", "int", "ratio", "text", "enum", "date", "id"]},
                      "unit": {"type": "string", "enum": ["元", "万元"], "description": "money 字段必填"},
-                     "if_empty": {"type": "string", "description": "可选：这一列的空单元格按这个值处理（如 0）。"
+                     "if_empty": {"type": "string", "description": "可选：这一列的空单元格按这个值处理（如 0）；写 skip 表示空格子所在的行当作没有"
+                                  "（材料说空着按“查不到 / 没有”处理时用，按对象取值时和查不到一样）。"
                                   "只在材料写明或财务答复过时填，说明里写依据；拿不准先 ask_question"},
                      "desc": _S}, ["column", "type"])
 
@@ -1297,6 +1298,17 @@ class Workspace:
                                 "（列名重复或对不上），不知道该读哪一列。用 ask_question 问财务这两段各列的对应关系，"
                                 "或用 header_rows 只取其中一段分别定义")
         fixed = []
+        if isinstance(fields, dict):     # key / link 不在 fields 里：是表里的列（含 combine 合成的新列）且没有字段用到它，就补成编号字段
+            used_cols = {d.get("column") for d in fields.values() if isinstance(d, dict)}
+            for which, val in (("key", key), ("link", link)):
+                if not val or val in fields:
+                    continue
+                spare = [c for c in (comb or {}) if c not in used_cols]
+                col = val if val in st.headers and val not in used_cols else (spare[0] if len(spare) == 1 else None)
+                if col and not any(isinstance(d, dict) and d.get("column") == val for d in fields.values()):
+                    fields = {**fields, val: {"column": col, "type": "id"}}
+                    used_cols.add(col)
+                    fixed.append(f"{which} 字段 {val} 没写进 fields，已按列「{col}」补上（类型 id）")
         if isinstance(fields, dict):     # key / link 写成了 Excel 列名（如 entity_id），而字段已改名（dept_id ← entity_id）
             for which, val in (("key", key), ("link", link)):
                 hit = [f for f, d in fields.items() if isinstance(d, dict) and d.get("column") == val] if val and val not in fields else []
@@ -1570,6 +1582,17 @@ class Workspace:
                 if not vals or not keys:
                     continue
                 hit = len(vals & keys)
+                if hit < len(vals):        # 只差分隔符（202609|C1 ↔ 202609C1）的，计算时按去掉分隔符的写法对上（见 engine.tree._loose_get）
+                    from bonus_core.engine.tree import _SEP
+                    loose_keys = {}
+                    for k in keys:
+                        loose_keys.setdefault(_SEP.sub("", str(k)), []).append(k)
+                    sep_hit = sum(1 for v in vals - keys if len(loose_keys.get(_SEP.sub("", str(v)), [])) == 1)
+                    if sep_hit:
+                        loose.append(f"「{child}」的 {fld} 有 {sep_hit} 个取值和「{owner}」的编号只差分隔符（如 "
+                                     f"{sorted(vals - keys)[0]} ↔ {loose_keys[_SEP.sub('', str(sorted(vals - keys)[0]))][0] if loose_keys.get(_SEP.sub('', str(sorted(vals - keys)[0]))) else '…'}），"
+                                     "计算时按去掉分隔符后的写法自动对上，不用改")
+                        hit += sep_hit
                 col = self.mapping[child].columns.get(fld, fld)
                 miss = sorted(vals - keys)[:3]
                 if hit == 0:

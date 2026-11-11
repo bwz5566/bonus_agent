@@ -131,3 +131,61 @@ def test_fact_from_wrong_page_is_flagged_once():
     assert "已登记 1 条" in w.record_facts([bad])            # 原样再提交：登记
     ok = {"name": "南方国家区阶梯-第1档", "value": "0.50%", "file": "规则.pptx", "quote": "南方国家区阶梯 200万以下 0.50%"}
     assert "已登记 1 条" in w.record_facts([ok])
+
+
+def test_link_matches_when_only_separators_differ(tmp_path):
+    """参考表里的编号是连写的（202609C1），项目编号是用 | 拼的（202609|C1）：去掉分隔符一致就对上，并提示"""
+    import openpyxl
+    from bonus_agent.agent import Workspace
+    from bonus_agent.auto import build_inventory, collect_files
+    from bonus_agent.llm import FakeLLM
+    from bonus_core.engine.tree import _loose_get
+    assert _loose_get({"202609|C1": 1, "202609|C2": 2}, "202609C2") == 2
+    assert _loose_get({"a|bc": 1, "ab|c": 2}, "abc") is None            # 去掉分隔符后撞车的不算
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "销售"
+    for r in [["月份", "客户", "金额"], ["202609", "C1", 100], ["202609", "C2", 200]]:
+        ws.append(r)
+    s = wb.create_sheet("系数")
+    for r in [["编号", "系数"], ["202609C1", 0.5], ["202609C2", 1]]:
+        s.append(r)
+    wb.save(tmp_path / "d.xlsx")
+    w = Workspace(FakeLLM(["x"]), build_inventory(collect_files([tmp_path])))
+    w.define_dataset("项目", "d.xlsx", "销售", {"pid": {"column": "项目编号", "type": "id"}, "amt": {"column": "金额", "type": "money", "unit": "元"}},
+                     key="pid", combine={"项目编号": ["月份", "客户"]})
+    w.define_dataset("系数", "d.xlsx", "系数", {"pid": {"column": "编号", "type": "id"}, "c": {"column": "系数", "type": "ratio"}}, link="pid")
+    w.set_rules(variables={"pay": {"scope": "项目", "expr": 'amt * sum(c, of: "系数")'}},
+                pool={"scope": "项目", "expr": "pay"}, allocation=[{"level": "项目", "key": "pid"}])
+    out = w.trial_run()
+    assert "试算成功" in out, out
+    assert w.result.pool == "250.00"
+
+
+def test_if_empty_skip_and_key_autofill(tmp_path):
+    """空格子按“查不到”处理（if_empty: skip）；key 没写进 fields、combine 合成了新列时自动补上"""
+    import openpyxl
+    from bonus_agent.agent import Workspace
+    from bonus_agent.auto import build_inventory, collect_files
+    from bonus_agent.llm import FakeLLM
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "销售"
+    for r in [["月份", "客户", "金额"], ["202609", "C1", 100], ["202609", "C2", 200]]:
+        ws.append(r)
+    s = wb.create_sheet("毛利")
+    for r in [["月份", "客户", "毛利率"], ["202609", "C1", 0.5], ["202609", "C2", None]]:
+        s.append(r)
+    wb.save(tmp_path / "d.xlsx")
+    w = Workspace(FakeLLM(["x"]), build_inventory(collect_files([tmp_path])))
+    out = w.define_dataset("项目", "d.xlsx", "销售", {"amt": {"column": "金额", "type": "money", "unit": "元"}},
+                           key="pid", combine={"项目编号": ["月份", "客户"]})
+    assert "已按列「项目编号」补上" in out
+    w.define_dataset("毛利", "d.xlsx", "毛利", {"pid": {"column": "项目编号", "type": "id"},
+                                                "m": {"column": "毛利率", "type": "ratio", "if_empty": "skip"}},
+                     link="pid", combine={"项目编号": ["月份", "客户"]})
+    w.set_rules(variables={"coef": {"scope": "项目", "expr": 'if(count(of: "毛利") > 0, sum(m, of: "毛利"), 1)'},
+                           "pay": {"scope": "项目", "expr": "amt * coef"}},
+                pool={"scope": "项目", "expr": "pay"}, allocation=[{"level": "项目", "key": "pid"}])
+    assert "试算成功" in w.trial_run()
+    assert w.result.pool == "250.00"          # C1：100×0.5；C2 毛利率空着按查不到，系数 1

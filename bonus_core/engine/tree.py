@@ -312,6 +312,32 @@ def _aux_order(lay: Layout) -> list[str]:
     return out
 
 
+_LOOSE_CACHE: dict = {}
+_SEP = re.compile(r"[|\s_\-/]+")
+
+
+def _loose_get(pool: dict, k: str):
+    """编号只差分隔符（一边是 202609|C001|甲，一边是 202609C001甲）时按去掉分隔符后的写法找；去掉后撞车的不算。"""
+    if not pool:
+        return None
+    key = id(pool)
+    hit = _LOOSE_CACHE.get(key)
+    if hit is None or hit[0] is not pool:
+        m, dup = {}, set()
+        for kk, n in pool.items():
+            x = _SEP.sub("", str(kk))
+            if x in m:
+                dup.add(x)
+            m[x] = n
+        for x in dup:
+            m.pop(x, None)
+        hit = (pool, m)
+        if len(_LOOSE_CACHE) > 200:
+            _LOOSE_CACHE.clear()
+        _LOOSE_CACHE[key] = hit
+    return hit[1].get(_SEP.sub("", k))
+
+
 def _parent_node(lay: Layout, name: str, row: Row, root: Node, nodes, index, issues, dropped: list | None = None) -> Node | None:
     kind, target, f = lay.parent[name]
     if kind == "root":
@@ -319,10 +345,16 @@ def _parent_node(lay: Layout, name: str, row: Row, root: Node, nodes, index, iss
     k = row.values.get(f)
     if kind == "level":
         level = lay.rs.allocation[target].level
-        n = nodes[level].get(str(k)) if k is not None else None
+        pool = nodes[level]
     else:
         level = target
-        n = index.get(target, {}).get(str(k)) if k is not None else None
+        pool = index.get(target, {})
+    n = pool.get(str(k)) if k is not None else None
+    if n is None and k is not None:
+        n = _loose_get(pool, str(k))
+        if n is not None and not any(i.code == "key_separator" and i.message.startswith(f"「{name}」") for i in issues):
+            issues.append(Issue.warn("key_separator", f"「{name}」的 {f} 和「{level}」的编号只差分隔符（如 {k} ↔ {n.key or n.id}），"
+                                     "已按去掉分隔符后的写法对上", where=str(row.src)))
     if n is None:
         if dropped is not None:        # 财务确认过查不到的不参与：不阻断，汇总成一条提示
             dropped.append(str(k))

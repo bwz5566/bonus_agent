@@ -44,7 +44,7 @@ _NUM_CLEAN = re.compile(r"[,\s¥￥$元]")
 def convert(value, fd: FieldDef):
     """把单元格的值转换为字段类型。空值返回 None；字段写了 if_empty 时按它处理。"""
     if value is None or (isinstance(value, str) and value.strip() == ""):
-        if getattr(fd, "if_empty", None) in (None, ""):
+        if getattr(fd, "if_empty", None) in (None, "", "skip"):
             return None
         value = fd.if_empty
     t = fd.type

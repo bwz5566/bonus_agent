@@ -247,7 +247,7 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping, period
             continue
         win = period.window(ds.window) if period is not None else None
         win_text = "" if win is None else {"year_to_date": f"（年初累计 {win.start}~{win.end}）", "to_date": f"（截至 {win.end}）"}.get(ds.window, "")
-        out_of, unclear = 0, []
+        out_of, unclear, skipped = 0, [], 0
         for excel_row, vals in st.rows:
             if not keep(vals):
                 continue
@@ -260,6 +260,10 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping, period
                 if inside is None:
                     unclear.append((str(src), vals[pcol] if pcol < len(vals) else None))
                     continue
+            if any(getattr(fd, "if_empty", None) == SKIP and f in idx and _blank(vals[idx[f]] if idx[f] < len(vals) else None)
+                   for f, fd in ds.fields.items()):
+                skipped += 1           # 这一格空着的行当作没有（如毛利率空着按“查不到”处理）
+                continue
             rv = {}
             for f, fd in ds.fields.items():
                 raw = vals[idx[f]] if f in idx else None
@@ -273,6 +277,9 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping, period
             issues.append(Issue.block("period_unclear", f"「{ds_name}」有 {len(unclear)} 行的 {ds.period} 看不出是否属于核算期间 {period}{win_text}"
                                       f"（如 {unclear[0][1]!r}）：空值、写法认不出，或只有一部分落在期间里",
                                       unclear[0][0]))
+        if skipped:
+            issues.append(Issue.warn("empty_skipped", f"「{ds_name}」有 {skipped} 行按 if_empty: skip 当作没有（空格子所在的行不参与，"
+                                     f"按对象取值时和“查不到”一样）", ds_name))
         if ds.period and period is not None:
             issues.append(Issue.warn("period_filtered", f"「{ds_name}」按核算期间 {period}{win_text} 筛选（{ds.period}）：取 {len(t.rows)} 行，"
                                      f"期间外 {out_of} 行不参与计算", ds_name))
@@ -402,6 +409,13 @@ def _reconcile(st: SheetTable, idx, ds, t: StdTable) -> list[Issue]:
     return out
 
 
+SKIP = "skip"
+
+
+def _blank(v) -> bool:
+    return v is None or (isinstance(v, str) and not v.strip())
+
+
 def _sanity(ds_name, ds, t: StdTable, needed) -> list[Issue]:
     out = []
     for f, fd in ds.fields.items():
@@ -412,7 +426,8 @@ def _sanity(ds_name, ds, t: StdTable, needed) -> list[Issue]:
         if empty:
             out.append(Issue.block("value_empty", f"「{ds_name}」字段 {f} 有 {len(empty)} 个空值。空值怎么算要有依据："
                                    f"材料写明了就照写，没写就 ask_question 问财务（列出这几行和备注）；"
-                                   f"确定后在 define_dataset 的这个字段里写 if_empty（如 0）", ", ".join(empty[:5])))
+                                   f"确定后在 define_dataset 的这个字段里写 if_empty（如 0）；材料说空着按“查不到 / 没有”处理时写 if_empty: \"skip\""
+                                   f"（这些行不参与，按对象取值时和查不到一样）", ", ".join(empty[:5])))
         if fd.type == "money":
             nums = [v for v, _ in vals if v is not None]
             neg = [str(s) for v, s in vals if v is not None and v < 0]

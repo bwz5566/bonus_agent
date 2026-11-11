@@ -295,7 +295,7 @@ def check_dataset(name: str, pd: PlanDataset, st: SheetTable, field_types: dict[
         field_types.setdefault(f, (pf.type, name))
         fields[f] = FieldDef(type=pf.type, desc=pf.desc or col, unit=unit if pf.type == "money" else None,
                              values=values, if_empty=pf.if_empty)
-        if pf.if_empty is not None:
+        if pf.if_empty is not None and pf.if_empty != "skip":
             try:
                 convert(pf.if_empty, FieldDef(type=pf.type, unit=fields[f].unit, values=values))
             except ConvertError as e:
