@@ -189,3 +189,44 @@ def test_if_empty_skip_and_key_autofill(tmp_path):
                 pool={"scope": "项目", "expr": "pay"}, allocation=[{"level": "项目", "key": "pid"}])
     assert "试算成功" in w.trial_run()
     assert w.result.pool == "250.00"          # C1：100×0.5；C2 毛利率空着按查不到，系数 1
+
+
+def test_page_with_parameters_not_cited_blocks_finish():
+    """PPT 某页有整张参数表（成组的百分数），台账和条款都没引用这一页：结束前拦下，指出哪一页；写进 ignored 后放行"""
+    from bonus_agent.agent import Workspace
+    from bonus_agent.auto import Inventory
+    from bonus_agent.facts import Fact
+    from bonus_agent.llm import FakeLLM
+    from bonus_agent.parsing.docs import Block, ParsedDoc
+    d = ParsedDoc("规则.pptx", [Block("规则.pptx", 1, "text", "2026年 提成方案"),
+                                 Block("规则.pptx", 2, "text", "甲区阶梯 100万以下 0.20% 100-200万 0.25%"),
+                                 Block("规则.pptx", 3, "text", "乙区阶梯 100万以下 0.30% 100-200万 0.33%")])
+    w = Workspace(FakeLLM(["x"]), Inventory([Path("规则.pptx")], [d], [], {}))
+    w.facts.append(Fact(name="甲区阶梯-第1档", value="0.20%", file="规则.pptx", quote="甲区阶梯 100万以下 0.20%"))
+    gaps = w._page_gaps(set())
+    assert len(gaps) == 1 and "第 3 页" in gaps[0] and "〔规则.pptx#3〕" in gaps[0]      # 第 1 页只有年份，不算参数页
+    assert w._page_gaps({"规则.pptx#3"}) == [] and w._page_gaps({"规则.pptx"}) == []
+
+
+def test_hint_when_same_table_with_more_months_exists(tmp_path):
+    """用当月明细定义数据表时，另有表头相同、行数多得多的表（年内累计明细）：提示规则要累计/月平均时用那份并写 window"""
+    import openpyxl
+    from bonus_agent.agent import Workspace
+    from bonus_agent.auto import build_inventory, collect_files
+    from bonus_agent.llm import FakeLLM
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "本月"
+    for r in [["月份", "客户", "产品", "金额"], ["2026-09", "C1", "P1", 100], ["2026-09", "C2", "P1", 200]]:
+        ws.append(r)
+    s = wb.create_sheet("累计")
+    s.append(["月份", "客户", "产品", "金额"])
+    for m in range(1, 10):
+        s.append([f"2026-{m:02d}", "C1", "P1", 10 * m])
+    wb.save(tmp_path / "d.xlsx")
+    w = Workspace(FakeLLM(["x"]), build_inventory(collect_files([tmp_path])))
+    fields = {"cust": {"column": "客户", "type": "id"}, "amt": {"column": "金额", "type": "money", "unit": "元"}}
+    out = w.define_dataset("当月", "d.xlsx", "本月", fields, key="cust")
+    assert "另有「d.xlsx/累计」" in out and "year_to_date" in out
+    out = w.define_dataset("累计", "d.xlsx", "累计", {**fields, "m": {"column": "月份", "type": "text"}}, link="cust")
+    assert "另有" not in out

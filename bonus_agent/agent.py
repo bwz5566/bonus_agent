@@ -1045,6 +1045,81 @@ class Workspace:
 
     def _page_texts(self, name: str) -> dict[int, str]:
         """多页文档（PPT、PDF）每一页规范化后的文字，含这一页图片的转写。"""
+        return {p: fx.norm(t) for p, t in self._page_raw(name).items()}
+
+    _GENERIC_WORDS = ("新项目", "老项目", "项目", "提成", "比例", "系数", "阶梯", "金额", "上限", "下限", "以上", "以下", "参数",
+                      "规则", "标准", "奖金", "计算", "基数", "取值", "档位", "档", "第", "万元", "万", "元")
+
+    def _generic_only(self, t: str) -> bool:
+        """去掉通用词（提成、比例、阶梯、第几档……）和数字后不剩两个字：不是区分区域、产品线的词。"""
+        rest = re.sub(r"[\d.%一二三四五六七八九十]", "", t)
+        for w in sorted(self._GENERIC_WORDS, key=len, reverse=True):
+            rest = rest.replace(w, "")
+        return len(rest) < 2
+
+    @staticmethod
+    def _quote_pages(quote: str, pages: dict[int, str]) -> list[int]:
+        """引用原文所在的页（整段在这一页，或分行引用时每一行都在这一页）。"""
+        q = fx.norm(quote)
+        parts = [fx.norm(x) for x in str(quote).splitlines() if fx.norm(x)]
+        if not q:
+            return []
+        return [p for p, t in pages.items() if q in t or (len(parts) > 1 and all(x in t for x in parts))]
+
+    _NUM_TOKEN = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)(%?)")
+
+    @classmethod
+    def _numeric_page(cls, raw: str) -> bool:
+        """这一页有成组的数（像参数表、阶梯表）：至少 2 个百分数，或至少 4 个不是年份、不是单个数字的数。"""
+        pct = nums = 0
+        for n, sign in cls._NUM_TOKEN.findall(raw):
+            if sign:
+                pct += 1
+            elif len(n.split(".")[0]) >= 2 and not re.fullmatch(r"(19|20)\d\d", n):
+                nums += 1
+        return pct >= 2 or nums >= 4
+
+    def _page_gaps(self, skipped: set[str]) -> list[str]:
+        """结束前检查：多页规则文档（PPT、PDF）里有成组数字的每一页，都要有登记的参数或摘出的条款引用到它，
+        或者写进 ignored 说明为什么不用。防止整页的参数表（如某个区域、产品线的阶梯表）被漏掉、按别的表算。"""
+        out = []
+        docs = [f.name for f in self.inv.files if f.suffix.lower() in RULE_SUFFIXES]
+        for d in docs:
+            if d in skipped:
+                continue
+            pages = self._page_texts(d)
+            if len(pages) < 2:
+                continue
+            raw = self._page_raw(d)
+            cited: set[int] = set()
+            for x in [*(f for f in self.facts if f.file == d), *(c for c in self.clauses if c.file == d)]:
+                cited.update(self._quote_pages(x.quote, pages))
+            for p in sorted(pages):
+                ref = f"{d}#{p}"
+                if p in cited or ref in skipped or not self._numeric_page(raw.get(p, "")):
+                    continue
+                head = re.sub(r"\s+", " ", raw.get(p, ""))[:60]
+                out.append(f"「{d}」第 {p} 页（{head}……）有成组的参数，但台账和条款都没有引用这一页〔{ref}〕")
+        return out
+
+    def _wider_sources(self, st, file: str) -> list[str]:
+        """另有表头基本相同、行数明显更多的表（常见：当月明细 vs 年内累计明细）：提示规则要累计、月平均等历史数据时用那份。"""
+        mine = {str(h).strip() for h in st.headers if str(h).strip()}
+        if len(mine) < 3:
+            return []
+        out = []
+        for o in self.inv.sheets:
+            if o is st or (Path(o.file).name == file and o.sheet == st.sheet):
+                continue
+            theirs = {str(h).strip() for h in o.headers if str(h).strip()}
+            if len(mine & theirs) >= 0.7 * len(mine) and len(o.rows) >= 1.5 * max(len(st.rows), 1):
+                out.append(f"另有「{Path(o.file).name}/{o.sheet}」表头和这张表基本相同、行数多得多（{len(o.rows)} 行，这张 {len(st.rows)} 行），"
+                           "可能含更多月份。规则里要用累计或历史数据（如本年 1 月到本月的月平均、累计出货）时，用那份数据定义，"
+                           "并写 period（月份字段）和 window: year_to_date；只用当月数据的不用管这条")
+        return out
+
+    def _page_raw(self, name: str) -> dict[int, str]:
+        """多页文档每一页的原始文字（含图片转写），不做规范化，用来数数字、给提示。"""
         d = next((d for d in self.inv.docs if d.name == name), None)
         if d is None:
             return {}
@@ -1058,26 +1133,14 @@ class Workspace:
                 t = b.text
             if b.page is not None and t:
                 out.setdefault(b.page, []).append(t)
-        return {p: fx.norm("\n".join(ts)) for p, ts in out.items()}
-
-    _GENERIC_WORDS = ("新项目", "老项目", "项目", "提成", "比例", "系数", "阶梯", "金额", "上限", "下限", "以上", "以下", "参数",
-                      "规则", "标准", "奖金", "计算", "基数", "取值", "档位", "档", "第", "万元", "万", "元")
-
-    def _generic_only(self, t: str) -> bool:
-        """去掉通用词（提成、比例、阶梯、第几档……）和数字后不剩两个字：不是区分区域、产品线的词。"""
-        rest = re.sub(r"[\d.%一二三四五六七八九十]", "", t)
-        for w in sorted(self._GENERIC_WORDS, key=len, reverse=True):
-            rest = rest.replace(w, "")
-        return len(rest) < 2
+        return {p: "\n".join(ts) for p, ts in out.items()}
 
     def _wrong_page(self, f) -> str:
         """参数名里写了区分用的词（如区域、产品线），引用的原文却在另一页、那一页没有这个词：多半是抄错了页（如把南方国家区的阶梯当成美洲的）。"""
         pages = self._page_texts(f.file)
         if len(pages) < 2:
             return ""
-        q = fx.norm(f.quote)
-        parts = [fx.norm(x) for x in str(f.quote).splitlines() if fx.norm(x)]
-        hit = [p for p, t in pages.items() if q in t or (len(parts) > 1 and all(x in t for x in parts))]
+        hit = self._quote_pages(f.quote, pages)
         if not hit:
             return ""
         # 参数名里能在材料某几页找到、却不在引用所在页的词（取最长的）：参数名常写成一整串（如 海外美洲新项目阶梯），逐段找
@@ -1383,6 +1446,8 @@ class Workspace:
             warnings.append(f"按 {period} 筛选核算期间：数据覆盖 {spans[0][0]} ~ {spans[-1][1]}"
                             + (f"；本次核算期间 {self.period}，计算时只取" + {"period": "期间里的行", "year_to_date": f"{self.period.window(window)} 年初累计的行",
                                "to_date": f"{self.period.end} 及以前的行"}[window] if self.period else "；本次没有指定核算期间，全部行都参与"))
+        if window == "period":
+            warnings += self._wider_sources(raw, f.name)
         if spec:
             m.unpivot = spec
         if comb:
@@ -2691,6 +2756,13 @@ class Workspace:
         pending = [s for s in self.schemes if s in self.untested or s not in self.results]
         if pending:
             raise ToolError(f"方案 {pending} 最近一次修改之后还没有成功试算，请先 trial_run")
+        gaps = self._page_gaps(skipped)
+        if gaps:
+            raise ToolError("规则文档里这些页有成组的参数（像参数表、阶梯表），台账和条款却都没有引用：多半是漏了这一页，"
+                            "相应的项目会被错套别的表。逐页打开原文核对：要用的就 record_facts 登记这一页的参数、record_clauses 摘出条款，"
+                            "并在规则里用上；确实与计算无关（如示例、说明、往年数据）的写进 finish 的 ignored，ref 照抄〔〕里的写法，"
+                            "reason 说明原因：\n" + "\n".join(f"- {g}" for g in gaps[:15])
+                            + (f"\n……共 {len(gaps)} 页" if len(gaps) > 15 else ""))
         gaps = self._clause_gaps(skipped)
         if gaps:
             raise ToolError("条款清单还有没落实的（逐条处理后再 finish；用 cover_clauses 标注）：\n"
@@ -2843,14 +2915,17 @@ class Workspace:
         docs = [f.name for f in self.inv.files if f.suffix.lower() in RULE_SUFFIXES and f.name not in skipped]
         read = all(any(f.file == d for f in self.facts) and any(c.file == d for c in self.clauses) for d in docs) \
             if docs else bool(self.clauses or self.datasets or self.drafts)
-        return 1 if read else 0
+        return 1 if read and not self._page_gaps(skipped) else 0
 
     def next_hint(self) -> str:
         """程序根据工作区判断的下一步（模型原地打转或步数用得多时提示）。"""
         docs = [f.name for f in self.inv.files if f.suffix.lower() in RULE_SUFFIXES]
         bare = [d for d in docs if not any(f.file == d for f in self.facts)
                 and d not in {str(i.get("ref", "")) for i in self.ignored}]
-        if not self.datasets:
+        pg = self._page_gaps({str(i.get("ref", "")) for i in self.ignored}) if self.facts else []
+        if pg:
+            step = "规则文档里有成组参数的页还没登记（多半漏了，逐页核对后 record_facts / record_clauses 并在规则里用上）：" + "；".join(pg[:3])
+        elif not self.datasets:
             step = f"用 define_dataset 定义数据表（数据文件：{'、'.join(f.name for f in self.data_files) or '无'}）"
         elif not self.schemes:
             step = ("共用部分已保存，接着用 set_rules(scheme=方案名) 写每个方案自己的 pool（和需要的 allocation、payout），"
