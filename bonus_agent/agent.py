@@ -3968,6 +3968,26 @@ def _unpivot_spec(spec, st) -> dict:
     unknown = sorted(set(spec) - {"columns", "value", "label", "share", "remainder", "blank", "share_from", "blank_except", "share_from_columns"})
     if unknown:
         raise ToolError(f"unpivot 不认识 {unknown}，可以写的是 columns、value、label、share、remainder、blank、share_from、blank_except、share_from_columns")
+    if not share_from:
+        # 名单里同一角色几个人、各人比例写在另一列的文字里（如“甲80%，乙20%”），展开时没用上这一列：会按平分或全额算错到人
+        from bonus_core.data.table_detect import parse_shares, split_name_share
+        idx = [st.headers.index(c) for c in cols]
+        for j, h in enumerate(st.headers):
+            if not h or h in cols:
+                continue
+            hits = []
+            for _, v in st.rows:
+                txt = v[j] if j < len(v) else None
+                shares = parse_shares(txt) if isinstance(txt, str) else {}
+                if len(shares) < 2:
+                    continue
+                names = {str(split_name_share(v[i])[0]).strip() for i in idx if i < len(v) and v[i] not in (None, "")}
+                if len(names & set(shares)) >= 2:
+                    hits.append(str(txt).strip())
+            if hits:
+                raise ToolError(f"unpivot 要展开的人名在另一列「{h}」里写了各自的比例（{len(hits)} 行，如「{hits[0]}」），"
+                                f"展开时没用上：会按平分或全额算到人。写 \"share_from\": \"{h}\" 并写 share（记比例的列名），"
+                                "按名字到这一列取比例；只有部分列的比例写在那一列时，再写 share_from_columns")
     if share_from:
         from bonus_core.data.table_detect import parse_shares, split_name_share
         if share_from not in st.headers or share_from in cols:

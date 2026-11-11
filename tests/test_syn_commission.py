@@ -88,6 +88,18 @@ def test_unpivot_share_from_text_column():
     assert got == [("P1", "吴晨晨", D("0.8")), ("P1", "张荣", D("0.2")), ("P2", "吴晨晨", D(1))]
 
 
+def test_unpivot_without_share_from_blocked_when_ratio_column_exists():
+    """另一列写了这几个人各自的比例，展开时没写 share_from：拦下，指出那一列"""
+    import pytest
+    from bonus_agent.agent import ToolError, _unpivot_spec
+    from bonus_core.data.table_detect import SheetTable
+    st = SheetTable("f.xlsx", "s", 1, ["项目", "经理1", "经理2", "比例"],
+                    [(2, ["P1", "吴晨晨", "张荣", "吴晨晨80%，张荣20%"]), (3, ["P2", "吴晨晨", None, None])], [], 1.0, [], [], [], [])
+    with pytest.raises(ToolError, match="share_from"):
+        _unpivot_spec({"columns": ["经理1", "经理2"], "value": "人"}, st)
+    assert _unpivot_spec({"columns": ["经理1", "经理2"], "value": "人", "share": "占比", "share_from": "比例"}, st)["share_from"] == "比例"
+
+
 def test_reference_rules_match_expected_v2():
     """第二套：规则在 PPT 里、销售单有标题行和合计行、名单跨月且夹着重复表头、技术支持比例写在另一列文字里、毛利率有空值"""
     c2 = CASE.parent / "syn_commission2"
