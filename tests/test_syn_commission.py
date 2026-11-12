@@ -270,3 +270,40 @@ def test_link_to_wrong_table_suggests_better_owner(tmp_path):
     out = w.define_dataset("逾期", "d.xlsx", "逾期", {"cust": {"column": "客户", "type": "id"},
                                                     "yq": {"column": "逾期金额", "type": "money", "unit": "元"}}, link="cust")
     assert "多半挂错了表" in out and "「销售单」的字段 cust 能对上 3/3" in out
+
+
+def test_project_key_built_from_wrong_columns_suggests_swap(tmp_path):
+    """项目编号用了「送达方客户」和第一列客户简称，名单按「客户编码」和另一列客户简称写：拦下并指出换哪两列；再提交一次照常保存"""
+    import openpyxl
+    from bonus_agent.agent import Workspace
+    from bonus_agent.auto import build_inventory, collect_files
+    from bonus_agent.llm import FakeLLM
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "销售"
+    ws.append(["日期", "客户简称", "客户编码", "送达方客户", "产品型号", "金额", "客户简称"])
+    for r in [["202609", "G", "C1", "C9", "M1", 100, "A"], ["202609", "G", "C2", "C9", "M1", 100, "B"],
+              ["202609", "G", "C2", "C9", "M2", 100, "B"], ["202609", "H", "C3", "C3", "M3", 100, "H"],
+              ["202609", "H", "C4", "C4", "M3", 100, "K"]]:
+        ws.append(r)
+    s = wb.create_sheet("名单")
+    s.append(["日期", "客户编码", "客户简称2", "产品型号", "人员"])
+    for r in [["202609", "C1", "A", "M1", "张"], ["202609", "C2", "B", "M1", "李"], ["202609", "C2", "B", "M2", "王"],
+              ["202609", "C3", "H", "M3", "赵"], ["202609", "C4", "K", "M3", "钱"], ["202608", "C7", "Z", "M9", "孙"]]:
+        s.append(r)
+    wb.save(tmp_path / "d.xlsx")
+    w = Workspace(FakeLLM(["x"]), build_inventory(collect_files([tmp_path])))
+    out = w.define_dataset("项目", "d.xlsx", "销售", {"pid": {"column": "pid", "type": "id"}}, key="pid", distinct=True,
+                           combine={"pid": ["日期", "送达方客户", "客户简称(B列)", "产品型号"]})
+    assert "错误" not in out, out
+    args = dict(fields={"pid": {"column": "pid", "type": "id"}, "who": {"column": "人员", "type": "text"}}, link="pid",
+                combine={"pid": ["日期", "客户编码", "客户简称2", "产品型号"]})
+    import pytest
+    from bonus_agent.agent import ToolError
+    with pytest.raises(ToolError) as e:
+        w.define_dataset("名单", "d.xlsx", "名单", **args)
+    out = str(e.value)
+    assert "选错了列" in out and "「送达方客户」换成「客户编码」" in out and "换成「客户简称(G列)」" in out, out
+    assert "只对上 1 个" in out and "能对上 5 个" in out
+    out = w.define_dataset("名单", "d.xlsx", "名单", **args)        # 坚持原来的列：第二次照常保存，只提醒
+    assert "未保存" not in out and "错误" not in out.split("\n")[0], out

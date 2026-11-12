@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import itertools
 import json
 import re
 import time
@@ -1629,8 +1630,8 @@ class Workspace:
                                 f"排除条款 {name}.{h}"))
         return out
 
-    def _values(self, name: str, fld: str) -> list[str]:
-        """数据表某个字段的全部取值（文字），用来判断表之间的关联。"""
+    def _values(self, name: str, fld: str, combine: dict | None = None) -> list[str]:
+        """数据表某个字段的全部取值（文字），用来判断表之间的关联。combine 给了就按它合成（试换一列时用）。"""
         from bonus_core.data.mapping import cell_text
         m = self.mapping[name]
         st = table_at(Path(m.file) if Path(m.file).exists() else self._file(Path(m.file).name), m.sheet, m.header_rows) \
@@ -1639,8 +1640,8 @@ class Workspace:
             return []
         if m.unpivot:
             st = unpivot_by(st, m.unpivot)
-        if m.combine:
-            st = combine_columns(st, m.combine)
+        if combine or m.combine:
+            st = combine_columns(st, combine or m.combine)
         if ROW_ID in m.columns.values():
             st = add_row_ids(st)
         st, _ = filter_sheet(st, m.filter or None)
@@ -1691,9 +1692,57 @@ class Workspace:
                     better = self._better_owner(child, fld, vals, hit, owner)
                     if better:
                         (bad if hit == 0 and child == name else loose).append(better)
+                    swap = self._better_combine(child, fld, vals, hit, owner)
+                    if swap:
+                        sig = ("swap", child, owner, swap)
+                        seen = self.__dict__.setdefault("_swap_seen", set())
+                        (loose if sig in seen else bad).append(swap)
+                        seen.add(sig)
         except Exception:      # 取值失败不影响保存
             pass
         return bad, loose
+
+    def _better_combine(self, child: str, fld: str, vals: set, hit: int, owner: str) -> str:
+        """「owner」的编号由几列合成（combine），其中一列换成同一类的另一列（如 客户编码 ↔ 送达方客户、两列同名的客户简称）后，
+        「child」能对上的明显更多、而且全部对上：多半是合成编号时选错了列。按数据指出换哪一列。"""
+        from bonus_agent.skills.link_suggest import kind
+        m = self.mapping.get(owner)
+        if not m or not m.combine or m.columns.get(fld) not in m.combine:
+            return ""
+        st = self.inv.sheet(f"{Path(m.file).name}/{m.sheet}")
+        if st is None:
+            return ""
+        new = m.columns[fld]
+        cols = list(m.combine[new])
+        opts = [[(i, h) for h in st.headers if h and h not in cols and kind(h) == kind(c)] for i, c in enumerate(cols) if kind(c)]
+        singles = [o for g in opts for o in g]
+        tries = [(s,) for s in singles] + [(a, b) for a, b in itertools.combinations(singles, 2) if a[0] != b[0] and a[1] != b[1]]
+        best, reach = None, set()
+        for swaps in tries:                     # 换一列或同时换两列（如客户编码和客户简称都选错）
+            alt_cols = list(cols)
+            for i, h in swaps:
+                alt_cols[i] = h
+            try:
+                got = vals & set(self._values(owner, fld, {**m.combine, new: alt_cols}))
+            except Exception:
+                continue
+            reach |= got
+            if best is None or len(got) > len(best[1]) or (len(got) == len(best[1]) and len(swaps) < len(best[0])):
+                best = (swaps, got)
+        try:
+            reach |= vals & set(self._values(owner, fld))
+        except Exception:
+            pass
+        # 只比“换列后能对上的”这部分（参考表跨期间、多出别的客户时，其余取值怎么换都对不上，不算在内）
+        n = len(reach)
+        if not best or len(best[1]) < n or len(best[1]) - hit < max(2, n * 0.05):
+            return ""
+        swaps, got = best[0], len(best[1])
+        how = "、".join(f"「{cols[i]}」换成「{h}」" for i, h in swaps)
+        return (f"「{owner}」的编号 {fld} 由 {'+'.join(cols)} 合成，「{child}」的取值只对上 {hit} 个；"
+                f"把{how}（同一张表里同一类的列）后能对上 {got} 个（共 {len(vals)} 个）。多半是合成编号时选错了列："
+                f"重新 define_dataset「{owner}」（以及用同样几列合成编号、挂在它下面的表），combine 里改用新列。"
+                f"确实应该用原来的列的（材料原文写明了），再提交一次就会保存，并在 note 里写明依据")
 
     def _better_owner(self, child: str, fld: str, vals: set, hit: int, owner: str) -> str:
         """挂到「owner」上有取值对不上，而另一张表的某个字段能对上更多（全部或明显更多）：多半挂错了表
@@ -2115,7 +2164,7 @@ class Workspace:
                 hit = len(vals & set(self._values(level, fld))) if level in self.datasets else len(vals - set(keys))
             except Exception:
                 continue
-            better = self._better_owner(tbl, fld, vals, hit, level)
+            better = self._better_owner(tbl, fld, vals, hit, level) or self._better_combine(tbl, fld, vals, hit, level)
             if better:
                 out += "\n" + better
         if again:
