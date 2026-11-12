@@ -198,7 +198,8 @@ def test_helpers_are_kept_and_reused(tmp_path):
     w.verify("个人:002", 'round(sum(v_oc, of: "订单") * coef, 2)', "个人提成 = 订单提成合计 × 计奖系数", helpers=first)
     assert w.check_vars == first and "v_oc[订单] = round(amount * rate, 2)" in w.state()
     assert "一致" in w.verify("个人:001", 'round(sum(v_oc, of: "订单") * coef, 2)', "个人提成 = 订单提成合计 × 计奖系数")
-    assert w.verified["月度|个人:001"]["helpers"] == first
+    from bonus_agent.agent import _verify_key
+    assert w.verified[_verify_key('月度','个人:001','应得')]["helpers"] == first
     with pytest.raises(ToolError, match="验算式写错了"):          # 写法错了的不留
         w.verify("个人:001", "v_bad", "x", helpers={"v_bad": {"scope": "个人", "expr": "sum((("}})
     assert "v_bad" not in w.check_vars

@@ -1,10 +1,26 @@
 """独立复读：输入边界（不给数据行）、程序比对（列、常数、分档点、筛选取值、日期）、结束前拦下和放过。"""
 import json
+import pytest
 from types import SimpleNamespace as NS
 
 from bonus_agent import reread as rr
 from bonus_core.data.mapping import DatasetMapping
 from bonus_core.data.table_detect import SheetTable
+
+pytestmark = pytest.mark.reread
+
+
+@pytest.fixture(autouse=True)
+def complete_reference_responses(monkeypatch):
+    """Use fixed fixture references, independently of the Workspace being mutated."""
+    from bonus_agent.llm import FakeLLM
+    init = FakeLLM.__init__
+
+    def configured(self, *args, **kwargs):
+        init(self, *args, **kwargs)
+        self.calc = _calc(PROCESS_OK)
+
+    monkeypatch.setattr(FakeLLM, "__init__", configured)
 
 
 def _ws(drafts, sheet_rows=None):
@@ -97,14 +113,26 @@ def test_finish_blocks_until_reread_diff_handled(tmp_path):
     llm = FakeLLM(_script())
     llm.reread = "不是 JSON"
     ar = run_agent(llm, [run_case.XLSX], tmp_path / "c")
-    assert ar.status == "OK" and ar.ws.reread["error"]
-    assert any(r["item"] == "独立复读没有完成" and r["flag"] for r in rv.load(tmp_path / "c"))
+    assert ar.status != "OK" and ar.ws.reread["error"]
+    assert any("独立复读没有完成" in s.result for s in ar.steps if s.tool == "finish")
 
 
 def _calc(pool, helpers=None):
     tables = {"r": {"kind": "lookup", "mapping": {"华东": 1.1, "华南": 1.0, "华北": 0.9, "西部": 1.2}},
               "d": {"kind": "lookup", "mapping": {"1": 1.0, "2": 1.1, "3": 1.25}}}
-    return json.dumps({"schemes": {"PROCESS": {"tables": tables, "helpers": helpers or {}, "pool": pool}}}, ensure_ascii=False)
+    # All schemes need a reference, not just the scheme whose mutation is under test.
+    import yaml
+    from tests.test_syn_acceptance import CASE
+    shared = yaml.safe_load((CASE / "rules/shared.yaml").read_text(encoding="utf-8"))
+    schemes = {}
+    for name in ("QUARTER", "ANNUAL", "PROCESS"):
+        own = yaml.safe_load((CASE / f"rules/rules_{name}.yaml").read_text(encoding="utf-8"))
+        schemes[name] = {"tables": {**shared.get("tables", {}), **own.get("tables", {})},
+                         "helpers": {**shared.get("variables", {}), **own.get("variables", {})},
+                         "pool": own["pool"]["expr"], "pay_ratio": own["payout"][0]["pay_ratio"]}
+    schemes["PROCESS"] = {**schemes["PROCESS"], "tables": {**schemes["PROCESS"]["tables"], **tables},
+                          "helpers": {**schemes["PROCESS"]["helpers"], **(helpers or {})}, "pool": pool}
+    return json.dumps({"schemes": schemes}, ensure_ascii=False)
 
 
 PROCESS_OK = ('sum(round(base_bonus * lookup(r, region) * if(contract_date >= "2026-01-01", 1.10, 0.95) * lookup(d, difficulty), 2), '
@@ -227,9 +255,8 @@ def test_independent_formula_needs_two_consistent_samples(tmp_path):
     b, c = _calc(PROCESS_OK.replace("1.10, 0.95", "1.2, 0.9")), _calc(PROCESS_OK.replace("1.10, 0.95", "1.3, 0.8"))
     llm.calc = [a] * 3 + [b, c]
     ar = run_agent(llm, [run_case.XLSX], tmp_path / "a")
-    assert ar.status == "OK", ar.error
-    assert ar.ws.reread["calc"]["unsettled"] == {"PROCESS": ["奖金池"]}
-    assert any(r["item"] == "独立算式没有定论：PROCESS" and r["flag"] for r in rv.load(tmp_path / "a"))
+    assert ar.status != "OK"
+    assert any("复读 奖金池 PROCESS" in s.result for s in ar.steps if s.tool == "finish")
     llm = FakeLLM(_script())
     llm.calc = [a] * 3 + [b, a]
     ar = run_agent(llm, [run_case.XLSX], tmp_path / "b")

@@ -1151,7 +1151,8 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         note = str(f.get("note", "")).strip()[:300]
         try:
             rel = rl.publish(registry, m["scenario"], d / "out" / "template", u["display"], note,
-                             source=f"案卷「{m['name']}」（{cid}）第 {conf['round']} 轮", questions=load_questions(d / "out"))
+                             source=f"案卷「{m['name']}」（{cid}）第 {conf['round']} 轮", questions=load_questions(d / "out"),
+                             repairs=(case.get("workspace") or {}).get("repairs"))
         except ScenarioError as err:
             store.audit(cid, u["display"], "发布被拒绝", reason=str(err)[:500])
             return back(cid, f"不能发布：{err}")

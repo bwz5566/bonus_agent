@@ -72,7 +72,7 @@ def test_unmentioned_value_with_exclusion_must_be_asked(tmp_path):
     w = case(tmp_path / "m", status=("已关闭", "挂起"))
     out = rules(w, 'count(of: "工单", where: review == "有效" and status != "已作废" and status != "处理中")')
     assert "「status」有取值「挂起」" in out and "算进去" in out
-    w.ignored = [{"ref": "取值 挂起", "reason": "财务口头确认挂起算有效"}]
+    w.ignored = [{"ref": "取值 挂起", "reason": "财务口头确认挂起算有效", "rules": w._rules_print()}]
     assert not gates(w)
 
 
@@ -86,7 +86,7 @@ def test_status_column_not_filtered_must_be_handled(tmp_path):
     w = case(tmp_path / "m", status=("已关闭", "挂起"))
     out = rules(w, 'count(of: "工单", where: status == "已关闭")')      # 复核列（有效 / 无效）没用来筛选
     assert "没有用 review（表头：工单 复核） 筛选" in out and "有效、无效" in out
-    w.ignored = [{"ref": "状态 review", "reason": "材料说复核结果不影响计件"}]
+    w.ignored = [{"ref": "状态 review", "reason": "材料说复核结果不影响计件", "rules": w._rules_print()}]
     assert not gates(w)
 
 

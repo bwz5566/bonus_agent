@@ -100,12 +100,14 @@ def run_acceptance(sc: Scenario, template_dir: Path) -> list[dict]:
 
 
 def publish(reg: Registry, scenario_id: str, template_dir: str | Path, by: str, note: str = "", *,
-            source: str = "", questions: list[dict] | None = None) -> Release:
+            source: str = "", questions: list[dict] | None = None, repairs: dict | None = None) -> Release:
     """把已确认的计算模板发布成场景的下一个规则版本。验收用例没全部对上时拒绝发布。"""
     from bonus_core.template import Template, TemplateError
     sc = reg.get(scenario_id)
     if not by.strip():
         raise PublishError("要写明发布人")
+    if not sc.acceptance:
+        raise PublishError("没有验收用例，不能正式发布；请先配置独立期望结果及核算期间")
     src = Path(template_dir)
     try:
         tpl = Template.load(src)
@@ -148,6 +150,8 @@ def publish(reg: Registry, scenario_id: str, template_dir: str | Path, by: str, 
     tmp.rename(dest)
     if sc.memory and questions:
         reg.memory(scenario_id).add_questions(questions, version=version, source=source, by=by)
+    if sc.memory and repairs:
+        reg.memory(scenario_id).add_repairs(repairs, version=version, source=source, by=by)
     return Release(scenario_id, version, dest, info)
 
 

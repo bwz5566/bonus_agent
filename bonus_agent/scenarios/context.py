@@ -44,8 +44,9 @@ def agent_brief(reg: Registry, sc: Scenario, files: list[str | Path], *, use_mem
     if use_memory and sc.memory:
         mem = reg.memory(sc.id).brief()
         if mem:
-            parts.append("【场景记忆】以前在这个场景里财务确认过的口径（发布规则版本时记下的）。本次材料同样适用时可以直接采用，"
-                         "在 note 里注明“沿用场景记忆”；材料变了、与本次材料冲突或拿不准是否适用时，仍要提问：\n" + mem)
+            parts.append("【场景记忆】以前在这个场景里财务确认过的口径，以及已发布案卷的修复检查提示。问答口径在本次材料同样适用时可以采用，"
+                         "在 note 里注明“沿用场景记忆”；修复提示仅原案验证，不能直接当成费率或默认政策。"
+                         "材料变了、与本次材料冲突或拿不准是否适用时，仍要提问：\n" + mem)
     return "\n\n".join(parts)
 
 
@@ -56,6 +57,7 @@ class AgentScenario:
     brief: str
     files: list[Path] = field(default_factory=list)
     outputs: str = ""          # 场景的输出要求：有的话，规则里要写 report（汇总核算、分配人员金额）
+    regressions: list[dict] = field(default_factory=list, repr=False)  # server-only holdout references; never in brief
 
 
 def expand(paths: list[str | Path]) -> list[Path]:
@@ -68,5 +70,7 @@ def expand(paths: list[str | Path]) -> list[Path]:
 def prepare(reg: Registry, scenario_id: str, materials: list[str | Path], *, use_memory: bool = True) -> AgentScenario:
     sc = reg.get(scenario_id)
     guide = guide_file(reg, sc)
+    cases = [{"id": c.id, "files": [str(sc.file(f)) for f in c.data], "expected": str(sc.file(c.expected)), "period": c.period}
+             for c in sc.acceptance]
     return AgentScenario(sc.id, agent_brief(reg, sc, expand(materials), use_memory=use_memory), [guide] if guide else [],
-                         sc.outputs.strip())
+                         sc.outputs.strip(), cases)

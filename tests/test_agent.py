@@ -196,7 +196,7 @@ def test_agent_native_end_to_end(tmp_path):
     q = yaml.safe_load((tmp_path / "questions.yaml").read_text(encoding="utf-8"))
     q[0]["answer"] = 0
     (tmp_path / "questions.yaml").write_text(yaml.safe_dump(q, allow_unicode=True), encoding="utf-8")
-    llm2 = FakeLLM([{"tool": "trial_run"}, {"tool": "finish", "args": {"summary": "x"}}])
+    llm2 = FakeLLM([{"tool": "trial_run"}, {"tool": "finish", "args": {"summary": "x", "ignored": script[-1]["args"].get("ignored", [])}}])
     ar = run_agent(llm2, [ANNUAL], tmp_path)
     assert ar.ok and ar.status == "OK" and ar.round == 2, ar.error
     task = llm2.calls[0][1]["content"]
@@ -316,7 +316,8 @@ def test_text_only_model_and_vision_model():
 
 def test_period_mismatch_between_pool_and_shared_weights():
     from bonus_agent.agent import Workspace
-    ws = Workspace(FakeLLM([]), None)
+    from bonus_agent.auto import build_inventory
+    ws = Workspace(FakeLLM([]), build_inventory([]))
     ws.drafts = {"共用": {"allocation": [{"level": "个人", "key": "employee_id",
                                          "weight": 'sum(score, where: period == "Q3")'}]},
                  "ANNUAL": {"pool": {"expr": 'sum(sales, where: between(d, "2026-01-01", "2026-12-31"))'}},

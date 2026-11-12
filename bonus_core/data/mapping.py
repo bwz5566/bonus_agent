@@ -111,6 +111,9 @@ def used_fields(rs: RuleSet) -> set[str]:
     exprs = [v.expr for v in rs.variables.values()] + [rs.pool.expr] + [lv.weight for lv in rs.allocation if lv.weight.strip()]
     exprs += [e for p in rs.payout for e in (p.hold_ratio, p.pay_ratio) if e.strip()]
     exprs += [c.expr for c in rs.checks] + [o.expr for o in rs.offsets]
+    if rs.report:
+        exprs += [t.expr for t in [*rs.report.totals, *rs.report.pending]]
+        exprs += [e for b in rs.report.balances for e in [b.total, *b.parts]]
     for e in exprs:
         used |= names(parse(e))
     for d in rs.datasets.values():

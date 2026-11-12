@@ -71,7 +71,7 @@ def test_unused_money_field_and_tier_scale_are_gated(tmp_path):
     # 拦下时告诉模型放过要写的 ref；照写就放过（Q1：模型自己拼的 ref 对不上，同一条拦了 6 次）
     shown = ws._open_gates(bad)
     assert any("〔放过时 ignored 的 ref 写「金额 expense_amount」，提问时 related 写同样内容〕" in g for g in shown)
-    ws.ignored = [{"ref": "金额 expense_amount", "reason": "费用不计入本奖金"}]
+    ws.ignored = [{"ref": "金额 expense_amount", "reason": "费用不计入本奖金", "rules": ws._rules_print()}]
     assert not [g for g in ws._open_gates(bad) if "expense_amount" in g]
     # 其他方案用到了就不算漏用
     assert not [g for g in lint.check(rs.model_copy(update={"variables": v}), data, "", used_elsewhere={"expense_amount"}).gates
@@ -120,7 +120,7 @@ def test_engine_records_tier_inputs(tmp_path):
     assert st["n"] > 0 and st["min"] <= st["max"] and sum(st["bands"].values()) == st["n"]
     assert "tier_stats" not in ws.results["V1"]["R0"].to_dict() and "coverage" not in ws.results["V1"]["R0"].to_dict()
     cov = ws.results["V1"]["R0"].coverage
-    assert cov and all(c["kind"] in ("if", "lookup") and sum(c["seen"].values()) > 0 for c in cov)
+    assert cov and all(c["kind"] in ("if", "lookup", "tier", "default", "period") and sum(c["seen"].values()) > 0 for c in cov)
 
 
 def test_unfiltered_status_and_period_are_flagged(tmp_path):

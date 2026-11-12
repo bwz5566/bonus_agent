@@ -125,7 +125,7 @@ def test_dup_column_choice_checked_against_reference_tables():
     assert "已保存" in w.define_dataset("客户Y", ref.X, "销售单", {"cust": {"column": "客户简称(K列)", "type": "id"}}, key="cust", distinct=True)
 
 
-def test_fact_from_wrong_page_is_flagged_once():
+def test_fact_from_wrong_page_cannot_be_retried_away(tmp_path):
     """参数名写了区域，引用的原文却在另一页（那一页没有这个区域）：先拦一次提示抄错页，原样再提交才登记"""
     import pytest
     from bonus_agent.agent import ToolError, Workspace
@@ -136,11 +136,14 @@ def test_fact_from_wrong_page_is_flagged_once():
     d = ParsedDoc("规则.pptx", [Block("规则.pptx", 1, "text", "欧洲区阶梯 200万以下 0.30%"),
                                  Block("规则.pptx", 2, "text", "南方国家区阶梯 200万以下 0.50%"),
                                  Block("规则.pptx", 3, "text", "美洲区阶梯同欧洲区")])
-    w = Workspace(FakeLLM(["x"]), Inventory([Path("规则.pptx")], [d], [], {}))
+    source = tmp_path / "规则.pptx"
+    source.write_bytes(b"parsed-document-fixture")
+    w = Workspace(FakeLLM(["x"]), Inventory([source], [d], [], {}))
     bad = {"name": "美洲区阶梯-第1档", "value": "0.50%", "file": "规则.pptx", "quote": "南方国家区阶梯 200万以下 0.50%"}
     with pytest.raises(ToolError, match="抄错了页"):
         w.record_facts([bad])
-    assert "已登记 1 条" in w.record_facts([bad])            # 原样再提交：登记
+    with pytest.raises(ToolError, match="抄错了页"):
+        w.record_facts([bad])
     ok = {"name": "南方国家区阶梯-第1档", "value": "0.50%", "file": "规则.pptx", "quote": "南方国家区阶梯 200万以下 0.50%"}
     assert "已登记 1 条" in w.record_facts([ok])
 
@@ -203,7 +206,7 @@ def test_if_empty_skip_and_key_autofill(tmp_path):
     assert w.result.pool == "250.00"          # C1：100×0.5；C2 毛利率空着按查不到，系数 1
 
 
-def test_page_with_parameters_not_cited_blocks_finish():
+def test_page_with_parameters_not_cited_blocks_finish(tmp_path):
     """PPT 某页有整张参数表（成组的百分数），台账和条款都没引用这一页：结束前拦下，指出哪一页；写进 ignored 后放行"""
     from bonus_agent.agent import Workspace
     from bonus_agent.auto import Inventory
@@ -213,7 +216,9 @@ def test_page_with_parameters_not_cited_blocks_finish():
     d = ParsedDoc("规则.pptx", [Block("规则.pptx", 1, "text", "2026年 提成方案"),
                                  Block("规则.pptx", 2, "text", "甲区阶梯 100万以下 0.20% 100-200万 0.25%"),
                                  Block("规则.pptx", 3, "text", "乙区阶梯 100万以下 0.30% 100-200万 0.33%")])
-    w = Workspace(FakeLLM(["x"]), Inventory([Path("规则.pptx")], [d], [], {}))
+    source = tmp_path / "规则.pptx"
+    source.write_bytes(b"parsed-document-fixture")
+    w = Workspace(FakeLLM(["x"]), Inventory([source], [d], [], {}))
     w.facts.append(Fact(name="甲区阶梯-第1档", value="0.20%", file="规则.pptx", quote="甲区阶梯 100万以下 0.20%"))
     gaps = w._page_gaps(set())
     assert len(gaps) == 1 and "第 3 页" in gaps[0] and "〔规则.pptx#3〕" in gaps[0]      # 第 1 页只有年份，不算参数页

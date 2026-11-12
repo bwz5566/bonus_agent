@@ -17,11 +17,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 def to_decimal(v) -> Decimal:
     """把 YAML/JSON 里的数字安全地转成 Decimal（不经过 float 误差）。"""
     if isinstance(v, Decimal):
+        if not v.is_finite():
+            raise ValueError("规则参数必须是有限数字")
         return v
     if isinstance(v, bool):
         raise ValueError("布尔值不能作为数字")
     if isinstance(v, (int, float)):
-        return Decimal(str(v))
+        return to_decimal(Decimal(str(v)))
     if isinstance(v, str):
         s = v.strip().replace(",", "").replace("，", "")
         scale = Decimal(1)
@@ -30,7 +32,7 @@ def to_decimal(v) -> Decimal:
                 s, scale = s[:-len(suffix)].strip(), k
                 break
         try:
-            return Decimal(s) * scale if scale != 1 else Decimal(s)
+            return to_decimal(Decimal(s) * scale if scale != 1 else Decimal(s))
         except InvalidOperation:    # 不是数字：报成普通的校验错误（原来会让整次运行崩掉，只留下 ConversionSyntax）
             raise ValueError(f"无法转换为数字: {v!r}（写数字，可带 %、万、亿）") from None
     raise ValueError(f"无法转换为数字: {v!r}")
@@ -53,6 +55,7 @@ class RuleItem(_Base):
     sources: list[SourceRef] = []
     confidence: float | None = None
     confirmed_by: str | None = None
+    applies_when: str = ""  # material-backed applicability guard, checked on table use
 
 
 FieldType = Literal["money", "number", "int", "ratio", "text", "enum", "date", "id", "bool"]
@@ -92,6 +95,7 @@ class DatasetDef(_Base):
     # 按期间取哪些行（写了 period 才有用）：period（默认，只取本期）；year_to_date（本期所在年份年初到本期末，如按年内累计出货算月均）；
     # to_date（本期末及以前的全部行）。同一份明细既要当期又要累计时，定义成两张表
     window: Literal["period", "year_to_date", "to_date"] = "period"
+    population_from: str | None = None
 
 
 class TierTable(RuleItem):
@@ -219,11 +223,26 @@ class ReportTotal(RuleItem):
     expr: str
 
 
+class ReportBalance(RuleItem):
+    """A material-backed decomposition checked for every object before totals are rounded."""
+    name: str
+    level: str
+    total: str
+    parts: list[str] = Field(min_length=1)
+    rounding: Literal["exact", "cent"] = "exact"
+
+
+class ReportPending(ReportTotal):
+    """An explicitly named unallocated component; not a recipient of the allocated pool."""
+
+
 class Report(RuleItem):
     """结果文件的固定输出：汇总核算（按核算类型的总金额）和分配人员金额。
     totals：按顺序列出的各类总金额；people：最末层上表示“人”的字段或变量，按它把每人参与的各项合计成一行。"""
     totals: list[ReportTotal] = []
     people: str | None = None
+    balances: list[ReportBalance] = []
+    pending: list[ReportPending] = []
 
 
 class RuleSet(_Base):

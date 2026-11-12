@@ -24,6 +24,8 @@ FUNCTIONS: dict[str, FnSpec] = {
     "max": FnSpec(1, 9, AGG_KW, True, "一个参数时为明细行最大值，多个参数时为取最大"),
     "tier": FnSpec(2, 2, doc="tier(阶梯表, x) 直接返回奖金金额：whole=x×所在档比例；excess=各档分段累加"),
     "tier_rate": FnSpec(2, 2, doc="tier_rate(阶梯表, x) 只返回所在档的比例或系数"),
+    "tier_ratio": FnSpec(4, 4, frozenset({"missing"}), doc="tier_ratio(阶梯表, 分子, 分母, 默认系数, missing: 条件)；分母为0或missing为真时直接返回默认系数，不把默认值当达成率再查表。默认值必须有材料依据"),
+    "period_value": FnSpec(12, 12, doc="period_value(1月值,2月值,...,12月值) 按核算期间结束月选当月值，避免写死月份"),
     "lookup": FnSpec(2, 2, doc="lookup(查找表, 键) 查表，无匹配且无 default 时报错"),
     "if": FnSpec(3, 3, doc="if(条件, 真值, 假值)"),
     "ratio": FnSpec(2, 2, frozenset({"zero"}), doc="ratio(a, b, zero: v) = a/b，b 为 0 时返回 v，未给 v 则报错"),

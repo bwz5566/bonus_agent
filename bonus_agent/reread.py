@@ -14,7 +14,7 @@
 独立算式：只比列名、常数看不出“公式本身写错”（如分子分母取错、该减的没减）。所以复读之后再调用一次，
 让它只按材料把每个方案的奖金池、可发比例（本次可发上限 ÷ 应得，材料有按回款发放、暂缓这类规定时）写成算式
 （给数据字典和分配层级，不给规则的算式），程序把它放到同一份数据上算，和规则算出的数逐个对象比。不预设会错在哪里：两份独立理解只要不一样，数就对不上。
-算式写不对时把报错交还它自己改（最多 CALC_TRIES 次）；还是算不出来不拦，口径单上注明。
+算式写不对时带报错重试（最多 CALC_TRIES 次）；仍失败则保留错误并阻断正式完成。
 """
 from __future__ import annotations
 
@@ -22,14 +22,13 @@ import hashlib
 import json
 import re
 from datetime import date
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from bonus_agent.extract_rules import prompt
 from bonus_agent.llm import LLMError, parse_json
 
 MARK = "【独立复读】"            # 系统提示的开头；测试用的 FakeLLM 靠它认出复读调用
 CALC_MARK = "【独立算式】"
-EXTRA_SAMPLES = 2                # 独立算式和规则对不上时，最多再独立写几次（两次彼此一致才算数，否则多数说了算）
 CALC_TRIES = 3                   # 独立算式写不对时，带着报错让它自己改，最多试这么多次
 CALC_SHOW = 3                    # 奖金池对不上时，列出几个对象的两边金额
 PARAM_ROWS = 80                  # 没定义成数据表、不超过这么多行的工作表当作参数表，整表给复读
@@ -197,9 +196,8 @@ def calc(ws, rr: dict) -> dict:
     """让复读按材料写出每个方案的奖金池算式，写不对就带着报错让它改。结果存在 rr["calc"]：
     {"sig", "schemes": {方案: {"tables", "helpers", "pool"}}, "unclear", "error", "second"}。
     材料、数据字典、方案结构没变时用上次的。
-    和规则算出的数对不上的方案，再独立写（新开对话，最多 EXTRA_SAMPLES 次）：有一次和规则一致，就当是第一次写错了，用那一次的；
-    有两次都和规则不一致、而且彼此一致，才交给智能体核对；始终凑不出两次一致的记在 unsettled（不拦，口径单注明）。
-    这样复读自己偶尔理解错，不会把对的规则带偏。"""
+    对不上的独立理解保留为反证，不能靠重复采样直到某次赞同主结果来消除差异。
+    算不出来、缺少方案或覆盖不完整均阻断正式完成。"""
     names = schemes(ws)
     if not names:
         return {}
@@ -215,52 +213,8 @@ def calc(ws, rr: dict) -> dict:
     base = [{"role": "system", "content": prompt("reread_calc").replace("{dsl}", dsl)},
             {"role": "user", "content": text}]
     out = {"sig": sig, **_sample(ws, base, names), "second": [], "unsettled": {}}
-    for n in [n for n in out["schemes"] if _disagree(ws, n, out["schemes"][n])]:
-        first = out["schemes"][n]
-        kinds = sorted({b[0] for b in _disagree(ws, n, first)})
-        kept, shaky = [first], kinds
-        out["second"].append(n)
-        for _ in range(EXTRA_SAMPLES):
-            got = _sample(ws, base, [n])["schemes"].get(n)
-            # 第二次要覆盖第一次写了的各项（第一次写了可发比例、这次没写，不能算数）
-            if not got or (first.get("pay_ratio") and not got.get("pay_ratio")):
-                continue
-            if not _disagree(ws, n, got):          # 有一次和规则一致：当是前面写错了，用这一次的
-                out["schemes"][n], shaky = got, []
-                break
-            kept.append(got)
-            pair = {k: _pair(ws, n, k, kept) for k in kinds}
-            shaky = [k for k, p in pair.items() if p is None]
-            if not shaky:                          # 有两次彼此一致、又都和规则对不上：一份站得住的独立理解，交给智能体核对
-                out["schemes"][n] = pair[kinds[0]]
-                break
-        if shaky:                                  # 几次各算各的（复读自己都没读准）：不拦，口径单注明
-            out["unsettled"][n] = shaky
     rr["calc"] = out
     return out
-
-
-def _pair(ws, name: str, kind: str, kept: list[dict]) -> dict | None:
-    """几次独立算式里，有两次在这一项上都和规则对不上、而且彼此一致：返回其中一次。"""
-    off = [k for k in kept if any(b[0] == kind for b in _disagree(ws, name, k))]
-    for i, a in enumerate(off):
-        if any(_same(ws, name, kind, a, b) for b in off[i + 1:]):
-            return a
-    return None
-
-
-def _values(ws, name: str, kind: str, spec: dict) -> dict[str, Decimal]:
-    try:
-        return ws._independent_pool(name, spec) if kind == "奖金池" else ws._independent_pay(name, spec)
-    except Exception:
-        return {}
-
-
-def _same(ws, name: str, kind: str, a: dict, b: dict) -> bool:
-    """两次独立写的算式在同一份数据上算出的数是否一致（奖金池差不超过 1 分，比例差不超过万分之一）。"""
-    x, y = _values(ws, name, kind, a), _values(ws, name, kind, b)
-    tol = Decimal("0.01") if kind == "奖金池" else Decimal("0.0001")
-    return bool(x) and x.keys() == y.keys() and all(abs(x[k] - y[k]) <= tol for k in x)
 
 
 def _sample(ws, base: list[dict], names: list[str]) -> dict:
@@ -284,10 +238,13 @@ def _sample(ws, base: list[dict], names: list[str]) -> dict:
             if n not in out["schemes"]:
                 errs.append(f"方案「{n}」：没有写奖金池算式")
                 continue
-            try:      # 最后一次不再按分档漏段拦：改不好也留着比，不丢掉这份独立理解
-                strict = attempt < CALC_TRIES - 1
-                ws._independent_pool(n, out["schemes"][n], strict=strict)
-                ws._independent_pay(n, out["schemes"][n], strict=strict)
+            if ws._ruleset(n).payout and not out["schemes"][n].get("pay_ratio"):
+                errs.append(f"方案「{n}」：缺少独立可发比例算式")
+                out["schemes"].pop(n)
+                continue
+            try:
+                ws._independent_pool(n, out["schemes"][n], strict=True)
+                ws._independent_pay(n, out["schemes"][n], strict=True)
             except Exception as e:          # 算式是模型写的，任何报错都交还它自己改
                 errs.append(f"方案「{n}」：{str(e)[:400]}")
                 out["schemes"].pop(n)
@@ -307,20 +264,26 @@ def _disagree(ws, name: str, spec: dict) -> list[tuple[str, str, Decimal, Decima
     out = []
     try:
         mine = ws._independent_pool(name, spec)
-    except Exception:
-        mine = {}
+    except Exception as e:
+        raise ValueError(f"方案「{name}」独立奖金池验算执行失败：{e}") from e
     theirs = ws._pool_values(name)
+    from bonus_agent.validation import compare_values, Status
+    coverage = compare_values("pool", theirs, mine)
+    if coverage.status == Status.INCOMPLETE:
+        raise ValueError(f"方案「{name}」{coverage.message}：{coverage.examples}")
     out += [("奖金池", k, v, theirs[k]) for k, v in mine.items() if k in theirs and abs(v - theirs[k]) > Decimal("0.01")]
     try:
         ratio = ws._independent_pay(name, spec)
-    except Exception:
-        ratio = {}
+    except Exception as e:
+        raise ValueError(f"方案「{name}」独立可发比例验算执行失败：{e}") from e
     caps = ws._caps(name) if ratio else {}
+    if ratio and set(ratio) != set(caps):
+        raise ValueError(f"方案「{name}」可发比例验算对象集合不完整")
     for k, r in ratio.items():
-        if k not in caps or caps[k][0] <= 0:
+        if k not in caps or caps[k][0] == 0:
             continue
         final, cap, n = caps[k]
-        if abs((final * r).quantize(Decimal("0.01")) - cap) > Decimal("0.01") * n:
+        if abs((final * r).quantize(Decimal("0.01"), ROUND_HALF_UP) - cap) > Decimal("0.01") * n:
             out.append(("可发比例", k, r, cap / final))
     return out
 
@@ -329,9 +292,23 @@ def calc_gaps(ws, rr: dict) -> list[tuple[str, str]]:
     """独立算式和规则算出的数逐个对象比（奖金池、可发比例）；对不上的方案和项列出来。"""
     c = (rr or {}).get("calc") or {}
     out = []
+    if (rr or {}).get("error"):
+        out.append(("复读 执行", "独立复读没有完成：" + str(rr["error"])))
+    if c.get("error"):
+        out.append(("复读 执行 算式", "独立算式没有完成：" + str(c["error"])))
+    for name in schemes(ws):
+        if name not in (c.get("schemes") or {}):
+            out.append((f"复读 覆盖 {name}", "缺少本方案独立算式，不能判定验算通过"))
+        elif ws._ruleset(name).payout and not c["schemes"][name].get("pay_ratio"):
+            out.append((f"复读 覆盖 {name}", "缺少独立可发比例，不能判定发放验算通过"))
+    for name, kinds in (c.get("unsettled") or {}).items():
+        out.append((f"复读 未定论 {name}", f"独立算式没有定论：{kinds}，需按原文解决差异"))
     for name, spec in (c.get("schemes") or {}).items():
-        shaky = set((c.get("unsettled") or {}).get(name) or [])
-        bad = [b for b in _disagree(ws, name, spec) if b[0] not in shaky]
+        try:
+            bad = _disagree(ws, name, spec)
+        except Exception as e:
+            out.append((f"复读 执行 {name}", str(e)))
+            continue
         helpers = "；".join(f"{k}[{(h or {}).get('scope', 'global')}] = {(h or {}).get('expr', '')}"
                             for k, h in (spec.get("helpers") or {}).items())
         tables = "；".join(f"{k} = {json.dumps(t, ensure_ascii=False)}" for k, t in (spec.get("tables") or {}).items())

@@ -88,7 +88,8 @@ def test_per_person_end_to_end_with_independent_verification(tmp_path):
     first = next(s for s in ar.steps if s.tool == "finish")
     assert not first.ok and "个人:E1（应得金额最高" in first.result and "个人:E2（应得金额为 0" in first.result
     assert [s.ok for s in ar.steps if s.tool == "verify"] == [True, True, True]
-    assert ar.ws.verified["月度|个人:E3"]["basis"] == basis
+    from bonus_agent.agent import _verify_key
+    assert ar.ws.verified[_verify_key('月度','个人:E3','应得')]["basis"] == basis
 
 
 @pytest.mark.verify

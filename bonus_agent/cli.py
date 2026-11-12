@@ -364,7 +364,8 @@ def _scenario_cmd(a) -> int:
                 print(f"{out} 还没有确认（先 bonus-agent confirm）")
                 return 1
             qs = yaml.safe_load((out / "questions.yaml").read_text(encoding="utf-8")) if (out / "questions.yaml").exists() else []
-            rel = rl.publish(reg, a.scenario, out / "template", a.by, a.note, source=str(out), questions=qs)
+            rel = rl.publish(reg, a.scenario, out / "template", a.by, a.note, source=str(out), questions=qs,
+                             repairs=(case.get("workspace") or {}).get("repairs"))
             print(f"已发布 {reg.get(a.scenario).name} 规则版本 {rel.version}：{rel.dir}")
             for x in rel.info["acceptance"]:
                 print(f"  验收「{x['id']}」通过：" + "；".join(x["lines"]))

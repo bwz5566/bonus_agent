@@ -62,6 +62,8 @@ def convert(value, fd: FieldDef):
                 raise ConvertError(f"无法解析为数字: {value!r}") from None
             if pct:
                 d = d / Decimal(100)
+        if not d.is_finite():
+            raise ConvertError(f"数值必须是有限数字: {value!r}")
         if t == "money" and fd.unit == "万元":
             d = d * Decimal(10000)
         if t == "int" and d != d.to_integral_value():

@@ -25,6 +25,12 @@ def _exprs(rs: RuleSet):
         yield f"offsets.{o.id}", o.expr, o.scope
     for c in rs.checks:
         yield f"checks.{c.id}", c.expr, None if c.scope == "global" else c.scope
+    if rs.report:
+        for t in [*rs.report.totals, *rs.report.pending]:
+            yield f"report.{t.name}", t.expr, None if t.level == "global" else t.level
+        for b in rs.report.balances:
+            for i, expr in enumerate([b.total, *b.parts]):
+                yield f"report.balances.{b.name}.{i}", expr, None if b.level == "global" else b.level
 
 
 def _weighted(rs: RuleSet):
@@ -221,7 +227,7 @@ def validate(rs: RuleSet) -> list[Issue]:
         issues.append(Issue.warn("no_source", "智能体生成的规则元素缺少原文出处", where))
     # ---- 结果文件的汇总核算 ----
     if rs.report is not None:
-        for t in rs.report.totals:
+        for t in [*rs.report.totals, *rs.report.pending]:
             if t.level != "global" and t.level not in levels:
                 issues.append(Issue.block("report_level", f"汇总核算「{t.name}」的 level {t.level} 不是分配层级（可选：{'、'.join(levels)}、global）",
                                           "report.totals"))
@@ -232,6 +238,14 @@ def validate(rs: RuleSet) -> list[Issue]:
         names_ = [t.name for t in rs.report.totals]
         if len(set(names_)) != len(names_):
             issues.append(Issue.block("report_dup", "汇总核算的名称有重复", "report.totals"))
+        for group in (rs.report.pending, rs.report.balances):
+            if len({t.name for t in group}) != len(group):
+                issues.append(Issue.block("report_dup", "待分配或对账名称重复", "report"))
+        if rs.report.pending and not rs.report.people:
+            issues.append(Issue.block("report_pending_people", "待分配金额需要同时定义人员汇总字段 people", "report.pending"))
+        for balance in rs.report.balances:
+            if balance.level != "global" and balance.level not in levels:
+                issues.append(Issue.block("report_level", "对账对象层级不存在", balance.level))
     return issues
 
 

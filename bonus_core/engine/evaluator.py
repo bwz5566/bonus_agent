@@ -35,6 +35,7 @@ class Trace:
     value: str
     inputs: tuple[str, ...] = ()
     rows: tuple[str, ...] = ()
+    node_id: str = ""
 
     def to_dict(self):
         return asdict(self)
@@ -103,6 +104,7 @@ class Evaluator:
         self.tier_stats: dict[str, dict] = {}
         # 条件分支、查找表实际走到哪个结果：(所在计算项, "if"/"lookup", 条件或表名) -> {结果: 次数}，覆盖报告用
         self.outcomes: dict[tuple, dict[str, int]] = {}
+        self.outcome_nodes: dict[tuple, dict[str, set[str]]] = {}
         # 查找表没对上键、落到默认值的取值：表名 -> {取值: 次数}
         self.lookup_misses: dict[str, dict[str, int]] = {}
         self.layout = Layout(rs)
@@ -156,6 +158,7 @@ class Evaluator:
             id=trace_id, rule_item=rule_item, expr=expr, rendered=val.text,
             value=str(val.v), inputs=tuple(sorted(val.deps)),
             rows=tuple(sorted({str(r.src) for r in val.rows if r.src})),
+            node_id=node.id,
         )
         self._values[trace_id] = val.v
         return Val(val.v, fmt(val.v), frozenset({trace_id}))
@@ -313,6 +316,35 @@ class Evaluator:
     def _call(self, c: Call, ctx: Ctx) -> Val:
         fn = c.fn
         kw = c.kw()
+        if fn == "period_value":
+            if self.period is None:
+                raise EvalError("period_value 需要明确核算期间", ctx.where)
+            index = self.period.end.month - 1
+            self._seen(ctx, "period", c.args[index], str(index + 1))
+            return self.ev(c.args[index], ctx)
+        if fn == "tier_ratio":
+            missing = self.ev(kw["missing"], ctx) if "missing" in kw else Val(False, "false")
+            if self._bool(missing, ctx):
+                self._seen(ctx, "default", c.args[0], "missing")
+                default = self.ev(c.args[3], ctx)
+                deps, rows = _merge(missing, default)
+                return Val(default.v, f"默认系数({default.text})", deps, rows)
+            den = self.ev(c.args[2], ctx)
+            if self._num(den, ctx.where) == 0:
+                self._seen(ctx, "default", c.args[0], "zero")
+                default = self.ev(c.args[3], ctx)
+                deps, rows = _merge(missing, den, default)
+                return Val(default.v, f"分母0，默认系数({default.text})", deps, rows)
+            self._seen(ctx, "default", c.args[0], "normal")
+            table, num = self.ev(c.args[0], ctx), self.ev(c.args[1], ctx)
+            if not isinstance(table.v, TierTable):
+                raise EvalError("tier_ratio 第一个参数必须是阶梯表", ctx.where)
+            self._table_guard(table.v, ctx)
+            ratio = self._num(num, ctx.where) / self._num(den, ctx.where)
+            self._tier_seen(c.args[0], table, ratio, "tier_rate")
+            self._seen(ctx, "tier", c.args[0], str(tier_band(table.v, ratio)))
+            deps, rows = _merge(missing, num, den)
+            return Val(tier_rate(table.v, ratio), f"tier_ratio({table.text}, {num.text}/{den.text})", deps, rows)
         if fn in ("min", "max") and len(c.args) > 1:
             vals = [self.ev(a, ctx) for a in c.args]
             nums = [self._num(v, ctx.where) for v in vals]
@@ -332,15 +364,18 @@ class Evaluator:
             t, x = self.ev(c.args[0], ctx), self.ev(c.args[1], ctx)
             if not isinstance(t.v, TierTable):
                 raise EvalError(f"{fn} 的第一个参数必须是阶梯表，得到 {t.text}", ctx.where)
+            self._table_guard(t.v, ctx)
             xv = self._num(x, ctx.where)
             r = tier_amount(t.v, xv) if fn == "tier" else tier_rate(t.v, xv)
             self._tier_seen(c.args[0], t, xv, fn)
+            self._seen(ctx, "tier", c.args[0], str(tier_band(t.v, xv)))
             return Val(r, f"{fn}({t.text}, {x.text})", x.deps, x.rows)
         if fn == "lookup":
             t, k = self.ev(c.args[0], ctx), self.ev(c.args[1], ctx)
             if not isinstance(t.v, LookupTable):
                 raise EvalError(f"lookup 的第一个参数必须是查找表，得到 {t.text}", ctx.where)
             key = lookup_key(k.v)
+            self._table_guard(t.v, ctx)
             if key in t.v.mapping:
                 r = t.v.mapping[key]
             elif t.v.default is not None:
@@ -426,15 +461,22 @@ class Evaluator:
         return (f"分母 {unparse(den)} 在对象「{ctx.node.id}」上是 0：查这个对象的数据是否缺失，"
                 "筛选条件（期间、取值、所属对象）是否写对，或者材料对分母为 0 有没有规定")
 
+    def _table_guard(self, table, ctx):
+        if table.applies_when and not self._bool(self.ev(parse(table.applies_when), ctx), ctx):
+            raise EvalError(f"参数表适用条件不成立：{table.applies_when}，不能套用该表", ctx.where)
+
     def _seen(self, ctx: Ctx, kind: str, what, outcome: str) -> None:
-        item = ctx.where.split("/", 1)[-1]
+        item = ctx.where.removeprefix(ctx.node.id + "/")
         seen = self.outcomes.setdefault((item, kind, what), {})
         seen[outcome] = seen.get(outcome, 0) + 1
+        self.outcome_nodes.setdefault((item, kind, what), {}).setdefault(outcome, set()).add(ctx.node.id)
 
     def coverage(self) -> list[dict]:
         """条件分支、查找表的命中分布：[{item, kind, what, seen}]，what 是条件原文或表名。"""
         out = [{"item": item, "kind": kind, "what": what if isinstance(what, str) and kind == "lookup" else unparse(what),
-                "seen": dict(seen)} for (item, kind, what), seen in self.outcomes.items()]
+                "seen": dict(seen),
+                "nodes": {o: sorted(ns) for o, ns in self.outcome_nodes.get((item, kind, what), {}).items()}}
+               for (item, kind, what), seen in self.outcomes.items()]
         for c in out:
             if c["kind"] == "lookup" and c["what"] in self.lookup_misses:
                 c["misses"] = dict(self.lookup_misses[c["what"]])

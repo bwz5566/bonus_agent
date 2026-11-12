@@ -72,6 +72,22 @@ class ScenarioMemory:
             self._save(keep)
         return len(items) - len(keep)
 
+    def add_repairs(self, repairs: dict, *, version: str, source: str = "", by: str = "") -> int:
+        """Retain only verified, published case lessons; never promote them to business rules."""
+        lessons = []
+        for ident, repair in repairs.items():
+            report = repair.get("report") or {}
+            if repair.get("status") != "case_validated" or report.get("status") != "PASS" or not report.get("fingerprint"):
+                continue
+            lessons.append({"id": 'repair-' + ident, "kind": "repair", "status": "case_validated",
+                            "question": "历史修复，仅原案验证；使用前核对本期原文与条件",
+                            "answer": str(repair.get("reason", "")), "version": version, "source": source, "by": by,
+                            "fingerprint": report["fingerprint"], "at": datetime.now().isoformat(timespec="seconds")})
+        if lessons:
+            ids = {i['id'] for i in lessons}
+            self._save(lessons + [i for i in self.items() if i.get('id') not in ids])
+        return len(lessons)
+
     def brief(self, limit: int = LIMIT) -> str:
         items = self.items()[:limit]
         if not items:

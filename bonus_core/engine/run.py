@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
 
-from bonus_core.data.patches import apply_patches
+from bonus_core.data.population import prepare as apply_patches
 from bonus_core.data.table import Datasets
 from bonus_core.dsl.models import RuleSet
 from bonus_core.dsl.validator import _weighted, validate
@@ -151,7 +151,10 @@ class Engine:
         if issues:
             raise EngineError(issues)
         self.rs = rs
-        data, patched = apply_patches(rs, data)
+        try:
+            data, patched = apply_patches(rs, data)
+        except ValueError as e:
+            raise EngineError([Issue.block("population", str(e))]) from None
         self.data = data
         root, by_level, issues = build_tree(rs, data)
         issues = patched + issues
@@ -281,6 +284,22 @@ class Engine:
         """汇总核算：每一行在指定层的每个对象上算一遍再合计，保留到分。"""
         rep = self.rs.report
         out = []
+        for balance in (rep.balances if rep else []):
+            nodes = [self.root] if balance.level == "global" else self.by_level.get(balance.level)
+            if not nodes:
+                raise EngineError([Issue.block("report_balance_scope", f"对账「{balance.name}」没有可验证对象", balance.level)])
+            if not balance.sources:
+                raise EngineError([Issue.block("report_balance_source", f"对账「{balance.name}」缺少原文依据", balance.name)])
+            for n in nodes:
+                try:
+                    values = [self.ev.evaluate(e, n, f"{n.id}/对账/{balance.name}/{i}", "report.balances")
+                              for i, e in enumerate([balance.total, *balance.parts])]
+                    if balance.rounding == "cent":
+                        values = [round_pool(v) for v in values]
+                    if values[0] != sum(values[1:], Decimal(0)):
+                        raise EngineError([Issue.block("report_unbalanced", f"对账「{balance.name}」不闭合：{values[0]} != {values[1:]}", n.id)])
+                except EvalError as e:
+                    raise EngineError([Issue.block("report_balance_eval", str(e), n.id)]) from e
         for t in (rep.totals if rep else []):
             nodes = [self.root] if t.level == "global" else self.by_level.get(t.level, [])
             total = Decimal(0)
@@ -313,8 +332,18 @@ class Engine:
                 o["paid"] += Decimal(p.paid)
                 for c, h in p.holds.items():
                     o["holds"][c] = o["holds"].get(c, Decimal(0)) + Decimal(h)
-        return [{**o, "final": str(o["final"]), "held": str(o["held"]), "paid": str(o["paid"]),
+        rows = [{**o, "final": str(o["final"]), "held": str(o["held"]), "paid": str(o["paid"]),
                  "holds": {c: str(v) for c, v in o["holds"].items()}} for o in out.values()]
+        for pending in rep.pending:
+            if pending.name in out:
+                raise EngineError([Issue.block("report_pending_name", f"待分配名称「{pending.name}」与人员重复", pending.name)])
+            nodes = [self.root] if pending.level == "global" else self.by_level.get(pending.level)
+            if not nodes or not pending.sources:
+                raise EngineError([Issue.block("report_pending_source", f"待分配「{pending.name}」缺少对象或原文依据", pending.name)])
+            amount = sum((self.ev.evaluate(pending.expr, n, f"{n.id}/待分配/{pending.name}", "report.pending") for n in nodes), Decimal(0))
+            rows.append({"name": pending.name, "final": str(round_pool(amount)), "held": "0.00", "paid": "0.00",
+                         "holds": {}, "count": 0, "pending": True})
+        return rows
 
     def _sheet_inputs(self) -> dict[str, dict[str, object]]:
         """「过程复核」表里直接取数的列：每个对象的字段值和不能用公式复算的变量值。取不到的留空。"""

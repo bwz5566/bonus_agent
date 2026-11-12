@@ -15,7 +15,7 @@ import re
 import unicodedata
 from decimal import Decimal, InvalidOperation
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from bonus_agent.extract_rules import Question
 
@@ -38,6 +38,83 @@ class Fact(BaseModel):
     meaning: str = ""    # 文字口径的规范说法（可选）
     override: bool = False   # 原文明确写了修改旧规定，以这一条为准
     round: int = 1
+    targets: list[str] = []  # precise DSL paths, e.g. tables.eu.steps.0.1
+    page: int | None = Field(default=None, ge=1)
+    context: str = ""        # verbatim applicability heading on the cited page
+    source_hash: str = ""    # populated by the program, never trusted from the model
+
+
+def target_parts(path: str):
+    return [p.replace('~1', '/').replace('~0', '~') for p in path[1:].split('/')] if path.startswith('/') else path.split('.')
+
+
+def split_target(target: str):
+    return tuple(target.split('::', 1)) if '::' in target else (None, target)
+
+
+def target_value(draft: dict, path: str):
+    current = draft
+    for part in target_parts(path):
+        current = current[int(part)] if isinstance(current, (list, tuple)) else current[part]
+    return current
+
+
+def table_cells(tables: dict):
+    """Canonical JSON pointers preserve punctuation in table and lookup keys."""
+    escape = lambda s: str(s).replace('~', '~0').replace('/', '~1')
+    for name, table in tables.items():
+        prefix = '/tables/' + escape(name)
+        if table.get('kind') == 'tier':
+            for i, (lower, rate) in enumerate(table.get('steps', [])):
+                if i or Decimal(str(lower)) != 0:
+                    yield f'{prefix}/steps/{i}/0', Decimal(str(lower))
+                yield f'{prefix}/steps/{i}/1', Decimal(str(rate))
+        else:
+            for key, value in table.get('mapping', {}).items():
+                yield prefix + '/mapping/' + escape(key), Decimal(str(value))
+            if table.get('default') is not None:
+                yield prefix + '/default', Decimal(str(table['default']))
+
+
+def binding_errors(facts: list[Fact], drafts: dict) -> list[str]:
+    """A number at another rule position does not satisfy a declared parameter binding."""
+    errors = []
+    for f in facts:
+        value = number(f.value)
+        if value is None:
+            continue
+        if not f.targets:
+            errors.append(f"{f.name}：缺少精确规则位置，用 bind_facts 绑定参数")
+            continue
+        for target in f.targets:
+            matches = []
+            scheme, path = split_target(target)
+            for name, draft in drafts.items():
+                if scheme is not None and name != scheme:
+                    continue
+                try:
+                    v = target_value(draft, path)
+                except (KeyError, IndexError, TypeError, ValueError):
+                    continue
+                numeric = number(str(v))
+                if numeric is None:
+                    try:
+                        numeric = Decimal(str(v))
+                    except InvalidOperation:
+                        pass
+                if numeric is not None:
+                    matches.append({numeric})
+                elif isinstance(v, str):
+                    from bonus_core.dsl.parser import parse, walk, Num, ExprError
+                    try:
+                        matches.append({n.value for n in walk(parse(v)) if isinstance(n, Num)})
+                    except ExprError:
+                        matches.append(set())
+                else:
+                    matches.append(set())
+            if not matches or any(value not in values for values in matches):
+                errors.append(f"{f.name}：{target} 的取值与原文 {f.value} 不一致或位置不存在")
+    return errors
 
 
 def norm(s: str) -> str:

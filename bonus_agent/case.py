@@ -69,6 +69,8 @@ def snapshot(ws) -> dict:
         "check_vars": ws.check_vars,
         "reread": ws.reread,
         "triage": ws.triage,
+        "repairs": ws.repairs,
+        "repair_attempts": ws.repair_attempts,
     }
 
 
@@ -87,7 +89,28 @@ def restore(ws, snap: dict) -> None:
     ws.check_vars = snap.get("check_vars", {})
     ws.reread = snap.get("reread", {})
     ws.triage = snap.get("triage", {})
-    ws.verified = snap.get("verified", {})     # 验算式留着，按本轮的规则和数据重新比对
+    ws.repairs = snap.get("repairs", {})
+    ws.repair_attempts = snap.get("repair_attempts", {})
+    from bonus_agent.agent import _verify_key
+    ws.verified = {}
+    for key, record in snap.get("verified", {}).items():
+        if key.startswith('['):
+            try:
+                parts = json.loads(key)
+                if len(parts) == 3 and all(isinstance(x, str) for x in parts) and parts[2] in ('应得', '实发'):
+                    ws.verified[_verify_key(*parts)] = record
+            except (ValueError, TypeError):
+                pass
+            continue
+        matches = [s for s in ws.schemes if key.startswith(s + '|')]
+        if len(matches) != 1:  # ambiguous legacy keys require a new independent verification
+            continue
+        name = matches[0]
+        amount = record.get('amount', '应得')
+        node = key[len(name)+1:]
+        if amount == '实发':
+            node = node.removesuffix('|实发')
+        ws.verified[_verify_key(name, node, amount)] = record
     ws.untested = set(ws.schemes)            # 数据或答复可能变了，每个方案都要重新试算
 
 
