@@ -71,7 +71,7 @@ DEEP_LIMIT = 24                # 每一轮最多这么多步用深度思考（�
 MAX_REFLECT = 2                # 卡住时先让智能体停下来反思、换做法接着做，最多这么多次；再卡住才停下，把原因报给财务
 KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保留全文
 BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
-READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate"}
+READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate", "suggest_links"}
 NO_IGNORE = ("查找表 ", "抵扣 ")    # 程序检查里不能写进 ignored 放过的项
 MUST_FIX = ("抵扣 ",)              # 连提问也不能放过、只能改规则的项
 _CURRENCY_HEAD = re.compile(r"币种|币别|币制|结算币|外币|汇率|(?<![A-Za-z])(?:currency|exchange\s*rate|fx)(?![A-Za-z])", re.I)
@@ -134,6 +134,13 @@ TOOLS: list[dict] = [
     {"name": "view_image", "description": "查看文件中的第 index 张图片（从 1 开始，默认 1），返回图片内容的逐字转写。",
      "parameters": _obj({"file": _S, "index": _I, "focus": {**_S, "description": "可选：希望重点看清的内容"}},
                         ["file"])},
+    {"name": "suggest_links",
+     "description": "挂接建议（只读）：比较参考表（预算、名单、各类系数和标记表）和主数据表（每行一笔业务记录的那张表）"
+                    "的编号类列（月份、客户、型号、区域），列出哪几列对得上、各能对上多少行、应挂在哪一层（项目 / 客户 / 区域），"
+                    "以及同名列哪一列对得上、表是否跨期间。define_dataset 定义参考表之前先用它，按结果写 combine / link / key。",
+     "parameters": _obj({"file": {**_S, "description": "参考表所在文件"}, "sheet": _S,
+                         "base_file": {**_S, "description": "主数据表所在文件（如销售单）"}, "base_sheet": _S},
+                        ["file", "sheet", "base_file", "base_sheet"])},
     {"name": "read_sheet", "description": "查看 Excel 工作表的原始内容（带 Excel 行号），用于判断表头位置、合计行、说明文字等。",
      "parameters": _obj({"file": _S, "sheet": _S, "start_row": _I, "rows": _I}, ["file", "sheet"])},
     {"name": "note",
@@ -727,6 +734,18 @@ class Workspace:
         if not hit:
             raise ToolError(f"没有文件「{name}」，可用文件：{[f.name for f in self.inv.files]}")
         return hit[0]
+
+    def suggest_links(self, file: str, sheet: str, base_file: str, base_sheet: str) -> str:
+        from bonus_agent.skills.link_suggest import suggest
+        tables = []
+        for fn, sh in ((base_file, base_sheet), (file, sheet)):
+            f = self._file(fn)
+            st = self.inv.sheet(f"{f.name}/{sh}")
+            if st is None:
+                sheets = [r.split("/", 1)[1] for r in self.inv.sheet_text if r.startswith(f.name + "/")]
+                raise ToolError(f"{f.name} 里没有自动识别出表格的工作表「{sh}」，可选：{sheets}")
+            tables.append(st)
+        return suggest(tables[0], tables[1])
 
     def list_files(self) -> str:
         lines = []
