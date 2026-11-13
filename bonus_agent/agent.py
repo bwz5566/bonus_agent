@@ -4075,6 +4075,9 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     changes = None
     if resumed:
         cs.restore(ws, case["workspace"])
+        if restored := case.pop('_recovery', None):
+            rnd['recovery']=restored
+            ws.notes['案卷恢复']=f'当前工作区从{restored["source"]}恢复；原快照损坏位置：{restored["damaged_path"]}。本轮重新核算后才能确认结果。'
         changes = cs.file_changes(last["files"] if last else {}, prints)
         gone = set(changes["修改"]) | set(changes["删除"])
         ws.facts = [f for f in ws.facts if f.file not in gone]       # 这些文件的参数要按新内容重新登记
@@ -4562,11 +4565,13 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             ar.outputs = {}
             error = ar.error = (ar.error + "；" if ar.error else "") + f"写输出文件出错（{type(e).__name__}: {str(e)[:300]}）"
         rnd["inputs"] = [str(f) for f in ws.data_files]
+        rnd['source_inputs'] = [{'name':f.name,'path':str(f),'hash':cs.sha256(f)} for f in ws.inv.files]
         rnd["outputs"] = {k: [p.name, cs.sha256(p)] for k, p in ar.outputs.items()
                           if k in ("mapping", "rules", "review") or k.startswith(("rules:", "adjust:"))}
         if message:
             rnd["message"] = {"by": ws.chat_by, "text": message}
         rnd.update(status=ar.status, error=error, usage=ar.usage, pending=[q.id for q in ws.pending], summary=ws.summary,
+                   financial_digest=cs.financial_digest(tested) if tested else None,
                    last_request=dict(llm.last_call),
                    answered=[q.id for q in fresh], changes=changes, drafts=json.loads(json.dumps(ws.drafts)),
                    digest=cs.digest(tested) if tested else (last or {}).get("digest"))

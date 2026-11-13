@@ -66,6 +66,8 @@ def result_integrity(result):
         final, held, paid = Decimal(row.final), Decimal(row.held), Decimal(row.paid)
         cap = Decimal(row.cap or row.final)
         deducted, offset, overpaid = Decimal(row.deducted), Decimal(row.offset), Decimal(row.overpaid)
+        if min(deducted, offset, overpaid) < 0 or deducted > offset or deducted > max(cap, Decimal(0)):
+            errors.append({'node':row.node_id,'error':'抵扣或超发越界：须非负且实际抵扣不超过预发与非负可发上限'})
         if final != held + cap or cap != paid + deducted or offset != deducted + overpaid:
             errors.append({"node": row.node_id, "error": "应得、暂缓、可发上限、抵扣与实发不闭合"})
     for ledger in getattr(result,'rounding',[]):

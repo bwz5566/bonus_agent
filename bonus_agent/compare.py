@@ -46,10 +46,12 @@ class Match:
     ambiguous: list[tuple[str, list[str]]] = field(default_factory=list)  # (工作表, 几列都可能是这个指标)
     missing: list[tuple[str, Decimal]] = field(default_factory=list)      # 期望结果里有、本次结果里没有的对象 (编号, 期望)
     blank: list[str] = field(default_factory=list)                         # 本次结果里有、期望结果里金额为空的对象
+    extra: list[str] = field(default_factory=list)  # same entity scope, actual objects absent from acceptance
+    partial: bool = False
 
     @property
     def ok(self) -> bool:
-        return self.total > 0 and self.matched == self.total and not self.ambiguous and not self.missing and not self.blank
+        return self.total > 0 and self.matched == self.total and not self.ambiguous and not self.missing and not self.blank and not self.extra
 
     @property
     def sheet(self) -> str:
@@ -123,7 +125,7 @@ def _id_variants(figures):
 
 
 def compare_expected(results: dict[str, dict[str, Result]], path: str | Path, column: str | None = None,
-                     where: dict[str, str] | None = None) -> list[Match]:
+                     where: dict[str, str] | None = None, *, complete: bool = True) -> list[Match]:
     """column：指定应得金额的列名（期望结果的列名认不出或有歧义时用）。
     where：列名 -> 取值，只核对这些行（如期望结果里有几个版本，本次只算了其中一个）；没有这一列的工作表不受影响。
     方案名对不上时（智能体起名「季度」，期望结果的方案列写 QUARTER），按一一对应试一遍，取对上金额最多的那种，
@@ -131,7 +133,7 @@ def compare_expected(results: dict[str, dict[str, Result]], path: str | Path, co
     labels = _scheme_labels(path)
     ours = [s for s in results if s.upper() not in {x.upper() for x in labels}]
     free = [x for x in labels if x.upper() not in {s.upper() for s in results}]
-    best = _compare(results, path, column, where)
+    best = _compare(results, path, column, where, complete)
     if not ours or not free or len(ours) > 6 or len(free) > 6:
         return best
     from itertools import permutations
@@ -139,7 +141,7 @@ def compare_expected(results: dict[str, dict[str, Result]], path: str | Path, co
     top, pick = score(best), None
     for perm in permutations(free, min(len(ours), len(free))):
         names = dict(zip(ours, perm))
-        ms = _compare({names.get(k, k): v for k, v in results.items()}, path, column, where)
+        ms = _compare({names.get(k, k): v for k, v in results.items()}, path, column, where, complete)
         if score(ms) > top:
             top, pick, best = score(ms), names, ms
     if pick:
@@ -159,7 +161,24 @@ def _scheme_labels(path) -> list[str]:
     return out
 
 
-def _compare(results, path, column, where) -> list[Match]:
+def _coverage_groups(res, metric):
+    """Compare within an entity level/view, never require parent IDs in a recipient sheet."""
+    groups=[]
+    if metric=='汇总核算':
+        return [{str(n) for n,_ in res.totals}]
+    if metric=='应得' or not res.rollups:
+        levels={n.level for n in res.nodes.values() if n.key}
+        groups.extend({n.key for n in res.nodes.values() if n.key and n.level==level} for level in levels)
+    if res.rollups:
+        groups.append({r.key for r in res.rollups.values()})
+    if metric in ('应得','本次可发','暂缓'):
+        groups.append({str(p['name']) for p in res.people or []})
+    if metric=='应得':
+        groups.extend({str(r['key']) for r in rows.values()} for rows in getattr(res,'details',{}).values())
+    return groups
+
+
+def _compare(results, path, column, where, complete=True) -> list[Match]:
     tables = detect(path)
     for st in tables:
         for col, val in (where or {}).items():
@@ -171,7 +190,7 @@ def _compare(results, path, column, where) -> list[Match]:
     for scheme, revs in results.items():
         for rev, res in revs.items():
             for metric, ours in _figures(res).items():
-                total = Match(scheme, rev, metric)
+                total = Match(scheme, rev, metric, partial=not complete)
                 seen: set[str] = set()
                 for st in tables:
                     # 普通对象表排除合计；显式汇总指标必须核对合计行本身。
@@ -194,8 +213,16 @@ def _compare(results, path, column, where) -> list[Match]:
                     total.total += len(keys)
                     total.matched += len(keys) - len(fresh)
                     total.diffs += fresh
+                if complete:
+                    for group in _coverage_groups(res,metric):
+                        covered={k for k in group if k in seen or ('|' in k and k.replace('|','') in seen)}
+                        if covered:
+                            total.extra += sorted(group-covered-set(total.extra))
                 if total.total or total.ambiguous or metric == "应得":
                     out.append(total)
+            current=[m for m in out if m.scheme==scheme and m.revision==rev]
+            if complete and not any(m.total for m in current):
+                current[0].ambiguous.append(('验收范围',['缺少本方案/修订的有效金额对照']))
     return out
 
 
@@ -279,6 +306,10 @@ def _best_in(st, scheme, rev, metric, ours, schemes, revs, column=None) -> _Shee
     if not cand:
         return _SheetMatch()
     j = cand[0]
+    if len(revs)>1 and rev!='R0' and not any(r.upper() in st.sheet.upper() for r in revs) and not any(
+            rev.upper() in {t.upper() for t in ts} and
+            {t.upper() for t in ts if t} <= {r.upper() for r in revs} for ts in texts):
+        return _SheetMatch(ambiguous=['多修订结果需要明确修订列或含修订名的工作表'])
     pairs = [(texts[id_col][r], _num(cols[j][r])) for r in rows]
     blank = sorted({k for k, v in pairs if v is None})
     pairs = [(k, v) for k, v in pairs if v is not None]
@@ -306,6 +337,8 @@ def report(matches: list[Match]) -> list[str]:
         head = "、".join(f"{m.metric} {m.matched}/{m.total}" for m in found if m.total)
         bad = [m for m in found if not m.ok]
         line = f"「{label}」：{head} 个对象" + ("逐分一致" if not bad else "核对")
+        if any(m.partial for m in ms):
+            line += '（部分抽样，不代表完整验收）'
         for m in bad:
             for sheet, cols in m.ambiguous:
                 line += (f"；{m.metric}无法确定用哪一列（「{sheet}」里 {'、'.join(cols)} 都可能是），"
@@ -315,6 +348,8 @@ def report(matches: list[Match]) -> list[str]:
                          + ("……" if len(m.missing) > 10 else ""))
             if m.blank:
                 line += f"；期望结果里{m.metric}为空的 {len(m.blank)} 个：" + "、".join(m.blank[:10]) + ("……" if len(m.blank) > 10 else "")
+            if m.extra:
+                line += f'；实际结果中多出、未验收的 {len(m.extra)} 个：'+'、'.join(m.extra[:10])
             if not m.diffs:
                 continue
             line += (f"；{m.metric}不一致（对照{'；'.join(f'「{s}」的「{c}」列' for s, c in m.sources)}）："

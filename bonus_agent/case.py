@@ -33,7 +33,20 @@ def fingerprint(files: list[Path]) -> dict[str, str]:
 def load_case(out: Path) -> dict | None:
     p = Path(out) / CASE_FILE
     if p.exists():
-        return json.loads(p.read_text(encoding="utf-8"))
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except (ValueError, UnicodeError):
+            from bonus_agent.infra import checkpoints
+            recovered = checkpoints.latest_case(out)
+            if recovered is not None:
+                recovered['_recovery']={'source':'checkpoint','damaged_path':str(p)}
+                return recovered
+            backup = p.with_suffix('.previous.json')
+            if backup.exists():
+                recovered=json.loads(backup.read_text(encoding='utf-8'))
+                recovered['_recovery']={'source':'previous','damaged_path':str(p)}
+                return recovered
+            raise ValueError(f'案卷快照损坏且没有可恢复版本：{p}；保留损坏文件，不能从空工作区继续') from None
     # case.json 丢失（如写盘中途崩溃）：开启平台状态存储时从最近的检查点恢复
     from bonus_agent.infra import checkpoints
     return checkpoints.latest_case(out)
@@ -41,7 +54,16 @@ def load_case(out: Path) -> dict | None:
 
 def save_case(out: Path, case: dict) -> Path:
     p = Path(out) / CASE_FILE
-    p.write_text(json.dumps(case, ensure_ascii=False, indent=1), encoding="utf-8")
+    from bonus_agent.infra.atomic import write_text
+    if p.exists():
+        try:
+            prior = p.read_text(encoding='utf-8')
+            json.loads(prior)
+        except (ValueError,UnicodeError):
+            pass  # do not replace a good backup with an already damaged snapshot
+        else:
+            write_text(p.with_suffix('.previous.json'),prior)
+    write_text(p,json.dumps(case, ensure_ascii=False, indent=1))
     _checkpoint(out, case)
     return p
 
@@ -147,6 +169,20 @@ def digest(results: dict[str, dict[str, Result]]) -> dict:
                 nid: [n.label, n.final, r.payouts[nid].paid if nid in r.payouts else None]
                 for nid, n in r.nodes.items() if n.key}
             out[s][rev].update({nid: [x.label, x.final, x.paid] for nid, x in r.rollups.items()})
+    return out
+
+
+def financial_digest(results: dict) -> dict:
+    """Freeze all monetary views and their object sets, not only earned amounts."""
+    from dataclasses import asdict, is_dataclass
+    fields = ('nodes','payouts','rollups','people','totals','details','rounding','pool','pool_exact')
+    out={}
+    for scheme,revs in results.items():
+        out[scheme]={}
+        for rev,res in revs.items():
+            payload={k:getattr(res,k,None) for k in fields}
+            out[scheme][rev]=json.loads(json.dumps(payload,ensure_ascii=False,
+                         default=lambda value:asdict(value) if is_dataclass(value) else str(value)))
     return out
 
 
@@ -287,6 +323,13 @@ def confirm(out: Path, by: str, note: str = "", data: list[Path] | None = None, 
     if missing or not inputs:
         shutil.rmtree(tpl)
         raise ConfirmError("找不到确认时要复算用的数据文件：" + ("、".join(missing) or "无") + "，请在命令后面给出数据文件")
+    expected_files = rnd.get('files') or {}
+    changed_inputs = [p.name for p in inputs if expected_files.get(p.name) != sha256(p)]
+    changed_inputs += [item['name'] for item in rnd.get('source_inputs',[])
+                       if not Path(item['path']).exists() or sha256(Path(item['path'])) != item['hash']]
+    if changed_inputs:
+        shutil.rmtree(tpl)
+        raise ConfirmError('确认输入版本已变化或缺少原轮指纹，请重新核算：'+'、'.join(sorted(set(changed_inputs))))
     at = datetime.now().isoformat(timespec="seconds")
     manifest = {
         "confirmed": {"by": by, "at": at, "round": rnd["n"], "note": note, "summary": rnd.get("summary", "")},
@@ -305,9 +348,13 @@ def confirm(out: Path, by: str, note: str = "", data: list[Path] | None = None, 
         raise ConfirmError(f"按模板复算失败：{e}") from None
     want = rnd.get("digest") or {}
     got = digest(results)
-    diff = [f"{s} {r} {nid}" for s in want for r in want[s] for nid, v in want[s][r].items()
-            if got.get(s, {}).get(r, {}).get(nid, [None, None])[1] != v[1]]
-    if diff or set(got) != set(want):
+    diff = ['对象集合或应得/实发改变'] if got != want else []
+    frozen = rnd.get('financial_digest')
+    if frozen is None:
+        diff.append('缺少完整金额基线，旧案卷须重新核算后确认')
+    elif financial_digest(results) != frozen:
+        diff.append('完整金额及报告对账与原轮不一致')
+    if diff:
         shutil.rmtree(tpl)
         raise ConfirmError(f"按模板复算与第 {rnd['n']} 轮结果不一致：{diff[:10]}（数据文件是否换过？）")
     old = out / "template.old"

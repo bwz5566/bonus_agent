@@ -107,6 +107,7 @@ class Result:
     rounding: list[dict] = field(default_factory=list)
     auxiliary: dict[str, dict] = field(default_factory=dict)
     details: dict[str, dict] = field(default_factory=dict)
+    rules_hash: str = ""
 
     def payout_rows(self) -> list:
         """发放的最终口径：有按实体汇总的抵扣时用汇总行，否则用最末层。"""
@@ -123,6 +124,18 @@ class Result:
         d.pop("tier_stats", None)
         d.pop("coverage", None)
         return json.loads(json.dumps(d, default=str, ensure_ascii=False))
+
+
+def rule_fingerprint(rs: RuleSet) -> str:
+    from pydantic import BaseModel
+    def clean(value):
+        if isinstance(value,BaseModel):
+            return {k:clean(getattr(value,k)) for k in type(value).model_fields
+                    if k not in {'sources','desc','confidence','confirmed_by'} and not (isinstance(value,RuleSet) and k=='name')}
+        if isinstance(value,dict):return {k:clean(v) for k,v in value.items()}
+        if isinstance(value,(list,tuple)):return [clean(v) for v in value]
+        return value
+    return hashlib.sha256(json.dumps(clean(rs),sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
 
 
 def input_hash(rs: RuleSet, data: Datasets) -> str:
@@ -287,7 +300,7 @@ class Engine:
             totals=totals, people=people,
             coverage=self.ev.coverage(),
             rounding=list(getattr(self,'rounding_checks',[])), auxiliary=auxiliary,
-            details=details,
+            details=details, rules_hash=rule_fingerprint(self.rs),
         )
 
     def _report_nodes(self, level):
@@ -568,13 +581,13 @@ class Engine:
             # 可发上限 = 最末层可发上限之和；已发抵扣、实际抵扣、超发 = 最末层的 + 本层的；本次实发 = 可发上限 − 实际抵扣
             cap = sum((Decimal(p.cap or p.paid) for p in ps), Decimal(0))
             left = sum((Decimal(p.paid) for p in ps), Decimal(0))     # 最末层抵扣后剩下的
-            ded = min(left, offset)
+            ded = min(max(left, Decimal(0)), offset)
             leaf_off = sum((Decimal(p.offset or 0) for p in ps), Decimal(0))
             leaf_ded = sum((Decimal(p.deducted or 0) for p in ps), Decimal(0))
             leaf_over = sum((Decimal(p.overpaid or 0) for p in ps), Decimal(0))
             out[e.id] = RollupResult(e.id, ent, str(k), e.label, [m.id for m in ms], str(final), str(held), str(cap),
                                      str(leaf_off + offset), str(leaf_ded + ded), str(left - ded),
-                                     str((leaf_over + max(offset - left, Decimal(0))).quantize(CENT)))
+                                      str((leaf_over + offset - ded).quantize(CENT)))
         return out
 
 
