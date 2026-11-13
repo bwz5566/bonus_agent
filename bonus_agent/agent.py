@@ -305,8 +305,9 @@ TOOLS: list[dict] = [
                          "blocking": {"type": "boolean"},
                          "evidence": {"type": "array", "description": "问题和建议的依据，显示在答复页上给财务对照：每条 file 写材料文件名"
                                       "（财务在对话里说的写「财务对话」），quote 逐字复制原文或数据行里的取值（一句、一行）。"
-                                      "写了 suggested 就必须写，至少一条支持建议的原文；有冲突时各方的原文都列上",
-                                      "items": _obj({"file": _S, "quote": _S}, ["file", "quote"])}}, ["text", "options"])},
+                                       "写了 suggested 时所有引用必须核对通过。Excel可改传sheet、row（原Excel行号）、columns（精确列名），程序生成真实引用；禁止省略号拼接。",
+                                       "items": _obj({"file": _S, "quote": _S, "sheet": _S, "row": _I,
+                                                      "columns": {"type": "array", "items": _S}}, ["file"])}}, ["text", "options"])},
     {"name": "reply",
      "description": "对话时用：回复财务这条消息并结束本次对话。改过规则、数据表或台账时，程序会先自动试算全部方案并做完成前检查，"
                     "不通过会把原因返回给你修正。回复里的金额要来自 evaluate / explain / 试算结果，不要自己算。",
@@ -3135,12 +3136,18 @@ class Workspace:
     # ---- 问题与完成 ----
     def ask_question(self, text: str, options: list[str] | None = None, suggested: int | None = None, related: str = "",
                      blocking: bool = True, evidence: list[dict] | None = None) -> str:
-        same = next((q for q in self.questions if q.text.strip() == text.strip()), None)
+        from bonus_agent.question_match import same_pending
+        same = next((q for q in self.questions if not q.withdrawn and
+                     (q.text.strip() == text.strip() or same_pending(q,text,related))), None)
         if same is not None:
             if same.answer:
                 return f"这个问题（{same.id}）财务已答复：{same.answer}。请按答复处理"
             return f"这个问题已经问过（{same.id}），还在等财务答复"
         ev, bad = self._evidence(evidence)
+        if suggested is not None and bad:
+            raise ToolError("建议尚未保存：依据引用未核对通过。请用 read_sheet 复制真实原文，不要用省略号拼接；"
+                            "也可提供 evidence 的 file/sheet/row/columns，让程序读取真实单元格。"
+                            + '；'.join(bad[:3]))
         if suggested is not None and not ev:
             raise ToolError("写了 suggested（建议）就要在 evidence 里给出依据：file 写材料文件名，quote 逐字复制支持这个建议的原文或数据取值。"
                             "财务会对照原文判断，没有依据的建议容易误导财务；找不到依据就不要写 suggested")
@@ -3218,7 +3225,7 @@ class Workspace:
         return ""
 
     def _evidence(self, evidence) -> tuple[list[dict], list[str]]:
-        """提问的依据逐字核对原文：核对上的标 ok，核对不上的也保留（标出来给财务看），返回 (依据, 核对不上的说明)。"""
+        """逐字核对或从真实单元格生成提问依据；带建议的问题不能提交未通过的引用。"""
         if not evidence:
             return [], []
         corpus, out, bad = self._corpus(), [], []
@@ -3226,6 +3233,21 @@ class Workspace:
             if not isinstance(e, dict):
                 continue
             file, quote = str(e.get("file") or "").strip(), str(e.get("quote") or "").strip()
+            if e.get('sheet') is not None or e.get('row') is not None:
+                st=self.inv.sheet(f"{file}/{e.get('sheet','')}")
+                row=next((v for r,v in st.rows if r==e.get('row')),None) if st else None
+                columns=e.get('columns') or (st.headers if st else [])
+                if row is None or not isinstance(columns,list) or any(c not in st.headers for c in columns):
+                    bad.append(f'《{file}》单元格定位无效：{e.get("sheet")}!{e.get("row")}')
+                    continue
+                from bonus_core.data.mapping import cell_text
+                actual=' | '.join(f'{c}={cell_text(row[st.headers.index(c)])}' for c in columns)
+                # A supplied quotation must still be checked; coordinates cannot bless invented text.
+                if quote and fx.norm(quote) not in fx.norm(actual):
+                    bad.append(f'《{file}》引用与指定单元格不一致')
+                    continue
+                out.append({'file':file,'quote':actual,'ok':True,'sheet':st.sheet,'row':e['row'],'columns':columns})
+                continue
             if not quote:
                 continue
             name = next((n for n in corpus if n == file or Path(n).stem == Path(file).stem), file)

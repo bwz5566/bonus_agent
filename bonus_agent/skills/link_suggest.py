@@ -116,7 +116,7 @@ def suggest(base: SheetTable, ref: SheetTable, top: int = 5) -> str:
             continue
         top_ov = cand[0][1]
         for b, ov in cand:
-            if b == cand[0][0] or (_base_name(b) == _base_name(cand[0][0]) and ov >= top_ov - 0.05):
+            if b == cand[0][0] or (kind(b) == kind(h) and ov >= top_ov - 0.05):
                 matched.append((h, b))
     combos = []
     cache: dict[tuple, set] = {}
@@ -160,6 +160,8 @@ def suggest(base: SheetTable, ref: SheetTable, top: int = 5) -> str:
                          + (f"，挂在「{lv}」这一层" if lv else "")
                          + (f"；没对上的如 {['|'.join(m) for m in miss]}" if miss else "")
                          + (f"；主表同期有 {len(rev)} 个组合在参考表里没有，如 {['|'.join(m) for m in rev[:3]]}" if rev else ""))
+        lines.append("同名或同类列的单列取值覆盖相同，不代表完整项目键相同。先落实期间、零额与排除条款，"
+                     "再比较完整组合；同一简称对应多个客户编码不构成别名证据，禁止仅据抽样改用另一客户列或合并编码。")
         lines.append("怎么用：能按 月份+客户+型号 对上的是项目级的表，用 combine 合成和主表一样的编号再 link；"
                      "只能按客户对上的表挂到「客户」这一层（客户实体用主表的同一列客户列），按区域对上的挂到「区域」；"
                      "不要把参考表挂到另一张参考表下面。没对上的行先看写法、期间，再决定 unmatched 或提问。")

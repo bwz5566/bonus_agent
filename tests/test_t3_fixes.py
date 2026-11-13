@@ -37,9 +37,12 @@ def test_suggestion_needs_evidence_and_quotes_are_checked(tmp_path):
     w = _ws(tmp_path)
     with pytest.raises(ToolError, match="evidence"):
         w.ask_question("提成比例按多少？", ["10%", "8%"], 0)
-    out = w.ask_question("提成比例按多少？", ["10%", "8%"], 0,
-                         evidence=[{"file": "规则.txt", "quote": "提成按销售额的 10% 计提"},
-                                   {"file": "规则.txt", "quote": "提成按毛利的 8% 计提"}])
+    evidence=[{"file": "规则.txt", "quote": "提成按销售额的 10% 计提"},
+              {"file": "规则.txt", "quote": "提成按毛利的 8% 计提"}]
+    with pytest.raises(ToolError,match='引用未核对通过'):
+        w.ask_question("提成比例按多少？", ["10%", "8%"], 0,evidence=evidence)
+    assert not w.questions
+    out = w.ask_question("提成比例按多少？", ["10%", "8%"], evidence=evidence)
     assert "1 条在原文里找不到" in out
     ev = w.questions[-1].evidence
     assert [e["ok"] for e in ev] == [True, False] and ev[0]["file"] == "规则.txt"
