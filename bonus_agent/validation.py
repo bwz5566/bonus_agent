@@ -68,6 +68,11 @@ def result_integrity(result):
         deducted, offset, overpaid = Decimal(row.deducted), Decimal(row.offset), Decimal(row.overpaid)
         if final != held + cap or cap != paid + deducted or offset != deducted + overpaid:
             errors.append({"node": row.node_id, "error": "应得、暂缓、可发上限、抵扣与实发不闭合"})
+    for ledger in getattr(result,'rounding',[]):
+        if (Decimal(ledger['total']) != Decimal(ledger['allocated'])+Decimal(ledger['pending'])+Decimal(ledger['residual']) or
+                Decimal(ledger['allocated']) != Decimal(result.pool) or
+                abs(Decimal(ledger['raw_total'])-Decimal(ledger['raw_allocated'])-Decimal(ledger['raw_pending'])) > Decimal('0.000000000001')):
+            errors.append({'error':'人员舍入对账不闭合','name':ledger['name']})
     return CheckResult("engine.conservation", Status.FAIL if errors else Status.PASS,
                        "引擎金额不闭合" if errors else "分配及人员汇总闭合", len(nodes), len(nodes), errors)
 

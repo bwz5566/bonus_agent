@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+from typing import Literal
 from decimal import Decimal, InvalidOperation
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -21,12 +22,14 @@ from bonus_agent.extract_rules import Question
 
 MAX_QUOTE = 200
 OTHER = "都不对，另行说明"
-_NUM = re.compile(r"^([-+]?\d+(?:\.\d+)?)(%|‰|万元|万|亿元|亿|元)?$")
+_NUM = re.compile(r"^([-+]?\d+(?:\.\d+)?)(%|‰|万元|万|亿元|亿|元|个月|月|年|天|日|小时|人|件)?$")
 _SCALE = {"%": Decimal("0.01"), "‰": Decimal("0.001"), "万": Decimal(10000), "万元": Decimal(10000),
           "亿": Decimal(10) ** 8, "亿元": Decimal(10) ** 8, "元": Decimal(1), None: Decimal(1)}
+_SCALE.update({unit: Decimal(1) for unit in ('个月', '月', '年', '天', '日', '小时', '人', '件')})
 OVERRIDE_WORDS = ("修改为", "调整为", "改为", "变更为", "以本通知为准", "以本文件为准", "以此为准", "替代", "代替", "取代",
                   "废止", "不再执行", "停止执行", "更正为")
 _IN_TEXT = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)\s*(%|‰|万元|万|亿元|亿)?")
+_TOKEN = re.compile(r"(?<![\d.])([-+]?\d+(?:\.\d+)?)\s*(%|‰|万元|万|亿元|亿|元|个月|月|年|天|日|小时|人|件)?(?![\d.])")
 
 
 class Fact(BaseModel):
@@ -42,6 +45,8 @@ class Fact(BaseModel):
     page: int | None = Field(default=None, ge=1)
     context: str = ""        # verbatim applicability heading on the cited page
     source_hash: str = ""    # populated by the program, never trusted from the model
+    component: Literal["literal", "lower", "upper"] = "literal"
+    unit: Literal["%", "‰", "万", "万元", "亿", "亿元", "元"] | None = None
 
 
 def target_parts(path: str):
@@ -80,9 +85,13 @@ def binding_errors(facts: list[Fact], drafts: dict) -> list[str]:
     """A number at another rule position does not satisfy a declared parameter binding."""
     errors = []
     for f in facts:
-        value = number(f.value)
+        value = numeric(f)
         if value is None:
-            continue
+            if f.targets and (interval(f.value) is not None or f.unit):
+                errors.append(f"{f.name}：parameter.type，绑定到数值位置前须明确区间 lower/upper 或原文单位；原值 {f.value}")
+                continue
+            if not f.targets:
+                continue  # an unbound narrative clause is not a numeric parameter
         if not f.targets:
             errors.append(f"{f.name}：缺少精确规则位置，用 bind_facts 绑定参数")
             continue
@@ -96,14 +105,25 @@ def binding_errors(facts: list[Fact], drafts: dict) -> list[str]:
                     v = target_value(draft, path)
                 except (KeyError, IndexError, TypeError, ValueError):
                     continue
-                numeric = number(str(v))
-                if numeric is None:
+                if value is None:
+                    from bonus_core.dsl.parser import parse, walk, Str, ExprError
+                    values = [v] if isinstance(v, str) and target_parts(path)[-1] != 'expr' else []
+                    if isinstance(v, str):
+                        try:
+                            values += [n.value for n in walk(parse(v)) if isinstance(n, Str)]
+                        except ExprError:
+                            pass
+                    same = lambda s: date_key(str(s)) or norm(s)
+                    matches.append({None} if any(same(x) == same(f.value) for x in values) else set())
+                    continue
+                target_number = number(str(v))
+                if target_number is None:
                     try:
-                        numeric = Decimal(str(v))
+                        target_number = Decimal(str(v))
                     except InvalidOperation:
                         pass
-                if numeric is not None:
-                    matches.append({numeric})
+                if target_number is not None:
+                    matches.append({target_number})
                 elif isinstance(v, str):
                     from bonus_core.dsl.parser import parse, walk, Num, ExprError
                     try:
@@ -135,6 +155,56 @@ def number(value: str) -> Decimal | None:
         return None
 
 
+_RANGE = re.compile(r"(?<![\d.])([-+]?\d+(?:\.\d+)?)\s*(亿元|万元|亿|万|元|%|‰)?\s*(?:-|~|～|—|–|至|到)\s*([-+]?\d+(?:\.\d+)?)\s*(亿元|万元|亿|万|元|%|‰)?(?![\d.])")
+
+
+def interval(text: str):
+    """A shared unit belongs to both ends; keep the original text as evidence."""
+    m = _RANGE.fullmatch(unicodedata.normalize("NFKC", text).strip().replace(",", ""))
+    if not m:
+        return None
+    a, ua, b, ub = m.groups()
+    lo, hi = Decimal(a) * _SCALE[ua or ub], Decimal(b) * _SCALE[ub or ua]
+    return (lo, hi) if lo <= hi else None
+
+
+def numeric(f: Fact) -> Decimal | None:
+    """Typed conversion, never infer a percentage merely from a similar number."""
+    if f.component != "literal":
+        bounds = interval(f.value)
+        if bounds is None:
+            return None
+        value = bounds[0 if f.component == "lower" else 1]
+    else:
+        value = number(f.value)
+    if value is None:
+        return None
+    if f.unit:
+        # An explicit suffix already carries its unit; applying it twice is forbidden.
+        m = _NUM.fullmatch(unicodedata.normalize("NFKC", f.value).replace(",", "").replace(" ", ""))
+        if m and m.group(2):
+            if m.group(2) != f.unit:
+                return None
+        elif f.component != "literal":
+            return None  # range must carry its own unit
+        else:
+            value *= _SCALE[f.unit]
+    return value
+
+
+def binding_candidate(f: Fact, targets: list[str], component=None, unit=None) -> Fact:
+    """Only a tier lower-bound slot has an unambiguous automatic range projection."""
+    changes = {"targets": targets}
+    if component is not None:
+        changes["component"] = component
+    elif interval(f.value) is not None and f.component == "literal":
+        if all(re.fullmatch(r"tables[./].*[./]steps[./]\d+[./]0", split_target(t)[1].lstrip('/')) for t in targets):
+            changes["component"] = "lower"
+    if unit is not None:
+        changes["unit"] = unit
+    return Fact.model_validate({**f.model_dump(), **changes})
+
+
 _DATE = re.compile(r"^(?:(\d{4})\s*(?:年|-|/|\.)\s*)?(\d{1,2})\s*(?:月|-|/|\.)\s*(\d{1,2})\s*日?(?:\s+0{1,2}:0{2}(?::0{2})?)?$")
 
 
@@ -151,7 +221,7 @@ def date_key(value: str) -> str | None:
 
 def same_value(f: Fact) -> str:
     """用来判断两条记录是否一致的取值。"""
-    n = number(f.value)
+    n = numeric(f)
     if n is not None:
         return format(n.normalize(), "f")
     return date_key(f.value) or norm(f.meaning or f.value)
@@ -175,11 +245,31 @@ def check_fact(f: Fact, corpus: dict[str, str]) -> str | None:
     parts = [norm(x) for x in str(f.quote).splitlines() if norm(x)]
     if q not in corpus[f.file] and not (len(parts) > 1 and all(p in corpus[f.file] for p in parts)):   # 多行引用逐行核对
         return f"quote 在「{f.file}」里找不到，要逐字复制原文（图片要先 view_image 转写）"
-    if norm(f.value) not in q:
-        if len(re.findall(r"\d+(?:\.\d+)?", f.value)) > 1 and re.search(r"[,，;；:：、]|\s", f.value.strip()):
-            return (f"value「{f.value}」把好几个值写在了一条里。一条只登记一个值：阶梯、系数表每一档分开登记，"
-                    f"名字带上档位（如「{f.name}-第1档」value 8%，quote 写那一档所在的行）")
-        return f"value「{f.value}」不在 quote 里，value 写原文的写法（如 5%、30万元），换算交给程序"
+    raw = unicodedata.normalize('NFKC', f.value).replace(',', '').replace(' ', '')
+    scalar = _NUM.fullmatch(raw)
+    if f.unit and (not scalar or not scalar.group(2)):
+        without_values = re.sub(r'[-+]?\d+(?:\.\d+)?\s*(亿元|万元|亿|万|元|%|‰)', '',
+                                unicodedata.normalize('NFKC', f.quote))
+        if f.unit not in without_values:
+            return "parameter.unit：quote 必须同时包含数值及明确的单位表头，其他数字的单位不能代替"
+    if f.unit and numeric(f) is None:
+        return "parameter.unit：原值与所声明单位冲突，或不是可转换的单个数值"
+    if f.component != "literal" and interval(f.value) is None:
+        return "parameter.range：lower/upper 只能用于明确的数值区间"
+    present = norm(f.value) in q
+    if scalar:
+        # A substring such as 1 in 1.05 is not an original scalar parameter.
+        present = any(Decimal(m.group(1)) == Decimal(scalar.group(1)) and m.group(2) == scalar.group(2)
+                      for m in _TOKEN.finditer(unicodedata.normalize('NFKC', f.quote).replace(',', '')))
+    if not present:
+        # A scalar endpoint with the shared unit is a faithful projection of this quote.
+        wanted = number(f.value)
+        bounds = [interval(m.group()) for m in _RANGE.finditer(unicodedata.normalize("NFKC", f.quote).replace(",", ""))]
+        if wanted is None or not any(b and wanted in b for b in bounds):
+            if len(re.findall(r"\d+(?:\.\d+)?", f.value)) > 1 and re.search(r"[,，;；:：、]|\s", f.value.strip()):
+                return (f"value「{f.value}」把好几个值写在了一条里。一条只登记一个值：阶梯、系数表每一档分开登记，"
+                        f"名字带上档位（如「{f.name}-第1档」value 8%，quote 写那一档所在的行）")
+            return f"value「{f.value}」不在 quote 里，value 写原文的写法（如 5%、30万元），换算交给程序"
     if f.override and not any(w in q for w in OVERRIDE_WORDS):
         return f"quote 里没有写明修改旧规定（如 {'、'.join(OVERRIDE_WORDS[:5])}），不能标为 override"
     return None
@@ -224,7 +314,7 @@ def detect(facts: list[Fact], conflicts: dict[str, Conflict], questions: list[Qu
             full = [x for x in by if x.startswith("date:") and not x.startswith("date:*") and x.endswith(k[-5:])]
             if len(full) == 1:
                 by[full[0]] += by.pop(k)
-        if len(by) < 2 or len({number(g[0].value) is None for g in by.values()}) > 1:
+        if len(by) < 2 or len({numeric(g[0]) is None for g in by.values()}) > 1:
             continue      # 一处是数、一处是文字（如 0.1 和 “MIN(工龄,5)÷5”）：是两个参数用了同一个名字，不算冲突（record_facts 会提示改名）
         files = {f.file for f in fs}
         sets = {fl: frozenset(same_value(f) for f in fs if f.file == fl) for fl in files}
@@ -264,7 +354,7 @@ def multi_valued(facts: list[Fact]) -> list[str]:
         groups.setdefault(f.name.strip(), []).append(f)
     out = []
     for n, fs in groups.items():
-        if len({same_value(f) for f in fs}) < 2 or len({number(f.value) is None for f in fs}) > 1:
+        if len({same_value(f) for f in fs}) < 2 or len({numeric(f) is None for f in fs}) > 1:
             continue
         sets = {fl: frozenset(same_value(f) for f in fs if f.file == fl) for fl in {f.file for f in fs}}
         if len(sets) == 1 or _nested(sets):
@@ -276,7 +366,7 @@ def mixed_names(facts: list[Fact]) -> list[str]:
     """同一个参数名下既有数又有文字的：多半是把两个参数（如权重和归一化公式）登记成了一个名字。"""
     groups: dict[str, set[bool]] = {}
     for f in facts:
-        groups.setdefault(f.name.strip(), set()).add(number(f.value) is None)
+        groups.setdefault(f.name.strip(), set()).add(numeric(f) is None)
     return [n for n, kinds in groups.items() if len(kinds) > 1]
 
 
@@ -342,7 +432,7 @@ def unused(facts: list[Fact], drafts: dict, conflicts: dict[str, Conflict], ques
     nums = draft_numbers(drafts)
     out = []
     for name in dict.fromkeys(f.name.strip() for f in facts):
-        fs = [f for f in facts if f.name.strip() == name and number(f.value) is not None]
+        fs = [f for f in facts if f.name.strip() == name and numeric(f) is not None]
         if not fs:
             continue
         has, pick = chosen(name, conflicts, questions, fs)
@@ -351,8 +441,9 @@ def unused(facts: list[Fact], drafts: dict, conflicts: dict[str, Conflict], ques
                 continue
             out.append(f"{name}（财务选定 {pick}）")
             continue
-        n = number(fs[0].value)
-        raw = _NUM.match(unicodedata.normalize("NFKC", fs[0].value).replace(",", "").replace(" ", "")).group(1)
+        n = numeric(fs[0])
+        match = _NUM.match(unicodedata.normalize("NFKC", fs[0].value).replace(",", "").replace(" ", ""))
+        raw = match.group(1) if match and fs[0].component == "literal" and not fs[0].unit else str(n)
         keys = {format(n.normalize(), "f"), format(Decimal(raw).normalize(), "f")}
         if not keys & nums and not any((f.file, k) in read for f in fs for k in keys):
             out.append(f"{name}（{fs[0].value}）")

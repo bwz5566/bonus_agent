@@ -10,7 +10,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -75,10 +75,16 @@ def _figures(res: Result) -> dict[str, dict[str, Decimal]]:
     # 分配人员金额（report.people 按人名合计）：期望结果按人列金额时，按人名核对
     for p in getattr(res, "people", None) or []:
         out["应得"].setdefault(str(p["name"]), Decimal(p["final"]))
+    for group in getattr(res,'details',{}).values():
+        for row in group.values():
+            key,amount=str(row['key']),Decimal(row['amount'])
+            if key in out['应得'] and out['应得'][key] != amount:
+                raise ValueError(f'对象金额报告与分配金额使用相同编号但口径不同：{key}，请明确区分编号')
+            out['应得'][key]=amount
     if getattr(res, "totals", None):        # 汇总核算：期望结果里有同名的汇总行时核对
         out["汇总核算"] = {str(n): Decimal(v) for n, v in res.totals}
     if not res.payouts:
-        return out
+        return _id_variants(out)
     for r in res.rollups.values():          # 按关联实体汇总后再抵扣：发放类指标以实体为准
         out["应得"].setdefault(r.key, Decimal(r.final))
     for m, attr in (("本次可发", "paid"), ("暂缓", "held"), ("已发抵扣", "offset"), ("实际抵扣", "deducted"),
@@ -100,7 +106,20 @@ def _figures(res: Result) -> dict[str, dict[str, Decimal]]:
                     acc[n.key] = acc.get(n.key, Decimal(0)) + v
                 n = res.nodes.get(n.parent) if n.parent else None
         out[m] = acc
-    return out
+    return _id_variants(out)
+
+
+def _id_variants(figures):
+    """Composite IDs may differ only by the program's explicit separator; never choose by money."""
+    for values in figures.values():
+        aliases={}
+        for key in list(values):
+            if '|' in key:
+                aliases.setdefault(key.replace('|',''),[]).append(key)
+        for alias,keys in aliases.items():
+            if len(keys)==1 and alias not in values:
+                values[alias]=values[keys[0]]
+    return figures
 
 
 def compare_expected(results: dict[str, dict[str, Result]], path: str | Path, column: str | None = None,
@@ -147,6 +166,7 @@ def _compare(results, path, column, where) -> list[Match]:
             if col in st.headers:
                 i = st.headers.index(col)
                 st.rows = [(n, vals) for n, vals in st.rows if cell_text(vals[i]) == str(val)]
+                st.totals = [(n, vals) for n, vals in st.totals if cell_text(vals[i]) == str(val)]
     out = []
     for scheme, revs in results.items():
         for rev, res in revs.items():
@@ -154,6 +174,9 @@ def _compare(results, path, column, where) -> list[Match]:
                 total = Match(scheme, rev, metric)
                 seen: set[str] = set()
                 for st in tables:
+                    # 普通对象表排除合计；显式汇总指标必须核对合计行本身。
+                    if metric == '汇总核算':
+                        st = replace(st, rows=sorted(st.rows + st.totals, key=lambda row: row[0]))
                     m = _best_in(st, scheme, rev, metric, ours, list(results), list(revs),
                                  column if metric == "应得" else None)
                     if m.ambiguous:
@@ -212,8 +235,17 @@ def _best_in(st, scheme, rev, metric, ours, schemes, revs, column=None) -> _Shee
         hit = [t for t, k in zip(texts[i], keep) if k and t in ours]
         return len(hit) if hit and len(set(hit)) == len(hit) else 0
     id_col = max(range(len(cols)), key=id_score, default=None)
+    unmatched = False
     if id_col is None or not id_score(id_col):
-        return _SheetMatch()
+        strong = metric == '应得' and any(
+            any(w in str(h).lower() for w in PRIORITY[0]) and
+            any(w in str(h).lower() for w in METRICS['应得']) and
+            not any(w in str(h).lower() for w in EXCLUDE)
+            for h in st.headers)
+        ids=[j for j,h in enumerate(st.headers) if any(w in str(h).lower() for w in ('编号','姓名','对象','_id','name'))]
+        if not strong or len(ids)!=1:
+            return _SheetMatch()
+        id_col,unmatched=ids[0],True
     heads = [str(h or "").lower() for h in st.headers]
     others = [kw for m, kws in METRICS.items() if m != metric for kw in kws if m != "应得"]
 
@@ -222,6 +254,8 @@ def _best_in(st, scheme, rev, metric, ours, schemes, revs, column=None) -> _Shee
 
     def named(j):
         h = heads[j]
+        if metric=='汇总核算' and h.strip() in ('金额','值'):
+            return True
         return any(kw in h for kw in METRICS[metric]) and not any(x in h for x in EXCLUDE) and \
             (not any(kw in h for kw in others) if metric == "应得" else best(h) == metric)
 
@@ -238,7 +272,8 @@ def _best_in(st, scheme, rev, metric, ours, schemes, revs, column=None) -> _Shee
                 cand = top
                 break
     rows = [r for r in range(len(st.rows)) if keep[r] and texts[id_col][r] in ours]
-    cand = [j for j in cand if any(_num(cols[j][r]) is not None for r in rows)]
+    inspect_rows = [r for r in range(len(st.rows)) if keep[r]] if unmatched else rows
+    cand = [j for j in cand if any(_num(cols[j][r]) is not None for r in inspect_rows)]
     if len(cand) > 1:
         return _SheetMatch(ambiguous=[str(st.headers[j]) for j in cand])
     if not cand:

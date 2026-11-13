@@ -173,7 +173,7 @@ def test_link_matches_when_only_separators_differ(tmp_path):
     w.set_rules(variables={"pay": {"scope": "项目", "expr": 'amt * sum(c, of: "系数")'}},
                 pool={"scope": "项目", "expr": "pay"}, allocation=[{"level": "项目", "key": "pid"}])
     out = w.trial_run()
-    assert "试算成功" in out, out
+    assert "金额试算执行完成" in out, out
     assert w.result.pool == "250.00"
 
 
@@ -202,7 +202,7 @@ def test_if_empty_skip_and_key_autofill(tmp_path):
     w.set_rules(variables={"coef": {"scope": "项目", "expr": 'if(count(of: "毛利") > 0, sum(m, of: "毛利"), 1)'},
                            "pay": {"scope": "项目", "expr": "amt * coef"}},
                 pool={"scope": "项目", "expr": "pay"}, allocation=[{"level": "项目", "key": "pid"}])
-    assert "试算成功" in w.trial_run()
+    assert "金额试算执行完成" in w.trial_run()
     assert w.result.pool == "250.00"          # C1：100×0.5；C2 毛利率空着按查不到，系数 1
 
 

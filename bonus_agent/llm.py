@@ -229,12 +229,17 @@ class LLM:
     think_llm: "LLM | None" = None    # 深度思考的那一步改用的另一个（更强的）模型；平时仍用自己，省钱
     last_reasoning: str = ""          # 最近一次思考调用的思考内容
     usage: Usage = field(default_factory=Usage)
+    checker_required: bool = False  # do not silently replace an explicitly required independent reviewer
 
     @classmethod
-    def from_config(cls, name: str | None = None, config: dict | None = None, checker: str | None = None) -> "LLM":
+    def from_config(cls, name: str | None = None, config: dict | None = None, checker: str | None = None,
+                    *, _auxiliary: bool = False, _path: tuple = ()) -> "LLM":
         """checker：交叉验证用的模型名（不写就看 models.yaml 里这个模型的 checker 项，都没有就自己验证）。"""
         cfg = config or load_config()
         name = name or cfg["default"]
+        if name in _path:
+            raise LLMError(f"模型路由循环：{' -> '.join((*_path, name))}")
+        route_path = (*_path, name)
         if name not in cfg["models"]:
             raise LLMError(f"未配置的模型 {name}，可选：{', '.join(cfg['models'])}")
         m = cfg["models"][name]
@@ -252,26 +257,28 @@ class LLM:
         llm.think_max_tokens = int(m.get("think_max_tokens", llm.think_max_tokens))
         llm.think_timeout = float(m.get("think_timeout", max(llm.think_timeout, llm.timeout)))
         llm.think_echo = bool(m.get("think_echo", "thinking" in (llm.think_body or {})))
-        tm = m.get("think_model")       # 深度思考那一步换成这个模型（如平时 flash、卡住时 pro）
+        tm = m.get("think_model") if not _auxiliary else None
         if tm and tm != name:
             if tm not in cfg["models"]:
                 raise LLMError(f"深度思考模型 {tm} 没有配置，可选：{', '.join(cfg['models'])}")
-            llm.think_llm = cls.from_config(tm, cfg)
+            llm.think_llm = cls.from_config(tm, cfg, _auxiliary=True, _path=route_path)
             llm.think_llm.usage = llm.usage            # 用量记在同一处
             llm.think_echo = llm.think_echo or llm.think_llm.think_echo
         v = m.get("vision", True)       # true：自己看图；false：不能看图；模型名：用那个模型转写图片
         if isinstance(v, str):
             if v == name or cfg["models"].get(v, {}).get("vision", True) is not True:
                 raise LLMError(f"模型 {name} 的 vision 应是另一个能看图的模型名，得到 {v}")
-            llm.vision, llm.vision_llm = False, cls.from_config(v, cfg)
+            # A text-only checker can delegate image transcription back to the primary model.
+            llm.vision, llm.vision_llm = False, cls.from_config(v, cfg, _auxiliary=True)
             llm.vision_llm.usage = llm.usage          # 看图的用量记在同一处
         else:
             llm.vision = bool(v)
-        c = checker or m.get("checker")
+        c = (checker or m.get("checker")) if not _auxiliary else None
+        llm.checker_required = bool(m.get("checker_required", False))
         if c and c != name:
             if c not in cfg["models"]:
                 raise LLMError(f"交叉验证模型 {c} 没有配置，可选：{', '.join(cfg['models'])}")
-            llm.checker_llm = cls.from_config(c, cfg)
+            llm.checker_llm = cls.from_config(c, cfg, _auxiliary=True, _path=route_path)
             llm.checker_llm.usage = llm.usage          # 用量记在同一处
         return llm
 

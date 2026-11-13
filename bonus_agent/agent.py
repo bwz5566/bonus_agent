@@ -74,7 +74,7 @@ KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保�
 BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
 READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate", "suggest_links", "validation_report"}
 NO_IGNORE = ("查找表 ", "抵扣 ")    # 程序检查里不能写进 ignored 放过的项
-MUST_FIX = ("抵扣 ",)              # 连提问也不能放过、只能改规则的项
+MUST_FIX = ("抵扣 ", "计算契约 ")              # 连提问也不能放过、只能改规则的项
 _CURRENCY_HEAD = re.compile(r"币种|币别|币制|结算币|外币|汇率|(?<![A-Za-z])(?:currency|exchange\s*rate|fx)(?![A-Za-z])", re.I)
 REREAD_TIMES = 3                   # 一轮里同一份文档累计读到全文的这么多倍后，只给小段
 REREAD_MIN = 60000                 # 短文档反复读不费多少，读够这么多字才限制
@@ -90,7 +90,7 @@ def _GATE_ORDER(key: str) -> int:
     return {"抵扣": 0, "查找表": 0, "取值": 1, "未用": 1, "同字段比较": 1, "分档": 2, "参数表": 2, "名称百分比": 2,
             "阶梯方式": 2, "币种": 2, "全零": 1, "金额": 3, "状态": 3}.get(head, 4 if head in ("常数", "百分号") else 3)
 VERIFY_TOL = Decimal("0.005")   # 按份额分配时，独立算式和引擎未舍入的份额之差不超过半分，才算尾差
-WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", "bind_facts", "compile_table", "preview_repair", "verify_repair", "apply_repair", "remove_facts", "ask_question",
+WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", "bind_facts", "compile_table", "validate_parameters", "review_calculation", "preview_repair", "verify_repair", "apply_repair", "remove_facts", "ask_question",
                "record_clauses", "cover_clauses",
                "answer_question"}
 RULE_SUFFIXES = {".docx", ".pptx", ".pdf", ".png", ".jpg", ".jpeg", ".txt", ".md"}   # 规则文档：要登记参数
@@ -157,15 +157,24 @@ TOOLS: list[dict] = [
          "name": {**_S, "description": "参数名，写清适用范围，如 季度奖-部门净利润提成比例"},
          "value": {**_S, "description": "原文写法，一条只写一个值（阶梯、系数表每一档分开登记）"},
          "file": {**_S, "description": "出处文件名；财务在对话里发的内容写「财务对话」"}, "quote": _S,
+         "page": {**_I, "description": "多页文档的原文页码；参数表尚未创建时也可先登记页码"},
+         "context": {**_S, "description": "原文适用标题，须出现在引用所在页；用于区分重复参数表"},
          "meaning": {**_S, "description": "可选：文字口径的规范说法，如 含税"},
+         "component": {"type": "string", "enum": ["literal", "lower", "upper"], "description": "区间值选择下界或上界，保留原文如1000-3000万"},
+         "unit": {**_S, "description": "裸数的明确单位，如%，quote须同时包含单位表头；不得凭参数名猜测"},
          "override": {"type": "boolean", "description": "原文明确写了修改旧规定（修改为 / 以本通知为准）时为 true，"
                                                          "quote 要包含这句话"}}, ["name", "value", "file", "quote"])}},
          ["facts"])},
     {"name": "bind_facts", "description": "把已登记的参数绑定到精确规则位置；多页文档须给page和原文适用标题context。不能以另一处相同数字代替。",
      "parameters": _obj({"bindings": {"type": "array", "items": _obj({"name": _S,
          "targets": {"type": "array", "items": _S, "description": "如 tables.eu.steps.0.1 或 variables.bonus.expr"},
-         "page": _I, "context": _S}, ["name", "targets"])}}, ["bindings"])},
+         "page": _I, "context": _S, "component": {"type": "string", "enum": ["literal", "lower", "upper"]},
+         "unit": _S}, ["name", "targets"])}}, ["bindings"])},
+    {"name": "validate_parameters", "description": "局部参数预检：自动修正已声明阶梯下界绑定的共享单位区间投影，返回剩余缺口与具体动作；不重跑金额、不改规则数值。",
+     "parameters": _obj({"repair": {"type": "boolean"}})},
     {"name": "validation_report", "description": "查看可复核的验证状态、覆盖缺口和失败反例；不调用模型、不更改规则。", "parameters": _obj({})},
+    {"name": "review_calculation", "description": "关键复核：独立模型只看材料和数据结构重新解释规则并全量复算，返回差异；不修改规则。首次金额试算后尽早执行，不必等证据全部齐全。",
+     "parameters": _obj({})},
     {"name": "compile_table", "description": "从登记参数直接编译阶梯/查找表。value、lower引用参数名；首档lower可省略表示0。程序换算百分号和单位并绑定来源，不要重新抄比例。",
      "parameters": _obj({"name": _S, "scheme": _S, "kind": {"type": "string", "enum": ["tier", "lookup"]},
         "mode": {"type": "string", "enum": ["whole", "excess"]}, "applies_when": _S,
@@ -731,6 +740,10 @@ class Workspace:
     pinned: set[str] = field(default_factory=set)           # 全文已附在材料包里的文件 / 工作表
     _verify_note: str = ""
     _probe_cache: dict = field(default_factory=dict)
+    _full_gap_cache: tuple | None = None
+    _full_coverage: dict = field(default_factory=dict)
+    _trial_details: dict = field(default_factory=dict)
+    _trial_versions: dict = field(default_factory=dict)
     _prev_fields: dict = field(default_factory=dict)        # 每张表上一次定义成功的 fields：只改 key / link / filter 重新定义时沿用
     _gap_cache: tuple | None = None
     reread: dict = field(default_factory=dict)              # 独立复读的结果（见 reread.py），材料没变时复用
@@ -1240,14 +1253,17 @@ class Workspace:
             if f is None:
                 lines.append(f"第 {i} 条应为对象")
                 continue
+            previous = [g for g in self.facts if (g.name,g.file,fx.norm(g.quote),fx.norm(g.value)) ==
+                        (f.name,f.file,fx.norm(f.quote),fx.norm(f.value))]
+            for attr in ('component','unit','meaning','override'):
+                values = {getattr(g,attr) for g in previous}
+                if attr not in a and len(values) == 1:
+                    setattr(f,attr,next(iter(values)))
             bad = fx.check_fact(f, corpus)
             if bad:
                 near = fx.nearest(f, self._lines(f.file)) if f.file in corpus and "找不到" in bad else ""
                 lines.append(f"第 {i} 条「{f.name}」未登记：{bad}" + (f"。原文里最接近的一句：{near}（照这句改 quote，不必重读文件）"
                                                                       if near else ""))
-                continue
-            if any((g.name, g.file, fx.norm(g.quote)) == (f.name, f.file, fx.norm(f.quote)) for g in self.facts):
-                dup += 1
                 continue
             wrong = self._wrong_page(f)
             if wrong:
@@ -1261,8 +1277,30 @@ class Workspace:
                 continue
             if f.page is None:
                 hits = self._quote_pages(f.quote, self._page_texts(f.file))
+                if f.context:
+                    hits = [p for p in hits if fx.norm(f.context) in fx.norm(self._page_texts(f.file)[p])]
                 if len(hits) == 1:
                     f.page = hits[0]
+            if f.context:
+                body = self._page_texts(f.file).get(f.page, corpus.get(f.file,''))
+                if fx.norm(f.context) not in fx.norm(body):
+                    lines.append(f'第 {i} 条未登记：context 不在指定原文页；核对适用标题与页码')
+                    continue
+            same = [g for g in self.facts if (g.name,g.file,fx.norm(g.quote)) == (f.name,f.file,fx.norm(f.quote))]
+            if same and all((fx.same_value(g),g.override,fx.norm(g.meaning),g.source_hash) ==
+                            (fx.same_value(f),f.override,fx.norm(f.meaning),f.source_hash)
+                            and not fx.check_fact(g,corpus)
+                            and all(attr not in a or getattr(g,attr)==getattr(f,attr) for attr in ('component','unit','page','context'))
+                            for g in same):
+                dup += 1
+                continue
+            if same and any(g.source_hash == f.source_hash and fx.same_value(g) != fx.same_value(f)
+                            and fx.norm(g.value) != fx.norm(f.value) for g in same):
+                lines.append(f'第 {i} 条未登记：同名参数在同一引用里有多个不同值；逐项改名登记，更正旧登记先 remove_facts。')
+                continue
+            if same:
+                # Re-reading changed evidence/types replaces the old proof, never silently retains its bindings.
+                self.facts = [g for g in self.facts if g not in same]
             self.facts.append(f)
             added += 1
         if not added:       # 一条也没登记上：作为失败返回，避免模型以为成功、反复提交同样的内容
@@ -1283,12 +1321,28 @@ class Workspace:
 
     def bind_facts(self, bindings: list[dict]) -> str:
         """Bind a material parameter to exact DSL positions without changing its value."""
+        self._check_source_version()
         updates = []
+        scopes = {s: self._merged(s) for s in self.schemes}
+        if SHARED in self.drafts:
+            scopes[SHARED] = self.drafts[SHARED]
         for spec in bindings:
             found = [f for f in self.facts if f.name == spec.get("name")]
             if not found or not spec.get("targets"):
                 raise ToolError("bind_facts 需要已登记的 name 和非空 targets，如 tables.rate.steps.0.1")
+            has, chosen = fx.chosen(spec['name'], self.conflicts, self.questions, self.facts)
+            if has:
+                if chosen is None:
+                    raise ToolError("parameter.conflict：先解决该参数的原文冲突；不能通过绑定选择取值")
+                found = [f for f in found if fx.same_value(f) == chosen]
+                if not found:
+                    raise ToolError("parameter.conflict：已确认取值没有当前原文支持，需要重新核对台账")
             for f in found:
+                import hashlib
+                current_hash = (hashlib.sha256(self._file(f.file).read_bytes()).hexdigest() if f.file != CHAT_SOURCE else
+                                hashlib.sha256(self._chat_text().encode()).hexdigest())
+                if not f.source_hash or f.source_hash != current_hash:
+                    raise ToolError(f'parameter.source_version：{f.name} 的原文版本已变化；先 record_facts 重新核对登记，旧绑定未生效')
                 page = spec.get("page", f.page)
                 pages = self._page_texts(f.file)
                 hits = self._quote_pages(f.quote, pages)
@@ -1298,9 +1352,21 @@ class Workspace:
                 body = pages.get(page, self._corpus().get(f.file, ""))
                 if context and fx.norm(context) not in fx.norm(body):
                     raise ToolError(f"{f.name} 的适用条件 context 不在指定原文位置")
-                updates.append((f, list(spec["targets"]), page, context))
-        for f, targets, page, context in updates:
+                candidate = fx.binding_candidate(f, list(spec["targets"]), spec.get("component"), spec.get("unit"))
+                candidate.page, candidate.context = page, context
+                error = fx.check_fact(candidate, self._corpus())
+                errors = fx.binding_errors([candidate], scopes)
+                if error or errors:
+                    raise ToolError("parameter.binding：本批绑定未生效。" + str(error or '；'.join(errors))
+                                    + "。先修正类型、单位或绑定位置的取值；区间下界用 component: lower；不要重复试算。")
+                updates.append((f, candidate))
+        changed = 0
+        for f, candidate in updates:
+            targets, page, context = candidate.targets, candidate.page, candidate.context
+            if f.model_dump() != candidate.model_dump():
+                changed += 1
             f.targets, f.page, f.context = targets, page, context
+            f.component, f.unit = candidate.component, candidate.unit
             # Compile evidence into the target table; the model never has to copy its rate again.
             for target in targets:
                 qualifier, path = fx.split_target(target)
@@ -1316,8 +1382,26 @@ class Workspace:
                         source = {"doc": f.file, "page": page, "quote": f.quote}
                         if source not in table.setdefault("sources", []):
                             table["sources"].append(source)
-        self.untested |= set(self.schemes)
-        return f"已绑定 {len(updates)} 条参数；finish 前逐项核对目标位置的值和来源版本"
+                            changed += 1
+        # Evidence metadata cannot change computed money. Do not invalidate an existing trial.
+        return (f"已校验绑定 {len(updates)} 条参数，类型、数值、目标均一致；更新 {changed} 处。"
+                if changed else "no-op：绑定已一致，没有状态变化；无需重新试算。")
+
+    def validate_parameters(self, repair: bool = True) -> dict:
+        """Deterministic local recovery only for targets already explicitly declared."""
+        self._check_source_version()
+        repaired, errors = [], []
+        if repair:
+            for f in self.facts:
+                if f.targets and fx.numeric(f) is None and fx.interval(f.value) is not None:
+                    try:
+                        self.bind_facts([{"name": f.name, "targets": f.targets, "page": f.page, "context": f.context}])
+                        repaired.append(f.name)
+                    except ToolError as e:
+                        errors.append(str(e))
+        gaps = self._binding_gaps()
+        return {"status": "FAIL" if gaps or errors else "PASS", "repaired": repaired, "gaps": gaps,
+                "errors": errors, "next": "修正所列参数类型、单位或目标；证据问题不需要重跑金额" if gaps or errors else "参数检查通过；继续其他未完成检查"}
 
     def compile_table(self, name: str, rows: list[dict], scheme: str | None = None,
                       kind: str = "tier", mode: str = "whole", applies_when: str = "",
@@ -1329,19 +1413,21 @@ class Workspace:
         bindings, sources = [], []
 
         def take(ref, path):
-            fs = [f for f in self.facts if f.name == ref]
+            originals = [f for f in self.facts if f.name == ref]
+            fs = [fx.binding_candidate(f, [path]) for f in originals]
             has, pick = fx.chosen(ref, self.conflicts, self.questions, self.facts)
-            fs = [f for f in fs if fx.number(f.value) is not None and (not has or format(fx.number(f.value).normalize(), 'f') == pick)]
-            if not fs or len({fx.number(f.value) for f in fs}) != 1:
+            fs = [f for f in fs if fx.numeric(f) is not None and (not has or format(fx.numeric(f).normalize(), 'f') == pick)]
+            if not fs or len({fx.numeric(f) for f in fs}) != 1:
                 raise ToolError(f"参数「{ref}」不存在、非数值或冲突尚未确认")
             f = fs[-1]
             if self._page_texts(f.file) and f.page is None:
-                raise ToolError(f"参数「{ref}」需先 bind_facts 确认原文页码")
-            bindings.append((f, self._scheme(scheme, for_write=True) + '::' + path))
+                raise ToolError(f"参数「{ref}」需先用 record_facts 补齐原文 page/context，再 compile_table；表未创建时不使用 bind_facts")
+            bindings.append((next(o for o in originals if o.file == f.file and o.quote == f.quote), f,
+                             self._scheme(scheme, for_write=True) + '::' + path))
             source = {"doc": f.file, "page": f.page, "quote": f.quote}
             if source not in sources:
                 sources.append(source)
-            return str(fx.number(f.value))
+            return str(fx.numeric(f))
 
         table = {"kind": kind, "applies_when": applies_when}
         prefix = '/tables/' + escape(name)
@@ -1361,7 +1447,8 @@ class Workspace:
                 table["mapping"][key] = take(row["value"], prefix+'/mapping/'+escape(key))
         table["sources"] = sources
         out = self.set_rules(scheme=scheme, tables={name: table})
-        for f, path in bindings:
+        for f, candidate, path in bindings:
+            f.component, f.unit = candidate.component, candidate.unit
             if path not in f.targets:
                 f.targets.append(path)
         return out + "\n参数表由原文参数直接编译，已自动建立单元格绑定。"
@@ -1371,7 +1458,7 @@ class Workspace:
         gaps = []
         hashes = {}
         ignored = {i.get("ref") for i in self.ignored if i.get("rules") == self._rules_print()}
-        used = [f for f in self.facts if fx.number(f.value) is not None and f.targets]
+        used = [f for f in self.facts if f.targets]
         for f in used:
             if f.file not in hashes:
                 hashes[f.file] = hashlib.sha256(self._file(f.file).read_bytes()).hexdigest() if f.file != CHAT_SOURCE else hashlib.sha256(self._chat_text().encode()).hexdigest()
@@ -1382,8 +1469,13 @@ class Workspace:
         read = set().union(*(self.read_nums.get(s, set()) for s in self.schemes))
         active = []
         for f in self.facts:
-            v = fx.number(f.value)
+            v = fx.numeric(f)
             if v is None or (f.file, format(v.normalize(), 'f')) in read:
+                if v is None and f.targets:
+                    if fx.interval(f.value) is not None or f.unit:
+                        gaps.append(f"{f.name}：parameter.type，原值 {f.value} 不能作为绑定数值；用 validate_parameters 局部修复或明确 component/unit")
+                    else:
+                        active.append(f)
                 continue
             if not f.targets and f.name in ignored:
                 continue
@@ -1397,6 +1489,14 @@ class Workspace:
         gaps += fx.binding_errors(active, scopes)
         for scheme in self.schemes:
             draft = self._merged(scheme)
+            for name, variable in self._ruleset(scheme).variables.items():
+                if variable.ratio_default:
+                    if not variable.sources:
+                        gaps.append(f"variables.{name} 的 ratio_default 缺少明确原文依据")
+                    for source in variable.sources:
+                        bad = cl.check_quote(source.doc, source.quote, self._corpus())
+                        if bad:
+                            gaps.append(f"variables.{name} 默认行为依据：{bad}")
             for path, value in fx.table_cells(draft.get("tables") or {}):
                 bound = []
                 for f in active:
@@ -1409,13 +1509,16 @@ class Workspace:
                                 bound.append(f)
                         except (KeyError, IndexError, TypeError, ValueError):
                             pass
-                if not any(fx.number(f.value) == value for f in bound):
+                if not any(fx.numeric(f) == value for f in bound):
                     gaps.append(f"方案「{scheme}」{path}={value} 缺少精确参数绑定")
             report = self._ruleset(scheme).report
             if report:
                 if self.report_required and len(report.totals) > 1 and not report.balances:
                     gaps.append(f"方案「{scheme}」有多项汇总但未声明 report.balances 对账关系")
-                for item in [*report.balances, *report.pending]:
+                if (self.report_required and report.people and report.totals and
+                        self._ruleset(scheme).pool.scope != "global" and not report.distributions):
+                    gaps.append(f"方案「{scheme}」缺少 report.distributions：在奖金池层用原文应分配总额，对账分配池与已列示 pending；不能只对账总额=正常+暂扣")
+                for item in [*report.balances, *report.pending, *report.distributions, *report.details]:
                     if not item.sources:
                         gaps.append(f"{item.name} 缺少原文依据")
                     for source in item.sources:
@@ -1525,6 +1628,7 @@ class Workspace:
                        unmatched: str = "block", period: str | None = None, window: str = "period",
                        combine: dict | None = None, unmatched_basis: dict | None = None,
                        population_from: str | None = None) -> str:
+        before, untested = self._rules_print(), set(self.untested)
         reuse = ""
         if not fields:      # 重新定义时只改 key / link / filter：沿用上一次的字段（模型常只写要改的部分，反复因缺 fields 失败）
             fields = self._prev_fields.get(name)
@@ -1535,6 +1639,9 @@ class Workspace:
                                    period, window, combine, unmatched_basis)
         self._prev_fields[name] = fields
         self.datasets[name].population_from = population_from
+        if self._rules_print() == before:
+            self.untested = untested
+            return "no-op：数据定义和映射未变化，未触发重新试算。" + (f"\n{reuse}" if reuse else "")
         return out + (f"\n{reuse}" if reuse else "")
 
     def _define_dataset(self, name: str, file: str, sheet: str, fields: dict, key: str | None = None,
@@ -2051,6 +2158,8 @@ class Workspace:
         if broken:       # 式子解析不了就不保存：存进去之后试算、查询都会报同一个错，又不知道是哪一条
             raise ToolError("未保存：这些式子解析不了，改好后再一起提交（其余部分也没保存）：\n"
                             + "\n".join(f"- {w}：{m}" for w, m in broken[:6]))
+        if draft == self.drafts.get(name):
+            return "no-op：规则完全相同，没有保存新版本或触发重算；继续处理当前验证缺口。"
         self.drafts[name] = draft
         self.untested |= set(targets) - {SHARED}
         out = [f"已保存{'共用部分' if name == SHARED else f'方案「{name}」'}。"]
@@ -2115,6 +2224,10 @@ class Workspace:
         blocking = [i for i in issues if i.severity == "blocking"]
         if blocking:
             raise ToolError("数据问题：\n" + "\n".join(f"- {i}" for i in blocking[:8]))
+        from bonus_agent.contracts import identity_conflicts
+        conflicts = identity_conflicts(rs, data, self.mapping)
+        if conflicts:
+            raise ToolError("数据身份校验失败，不能静默跳过：" + json.dumps(conflicts, ensure_ascii=False))
         return data, issues
 
     def trial_run(self, scheme: str | None = None) -> str:
@@ -2126,6 +2239,9 @@ class Workspace:
             if "pool" not in self._merged(name) or not self._merged(name).get("allocation"):
                 raise ToolError(f"方案「{name}」的规则还缺 pool 或 allocation")
             out.append(self._trial(name))
+        parameters = self.validate_parameters()
+        if parameters["gaps"] or parameters["errors"]:
+            out.append("注意：参数预检未通过；金额试算不能解决证据问题。" + json.dumps(parameters, ensure_ascii=False))
         return "\n\n".join(out)
 
     def _deps(self, name: str) -> set[tuple[str, str]]:
@@ -2188,10 +2304,18 @@ class Workspace:
         return out
 
     def _trial(self, name: str, _path: tuple = ()) -> str:
+        self._check_source_version()
         rs = self._ruleset(name)
         guard = [str(i) for i in self._validate(name, rs) if i.code == "global_in_level" and i.severity == "blocking"]
         if guard:
             raise ToolError(f"方案「{name}」试算前需要修正：\n" + "\n".join(f"- {g}" for g in guard))
+        version = self._calculation_version()
+        if name in self.results and self._trial_versions.get(name) == version:
+            self.untested.discard(name)
+            spot = '\n'.join(line for line in self._trial_details.get(name, '').splitlines() if line.startswith('抽查'))
+            return (f"no-op：方案「{name}」规则与数据没有变化，复用已有试算，奖金池 "
+                    + self.results[name]["R0"].pool + "。继续处理验证缺口；重复试算不会消除证据或业务问题。"
+                    + (f'\n已有试算的抽查：\n{spot}' if spot else ''))
         data, issues = self._data(rs)
         refs = self._refs(name, _path)
         try:
@@ -2213,7 +2337,7 @@ class Workspace:
         self.untested.discard(name)
         self.untested |= {s for s in self.schemes if s != name and name in {d for d, _ in self._deps(s)}}  # 引用本方案的要重算
         base = res["R0"]
-        lines = [f"方案「{name}」试算成功。奖金池 {fmt(Decimal(base.pool))} 元（精确值 {base.pool_exact}）"]
+        lines = [f"方案「{name}」金额试算执行完成（尚未验收）。奖金池 {fmt(Decimal(base.pool))} 元（精确值 {base.pool_exact}）"]
         if prev is not None and Decimal(prev.pool) != 0 and Decimal(base.pool) != 0:
             k = abs(Decimal(base.pool) / Decimal(prev.pool))
             if k >= 10 or k <= Decimal("0.1"):       # T3：改了分档表，奖金池从十几万变成一千多亿，没人发现
@@ -2289,6 +2413,10 @@ class Workspace:
                                            headers=heads, tiers=base.tier_stats, used_elsewhere=others,
                                            coverage=base.coverage, reached_elsewhere=elsewhere,
                                            said=self._finance_said())
+        from bonus_agent.contracts import ratio_default_gaps
+        for path, message in ratio_default_gaps(rs):
+            rep.gates.append(message)
+            rep.keys.append(f"计算契约 {path}")
         from bonus_core.data.population import gaps as population_gaps
         for entity, message in population_gaps(rs, data, self.mapping):
             rep.gates.append(message)
@@ -2307,7 +2435,34 @@ class Workspace:
                          + "\n".join(f"- {g}" for g in gates[:GATES_SHOWN])
                          + (f"\n……还有 {len(gates) - GATES_SHOWN} 处没列出（先处理上面的，改完再 trial_run 会列出其余的）"
                             if len(gates) > GATES_SHOWN else ""))
-        return "\n".join(lines)
+        self._trial_details[name] = "\n".join(lines)
+        self._trial_versions[name] = version
+        return self._trial_details[name]
+
+    def _calculation_version(self) -> str:
+        """Hash typed semantics; evidence descriptions cannot invalidate computed money."""
+        from pydantic import BaseModel
+        import hashlib
+        def clean(value):
+            if isinstance(value, BaseModel):
+                return {k: clean(getattr(value,k)) for k in type(value).model_fields
+                        if k not in {'sources','desc','confidence','confirmed_by'}}
+            if isinstance(value, dict):
+                return {k: clean(v) for k,v in value.items()}
+            if isinstance(value, (list,tuple)):
+                return [clean(v) for v in value]
+            return value
+        body = {'rules': {s: clean(self._ruleset(s)) for s in self.schemes},
+                'mapping': clean(self.mapping), 'period': str(self.period),
+                'revisions': {s: self._merged(s).get('revisions') for s in self.schemes},
+                'answers': [(q.id,q.text,q.answer,q.withdrawn) for q in self.questions if q.answer not in (None,'')],
+                'said':self.said}
+        return hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
+
+    def _refresh_result_versions(self):
+        if self.results:
+            current = self._calculation_version()
+            self.untested.update(s for s in self.results if self._trial_versions.get(s) != current)
 
     def _finance_said(self) -> str:
         """财务自己说过的话：对话原文和各问题的答复。答复只是选了一个选项（很短）时带上问题和选项，
@@ -2561,6 +2716,81 @@ class Workspace:
         ev = Evaluator(rs, root, by_level, self._refs(name), self.period)
         ev.peer_scope = True
         return rs, root, by_level, ev
+
+    def _independent_people(self, name: str, spec: dict) -> dict[str, Decimal]:
+        """Independent recipient totals, including explicitly named pending components."""
+        base = self._ruleset(name)
+        if not base.report or not base.report.people:
+            return {}
+        cfg = spec.get('people')
+        if not cfg:
+            if self.report_required:
+                raise ToolError('缺少人员汇总独立验算 people；须按原文明确分配权重与舍入时点')
+            return {}
+        if not isinstance(cfg, dict) or not isinstance(cfg.get('key'), str):
+            raise ToolError('people 须给出 key（人员字段表达式）与 mode（allocation / after_sum / per_record）')
+        rs, root, by_level, ev = self._independent_env(name, spec)
+        mode = cfg.get('mode', 'allocation')
+        if mode == 'allocation':
+            weights = cfg.get('weights') or {}
+            start = next((i for i, lv in enumerate(rs.allocation) if lv.level == rs.pool.scope), -1)
+            missing = [lv.level for lv in rs.allocation[start+1:] if not weights.get(lv.level)]
+            if missing:
+                raise ToolError(f'人员独立验算缺少这些层的独立权重：{missing}，不能借用主规则权重')
+            levels = [lv.model_copy(update={'weight': weights.get(lv.level, '')}) for lv in rs.allocation]
+            from bonus_core.dsl.models import Report
+            independent = rs.model_copy(update={'allocation': levels,
+                'pool': rs.pool.model_copy(update={'expr': str(spec['pool'])}),
+                'checks': [], 'patches': [], 'payout': [], 'offsets': [], 'report': Report(people=cfg['key'])})
+            data, _ = self._data(base)
+            data, issues = apply_patches(base, data)
+            if any(i.severity == 'blocking' for i in issues):
+                raise ToolError('独立人员验算的数据修订未通过')
+            reference = Engine(independent, data, self._refs(name), self.period).compute()
+            out = {r['name']: Decimal(r['final']) for r in reference.people}
+        elif mode in ('after_sum', 'per_record'):
+            leaf = rs.allocation[-1].level
+            nodes = by_level.get(leaf) or []
+            values = self._independent_eval(ev, str(cfg.get('expr') or ''), nodes, '人员记录金额')
+            out = {}
+            for n in nodes:
+                person = ev._eval_traced(cfg['key'], n, f'{n.id}/复读人员', '复读').v
+                if person in (None, ''):
+                    raise ToolError(f'独立人员验算的人员字段为空：{n.id}')
+                amount = values[n.id]
+                if mode == 'per_record':
+                    amount = amount.quantize(Decimal('.01'), ROUND_HALF_UP)
+                out[str(person)] = out.get(str(person), Decimal(0)) + amount
+        else:
+            raise ToolError(f'不支持的独立人员舍入方式：{mode}')
+        for pending in base.report.pending:
+            expr = (spec.get('pending') or {}).get(pending.name)
+            if not expr:
+                raise ToolError(f'缺少待分配项「{pending.name}」的独立表达式 pending')
+            nodes = [root] if pending.level == 'global' else by_level.get(pending.level) or []
+            if not nodes or pending.name in out:
+                raise ToolError('待分配独立验算层级为空或名称与人员重复')
+            out[pending.name] = sum(self._independent_eval(ev, expr, nodes, '待分配').values(), Decimal(0))
+        return out
+
+    def _independent_details(self, name: str, spec: dict) -> dict[str, Decimal]:
+        base=self._ruleset(name)
+        if not base.report or not base.report.details:
+            return {}
+        _,root,by_level,ev=self._independent_env(name,spec)
+        out={}
+        for item in base.report.details:
+            expr=(spec.get('details') or {}).get(item.name)
+            if not expr:
+                raise ToolError(f'缺少对象金额报告「{item.name}」的独立表达式 details')
+            nodes=([root] if item.level=='global' else by_level.get(item.level) or
+                   list((root.index or {}).get(item.level,{}).values()))
+            if not nodes:
+                raise ToolError('对象金额独立验算没有可核对对象')
+            values=self._independent_eval(ev,expr,nodes,'对象金额')
+            out.update({json.dumps([item.name,nid],ensure_ascii=False):value.quantize(Decimal('.01'),ROUND_HALF_UP)
+                        for nid,value in values.items()})
+        return out
 
     @staticmethod
     def _independent_eval(ev, expr: str, nodes, label: str) -> dict[str, Decimal]:
@@ -3059,6 +3289,7 @@ class Workspace:
 
     def finish(self, summary: str, ignored: list[dict] | None = None, review: bool = True) -> str:
         self._check_source_version()
+        self._refresh_result_versions()
         stamp = self.validation_fingerprint()
         current = [{**i, "fingerprint": stamp, "rules": self._rules_print()} for i in (ignored or []) if isinstance(i, dict)]
         prior = [i for i in self.ignored if i.get("fingerprint") == stamp]
@@ -3167,28 +3398,68 @@ class Workspace:
             self._check_source_version()
         except ToolError as e:
             return {"status": "ERROR", "checks": [CheckResult("source.version", Status.ERROR, str(e)).to_dict()]}
+        self._refresh_result_versions()
         for scheme, revs in self.results.items():
             for rev, res in revs.items():
                 check = result_integrity(res)
                 check.id = f"{scheme}/{rev}/{check.id}"
                 checks.append(check)
         gaps = self._verify_gaps()
-        checks.append(CheckResult("independent.samples", Status.INCOMPLETE if gaps else Status.PASS,
-                                  "独立样本验算", examples=gaps))
+        expected = [(s, node, kind) for s in self.schemes if s in self.results and s not in self.untested
+                    for node, kind, _ in self._verify_targets(s)]
+        checked = sum(_verify_key(s, node, kind) in self.verified for s, node, kind in expected)
+        checks.append(CheckResult("independent.samples", Status.INCOMPLETE if gaps or not expected else Status.PASS,
+                                  "独立样本验算", expected=len(expected), checked=checked, examples=gaps))
         bindings = self._binding_gaps()
-        checks.append(CheckResult("evidence.bindings", Status.FAIL if bindings else Status.PASS, examples=bindings))
+        binding_count = sum(1 for f in self.facts if fx.numeric(f) is not None)
+        binding_count += sum(len(list(fx.table_cells(self._merged(s).get('tables') or {}))) for s in self.schemes)
+        checks.append(CheckResult("evidence.bindings", Status.FAIL if bindings else Status.PASS,
+                                  "数值事实和参数表位置均已检查；缺口见反例", expected=binding_count, checked=binding_count, examples=bindings))
+        program_gaps = [f"{s}: {g}" for s, rep in self.lint.items() for g in self._open_gates(rep)]
+        checks.append(CheckResult("program.contracts", Status.FAIL if program_gaps else Status.PASS,
+                                  "程序及业务结构校验", examples=program_gaps))
         from bonus_agent import reread as rr
         gaps = rr.calc_gaps(self, self.reread)
         state = (Status.ERROR if any(k.startswith('复读 执行') for k,_ in gaps) else
                  Status.INCOMPLETE if any(k.startswith(('复读 覆盖', '复读 未定论')) for k,_ in gaps) else
                  Status.FAIL if gaps else Status.PASS)
         checks.append(CheckResult("independent.full", state,
-                                  "独立全量复算", examples=gaps))
+                                  "独立全量复算", expected=sum(v['expected'] for v in self._full_coverage.values()),
+                                  checked=sum(v['checked'] for v in self._full_coverage.values()), examples=gaps))
         if not self.results or self.untested or self.pending:
             checks.append(CheckResult("run.complete", Status.INCOMPLETE, "没有有效结果、存在未重算方案或待确认问题"))
         status = 'ERROR' if any(c.status == Status.ERROR for c in checks) else 'FAIL' if any(c.status == Status.FAIL for c in checks) else 'INCOMPLETE' if any(not c.ok for c in checks) else 'PASS'
         return {"fingerprint": self.validation_fingerprint(), "status": status,
                 "checks": [c.to_dict() for c in checks]}
+
+    def review_calculation(self) -> dict:
+        self._refresh_result_versions()
+        if not self.results or self.untested:
+            raise ToolError("先完成当前版本金额试算，再做独立复核")
+        gaps = self._reread_gaps(set())
+        return {"status": "FAIL" if gaps else "PASS", "gaps": gaps,
+                "by": self.reread.get("by", ""), "validation": self.validation_report()}
+
+    def blocker_frontier(self) -> set[str]:
+        """No model calls and no full recalculation; stable unresolved work survives history pruning."""
+        if not self.results:
+            return set()
+        bindings = self._binding_gaps()
+        table_gaps = {m.group() for g in bindings if (m := re.search(r'/tables/\S+?(?==)', g))}
+        if table_gaps:
+            return table_gaps  # renaming/removing unrelated facts cannot masquerade as a fixed cell
+        out = {g.split('：', 1)[0] for g in bindings}
+        for scheme, rep in self.lint.items():
+            open_gates = self._open_gates(rep)
+            out.update(f"{scheme}:{key}" for g, key in zip(rep.gates, rep.keys)
+                       if any(o.startswith(g) for o in open_gates))
+        if not out:
+            if self.reread and not self.untested:
+                from bonus_agent.reread import calc_gaps
+                out.update(key for key,_ in calc_gaps(self,self.reread))
+        if not out:
+            out.update('独立验算 ' + g.split('（', 1)[0].split(' 之前', 1)[0] for g in self._verify_gaps())
+        return out
 
     def preview_repair(self, parts: dict, reason: str, scheme: str | None = None) -> dict:
         from bonus_agent import repair
@@ -3318,6 +3589,8 @@ class Workspace:
             step = ("共用部分已保存，接着用 set_rules(scheme=方案名) 写每个方案自己的 pool（和需要的 allocation、payout），"
                     "不要再重复提交共用部分" if SHARED in self.drafts else
                     "用 set_rules 写入规则（笔记和参数台账里已有的内容不必重读）")
+        elif any(f.targets and fx.numeric(f) is None and fx.interval(f.value) is not None for f in self.facts):
+            step = "先用 validate_parameters 局部诊断/修复参数类型；不重跑金额，不重复绑定原文区间"
         elif any(s in self.untested or s not in self.results for s in self.schemes):
             step = "用 trial_run 试算"
         elif bare:
@@ -3325,7 +3598,7 @@ class Workspace:
         elif self._clause_gaps({str(i.get("ref", "")) for i in self.ignored}):
             step = "用 record_clauses / cover_clauses 把条款清单逐条落实"
         elif bindings := self._binding_gaps():
-            step = "用 compile_table / bind_facts 核对参数来源和精确位置：" + "；".join(bindings[:3])
+            step = "先用 validate_parameters 查看具体缺口，再修正来源、类型或目标；不重复试算：" + "；".join(bindings[:3])
         elif self._verify_gaps():
             step = "用 verify 独立验算：" + "；".join(self._verify_gaps()[:3])
         else:
@@ -3766,6 +4039,9 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     reads = 0                          # 连续只读材料（读表、读文档、看图）、没有落下任何东西的次数
     reached = ws.phase()               # 本轮到过的最远阶段：往前推进到新阶段时清空对话历史；改规则退回前面的阶段再回来不清
     deep_why, deep_used = "", 0        # 下一步要深度思考的原因（空：普通模式）；本轮已用的深度思考步数
+    from bonus_agent.progress import ProgressWatch
+    progress_watch = ProgressWatch()
+    context_retries = 0
     for turn in range(max_steps):
         if should_stop and should_stop():
             error = f"已手动停止（第 {len(steps)} 步）"
@@ -3791,6 +4067,14 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             try:
                 text = llm.chat(msgs, json_out=True, temperature=AGENT_TEMPERATURE, **({"think": True} if think else {}))
             except LLMError as e:
+                if _context_overflow(str(e)) and context_retries < 2:
+                    context_retries += 1
+                    _shrink(history, max(1500, _size(history) // 2), keep=2)
+                    deep_why = "模型上下文超限，已压缩工具历史；按工作区结构化规则、参数和纠错进度继续，必要时使用配置的强模型"
+                    steps.append(Step("（上下文恢复）", {}, deep_why, False))
+                    if on_step:
+                        on_step(len(steps), steps[-1])
+                    continue
                 error = str(e)
                 break
             reasoning = getattr(llm, "last_reasoning", "") if think else ""
@@ -3812,6 +4096,17 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             try:
                 reply = llm.chat_tools(msgs, openai_tools(), temperature=AGENT_TEMPERATURE, **({"think": True} if think else {}))
             except LLMError as e:
+                if _context_overflow(str(e)) and context_retries < 2:
+                    context_retries += 1
+                    _shrink(history, max(1500, _size(history) // 2), keep=2)
+                    deep_why = "模型上下文超限，已压缩工具历史；按工作区结构化规则、参数和纠错进度继续，必要时使用配置的强模型"
+                    steps.append(Step("（上下文恢复）", {}, deep_why, False))
+                    if on_step:
+                        on_step(len(steps), steps[-1])
+                    continue
+                if _context_overflow(str(e)):
+                    error = f"上下文恢复已尝试 {context_retries} 次仍超限；保留当前工作区，未通过的结果不能交付：{e}"
+                    break
                 if turn == 0:  # 模型或服务不支持原生工具调用，改用 JSON 协议
                     mode = "json"
                     continue
@@ -4012,6 +4307,19 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             first = steps[turn_steps]
             first.model_secs, (first.tokens_in, first.tokens_out) = round(model_secs, 2), model_tokens
         deep_why = _deep_reason(steps[turn_steps:], skipped, ws, fails)
+        if any(st.tool in {"bind_facts", "compile_table", "validate_parameters", "trial_run", "finish", "set_rules", "apply_repair"}
+               for st in steps[turn_steps:]):
+            frontier = ws.blocker_frontier()
+            stagnant = progress_watch.observe(frontier)
+            if stagnant >= 2:
+                deep_why = f"连续 {stagnant + 1} 次检查没有消除既有问题；工具返回成功不代表有进展。" + "；".join(sorted(frontier)[:3])
+                ws.notes["纠错进度"] = (deep_why + "。先做局部参数预检；金额问题用 review_calculation 定位，"
+                                      "按原文修复，已有独立基线时使用 preview_repair / verify_repair / apply_repair。"
+                                      "禁止通过改答案、降低校验或把分配池归零消除问题。")
+            elif not stagnant:
+                ws.notes.pop("纠错进度", None)
+            if stagnant >= 5:
+                repeats, stuck = MAX_STUCK, deep_why
         if skipped and skipped == len(calls):
             # 整轮都是被拦下的重复调用：不把它留在历史里，否则小模型会照着历史接着重复；只留一句说明
             del history[turn_start:]
@@ -4477,6 +4785,10 @@ DEEP_SHOW = 4000                 # 步骤记录里留多少思考内容（全文
 FORMAT_ERRORS = ("错误：参数", "错误：没有工具")    # 参数格式这类小错：程序已经说清楚怎么改，第一次不用深度思考
 
 
+def _context_overflow(message: str) -> bool:
+    return bool(re.search(r'context[_ ]length|maximum context|context window|too many tokens|上下文.{0,12}(?:超|不足)', message, re.I))
+
+
 def _deep_reason(turn: list[Step], skipped: int, ws: Workspace, fails: dict[str, int]) -> str:
     """这一步的结果是否要求下一步深度思考：失败（参数格式小错第一次除外）、被拦下的原样重复、
     程序提醒快要卡住、保存的规则还有阻断问题。返回原因（给模型看的一句话），不需要时返回空。"""
@@ -4490,6 +4802,8 @@ def _deep_reason(turn: list[Step], skipped: int, ws: Workspace, fails: dict[str,
             return f"{st.tool} 的结果里有提醒：{st.result.split(chr(10) + '注意：', 1)[1][:300]}"
         if st.ok and st.tool == "set_rules" and getattr(ws, "last_blocking", None):
             return f"set_rules 保存了，但还有阻断问题：{head}"
+        if st.ok and st.tool == "trial_run" and not ws.reread and "no-op" not in st.result:
+            return "首次金额试算完成：现在是关键复核节点，调用 review_calculation 先独立核对原文与全量金额；工具执行完成不等于验收通过"
     if skipped:
         return "又原样做了一遍之前做过的操作，结果和之前一样"
     return ""
@@ -4763,7 +5077,7 @@ def _sheets(ar: AgentResult, qrows: list[dict]):
     if ws.facts:
         conflicted = {c.name: c.question for c in ws.conflicts.values()}
         out.append(("参数台账", ["参数", "原文取值", "换算", "文件", "原文", "登记轮次", "冲突问题"],
-                    [[f.name, fx.label(f), fx.same_value(f) if fx.number(f.value) is not None else "", f.file, f.quote,
+                    [[f.name, fx.label(f), fx.same_value(f) if fx.numeric(f) is not None else "", f.file, f.quote,
                       f.round, conflicted.get(f.name, "以此为准（原文明确修改）" if f.override else "")]
                      for f in sorted(ws.facts, key=lambda f: f.name)],
                     {"参数": 30, "原文": 60}))

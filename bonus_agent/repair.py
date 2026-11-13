@@ -97,8 +97,11 @@ def preview(ws, scheme, parts, reason):
     ws.repair_attempts[budget_key] = attempts + 1
     candidate = _clone(ws, case.snapshot(ws))
     old_report = candidate._merged(scheme).get("report") or {}
-    if "report" in parts and parts["report"].get("balances", []) != old_report.get("balances", []):
-        raise ToolError("自动修复不能更改已冻结的对账契约")
+    if "report" in parts:
+        for field in ('balances', 'distributions', 'pending', 'details'):
+            proposed = parts['report'].get(field, [])
+            if any(item not in proposed for item in old_report.get(field, [])):
+                raise ToolError("自动修复不能删除或更改已冻结的对账契约及待分配去向")
     # Keep original checks and references frozen. New numeric constants still need exact source bindings.
     candidate.set_rules(scheme=scheme, **copy.deepcopy(parts))
     for name in candidate._order(candidate.schemes):
@@ -144,6 +147,7 @@ def apply(ws, candidate_id):
     ws.repair_attempts = attempts
     ws.results, ws.untested = candidate.results, set()
     ws.lint, ws.read_nums = candidate.lint, candidate.read_nums
+    ws._trial_versions, ws._trial_details = candidate._trial_versions, candidate._trial_details
     ws.done = False
     record["status"] = "case_validated"
     record["report"] = report

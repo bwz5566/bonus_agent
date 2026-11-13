@@ -111,12 +111,17 @@ models:
     model: deepseek-flash
     json_mode: json_object
     extra_body: {thinking: {type: disabled}}     # 默认开思考且 effort=high，一步就能把 8192 个输出 tokens 用完
+    think_model: deepseek-v4-pro
+    checker: deepseek-v4-pro
+    checker_required: true
   deepseek-flash-pro:           # 平时用 flash（低成本），出错、卡住需要深度思考的那一步交给 pro
     provider: deepseek
     model: deepseek-flash
     json_mode: json_object
     extra_body: {thinking: {type: disabled}}
     think_model: deepseek-v4-pro
+    checker: deepseek-v4-pro
+    checker_required: true
   deepseek-v4-pro:              # DeepSeek-V4-Pro，只有文本，图片交给 deepseek-flash 转写
     provider: deepseek
     model: deepseek-v4-pro

@@ -148,7 +148,12 @@ def test_agent_changing_quarter_retests_annual(tmp_path):
         getattr(ws, step["tool"])(**step["args"])
     ws.trial_run()
     assert not ws.untested
-    ws.trial_run("QUARTER")
+    assert 'no-op' in ws.trial_run("QUARTER")
+    assert not ws.untested                   # 同版本复用，不让依赖方案无故重算
+    pool = dict(ws._merged('QUARTER')['pool'])
+    pool['expr'] = f"({pool['expr']}) + 1"
+    ws.set_rules(scheme='QUARTER', pool=pool)
+    ws.trial_run('QUARTER')
     assert ws.untested == {"ANNUAL"}          # 季度重算后，引用它的年度要重算
     ws.set_rules(scheme="ANNUAL", offsets=[{"id": "x", "scope": "个人", "expr": 'scheme_paid("QUARTER", "R9")'}])
     from bonus_agent.agent import ToolError

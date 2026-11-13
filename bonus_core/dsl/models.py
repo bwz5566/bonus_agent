@@ -136,6 +136,7 @@ Table = Annotated[Union[TierTable, LookupTable], Field(discriminator="kind")]
 class Variable(RuleItem):
     scope: str = "global"      # "global" 或分配层级名，如 "个人"
     expr: str
+    ratio_default: Literal["rate", "coefficient"] | None = None
 
 
 class Pool(RuleItem):
@@ -236,6 +237,15 @@ class ReportPending(ReportTotal):
     """An explicitly named unallocated component; not a recipient of the allocated pool."""
 
 
+class ReportDistribution(RuleItem):
+    """Reconcile a material entitlement against actual allocated money and named pending items."""
+    name: str
+    level: str
+    total: str
+    pending: list[str] = []
+    rounding: Literal["per_pool", "after_sum"] = "per_pool"
+
+
 class Report(RuleItem):
     """结果文件的固定输出：汇总核算（按核算类型的总金额）和分配人员金额。
     totals：按顺序列出的各类总金额；people：最末层上表示“人”的字段或变量，按它把每人参与的各项合计成一行。"""
@@ -243,6 +253,8 @@ class Report(RuleItem):
     people: str | None = None
     balances: list[ReportBalance] = []
     pending: list[ReportPending] = []
+    distributions: list[ReportDistribution] = []
+    details: list[ReportTotal] = []  # explicit per-object money reports, including auxiliary entities
 
 
 class RuleSet(_Base):

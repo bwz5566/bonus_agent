@@ -93,22 +93,36 @@ def signature(text: str) -> str:
     return hashlib.sha1(text.encode()).hexdigest()[:16]
 
 
+def review_signature(ws, text):
+    text += '\nreference_schema:2'
+    other = getattr(ws.llm, 'checker_llm', None)
+    if other is not None:
+        text += f'\nreviewer:{other.name}:{other.model}:{other.think_body}'
+    return signature(text)
+
+
 def _ask(ws, msgs: list[dict]) -> str:
     """交叉验证：配置了另一个模型就让它来复读、写独立算式（和主流程的模型错法不同，验得更真）；
     它调用失败时退回主模型，并记下来，不让整轮失败。"""
     other = getattr(ws.llm, "checker_llm", None)
     if other is not None and not getattr(ws, "checker_down", ""):
         try:
-            return other.chat(msgs, json_out=True, temperature=0, max_tokens=8192)
+            return other.chat(msgs, json_out=True, temperature=0, max_tokens=8192, think=True)
         except LLMError as e:
-            ws.checker_down = f"交叉验证模型 {other.name} 调用失败（{str(e)[:120]}），改用主模型 {ws.llm.name} 验证"
-    return ws.llm.chat(msgs, json_out=True, temperature=0, max_tokens=8192)
+            ws.checker_down = (f"交叉验证模型 {other.name} 调用失败（{str(e)[:120]}）" +
+                               ('，关键复核阻断' if getattr(ws.llm, 'checker_required', False) else f'，改用主模型 {ws.llm.name} 验证'))
+    if getattr(ws.llm, 'checker_required', False):
+        if other is None:
+            raise LLMError('关键复核模型未配置；独立复核不能标记通过')
+        raise LLMError(f'关键复核模型 {other.name} 不可用；本轮不降级为主模型自验')
+    think = not bool(getattr(ws, 'checker_down', '') and getattr(ws.llm, 'think_llm', None))
+    return ws.llm.chat(msgs, json_out=True, temperature=0, max_tokens=8192, think=think)
 
 
 def run(ws) -> dict:
     """调用模型复读；材料没变时用上次的结果。返回 {"sig", "items", "unclear", "error"}。"""
     text = material(ws)
-    sig = signature(text)
+    sig = review_signature(ws, text)
     old = getattr(ws, "reread", None) or {}
     if old.get("sig") == sig and not old.get("error"):
         calc(ws, old)
@@ -163,6 +177,13 @@ def structure(ws) -> str:
         leaf = ((full.get("allocation") or [{}])[-1] or {}).get("level")
         out.append(f"- 方案「{name}」：分配层级 {levels or '无'}；奖金池{where}"
                    + (f"；发放（可发比例）在「{leaf}」层每个对象上算" if leaf else ""))
+        report = getattr(ws._ruleset(name), 'report', None)
+        if report and report.people:
+            out.append(f'  人员报告字段：{report.people}；独立复核须给 people（人员key、独立权重与舍入模式）。'
+                       f'待分配项及层级：{[(p.name,p.level) for p in report.pending]}；只给结构，不给主规则算式。')
+        if report and report.details:
+            out.append('  对象金额报告（details 须逐一提供独立表达式）：' +
+                       str([(d.name,d.level,d.desc) for d in report.details]))
     return "\n".join(out)
 
 
@@ -206,7 +227,7 @@ def calc(ws, rr: dict) -> dict:
     dsl = full[full.index("## 表达式语法"):full.index("## 发放与抵扣")].replace("{functions}", describe())
     text = (material(ws) + "\n\n# 你上一步列出的计算项\n" + json.dumps(rr.get("items") or [], ensure_ascii=False)
             + "\n\n" + structure(ws))
-    sig = signature(text)
+    sig = review_signature(ws, text)
     old = rr.get("calc") or {}
     if old.get("sig") == sig and old.get("schemes"):
         return old
@@ -245,6 +266,10 @@ def _sample(ws, base: list[dict], names: list[str]) -> dict:
             try:
                 ws._independent_pool(n, out["schemes"][n], strict=True)
                 ws._independent_pay(n, out["schemes"][n], strict=True)
+                if hasattr(ws, '_independent_people'):
+                    ws._independent_people(n, out['schemes'][n])
+                if hasattr(ws, '_independent_details'):
+                    ws._independent_details(n,out['schemes'][n])
             except Exception as e:          # 算式是模型写的，任何报错都交还它自己改
                 errs.append(f"方案「{n}」：{str(e)[:400]}")
                 out["schemes"].pop(n)
@@ -269,6 +294,8 @@ def _disagree(ws, name: str, spec: dict) -> list[tuple[str, str, Decimal, Decima
     theirs = ws._pool_values(name)
     from bonus_agent.validation import compare_values, Status
     coverage = compare_values("pool", theirs, mine)
+    if hasattr(ws, '_full_coverage'):
+        ws._full_coverage[name] = {'expected': coverage.expected, 'checked': coverage.checked}
     if coverage.status == Status.INCOMPLETE:
         raise ValueError(f"方案「{name}」{coverage.message}：{coverage.examples}")
     out += [("奖金池", k, v, theirs[k]) for k, v in mine.items() if k in theirs and abs(v - theirs[k]) > Decimal("0.01")]
@@ -279,23 +306,83 @@ def _disagree(ws, name: str, spec: dict) -> list[tuple[str, str, Decimal, Decima
     caps = ws._caps(name) if ratio else {}
     if ratio and set(ratio) != set(caps):
         raise ValueError(f"方案「{name}」可发比例验算对象集合不完整")
+    if ratio and hasattr(ws, '_full_coverage'):
+        ws._full_coverage[name]['expected'] += len(caps)
+        ws._full_coverage[name]['checked'] += len(ratio)
     for k, r in ratio.items():
         if k not in caps or caps[k][0] == 0:
             continue
         final, cap, n = caps[k]
         if abs((final * r).quantize(Decimal("0.01"), ROUND_HALF_UP) - cap) > Decimal("0.01") * n:
             out.append(("可发比例", k, r, cap / final))
+    if hasattr(ws, '_independent_people'):
+        try:
+            people = ws._independent_people(name, spec)
+        except Exception as e:
+            raise ValueError(f'方案「{name}」独立人员汇总执行失败：{e}') from e
+        if people:
+            actual = {p['name']: Decimal(p['final']) for p in ws.results[name]['R0'].people}
+            coverage = compare_values('people', actual, people, tolerance=Decimal(0))
+            if coverage.status == Status.INCOMPLETE:
+                raise ValueError(f'人员汇总独立验算对象集合不完整：{coverage.examples}')
+            if hasattr(ws, '_full_coverage'):
+                ws._full_coverage[name]['expected'] += len(actual)
+                ws._full_coverage[name]['checked'] += len(people)
+            out += [('人员汇总', p, value, actual[p]) for p,value in people.items()
+                    if value.quantize(Decimal('.01'), ROUND_HALF_UP) != actual[p].quantize(Decimal('.01'), ROUND_HALF_UP)]
+    if hasattr(ws,'_independent_details'):
+        reference=ws._independent_details(name,spec)
+        if reference:
+            actual={json.dumps([label,nid],ensure_ascii=False):Decimal(row['amount'])
+                    for label,group in ws.results[name]['R0'].details.items() for nid,row in group.items()}
+            coverage=compare_values('details',actual,reference,tolerance=Decimal(0))
+            if coverage.status==Status.INCOMPLETE:
+                raise ValueError(f'对象金额独立验算集合不完整：{coverage.examples}')
+            ws._full_coverage[name]['expected'] += len(actual)
+            ws._full_coverage[name]['checked'] += len(reference)
+            out += [('明细核算',key,value,actual[key]) for key,value in reference.items() if value!=actual[key]]
     return out
 
 
 def calc_gaps(ws, rr: dict) -> list[tuple[str, str]]:
+    """Memoize deterministic checks only for the same material, rules, result and reference."""
+    if not hasattr(ws, '_full_gap_cache'):
+        return _calc_gaps_now(ws, rr)
+    try:
+        ws._check_source_version()
+    except Exception as e:
+        return [('复读 执行 来源版本', str(e))]
+    key = (ws._rules_print(), str(ws.period), json.dumps(rr, sort_keys=True, ensure_ascii=False),
+           tuple(getattr(getattr(ws, n), '__func__', getattr(ws, n))
+                 for n in ('_independent_pool', '_independent_pay', '_independent_people', '_independent_details', '_pool_values', '_caps')),
+           tuple((s, id(revs), s in ws.untested,
+                  tuple((rev, r.pool, tuple((k,n.final) for k,n in r.nodes.items())) for rev,r in revs.items()))
+                 for s,revs in ws.results.items()))
+    if ws._full_gap_cache and ws._full_gap_cache[0] == key:
+        ws._full_coverage = dict(ws._full_gap_cache[2])
+        return list(ws._full_gap_cache[1])
+    ws._full_coverage = {}
+    out = _calc_gaps_now(ws, rr)
+    ws._full_gap_cache = (key, list(out), dict(ws._full_coverage))
+    return out
+
+
+def _calc_gaps_now(ws, rr: dict) -> list[tuple[str, str]]:
     """独立算式和规则算出的数逐个对象比（奖金池、可发比例）；对不上的方案和项列出来。"""
     c = (rr or {}).get("calc") or {}
     out = []
+    if hasattr(ws, '_full_coverage'):
+        for name in schemes(ws):
+            try:
+                ws._full_coverage[name] = {'expected': len(ws._pool_values(name)), 'checked': 0}
+            except Exception:
+                pass
     if (rr or {}).get("error"):
         out.append(("复读 执行", "独立复读没有完成：" + str(rr["error"])))
     if c.get("error"):
         out.append(("复读 执行 算式", "独立算式没有完成：" + str(c["error"])))
+    for uncertainty in c.get('unclear') or []:
+        out.append(('复读 未定论 口径', str(uncertainty)))
     for name in schemes(ws):
         if name not in (c.get("schemes") or {}):
             out.append((f"复读 覆盖 {name}", "缺少本方案独立算式，不能判定验算通过"))
@@ -313,7 +400,7 @@ def calc_gaps(ws, rr: dict) -> list[tuple[str, str]]:
                             for k, h in (spec.get("helpers") or {}).items())
         tables = "；".join(f"{k} = {json.dumps(t, ensure_ascii=False)}" for k, t in (spec.get("tables") or {}).items())
         how = (f"；辅助变量 {helpers}" if helpers else "") + (f"；参数表 {tables}" if tables else "")
-        for kind in ("奖金池", "可发比例"):
+        for kind in ("奖金池", "可发比例", "人员汇总", "明细核算"):
             rows = [b for b in bad if b[0] == kind]
             if not rows:
                 continue
@@ -321,10 +408,18 @@ def calc_gaps(ws, rr: dict) -> list[tuple[str, str]]:
                 total = len(ws._pool_values(name))
                 eg = "；".join(f"{k} 复读 {_money(v)}、规则 {_money(t)}" for _, k, v, t in rows[:CALC_SHOW])
                 expr = f"奖金池 = {spec.get('pool')}"
-            else:
+            elif kind == '可发比例':
                 total = sum(1 for f, _, _ in ws._caps(name).values() if f > 0)
                 eg = "；".join(f"{k} 复读 {_ratio(v)}、规则 {_ratio(t)}（可发上限 ÷ 应得）" for _, k, v, t in rows[:CALC_SHOW])
                 expr = f"可发比例 = {spec.get('pay_ratio')}"
+            elif kind=='人员汇总':
+                total = len(ws.results[name]['R0'].people)
+                eg = '；'.join(f'{k} 复读 {_money(v)}、规则 {_money(t)}' for _,k,v,t in rows[:CALC_SHOW])
+                expr = '人员独立汇总 = ' + json.dumps(spec.get('people'), ensure_ascii=False)
+            else:
+                total=sum(len(group) for group in ws.results[name]['R0'].details.values())
+                eg='；'.join(f'{key} 复读 {_money(v)}、规则 {_money(t)}' for _,key,v,t in rows[:CALC_SHOW])
+                expr='对象独立核算 = ' + json.dumps(spec.get('details'),ensure_ascii=False)
             mine = _rule_chain(ws, name, kind)
             split = _divergence(ws, name, spec, [k for _, k, _, _ in rows[:CALC_SHOW]])
             out.append((f"复读 {kind} {name}",

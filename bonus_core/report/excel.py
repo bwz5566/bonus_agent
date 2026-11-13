@@ -73,6 +73,21 @@ def write_excel(rs: RuleSet, res: Result, path: str | Path, ledger: list[dict] |
             ws.cell(r, 2).number_format = MONEY
     for title, headers, extra_rows, widths in extra_sheets or []:
         _sheet(wb, title, headers, extra_rows, widths=widths)
+    if res.rounding:
+        _sheet(wb,'舍入对账',['名称','理论金额','人员金额合计','待分配合计','舍入差额','说明'],
+            [[r['name'],float(_d(r['total'])),float(_d(r['allocated'])),float(_d(r['pending'])),
+              float(_d(r['residual'])),'先汇总到人员再舍入；差额单列，不转加到人员'] for r in res.rounding],
+            money_cols=(2,3,4,5))
+    for name, group in res.details.items():
+        _sheet(wb,f'{name}核算结果',['节点','编号','名称','核算金额'],
+               [[nid,r['key'],r['name'],float(_d(r['amount']))] for nid,r in group.items()],money_cols=(4,))
+    auxiliary={}
+    for item in res.auxiliary.values():
+        auxiliary.setdefault(item['level'],[]).append(item)
+    for scope, items in auxiliary.items():
+        cols=list(dict.fromkeys(c for item in items for c in item['values']))
+        _sheet(wb,f'{scope}核算底稿',['编号','名称','来源']+[_label(rs,c) for c in cols],
+               [[r['key'],r['name'],r['source']]+[_cell_value(r['values'].get(c)) for c in cols] for r in items])
 
     # 各层级明细
     for lv in res.levels:
