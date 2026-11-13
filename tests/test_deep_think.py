@@ -76,7 +76,8 @@ def test_think_model_handles_only_the_deep_steps(monkeypatch):
     llm.chat_tools([{"role": "user", "content": "a"}], [])
     assert seen[-1]["model"] == "deepseek-flash" and seen[-1]["extra_body"] == {"thinking": {"type": "disabled"}}
     out = llm.chat_tools([{"role": "user", "content": "a"}], [], think=True)
-    assert seen[-1]["model"] == "deepseek-v4-pro" and seen[-1]["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert seen[-1]["model"] == "deepseek-v4-pro" and seen[-1]["extra_body"] == {
+        "thinking": {"type": "enabled"}, "reasoning_effort": "high"}
     assert out["reasoning"] == "想清楚了"
     llm.chat([{"role": "user", "content": "a"}], json_out=True, think=True)
     assert seen[-1]["model"] == "deepseek-v4-pro" and llm.last_reasoning == "想清楚了"

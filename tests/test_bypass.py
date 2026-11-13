@@ -27,6 +27,7 @@ def attempt(w, ignored=(), chat=False) -> str:
 def ask_and_approve(w, text):
     w.ask_question(text, ["可以", "不可以"])
     w.questions[-1].answer = "可以"
+    w.trial_run()  # a new financial answer invalidates the prior calculation and its lint baseline
 
 
 # ---------------- G1 预发扣在奖金池里：哪条路都不放行 ----------------

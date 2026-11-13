@@ -78,6 +78,7 @@ def test_prepay_gate_cannot_be_ignored_or_asked_away(tmp_path):
     w.ignored = [{"ref": "抵扣 pool", "reason": "实发已经正确"}, {"ref": "01_规则.md", "reason": "测试"}]
     w.ask_question("pool 里直接扣预发可以吗？", ["可以", "不可以"])
     w.questions[-1].answer = "可以"
+    w.trial_run()  # evaluate the non-bypassable gate against the version with this financial answer
     assert any("直接扣减了已发" in g for g in w._open_gates(w.lint["S"]))
     with pytest.raises(ToolError, match="直接扣减了已发"):
         w.finish("x", ignored=[{"ref": "抵扣 pool", "reason": "实发已经正确"}, {"ref": "01_规则.md", "reason": "测试"}], review=False)

@@ -238,17 +238,17 @@ def test_failure_explained_with_retry(env):
     assert "算不出来" in x["title"] and "没对上" not in x["title"] and "不需要你回答" in x["title"]   # 写法问题，不问财务
     cid = store.create("失败", "张会计")
     (store.dir(cid) / "materials" / "数据.xlsx").write_bytes((m / "数据.xlsx").read_bytes())
-    scripts.append([{"tool": "trial_run"}] * 3)          # 连续失败 3 次，自动停下；程序自动接着做 2 轮，仍卡住才交给财务
+    scripts.append([{"tool": "trial_run"}] * 3)          # 同一失败达到预算即停止，外层不能重新开两轮
     post(c, store, f"/cases/{cid}/run")
     wait(app, cid)
     acts = [json.loads(x)["action"] for x in (store.dir(cid) / "audit.jsonl").read_text(encoding="utf-8").splitlines()]
-    assert acts.count("自动接续") == 2 and acts.count("本轮结束") == 3
-    assert sum("程序自动接着做" in m["text"] for m in store.chat(cid)) == 2
+    assert acts.count("自动接续") == 0 and acts.count("本轮结束") == 1
+    assert sum("程序自动接着做" in m["text"] for m in store.chat(cid)) == 0
     page = c.get(f"/cases/{cid}").text
-    assert "已自动停下" in page and ">重试<" in page and "详细信息" in page
+    assert "停止自动接续" in page and ">重试<" in page and "详细信息" in page
     said = store.chat(cid)[-1]["text"]                 # 对话里先说原因，再说需要什么帮助、想了解什么
-    assert said.index("已自动停下") < said.index("想请你确认：") < said.index("怎么继续：")
-    assert "点「发送」" in said and "直接重试多半还会卡" in said and "原因：" not in said
+    assert said.index("停止自动接续") < said.index("怎么继续：")
+    assert "重复重试不会清空" in said and "想请你确认：" not in said
     assert "程序内部出错" in explain("'list' object has no attribute 'items'")["title"]
     # 上一轮没完成时发文字：作为说明接着做这一轮（不是只回答问题的对话）
     scripts.append([{"tool": "finish", "args": {"summary": "x"}}])
@@ -282,8 +282,8 @@ def test_steps_written_while_running(env):
     post(c, store, f"/cases/{cid}/run")
     wait(app, cid)
     log = (store.dir(cid) / "out" / "running_steps.txt").read_text(encoding="utf-8")
-    # 连续失败 3 次算卡住，先停下来反思、换做法接着做（2 次），都没过去才停
-    assert log.count("行动：trial_run") == 9 and log.count("行动：（反思）") == 2 and "观察：" in log and "思考：" in log
+    # 同一问题累计3次即止损，不能靠清空历史重复执行9次。
+    assert log.count("行动：trial_run") == 3 and log.count("行动：（反思）") == 0 and "观察：" in log and "思考：" in log
 
 
 def test_chat_text_is_citable_source(tmp_path):

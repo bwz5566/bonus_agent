@@ -224,7 +224,7 @@ class Runner:
         from bonus_agent.scenarios import Registry
         self.store, self.llm_factory = store, llm_factory
         self.registry = registry or Registry([store.root / "scenarios"])
-        self.auto_continue = auto_continue      # 模型自己卡住时自动接着做的轮数上限（tokens 上限按这一次运行的合计算）
+        self.auto_continue = auto_continue      # 步数用完时的接续上限；卡住不接续，tokens/时间按整个作业累计
         self.jobs: dict[str, Job] = {}
         self.lock = threading.Lock()
         self.slots = threading.Semaphore(max_parallel)
@@ -277,13 +277,15 @@ class Runner:
                 scenario = prepare(self.registry, meta["scenario"], [d / "materials"], use_memory=meta.get("memory", True))
             with self.slots:
                 llm = self.llm_factory()
+                from bonus_agent.recovery import RunBudget
+                budget = RunBudget(llm.usage.prompt_tokens + llm.usage.completion_tokens, self.max_tokens)
                 ar = run_agent(llm, [d / "materials"], d / "out", resume=not new, max_steps=self.max_steps,
                                max_tokens=self.max_tokens, message=message, by=job.by,
                                chat=self.store.chat(job.cid)[:-1] if message else self.store.chat(job.cid),
                                on_step=lambda n, s: self._step(job, d / "out", n, s), should_stop=lambda: job.cancel,
-                               instruction=instruction, scenario=scenario, period=meta.get("period"))
+                               instruction=instruction, scenario=scenario, period=meta.get("period"), run_budget=budget)
                 auto = 0
-                # 模型自己卡住（写法、原地打转等）而停下：程序自动接着做下一轮（带上停下的原因），有次数上限，不用财务手动点重试
+                # 仅步数用完允许续跑；重复失败和无进展是终止条件，不能在外层清零重试。
                 while not message and not instruction and auto < self.auto_continue and retryable(ar.error) and not job.cancel:
                     auto += 1
                     self.store.audit(job.cid, job.by, "本轮结束", round=ar.round, status=ar.status, error=ar.error)
@@ -294,7 +296,7 @@ class Runner:
                     ar = run_agent(llm, [d / "materials"], d / "out", resume=True, max_steps=self.max_steps,
                                    max_tokens=self.max_tokens, by=job.by, chat=self.store.chat(job.cid),
                                    on_step=lambda n, s: self._step(job, d / "out", n, s), should_stop=lambda: job.cancel,
-                                   scenario=scenario, period=meta.get("period"))
+                                   scenario=scenario, period=meta.get("period"), run_budget=budget)
                 expected = sorted((d / "expected").glob("*.xlsx"))
                 if expected and ar.results:
                     from bonus_agent.compare import compare_expected, report

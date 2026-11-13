@@ -29,6 +29,13 @@ def explain(error: str) -> dict:
 
 
 def _explain(err: str) -> dict:
+    if err.startswith("纠错预算耗尽"):
+        return {"title": "同一问题多次纠错仍未解决，已停止自动接续并保存工作区。",
+                "where": err.split('：', 1)[-1][:350],
+                "advice": "请开发检查记录中的失败原因；补充材料、答复或更新修复代码后再运行。重复重试不会清空纠错记录。"}
+    if err.startswith("作业") and "上限" in err:
+        return {"title": "本次作业达到总用量或时间上限，已停止并保存工作区。",
+                "where": err, "advice": "请先检查未解决的校验问题，再决定是否继续。"}
     m = re.search(r"：(\w+) 连续 (\d+) 次失败，最后一次：(.*)", err, re.S)
     if m:
         tool, n, last = TOOL_NAMES.get(m.group(1), m.group(1)), m.group(2), m.group(3)
@@ -140,11 +147,11 @@ def _where(err: str) -> str:
 
 
 def retryable(error: str | None) -> bool:
-    """停下的原因是模型自己卡住（写法不对、原地打转、步数用完），接着做一轮多半能过：可以自动接续。
-    tokens 用完、服务出错、程序出错、等财务答复都不自动接续。"""
+    """Only an exhausted step allowance can continue; stagnation never restarts itself."""
     if not error or _is_bug(error):
         return False
-    return error.startswith("智能体卡住了") or error.startswith("达到最大步数")
+    # Stagnation is a stop condition, not permission to restart the same repair loop.
+    return error.startswith("达到最大步数")
 
 
 def to_text(error: str) -> str:

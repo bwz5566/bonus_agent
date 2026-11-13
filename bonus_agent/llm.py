@@ -147,13 +147,13 @@ def direct(base_url: str) -> bool:
         return False
 
 
-MAX_RETRIES = 6
+MAX_RETRIES = 2
 
 
 def openai_client(base_url: str, api_key: str, timeout: float):
     from openai import DefaultHttpxClient, OpenAI
     http = DefaultHttpxClient(trust_env=False) if direct(base_url) else None
-    # 网关偶发 502 / 503、连接中断时多重试几次（SDK 自带退避，约 0.5～8 秒一次）：几小时的回归不该因为一次抖动丢掉整次运行
+    # Transport retries are bounded separately from business recovery; six retries can hide minutes of failure.
     return OpenAI(base_url=base_url, api_key=api_key, timeout=timeout, http_client=http, max_retries=MAX_RETRIES)
 
 
@@ -230,6 +230,8 @@ class LLM:
     last_reasoning: str = ""          # 最近一次思考调用的思考内容
     usage: Usage = field(default_factory=Usage)
     checker_required: bool = False  # do not silently replace an explicitly required independent reviewer
+    recovery_mode: str = "inline"   # advisor: isolated diagnosis; main tool loop stays on its primary model
+    last_call: dict = field(default_factory=dict)
 
     @classmethod
     def from_config(cls, name: str | None = None, config: dict | None = None, checker: str | None = None,
@@ -275,6 +277,7 @@ class LLM:
             llm.vision = bool(v)
         c = (checker or m.get("checker")) if not _auxiliary else None
         llm.checker_required = bool(m.get("checker_required", False))
+        llm.recovery_mode = m.get("recovery_mode", "inline")
         if c and c != name:
             if c not in cfg["models"]:
                 raise LLMError(f"交叉验证模型 {c} 没有配置，可选：{', '.join(cfg['models'])}")
@@ -345,6 +348,7 @@ class LLM:
             out = self.think_llm.chat(messages, schema=schema, json_out=json_out, temperature=temperature,
                                       max_tokens=max_tokens, think=True)
             self.last_reasoning = self.think_llm.last_reasoning
+            self.last_call = self.think_llm.last_call
             return out
         think, body, max_tokens = self._think(think, dict(self.extra_body or {}), max_tokens)
         kwargs = dict(model=self.model, messages=self._prepare(messages), temperature=temperature, max_tokens=max_tokens)
@@ -355,35 +359,53 @@ class LLM:
                 kwargs["response_format"] = {"type": "json_schema", "json_schema": {"name": "output", "schema": schema}}
             else:
                 kwargs["response_format"] = {"type": "json_object"}
+        self.last_call = {'model': self.model, 'thinking': think, 'status': 'requesting',
+                          'reasoning_effort': (body or {}).get('reasoning_effort'), 'transport_retries_limit': MAX_RETRIES}
         t0 = time.monotonic()
         try:
             resp = self._client(think).chat.completions.create(**kwargs)
         except Exception as e:  # 网络、鉴权、限流等
+            self.last_call.update(status='failed', error_type=type(e).__name__)
             raise LLMError(f"{self.name} 调用失败：{e}") from e
         self._usage(resp, t0)
+        self._record_call(resp, think)
         self.last_reasoning = _reasoning(resp.choices[0].message) if think else ""
         return resp.choices[0].message.content or ""
 
     def chat_json(self, messages: list[dict], **kw):
         return parse_json(self.chat(messages, json_out=True, **kw))
 
+    def _record_call(self, resp, think):
+        reason = getattr(resp.choices[0], 'finish_reason', None)
+        self.last_call = {**self.last_call, 'model': getattr(resp, 'model', self.model), 'thinking': think,
+                          'response_id': getattr(resp, 'id', ''), 'request_id': getattr(resp, '_request_id', ''),
+                          'finish_reason': reason, 'status': 'completed'}
+        if reason in {'length', 'content_filter'}:
+            raise LLMError(f'{self.name} 输出未完成（finish_reason={reason}），未执行工具或应用结果')
+
     def chat_tools(self, messages: list[dict], tools: list[dict], *, temperature: float = 0.1,
                    max_tokens: int = 8192, think: bool = False) -> dict:
         """工具调用。返回 {"content": 文本, "tool_calls": [{"id", "name", "arguments"(JSON 字符串)}], "reasoning": 思考内容}。
         think：这一步打开思考（模型不能切换时照常调用，reasoning 为空）；配了 think_model 时这一步交给那个模型。"""
         if think and self.think_llm is not None:
-            return self.think_llm.chat_tools(messages, tools, temperature=temperature, max_tokens=max_tokens, think=True)
+            out = self.think_llm.chat_tools(messages, tools, temperature=temperature, max_tokens=max_tokens, think=True)
+            self.last_call = self.think_llm.last_call
+            return out
         think, body, max_tokens = self._think(think, _merge(self.extra_body, self.tools_extra_body), max_tokens)
         kwargs = dict(model=self.model, messages=self._prepare(messages), tools=tools, temperature=temperature,
                       max_tokens=max_tokens)
         if body:
             kwargs["extra_body"] = body
+        self.last_call = {'model': self.model, 'thinking': think, 'status': 'requesting',
+                          'reasoning_effort': (body or {}).get('reasoning_effort'), 'transport_retries_limit': MAX_RETRIES}
         t0 = time.monotonic()
         try:
             resp = self._client(think).chat.completions.create(**kwargs)
         except Exception as e:
+            self.last_call.update(status='failed', error_type=type(e).__name__)
             raise LLMError(f"{self.name} 调用失败：{e}") from e
         self._usage(resp, t0)
+        self._record_call(resp, think)
         msg = resp.choices[0].message
         calls = [{"id": c.id, "name": c.function.name, "arguments": c.function.arguments or "{}"}
                  for c in (msg.tool_calls or [])]

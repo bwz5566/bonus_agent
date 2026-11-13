@@ -1,6 +1,6 @@
 """固定回归：对一组场景各跑 N 次，和期望结果逐分比对，出 JSON 汇总，用来判断每次改动是变好还是变坏。
 
-每个场景按网页上的用法跑：智能体自己卡住（写法、原地打转等）时自动接着做，最多 auto_continue 次；
+每个场景按网页上的用法跑：步数用完时在同一作业预算内接续，最多 auto_continue 次；卡住不自动接续；
 停下提问时，场景配了财务答复文件就把它作为答复接着跑下一轮，没配就记为“停下提问”。
 期望结果只在算完后用来核对，不会交给智能体；坏数据用例等不该当材料的文件用 exclude 排除。
 
@@ -157,6 +157,9 @@ def run_once(sc: Scenario, i: int, out: Path, llm_factory: Callable[[], object],
     out.mkdir(parents=True)
     files = sc.materials()
     llm = llm_factory()
+    from bonus_agent.recovery import RunBudget
+    budget = RunBudget(llm.usage.prompt_tokens + llm.usage.completion_tokens, max_tokens,
+                       max_minutes * 60 if max_minutes else 1800)
     t0 = time.time()
     steps = 0
     ar = None
@@ -165,7 +168,7 @@ def run_once(sc: Scenario, i: int, out: Path, llm_factory: Callable[[], object],
         new, auto, answered = True, 0, 0
         while True:
             ar = run_agent(llm, files, out, resume=not new, max_steps=max_steps, max_tokens=max_tokens,
-                           max_history_chars=max_history_chars, should_stop=late)
+                           max_history_chars=max_history_chars, should_stop=late, run_budget=budget)
             if late() and ar.status == "FAILED":
                 ar.error = f"单次运行超过 {max_minutes:g} 分钟，已跳过（{ar.error[:80]}）"
             new = False

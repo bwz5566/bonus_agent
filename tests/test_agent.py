@@ -463,7 +463,7 @@ def test_calls_repeated_in_rotation_are_stuck(tmp_path):
     ar = run_agent(llm, [ANNUAL], tmp_path, reflect=0)
     ver = [s for s in ar.steps if s.tool == "verify"]
     assert "原样再提交不会有变化" in ver[3].result and "原样再提交" not in ver[2].result
-    assert ar.status == "FAILED" and "原样提交了 3 次" in ar.error, ar.error
+    assert ar.status == "FAILED" and ("原样提交了 3 次" in ar.error or "累计失败 3 次" in ar.error), ar.error
     assert len(ver) == 7
 
 

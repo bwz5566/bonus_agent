@@ -703,6 +703,7 @@ class Step:
     model_secs: float = 0.0       # 这次模型回复用时（一次回复里有几个调用时记在第一个上）
     tokens_in: int = 0            # 这次模型回复的输入 / 输出 tokens（同上）
     tokens_out: int = 0
+    request: dict = field(default_factory=dict)  # actual serving model, finish reason and request id
 
 
 @dataclass
@@ -1435,7 +1436,15 @@ class Workspace:
         if kind == "tier":
             table.update(mode=mode, lower_inclusive=lower_inclusive, below_first=below_first, steps=[])
             for i, row in enumerate(rows):
-                lower = take(row["lower"], f'{prefix}/steps/{i}/0') if row.get("lower") else "0"
+                ref = row.get("lower")
+                if ref and not any(f.name == ref for f in self.facts) and re.fullmatch(r'[+-]?\d+(?:\.\d+)?%?', str(ref)):
+                    if i == 0 and str(ref) in {"0", "0.0"}:
+                        ref = None  # the documented implicit structural origin, never a business threshold
+                    else:
+                        raise ToolError(f'parameter.ref：{prefix}/steps/{i}/0 的 lower={ref!r} 是数字，不是参数名。'
+                                        'lower 引用 record_facts 中的参数名；区间参数会投影为下界，首档0可省略。'
+                                        '请先登记该边界的原文，再用参数名编译；本次未保存。')
+                lower = take(ref, f'{prefix}/steps/{i}/0') if ref else "0"
                 if i and not row.get("lower"):
                     raise ToolError("除首档隐含0起点外，每个阈值都必须引用登记的参数")
                 table["steps"].append([lower, take(row["value"], f'{prefix}/steps/{i}/1')])
@@ -2235,14 +2244,15 @@ class Workspace:
         if not self.datasets:
             raise ToolError("还没有定义数据表")
         names = [self._scheme(scheme)] if scheme or len(self.schemes) <= 1 else self._order(self.schemes)
+        parameters = self.validate_parameters()
         out = []
+        if parameters["gaps"] or parameters["errors"]:
+            out.append("【草稿试算：参数预检未通过，不推进验收阶段】先修复来源、类型和绑定缺口："
+                       + json.dumps(parameters, ensure_ascii=False))
         for name in names:
             if "pool" not in self._merged(name) or not self._merged(name).get("allocation"):
                 raise ToolError(f"方案「{name}」的规则还缺 pool 或 allocation")
             out.append(self._trial(name))
-        parameters = self.validate_parameters()
-        if parameters["gaps"] or parameters["errors"]:
-            out.append("注意：参数预检未通过；金额试算不能解决证据问题。" + json.dumps(parameters, ensure_ascii=False))
         return "\n\n".join(out)
 
     def _deps(self, name: str) -> set[tuple[str, str]]:
@@ -2447,7 +2457,8 @@ class Workspace:
         def clean(value):
             if isinstance(value, BaseModel):
                 return {k: clean(getattr(value,k)) for k in type(value).model_fields
-                        if k not in {'sources','desc','confidence','confirmed_by'}}
+                        if k not in {'sources','desc','confidence','confirmed_by'}
+                        and not (isinstance(value, RuleSet) and k == 'name')}
             if isinstance(value, dict):
                 return {k: clean(v) for k,v in value.items()}
             if isinstance(value, (list,tuple)):
@@ -3590,7 +3601,7 @@ class Workspace:
     def phase(self) -> int:
         """程序按工作区判断现在处在第几个阶段（0 起，见 PHASES）。规则改动后会退回前面的阶段。"""
         skipped = {str(i.get("ref", "")) for i in self.ignored}
-        if self.schemes and not self.dirty and not self._clause_gaps(skipped):
+        if self.schemes and not self.dirty and not self._clause_gaps(skipped) and not self._binding_gaps():
             return 2 if self._verify_gaps() else 3
         docs = [f.name for f in self.inv.files if f.suffix.lower() in RULE_SUFFIXES and f.name not in skipped]
         read = all(any(f.file == d for f in self.facts) and any(c.file == d for c in self.clauses) for d in docs) \
@@ -3613,14 +3624,14 @@ class Workspace:
                     "用 set_rules 写入规则（笔记和参数台账里已有的内容不必重读）")
         elif any(f.targets and fx.numeric(f) is None and fx.interval(f.value) is not None for f in self.facts):
             step = "先用 validate_parameters 局部诊断/修复参数类型；不重跑金额，不重复绑定原文区间"
+        elif bindings := self._binding_gaps():
+            step = "先用 validate_parameters 查看具体缺口，再修正来源、类型或目标；不重复试算：" + "；".join(bindings[:3])
         elif any(s in self.untested or s not in self.results for s in self.schemes):
             step = "用 trial_run 试算"
         elif bare:
             step = f"用 record_facts 登记这些文档的参数：{'、'.join(bare)}"
         elif self._clause_gaps({str(i.get("ref", "")) for i in self.ignored}):
             step = "用 record_clauses / cover_clauses 把条款清单逐条落实"
-        elif bindings := self._binding_gaps():
-            step = "先用 validate_parameters 查看具体缺口，再修正来源、类型或目标；不重复试算：" + "；".join(bindings[:3])
         elif self._verify_gaps():
             step = "用 verify 独立验算：" + "；".join(self._verify_gaps()[:3])
         else:
@@ -3945,7 +3956,8 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
               on_step: Callable[[int, Step], None] | None = None, resume: bool = True,
               should_stop: Callable[[], bool] | None = None, instruction: str | None = None,
               message: str | None = None, by: str = "", chat: list[dict] | None = None,
-              reflect: int = MAX_REFLECT, deep: int = DEEP_LIMIT, scenario=None, period: str | None = None) -> AgentResult:
+              reflect: int = MAX_REFLECT, deep: int = DEEP_LIMIT, scenario=None, period: str | None = None,
+              run_budget=None) -> AgentResult:
     """max_steps 和 max_tokens 都是安全上限：模型调用 finish 就结束，正常不会用满。
     reflect：卡住时在本轮内反思、换做法的次数上限（清掉打转的对话历史，带上卡在哪、试过什么，工作区保留），用完再停下。
     deep：按需深度思考的步数上限。平时不思考；上一步出错、被拦下、原样重复或停下来反思后，下一步先分析错在哪、
@@ -3974,6 +3986,8 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                         f"至少要 {MIN_CONTEXT}，建议 131072。请管理员调大模型服务的上下文长度（vLLM 启动参数 --max-model-len；"
                         "超过模型原生长度的要同时开 YaRN），再重试")
     used0 = llm.usage.prompt_tokens + llm.usage.completion_tokens    # 本轮开始前的累计用量（自动接续时同一个模型对象接着用）
+    from bonus_agent.recovery import RecoveryJournal, RunBudget, local_advice
+    run_budget = run_budget or RunBudget(used0, max_tokens)
     u0, t0 = (llm.usage.calls, llm.usage.prompt_tokens, llm.usage.completion_tokens), time.time()
     ws = Workspace(llm, build_inventory(files))
     out = Path(out_dir) if out_dir is not None else None
@@ -4008,6 +4022,10 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                         for i, a in enumerate(answers or []) if a.get("text") and a.get("answer") not in (None, "")]
     fresh = cs.apply_answers(ws.questions, answers)
     ws.said = _said(chat, message, instruction)
+    recovery = RecoveryJournal(out / 'recovery.json' if out else None,
+                               {'files': prints, 'period': period_obj.label if period_obj else None,
+                                'answers': [(q.id, q.answer) for q in ws.questions if q.answer is not None],
+                                'code': rnd['code'], 'financial_context': ws.said})
     ws.notes.pop(ANSWER_NOTE, None)          # 上一轮的回答不带到这一轮
     handlers = {t["name"]: getattr(ws, t["name"]) for t in TOOLS}
     ws.transcribe_all()
@@ -4043,7 +4061,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     sys = system_prompt()
     history: list[dict] = []
     steps: list[Step] = []
-    error = ""
+    error = recovery.error
     nudges = 0
     seen: dict[str, int] = {}          # 只读工具的调用 -> 第几步，用来发现原地打转
     repeats = 0
@@ -4062,13 +4080,16 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     reached = ws.phase()               # 本轮到过的最远阶段：往前推进到新阶段时清空对话历史；改规则退回前面的阶段再回来不清
     deep_why, deep_used = "", 0        # 下一步要深度思考的原因（空：普通模式）；本轮已用的深度思考步数
     from bonus_agent.progress import ProgressWatch
-    progress_watch = ProgressWatch()
+    saved_progress = recovery.state.get('progress', {})
+    progress_watch = ProgressWatch(set(saved_progress.get('previous', [])), saved_progress.get('stagnant', 0))
     context_retries = 0
-    for turn in range(max_steps):
+    for turn in range(max_steps if not error else 0):
         if should_stop and should_stop():
             error = f"已手动停止（第 {len(steps)} 步）"
             break
         used = llm.usage.prompt_tokens + llm.usage.completion_tokens - used0     # 只算本轮的用量
+        if error := run_budget.check(llm):
+            break
         if max_tokens and used >= max_tokens:
             error = f"tokens 用量 {used} 达到上限 {max_tokens}，已停止"
             break
@@ -4077,6 +4098,32 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         if _shrink(history, max_history_chars):
             seen.clear()       # 较早的结果已省略，重新读取是合理的
         think = bool(deep_why) and deep_used < deep
+        if think and llm.recovery_mode == 'advisor' and llm.think_llm is not None:
+            if recovery.claim_advice(deep_why):
+                deep_used += 1
+                started_advice = time.time()
+                before_advice = (llm.usage.prompt_tokens, llm.usage.completion_tokens)
+                try:
+                    advice = local_advice(llm.think_llm, deep_why, steps, ws.facts, ws.next_hint())
+                    content = json.dumps(advice, ensure_ascii=False)
+                    history.append({'role': 'user', 'content': '【只读纠错建议，必须经原文和程序验证后应用】' + content})
+                    advice_ok = True
+                except (LLMError, ValueError) as exc:
+                    content, advice_ok = f'局部诊断未完成：{exc}；不修改工作区，停止本次运行。', False
+                st = Step('（局部诊断）', {'reason': deep_why}, content, advice_ok, deep=True,
+                          model_secs=round(time.time() - started_advice, 2),
+                          tokens_in=llm.usage.prompt_tokens-before_advice[0],
+                          tokens_out=llm.usage.completion_tokens-before_advice[1],
+                          request=dict(llm.think_llm.last_call))
+                steps.append(st)
+                if on_step:
+                    on_step(len(steps), st)
+                if not advice_ok:
+                    error = content
+                    break
+                if error := run_budget.check(llm):
+                    break
+            think = False  # advice never inherits primary tools or the full conversation
         if think:
             deep_used += 1
         tail = [{"role": "user", "content": ws.state() + (_deep_note(deep_why, steps) if think else "")}]
@@ -4162,6 +4209,8 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         failed_now: set[str] = set()                  # 这次回复里已经算过一次失败的工具
         said = "" if mode == "json" else (reply.get("content") or "").strip()     # 原生工具调用时模型写在正文里的思考
         for c in calls:
+            if recovery.error:
+                break  # no later write in the same model response may bypass the stop
             args, note, dup = {}, "", False
             thought, bare = _split_thought(c["arguments"])
             thought = thought or said
@@ -4214,7 +4263,11 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             if not thought:
                 result += "\n（提醒：每次调用都先在 thought 里写思考：上一步观察到了什么、为什么做这一步、预期看到什么。）"
             step = Step(c["name"], args if isinstance(args, dict) else {}, result, ok, thought,
-                        at=time.strftime("%H:%M:%S", time.localtime(t_tool)), secs=round(time.time() - t_tool, 2))
+                        at=time.strftime("%H:%M:%S", time.localtime(t_tool)), secs=round(time.time() - t_tool, 2),
+                        request=dict(llm.last_call))
+            failed_validation = ok and isinstance(value, dict) and value.get('status') == 'FAIL'
+            if not ok or failed_validation:
+                recovery.failure(c['name'], step.args, result, waiting=bool(ws.pending))
             if len(steps) == turn_steps:     # 本次回复的第一个调用：记上模型用时和 tokens
                 step.model_secs, (step.tokens_in, step.tokens_out) = round(model_secs, 2), model_tokens
             if c.get("raw") and c["raw"] != c["arguments"]:     # 模型的原文（格式有误、程序改过或没能执行）留档，便于做回放用例
@@ -4333,6 +4386,8 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                for st in steps[turn_steps:]):
             frontier = ws.blocker_frontier()
             stagnant = progress_watch.observe(frontier)
+            recovery.state['progress'] = {'previous': sorted(progress_watch.previous), 'stagnant': stagnant}
+            recovery.save()
             if stagnant >= 2:
                 deep_why = f"连续 {stagnant + 1} 次检查没有消除既有问题；工具返回成功不代表有进展。" + "；".join(sorted(frontier)[:3])
                 ws.notes["纠错进度"] = (deep_why + "。先做局部参数预检；金额问题用 review_calculation 定位，"
@@ -4341,12 +4396,19 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             elif not stagnant:
                 ws.notes.pop("纠错进度", None)
             if stagnant >= 5:
-                repeats, stuck = MAX_STUCK, deep_why
+                if ws.pending:
+                    repeats, stuck = MAX_STUCK, deep_why
+                else:
+                    recovery.halt(deep_why)
         if skipped and skipped == len(calls):
             # 整轮都是被拦下的重复调用：不把它留在历史里，否则小模型会照着历史接着重复；只留一句说明
             del history[turn_start:]
             history.append({"role": "user", "content": f"（你刚才又原样调用了 {calls[0]['name']}，和之前完全相同，没有任何变化。"
                                                        f"不要再重复；下一步（程序判断）：{ws.next_hint()}）"})
+        if recovery.error:
+            error = recovery.error
+            ws.done = False
+            break
         if ws.done:
             break
         now = ws.phase() if not message else reached
@@ -4398,7 +4460,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                      + "。请把这条信息反馈给开发，或在对话里告诉智能体怎么处理")
             break
     else:
-        error = f"达到最大步数 {max_steps} 仍未完成"
+        error = error or f"达到最大步数 {max_steps} 仍未完成"
 
     if message and not ws.changed and not fresh and not any((changes or {}).values()):
         # 对话里只是问答、没有改动：不算新的一轮，不改案卷和输出
@@ -4439,6 +4501,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         if message:
             rnd["message"] = {"by": ws.chat_by, "text": message}
         rnd.update(status=ar.status, error=error, usage=ar.usage, pending=[q.id for q in ws.pending], summary=ws.summary,
+                   last_request=dict(llm.last_call),
                    answered=[q.id for q in fresh], changes=changes, drafts=json.loads(json.dumps(ws.drafts)),
                    digest=cs.digest(tested) if tested else (last or {}).get("digest"))
         case = case or {"created": rnd["at"], "rounds": []}

@@ -112,6 +112,7 @@ models:
     json_mode: json_object
     extra_body: {thinking: {type: disabled}}     # 默认开思考且 effort=high，一步就能把 8192 个输出 tokens 用完
     think_model: deepseek-v4-pro
+    recovery_mode: advisor         # Pro只诊断局部反例；Flash执行工具，避免交替接管长历史
     checker: deepseek-v4-pro
     checker_required: true
   deepseek-flash-pro:           # 平时用 flash（低成本），出错、卡住需要深度思考的那一步交给 pro
@@ -120,6 +121,7 @@ models:
     json_mode: json_object
     extra_body: {thinking: {type: disabled}}
     think_model: deepseek-v4-pro
+    recovery_mode: advisor
     checker: deepseek-v4-pro
     checker_required: true
   deepseek-v4-pro:              # DeepSeek-V4-Pro，只有文本，图片交给 deepseek-flash 转写
@@ -127,6 +129,9 @@ models:
     model: deepseek-v4-pro
     json_mode: json_object
     extra_body: {thinking: {type: disabled}}
+    think: {thinking: {type: enabled}, reasoning_effort: high}  # 关键独立复核；局部纠错另限low/4096/180秒
+    think_max_tokens: 8192
+    think_timeout: 300
     vision: deepseek-flash
 
   # ---- 内网自建 Qwen（2026-11-02 起默认用 A）----
