@@ -45,6 +45,7 @@ class Fact(BaseModel):
     page: int | None = Field(default=None, ge=1)
     context: str = ""        # verbatim applicability heading on the cited page
     source_hash: str = ""    # populated by the program, never trusted from the model
+    source_cell: dict | None = None  # verified physical table coordinates, 1-based
     component: Literal["literal", "lower", "upper"] = "literal"
     unit: Literal["%", "‰", "万", "万元", "亿", "亿元", "元"] | None = None
 

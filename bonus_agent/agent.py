@@ -16,7 +16,7 @@ import re
 import time
 import unicodedata
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
@@ -72,7 +72,7 @@ DEEP_LIMIT = 24                # 每一轮最多这么多步用深度思考（�
 MAX_REFLECT = 2                # 卡住时先让智能体停下来反思、换做法接着做，最多这么多次；再卡住才停下，把原因报给财务
 KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保留全文
 BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
-READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate", "suggest_links", "validation_report"}
+READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate", "suggest_links", "validation_report", "read_parameter_table"}
 NO_IGNORE = ("查找表 ", "抵扣 ")    # 程序检查里不能写进 ignored 放过的项
 MUST_FIX = ("抵扣 ", "计算契约 ")              # 连提问也不能放过、只能改规则的项
 _CURRENCY_HEAD = re.compile(r"币种|币别|币制|结算币|外币|汇率|(?<![A-Za-z])(?:currency|exchange\s*rate|fx)(?![A-Za-z])", re.I)
@@ -92,7 +92,7 @@ def _GATE_ORDER(key: str) -> int:
 VERIFY_TOL = Decimal("0.005")   # 按份额分配时，独立算式和引擎未舍入的份额之差不超过半分，才算尾差
 WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", "bind_facts", "compile_table", "validate_parameters", "review_calculation", "preview_repair", "verify_repair", "apply_repair", "remove_facts", "ask_question",
                "record_clauses", "cover_clauses",
-               "answer_question"}
+               "answer_question", "update_dataset"}
 RULE_SUFFIXES = {".docx", ".pptx", ".pdf", ".png", ".jpg", ".jpeg", ".txt", ".md"}   # 规则文档：要登记参数
 CHAT_SOURCE = "财务对话"       # 财务在对话里贴的规则原文、口径说明：和材料一样可以引用核对
 ANSWER_NOTE = "回答财务"       # 财务的说明里带了提问：智能体把回答记在这条笔记里，网页放在本轮回复的开头（没算完也显示）
@@ -148,6 +148,10 @@ TOOLS: list[dict] = [
      "description": "把读到的关键信息记在工作区（如某条规则、某个参数、文件用途、待核对事项）。笔记每轮都会附给你，"
                     "较早的对话会被裁剪，重要内容请及时记下。同一 topic 再次记录会覆盖，text 为空则删除。",
      "parameters": _obj({"topic": _S, "text": _S}, ["topic", "text"])},
+    {"name": "update_dataset", "description": "局部修改已保存的数据定义。只补link/key/period等时使用，自动保留字段、筛选和完整复合键，不重抄成功映射。",
+     "parameters": _obj({"name":_S,"changes":{"type":"object","properties":{"key":_S,"link":_S,"period":_S,"window":_S,"filter":{"type":"object"},"population_from":_S}}},["name","changes"])},
+    {"name":"read_parameter_table", "description":"读取PPT指定页原始表格及精确table/row/column/line坐标，不依赖模型转写。按新老项目和区域定位后登记source_cell。",
+     "parameters":_obj({"file":_S,"page":_I},["file","page"])},
     {"name": "record_facts",
      "description": "登记从材料里读到的参数和口径（比例、金额、阶梯、系数、门槛、日期、取数口径等），程序据此比对冲突。"
                     "每个文件里出现的都要登记，同一参数在几个文件（或一个文件的几处）出现就登记几次，用同一个 name；"
@@ -159,6 +163,8 @@ TOOLS: list[dict] = [
          "file": {**_S, "description": "出处文件名；财务在对话里发的内容写「财务对话」"}, "quote": _S,
          "page": {**_I, "description": "多页文档的原文页码；参数表尚未创建时也可先登记页码"},
          "context": {**_S, "description": "原文适用标题，须出现在引用所在页；用于区分重复参数表"},
+          "source_cell": {"type": "object", "description": "PPT多值表行必须精确定位，坐标从1开始；多行单元格指定line。value须对应选中行，不能整行挑数。",
+                          "properties": {"table": _I, "row": _I, "column": _I, "line": _I}, "required": ["table","row","column"]},
          "meaning": {**_S, "description": "可选：文字口径的规范说法，如 含税"},
          "component": {"type": "string", "enum": ["literal", "lower", "upper"], "description": "区间值选择下界或上界，保留原文如1000-3000万"},
          "unit": {**_S, "description": "裸数的明确单位，如%，quote须同时包含单位表头；不得凭参数名猜测"},
@@ -1203,6 +1209,13 @@ class Workspace:
                 out.setdefault(b.page, []).append(t)
         return {p: "\n".join(ts) for p, ts in out.items()}
 
+    def read_parameter_table(self, file: str, page: int) -> dict:
+        from bonus_agent.source_cells import read_ppt_tables
+        try:
+            return {'file':file,'page':page,'tables':read_ppt_tables(self._file(file),page)}
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
+
     def _wrong_page(self, f) -> str:
         """参数名里写了区分用的词（如区域、产品线），引用的原文却在另一页、那一页没有这个词：多半是抄错了页（如把南方国家区的阶梯当成美洲的）。"""
         pages = self._page_texts(f.file)
@@ -1211,6 +1224,8 @@ class Workspace:
         hit = self._quote_pages(f.quote, pages)
         if not hit:
             return ""
+        if f.page in hit and f.context and fx.norm(f.context) in fx.norm(pages.get(f.page, '')):
+            return ""  # explicit verified heading/page outrank name-word heuristics (including script variants)
         # 参数名里能在材料某几页找到、却不在引用所在页的词（取最长的）：参数名常写成一整串（如 海外美洲新项目阶梯），逐段找
         name = fx.norm(f.name)
         for w in sorted(self._GENERIC_WORDS, key=len, reverse=True):     # 先按通用词切开，只在剩下的段里找（不会切出“成比”这种半个词）
@@ -1266,6 +1281,21 @@ class Workspace:
                 near = fx.nearest(f, self._lines(f.file)) if f.file in corpus and "找不到" in bad else ""
                 lines.append(f"第 {i} 条「{f.name}」未登记：{bad}" + (f"。原文里最接近的一句：{near}（照这句改 quote，不必重读文件）"
                                                                       if near else ""))
+                continue
+            from bonus_agent.source_cells import ppt_cell, scalar_tokens
+            if f.source_cell:
+                try:
+                    selected, labels = ppt_cell(self._file(f.file), f.page, f.source_cell)
+                    if fx.norm(selected) not in fx.norm(f.quote):
+                        raise ValueError('source.cell：选中单元格行不在引用原文内')
+                    if fx.check_fact(f.model_copy(update={'quote': selected}), {f.file:fx.norm(selected)}):
+                        raise ValueError('source.cell：value与选中单元格行不一致，不能从其他区域或新老项目列取值')
+                    f.meaning = ' | '.join([*labels, selected])
+                except (ValueError, ArithmeticError) as exc:
+                    lines.append(f'第 {i} 条「{f.name}」未登记：{exc}')
+                    continue
+            elif Path(f.file).suffix.lower() == '.pptx' and f.component == 'literal' and len(scalar_tokens(f.quote)) > 1 and '|' in f.quote:
+                lines.append(f'第 {i} 条「{f.name}」未登记：source.cell：引用表行包含多个数值，须提供source_cell的table/row/column/line，不能仅验证数字存在')
                 continue
             wrong = self._wrong_page(f)
             if wrong:
@@ -1654,6 +1684,32 @@ class Workspace:
             return "no-op：数据定义和映射未变化，未触发重新试算。" + (f"\n{reuse}" if reuse else "")
         return out + (f"\n{reuse}" if reuse else "")
 
+    def update_dataset(self, name: str, changes: dict) -> str:
+        """Patch a saved definition without rewriting its successful identity mapping."""
+        import copy
+        if name not in self.datasets or name not in self.mapping:
+            raise ToolError('dataset.patch：没有已保存的数据定义')
+        if not changes or set(changes)-{'key','link','period','window','filter','population_from'}:
+            raise ToolError('dataset.patch：只允许修改key/link/period/window/filter/population_from')
+        d, m = self.datasets[name], self.mapping[name]
+        st = self.inv.sheet(f'{Path(m.file).name}/{m.sheet}')
+        dup = _dup_names(st.headers) if st else {}
+        alias = lambda c: f'{c}({dup[c]}列)' if c in dup else c
+        fields = {key:{**value.model_dump(exclude_defaults=True), 'column':alias(m.columns[key])}
+                  for key,value in d.fields.items() if key in m.columns}
+        combine = {key:[alias(c) for c in cols] for key,cols in (m.combine or {}).items()}
+        unpivot = copy.deepcopy(m.unpivot)
+        if unpivot:
+            unpivot['columns'] = [alias(c) for c in unpivot['columns']]
+            if unpivot.get('share_from'): unpivot['share_from'] = alias(unpivot['share_from'])
+            if unpivot.get('share_from_columns'): unpivot['share_from_columns'] = [alias(c) for c in unpivot['share_from_columns']]
+        args = dict(name=name,file=Path(m.file).name,sheet=m.sheet,fields=fields,key=d.key,link=d.link,
+                    desc=d.desc,header_rows=m.header_rows,filter={alias(k):v for k,v in m.filter.items()},
+                    distinct=d.distinct,unpivot=unpivot,unmatched=d.unmatched,period=d.period,window=d.window,
+                    combine=combine or None,population_from=d.population_from)
+        args.update(copy.deepcopy(changes))
+        return self.define_dataset(**args)
+
     def _define_dataset(self, name: str, file: str, sheet: str, fields: dict, key: str | None = None,
                         link: str | None = None, desc: str = "", header_rows: list[int] | None = None,
                         filter: dict | None = None, distinct: bool = False, unpivot: dict | None = None,
@@ -1950,6 +2006,11 @@ class Workspace:
         if ROW_ID in m.columns.values():
             st = add_row_ids(st)
         st, _ = filter_sheet(st, m.filter or None)
+        ds = self.datasets[name]
+        if self.period and ds.period and ds.period in m.columns:
+            period_col = st.headers.index(m.columns[ds.period])
+            win = self.period.window(ds.window)
+            st = replace(st, rows=[(n,v) for n,v in st.rows if win.contains(v[period_col])])
         i = st.headers.index(m.columns[fld])
         return [cell_text(v[i]) for _, v in st.rows if v[i] not in (None, "")]
 
@@ -3449,13 +3510,15 @@ class Workspace:
         checks.append(CheckResult("evidence.bindings", Status.FAIL if bindings else Status.PASS,
                                   "数值事实和参数表位置均已检查；缺口见反例", expected=binding_count, checked=binding_count, examples=bindings))
         program_gaps = [f"{s}: {g}" for s, rep in self.lint.items() for g in self._open_gates(rep)]
-        checks.append(CheckResult("program.contracts", Status.FAIL if program_gaps else Status.PASS,
+        checks.append(CheckResult("program.contracts", Status.FAIL if program_gaps else Status.PASS if self.results else Status.INCOMPLETE,
                                   "程序及业务结构校验", examples=program_gaps))
         from bonus_agent import reread as rr
         gaps = rr.calc_gaps(self, self.reread)
         state = (Status.ERROR if any(k.startswith('复读 执行') for k,_ in gaps) else
                  Status.INCOMPLETE if any(k.startswith(('复读 覆盖', '复读 未定论')) for k,_ in gaps) else
                  Status.FAIL if gaps else Status.PASS)
+        if (not self.results or self.untested) and state == Status.PASS:
+            state = Status.INCOMPLETE
         checks.append(CheckResult("independent.full", state,
                                   "独立全量复算", expected=sum(v['expected'] for v in self._full_coverage.values()),
                                   checked=sum(v['checked'] for v in self._full_coverage.values()), examples=gaps))
@@ -4123,6 +4186,9 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                     break
                 if error := run_budget.check(llm):
                     break
+                if should_stop and should_stop():
+                    error = f'已手动停止（第 {len(steps)} 步）'
+                    break
             think = False  # advice never inherits primary tools or the full conversation
         if think:
             deep_used += 1
@@ -4676,6 +4742,11 @@ def _resolve_dup_columns(st, fields, combine, unpivot, filter):
         unpivot = {**unpivot, "columns": [fix(c) for c in unpivot["columns"]]}
     if isinstance(filter, dict):
         filter = {fix(k): v for k, v in filter.items()}
+    if isinstance(unpivot, dict):
+        if unpivot.get('share_from'):
+            unpivot = {**unpivot, 'share_from':fix(unpivot['share_from'])}
+        if unpivot.get('share_from_columns'):
+            unpivot = {**unpivot, 'share_from_columns':[fix(c) for c in unpivot['share_from_columns']]}
     return fields, combine, unpivot, filter
 
 
@@ -4883,8 +4954,6 @@ def _deep_reason(turn: list[Step], skipped: int, ws: Workspace, fails: dict[str,
         head = st.result.removeprefix("错误：").split("\n", 1)[0][:300]
         if not st.ok and (not st.result.startswith(FORMAT_ERRORS) or fails.get(st.tool, 0) >= 2):
             return f"{st.tool} 失败：{head}"
-        if "\n注意：" in st.result:
-            return f"{st.tool} 的结果里有提醒：{st.result.split(chr(10) + '注意：', 1)[1][:300]}"
         if st.ok and st.tool == "set_rules" and getattr(ws, "last_blocking", None):
             return f"set_rules 保存了，但还有阻断问题：{head}"
         if st.ok and st.tool == "trial_run" and not ws.reread and "no-op" not in st.result:
