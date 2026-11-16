@@ -234,6 +234,7 @@ class LLM:
     last_call: dict = field(default_factory=dict)
     workflow_mode: str = 'staged'
     max_input_tokens: int = 96000
+    max_history_chars: int | None = None   # 对话历史上限（字符），见 models.yaml
 
     @classmethod
     def from_config(cls, name: str | None = None, config: dict | None = None, checker: str | None = None,
@@ -284,6 +285,7 @@ class LLM:
         if llm.workflow_mode not in ('staged','legacy'):
             raise LLMError('workflow_mode须为staged或legacy')
         llm.max_input_tokens = int(m.get('max_input_tokens',96000))
+        llm.max_history_chars = int(m.get('max_history_chars', 0)) or None   # 没写由智能体用默认值
         if c and c != name:
             if c not in cfg["models"]:
                 raise LLMError(f"交叉验证模型 {c} 没有配置，可选：{', '.join(cfg['models'])}")

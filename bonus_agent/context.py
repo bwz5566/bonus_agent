@@ -58,11 +58,26 @@ _BRIEF = {'facts': ('name', 'value', 'unit', 'page', 'context', 'meaning'), 'cla
 def _brief(section, item):
     out = {k: item[k] for k in _BRIEF[section] if item.get(k) not in (None, '', [])}
     if section == 'facts':
-        if not str(item.get('name', '')).startswith(f"{item.get('file')}::"):
+        name = str(item.get('name', ''))
+        if not name.startswith(f"{item.get('file')}::"):
             out['file'] = item.get('file')  # coordinate names already carry the file
+        elif f"::P{item.get('page')}." in name:
+            out.pop('page', None)  # ...and the page
+        value, meaning = str(item.get('value', '')), str(out.get('meaning', ''))
+        if value and meaning.endswith(f' | {value}'):
+            out['meaning'] = meaning[: -len(value) - 3]  # the value is already shown
         if item.get('targets'):
             out['bound'] = len(item['targets'])
     return out
+
+
+def _drop_empty(value):
+    """Mapping definitions repeat unit/values/if_empty: null for every field; absent means the same."""
+    if isinstance(value, dict):
+        return {k: _drop_empty(v) for k, v in value.items() if v is not None and v != {} and v != []}
+    if isinstance(value, list):
+        return [_drop_empty(v) for v in value]
+    return value
 
 
 def workspace_view(
@@ -104,7 +119,7 @@ def workspace_view(
         ]
     elif section == 'mapping':
         items = [
-            {'dataset': n, 'definition': d.model_dump(mode='json'), 'mapping': ws.mapping[n].model_dump(mode='json')}
+            _drop_empty({'dataset': n, 'definition': d.model_dump(mode='json'), 'mapping': ws.mapping[n].model_dump(mode='json')})
             for n, d in ws.datasets.items()
         ]
     elif section == 'basis':
@@ -152,11 +167,18 @@ def workspace_view(
     if requested_limit != limit:
         result['notice'] = f'请求条数{requested_limit}已安全调整为{limit}；按next_call继续读取'
     # Stay below the runner's character cap while preserving whole records and real offsets.
+    context = None
     for item in items[offset : offset + limit] if detail_offset is None else []:
-        candidate = {**result, 'items': result['items'] + [item]}
+        shown = item
+        if brief and section == 'facts' and result['items'] and item.get('context') == context:
+            shown = {k: v for k, v in item.items() if k != 'context'}  # same table as the row above
+        candidate = {**result, 'items': result['items'] + [shown]}
         if len(json.dumps(candidate, ensure_ascii=False, default=str)) > PAGE_CHARS:
             break
-        result['items'].append(item)
+        result['items'].append(shown)
+        context = item.get('context')
+    if brief and section == 'facts' and context is not None:
+        result['view'] += '；context 与上一条相同的不再重复'
     if not result['items'] and offset < len(items):
         # A single large definition needs explicit fragments, not a silently cut JSON object.
         text = json.dumps(items[offset], ensure_ascii=False, default=str)

@@ -74,6 +74,7 @@ QUIET_WARN = 25
 QUIET_STUCK = 40
 DEEP_LIMIT = 24                # 每一轮最多这么多步用深度思考（出错、卡住的那几步），防止一直思考把时间和 tokens 用完
 MAX_REFLECT = 2                # 卡住时先让智能体停下来反思、换做法接着做，最多这么多次；再卡住才停下，把原因报给财务
+DEFAULT_HISTORY_CHARS = 40000  # 模型配置没写 max_history_chars 时对话历史的上限（字符）
 KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保留全文
 BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
 READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate", "suggest_links", "validation_report", "read_parameter_table", "diagnose_datasets"}
@@ -4250,7 +4251,7 @@ def _answers_text(answers: list[dict] | None) -> str:
 
 
 def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = None, *,
-              answers: list[dict] | None = None, max_steps: int = 150, max_history_chars: int = 40000,
+              answers: list[dict] | None = None, max_steps: int = 150, max_history_chars: int | None = None,
               max_files: int = MAX_FILES, max_tokens: int | None = 4_000_000, exclude: list[str | Path] = (),
               on_step: Callable[[int, Step], None] | None = None, resume: bool = True,
               should_stop: Callable[[], bool] | None = None, instruction: str | None = None,
@@ -4369,6 +4370,10 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         sys += '\n\n'+prompt('workflow')
         if ws._flow().stage()[0] == 6:
             ws.done = True
+    if not max_history_chars:      # 没指定就按模型配置（网页入口不传）；长上下文模型配得大，台账、条款读一遍就能留住
+        configured = getattr(llm, "max_history_chars", None)
+        max_history_chars = configured if isinstance(configured, int) and configured > 0 else DEFAULT_HISTORY_CHARS
+    carry_chars = max(CARRY_CHARS, max_history_chars // 4)
     history: list[dict] = []
     steps: list[Step] = []
     error = recovery.error
@@ -4707,6 +4712,10 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                     dup = ok
                 last_write = (sig, result)
                 seen.clear()   # 工作区变了，重新读取是合理的
+                if ok and not dup and repeats < MAX_STUCK:
+                    # 写入有了新结果就是进展：之前零星被拦下的重复读取不再累计。
+                    # 实测两次重复读取（第 240、241 步）隔着 6 次成功的定义数据表，第 249 步再重复一次就判成卡住、整轮停下
+                    repeats = 0
                 if dup:
                     # 成功的一步原样又做了一遍：不把它留在历史里（小模型会照着历史接着重复），改成一句说明和程序判断的下一步
                     result = (f"这一步和上一步的 {c['name']} 完全相同，结果也一样：上一步已经生效，不需要再提交。"
@@ -4878,7 +4887,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                 n, issues = failed[0]
                 note += (f"\n\n刚才的修改让前面的检查失效，程序已自动重跑 {n}，没有通过（不用再调用它，先按下面改）：\n"
                          + "\n".join(f"- {str(i)[:400]}" for i in issues[:6]))
-            carry, carried = _carry_reads(ws, recent_reads)
+            carry, carried = _carry_reads(ws, recent_reads, carry_chars)
             note += carry
             at = max((i for i, m in enumerate(history) if m["role"] == "assistant"), default=len(history))
             keep = history[at:]          # 刚完成的这一步（如试算结果和抽查）留着，接下来要看
@@ -4907,7 +4916,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             reflected += 1
             deep_why = f"卡住了：{stuck[:300]}"       # 反思后的第一步一定深度思考
             note = _reflection(ws, stuck, steps, reflected, reflect)
-            carry, carried = _carry_reads(ws, recent_reads)
+            carry, carried = _carry_reads(ws, recent_reads, carry_chars)
             note += carry
             history.clear()
             history.append({"role": "user", "content": note})
@@ -5445,10 +5454,10 @@ CARRY_READS = {"read_workspace"}     # 纯读取、重跑一次很便宜，清�
 CARRY_CHARS = 8000
 
 
-def _carry_reads(ws: Workspace, recent: dict) -> tuple[str, dict]:
+def _carry_reads(ws: Workspace, recent: dict, limit: int = CARRY_CHARS) -> tuple[str, dict]:
     """清空对话（进入新阶段、停下来反思）时，把这一段读过、现在内容仍没变的工作区内容附在说明里。
     实测每次清空后模型都把台账、条款、映射原样再读一遍（第 5 轮 51 次 read_workspace），每次重读都是一整步的输入。
-    最近读的优先，总共不超过 CARRY_CHARS 字；返回（附加文字，{调用签名: 内容}）。"""
+    最近读的优先，总共不超过 limit 字（按历史上限的四分之一，至少 CARRY_CHARS）；返回（附加文字，{调用签名: 内容}）。"""
     parts, kept, size = [], {}, 0
     for sig, (name, args, old) in reversed(list(recent.items())):
         try:
@@ -5456,7 +5465,7 @@ def _carry_reads(ws: Workspace, recent: dict) -> tuple[str, dict]:
         except Exception:  # noqa: BLE001 - 读不了就不带，模型需要时自己再读
             continue
         now = json.dumps(value, ensure_ascii=False, default=str) if isinstance(value, (dict, list)) else str(value)
-        if now != old or size + len(now) > CARRY_CHARS:
+        if now != old or size + len(now) > limit:
             continue
         shown = json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)
         parts.append(f"▸ {name} {shown}：\n{now}")
