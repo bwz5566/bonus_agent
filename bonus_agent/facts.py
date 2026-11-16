@@ -94,7 +94,10 @@ def binding_errors(facts: list[Fact], drafts: dict) -> list[str]:
             if not f.targets:
                 continue  # an unbound narrative clause is not a numeric parameter
         if not f.targets:
-            errors.append(f"{f.name}：缺少精确规则位置，用 bind_facts 绑定参数")
+            spots = _spots(value, drafts)
+            errors.append(f"{f.name}：缺少精确规则位置，用 bind_facts 绑定参数"
+                          + (f"（规则里取值 {f.value} 的位置：{'、'.join(spots)}；选对应的那个写进 targets）" if spots else
+                             f"（规则里还没有用到 {f.value} 的位置：先在规则里用上它，或确认这条不是计算参数后 remove_facts）"))
             continue
         for target in f.targets:
             matches = []
@@ -136,6 +139,27 @@ def binding_errors(facts: list[Fact], drafts: dict) -> list[str]:
             if not matches or any(value not in values for values in matches):
                 errors.append(f"{f.name}：{target} 的取值与原文 {f.value} 不一致或位置不存在")
     return errors
+
+
+def _spots(value: Decimal, drafts: dict, limit: int = 3) -> list[str]:
+    """规则里取值等于 value 的位置（参数表的格、变量表达式里的数），写成 bind_facts 的 targets。
+    实测场景说明里的“查不到预算系数为 1”“销售金额为 0 不计算”只报“缺少精确规则位置”，模型不知道能绑到变量的表达式上。"""
+    from bonus_core.dsl.parser import parse, walk, Num, ExprError
+    out = []
+    for scheme, draft in drafts.items():
+        for path, v in table_cells(draft.get('tables') or {}):
+            if v == value:
+                out.append(f'{scheme}::{path}')
+        for name, var in (draft.get('variables') or {}).items():
+            expr = var.get('expr') if isinstance(var, dict) else None
+            try:
+                if isinstance(expr, str) and any(isinstance(n, Num) and n.value == value for n in walk(parse(expr))):
+                    out.append(f"{scheme}::/variables/{str(name).replace('~', '~0').replace('/', '~1')}/expr")
+            except ExprError:
+                continue
+        if len(out) >= limit:
+            break
+    return out[:limit]
 
 
 def norm(s: str) -> str:

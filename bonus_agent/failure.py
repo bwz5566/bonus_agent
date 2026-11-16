@@ -60,6 +60,11 @@ def _explain(err: str) -> dict:
             return {"title": f"智能体写的独立验算式连续 {n} 次算不出来（写法不对，还没比到金额），已自动停下。"
                              "这是模型写法的问题，不需要你回答。",
                     "advice": f"{RETRY}；下一轮会带上这次的原因。连续几轮都卡在这里，请把这条消息发给开发。", "where": ""}
+        from bonus_agent.stuck_question import _PROGRAM
+        if _PROGRAM.search(last):          # 参数没绑到规则位置、报表声明没写这类，是智能体自己的核对没做完
+            return {"title": f"智能体在「{tool}」这一步连续 {n} 次没通过程序检查，已自动停下。"
+                             "卡住的是它自己的登记、绑定或写法，不是材料没写清，不需要你回答或补充材料。",
+                    "advice": f"{RETRY}（下一轮会带上这次卡在哪）；连续几轮都卡在同一处，请把这条消息发给开发。"}
         why, ask = _why(last)
         if "对不上：引擎算出" in last or "验算式" in last:       # 可能是规则错了，也可能是验算式没写对
             return {"title": f"智能体在「独立验算」这一步连续 {n} 次没对上，已自动停下，{why}。",

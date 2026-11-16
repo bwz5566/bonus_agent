@@ -260,3 +260,69 @@ def test_identical_resubmission_loop_is_not_turned_into_a_question_for_finance()
     assert program_issue(err)
     got = explain(err)
     assert "不需要你回答" in got["title"] and not got["ask"] and "update_dataset" in got["where"]
+
+
+def test_recompiling_a_table_drops_the_bindings_of_its_previous_version(tmp_path):
+    """实测首档 lower 先写档位格、再改成 0：旧绑定留在 steps/0/0 上，编译公式一直报“与原文不一致”。"""
+    ws, f = _tier_ppt(tmp_path)
+    ws.record_parameter_cells(f, 1, 1, [{"row": r, "column": c} for c in (1, 3) for r in (2, 3, 4)], applies_to="北区")
+    cf = {"file": f, "page": 1, "table": 1}
+    ws.compile_table("old", [{"lower": "R4C1", "value": "R4C3"}, {"lower": "R3C1", "value": "R3C3"},
+                             {"lower": "R2C1", "value": "R2C3"}], kind="tier", mode="excess", cells_from=cf)
+    first = next(x for x in ws.facts if x.name.endswith("R4.C1.L1"))
+    assert any(t.endswith("/tables/old/steps/0/0") for t in first.targets)
+    ws.compile_table("old", [{"value": "R4C3"}, {"lower": "R3C1", "value": "R3C3"}, {"lower": "R2C1", "value": "R2C3"}],
+                     kind="tier", mode="excess", cells_from=cf)
+    assert not first.targets
+    from bonus_agent import facts as fx
+    err = next(e for e in fx.binding_errors(ws.facts, ws.drafts) if e.startswith(first.name))
+    assert "缺少精确规则位置" in err
+
+
+def test_unbound_fact_message_points_at_the_rule_positions_using_its_number():
+    """实测“查不到预算系数为 1”只报“缺少精确规则位置”，模型不知道能绑到变量的表达式上。"""
+    from bonus_agent import facts as fx
+    from bonus_agent.facts import Fact
+    f = Fact(name="达成率无预算默认系数", value="1", file="场景说明.md", quote="该项系数指定为 1")
+    drafts = {"提成奖": {"tables": {}, "variables": {"cust_rate": {"expr": 'ratio(a, b, zero: 1)'}}}}
+    err = fx.binding_errors([f], drafts)[0]
+    assert "提成奖::/variables/cust_rate/expr" in err
+
+
+def test_keys_that_differ_only_in_case_count_as_matched_like_the_calculation(tmp_path):
+    """计算时 BELVAPE ↔ Belvape 按上级写法对上（同 Excel VLOOKUP）；保存和诊断时却报“对不上”，误导模型去改结构。"""
+    import openpyxl
+    from bonus_agent.auto import build_inventory
+    from bonus_agent.agent import Workspace
+    p = tmp_path / "ref.xlsx"
+    wb = openpyxl.Workbook()
+    for title, head, rows in (("stock", ["简称", "金额"], [["Belvape", 1], ["MURO", 2]]),
+                              ("budget", ["简称", "预算"], [["BELVAPE", 5], ["MURO", 6]])):
+        s = wb.create_sheet(title)
+        s.append(head)
+        for r in rows:
+            s.append(r)
+    wb.save(p)
+    ws = Workspace(FakeLLM([]), build_inventory([p]))
+    ws.define_dataset("呆滞库存", p.name, "stock", {"cust_short": {"column": "简称", "type": "text"},
+                                                    "stock": {"column": "金额", "type": "money"}}, key="cust_short")
+    out = ws.define_dataset("客户预算", p.name, "budget", {"cust_short": {"column": "简称", "type": "text"},
+                                                          "bud": {"column": "预算", "type": "money"}}, link="cust_short")
+    assert "只差大小写" in out and "BELVAPE" in out and "只有" not in out
+
+
+def test_check_that_keeps_shrinking_is_progress_not_the_same_failure():
+    from bonus_agent.agent import _issue_set
+    a = _issue_set('{"status": "FAIL", "issues": ["x 缺少精确规则位置", "y 不一致"]}\n注意：……')
+    b = _issue_set('{"status": "FAIL", "issues": ["y 不一致"]}')
+    assert a == frozenset({"x 缺少精确规则位置", "y 不一致"}) and not b >= a and a >= b
+    assert _issue_set("错误：别的") is None
+
+
+def test_stop_on_own_binding_gaps_does_not_ask_finance_how_the_rule_works():
+    from bonus_agent.failure import explain
+    err = ('智能体卡住了，已停止以免继续消耗 tokens：compile_formulas 连续 3 次失败，最后一次：{"status": "FAIL", "issues": '
+           '["达成率无预算默认系数：缺少精确规则位置，用 bind_facts 绑定参数", "方案「提成奖」有多项汇总但未声明 report.balances 对账关系"]}。'
+           '已用 74 步，中途停下来反思、换做法 2 次仍没过去。')
+    got = explain(err)
+    assert "不需要你回答" in got["title"] and not got["ask"]

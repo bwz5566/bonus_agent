@@ -1522,6 +1522,12 @@ class Workspace:
                 table["mapping"][key] = take(row["value"], prefix+'/mapping/'+escape(key))
         table["sources"] = sources
         out = self.set_rules(scheme=scheme, tables={name: table})
+        # 重编同一张表时，上一版自动建的绑定要先去掉：实测首档先写了 R1C2（“<25%”）后改成 0，
+        # R1C2 仍绑在 steps/0/0 上，编译公式一直报“与原文 25% 不一致”
+        mine = self._scheme(scheme, for_write=True) + '::' + prefix + '/'
+        for f in self.facts:
+            if any(t.startswith(mine) for t in f.targets):
+                f.targets = [t for t in f.targets if not t.startswith(mine)]
         for f, candidate, path in bindings:
             f.component, f.unit = candidate.component, candidate.unit
             if path not in f.targets:
@@ -1800,7 +1806,7 @@ class Workspace:
     def diagnose_datasets(self) -> dict:
         """Source-level diagnostics remain available even when allocation cannot build a tree."""
         from collections import Counter
-        from bonus_core.engine.tree import _SEP
+        from bonus_core.engine.tree import _SEP, _norm_id
         issues=[]
         coverage=[]
         def values(name,field,path=()):
@@ -1854,8 +1860,12 @@ class Workspace:
             canon=lambda x:_SEP.sub('',str(x))
             counts=Counter(canon(v) for v in wanted)
             strict=(child,parent,field,parent_field) in strict_relations
-            matched=lambda v:v in wanted or (not strict and counts[canon(v)]==1)
-            aliases={v for v in actual if v not in wanted and counts[canon(v)]==1}
+            # 计算时编号只差大小写/全半角/空格、且只对上唯一一个的，按上级写法对上（engine.tree._canonical_refs，同 Excel VLOOKUP）：
+            # 诊断也要这样算，否则把 BELVAPE ↔ Belvape 报成“对不上”，模型去改结构或设 unmatched
+            cases=Counter(_norm_id(v) for v in wanted)
+            loose=lambda v:counts[canon(v)]==1 or cases[_norm_id(v)]==1
+            matched=lambda v:v in wanted or (not strict and loose(v))
+            aliases={v for v in actual if v not in wanted and loose(v)}
             missing={v for v in actual if not matched(v)}
             coverage.append({'dataset':child,'parent':parent,'field':field,'parent_keys':len(wanted),
                              'child_keys':len(actual),'matched_keys':len(actual)-len(missing),'unmatched_keys':len(missing),
@@ -2253,8 +2263,20 @@ class Workspace:
                                      f"{sorted(vals - keys)[0]} ↔ {loose_keys[_SEP.sub('', str(sorted(vals - keys)[0]))][0] if loose_keys.get(_SEP.sub('', str(sorted(vals - keys)[0]))) else '…'}），"
                                      "计算时按去掉分隔符后的写法自动对上，不用改")
                         hit += sep_hit
+                    # 只差大小写 / 全半角 / 空格、宽松写法下只对上唯一一个的，计算时按上级写法对上（engine.tree._canonical_refs）
+                    from collections import Counter
+                    from bonus_core.engine.tree import _norm_id
+                    wide = Counter(_norm_id(k) for k in keys)
+                    case = sorted(v for v in vals - keys if len(loose_keys.get(_SEP.sub("", str(v)), [])) != 1
+                                  and wide[_norm_id(v)] == 1)
+                    if case:
+                        loose.append(f"「{child}」的 {fld} 有 {len(case)} 个取值和「{owner}」的编号只差大小写或全半角（如 {case[0]}），"
+                                     "计算时按「" + owner + "」的写法自动对上（同 Excel VLOOKUP），不用改")
+                        hit += len(case)
                 col = self.mapping[child].columns.get(fld, fld)
-                miss = sorted(vals - keys)[:3]
+                soft = {v for v in vals - keys if len(loose_keys.get(_SEP.sub("", str(v)), [])) == 1
+                        or wide[_norm_id(v)] == 1} if hit > len(vals & keys) else set()
+                miss = sorted(vals - keys - soft)[:3]
                 if hit == 0:
                     msg = (f"「{child}」的 {fld}（列「{col}」）取值和「{owner}」的主键 {fld} 一个都对不上："
                            f"本表如 {sorted(vals)[:3]}，「{owner}」如 {sorted(keys)[:3]}。多半是映射错了列，"
@@ -4412,6 +4434,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
     last_write: tuple[str, str] | None = None
     fails: dict[str, int] = {}         # 工具 -> 连续失败次数
     fail_why: dict[str, str | None] = {}   # 工具 -> 上次失败的原因（报错第一行的开头）
+    fail_issues: dict[str, frozenset] = {}  # 工具 -> 上次失败时列出的问题（一次报一串问题的检查）
     stuck = ""
     undo: dict[tuple[str, str], int] = {}
     # 同一个调用（参数、结果都一样）自上次有新进展以来出现了几次：几个调用轮流原样重复（如 4 个验算轮流提交、每次同样报错）时，
@@ -4758,6 +4781,16 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             # 一批参数里有登记上的、也有被拒的：步骤标为失败（不能当成整批通过），但有进展，不计入连续失败。
             # 否则去掉数字后每批的第一行都是“已登记 条（台账共 条）”，逐批推进也会被当成同一原因连续失败、判为卡住；
             # 同一条反复被拒仍由 recovery.failure 按完整原因计数拦下
+            listed = _issue_set(result)
+            if listed is not None and not ok:
+                # 编译公式、准备数据这类检查一次报一串问题，第一行永远是 {"status": "FAIL"...：只看开头会把逐条改掉的进展当成同一原因。
+                # 实测第 4 轮 compile_formulas 的问题从几十条减到 5 条，仍按“连续 3 次失败”停下。上次的问题有改掉的就算在推进
+                prev = fail_issues.get(c["name"])
+                if prev is not None and not listed >= prev:
+                    fail_why[c["name"]] = None
+                fail_issues[c["name"]] = listed
+            elif ok:
+                fail_issues.pop(c["name"], None)
             partial = _partial_facts(c["name"], ok, result)
             if ok or partial:
                 fails[c["name"]] = 0
@@ -4921,7 +4954,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             history.clear()
             history += [{"role": "user", "content": note}] + keep
             repeats, last_write, stuck, idle, quiet = 0, None, "", 0, 0
-            for d in (fails, fail_why, seen, undo, again, rereads):
+            for d in (fails, fail_why, fail_issues, seen, undo, again, rereads):
                 d.clear()
             same_block, prev_full, long_block, prev_block = 0, set(), 0, set()
             deep_why = ""
@@ -4948,7 +4981,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             history.clear()
             history.append({"role": "user", "content": note})
             repeats, last_write, stuck, idle, quiet = 0, None, "", 0, 0
-            for d in (fails, fail_why, seen, undo, again, rereads):
+            for d in (fails, fail_why, fail_issues, seen, undo, again, rereads):
                 d.clear()
             same_block, prev_full, long_block, prev_block = 0, set(), 0, set()
             steps.append(Step("（反思）", {}, note, True))
@@ -5423,6 +5456,18 @@ FORMAT_ERRORS = ("错误：参数", "错误：没有工具")    # 参数格式�
 
 def _context_overflow(message: str) -> bool:
     return bool(re.search(r'context[_ ]length|maximum context|context window|too many tokens|上下文.{0,12}(?:超|不足)', message, re.I))
+
+
+def _issue_set(result: str) -> frozenset | None:
+    """一次报一串问题的检查结果（{"status": "FAIL", "issues": [...]}）里的问题集合；别的结果返回 None。"""
+    if not result.startswith("{"):
+        return None
+    try:
+        issues = json.JSONDecoder().raw_decode(result)[0].get("issues")   # 结果后面可能还接着程序加的提醒
+    except (ValueError, AttributeError):
+        return None
+    return frozenset(str(i)[:300] for i in issues) if isinstance(issues, list) and issues else None   # 参数名里有数字，不能抹掉
+
 
 
 def _partial_facts(tool: str, ok: bool, result: str) -> bool:
