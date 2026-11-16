@@ -29,6 +29,8 @@ default: qwen-a
 #   tool_mode: native | json      native 为原生工具调用（默认）；服务不支持时会自动改用 json
 #   timeout: 300                  单次请求的超时（秒），默认 300；本地模型打开思考时可加大到 600
 #   max_history_chars: 24000      智能体对话历史的上限（字符）。超过时整理一次，压到一半；加大会让每步输入变多
+#   workflow_mode: staged        默认使用阶段回执：准备数据、编译、基础金额、独立复核、总额确认后分配；legacy仅用于旧协议兼容
+#   max_input_tokens: 96000      单次输入的保守预算（无服务tokenizer时按UTF-8字节估算），包含系统提示、工具schema、历史及任务卡
 #   cache: explicit               百炼显式缓存（命中部分按输入价 10% 计费，5 分钟有效）。只对支持的模型开启，
 #                                 目前候选开源模型都不支持；私有化 vLLM 自带前缀缓存，无需配置
 #   tools_extra_body: {...}       智能体工具调用时额外的参数，覆盖 extra_body。如打开思考（enable_thinking: true），
@@ -115,6 +117,8 @@ models:
     recovery_mode: advisor         # Pro只诊断局部反例；Flash执行工具，避免交替接管长历史
     checker: deepseek-v4-pro
     checker_required: true
+    workflow_mode: staged
+    max_input_tokens: 96000
   deepseek-flash-pro:           # 平时用 flash（低成本），出错、卡住需要深度思考的那一步交给 pro
     provider: deepseek
     model: deepseek-flash
@@ -124,6 +128,8 @@ models:
     recovery_mode: advisor
     checker: deepseek-v4-pro
     checker_required: true
+    workflow_mode: staged
+    max_input_tokens: 96000
   deepseek-v4-pro:              # DeepSeek-V4-Pro，只有文本，图片交给 deepseek-flash 转写
     provider: deepseek
     model: deepseek-v4-pro

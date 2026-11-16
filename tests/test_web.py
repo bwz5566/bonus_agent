@@ -16,6 +16,31 @@ from tests.test_conflicts import CLAUSES, DATASET, F5, F6, _materials, rules  # 
 PW = "password-123"
 
 
+def test_staged_total_confirmation_requires_role_csrf_and_current_digest(env,monkeypatch):
+    from tests.test_staged_workflow import make_workspace,reviewed,save_staged_case
+    from bonus_agent.recovery import fingerprint
+    from bonus_agent import case
+    app,store,scripts,c,_=env
+    response=post(c,store,'/cases',{'name':'分阶段核算'})
+    cid=response.headers['location'].split('/')[-1].split('?')[0]
+    ws=reviewed(make_workspace(store.dir(cid)/'materials'));out=store.dir(cid)/'out'
+    save_staged_case(ws,out)
+    url=f'/cases/{cid}/confirm-totals'
+    args={'scheme':'S','digest':fingerprint(ws.workflow['basis']['S'])}
+    assert post(c,store,url,args,user='alice').status_code==403
+    as_(c,'bob')
+    assert c.post(url,data={**args,'csrf':'invalid'}).status_code==403
+    page=c.get(f'/cases/{cid}').text
+    assert '确认本版本总额并继续人员分配' in page
+    assert post(c,store,url,{**args,'digest':'stale'},user='bob').status_code==303
+    assert 'approved:S' not in case.load_case(out)['workspace']['workflow']['receipts']
+    starts=[]
+    monkeypatch.setattr(app.state.runner,'start',lambda *a,**k:starts.append((a,k)))
+    assert post(c,store,url,args,user='bob').status_code==303
+    assert len(starts)==1
+    assert case.load_case(out)['workspace']['workflow']['receipts']['approved:S']['payload']['by']=='李经理'
+
+
 @pytest.fixture
 def env(tmp_path):
     scripts = []

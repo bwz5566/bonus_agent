@@ -91,6 +91,11 @@ def main(argv=None) -> int:
     p.add_argument("--note", default="", help="确认说明")
     p.add_argument("--no-review", action="store_true", help="口径单（口径单.json）已在线下逐条核对，不检查网页上的确认记录")
     p.add_argument("data", nargs="*", help="复算用的数据文件（默认用该轮的输入文件）")
+    p = sub.add_parser('confirm-totals',help='核对预核算后确认指定版本总额；不会调用模型')
+    p.add_argument('--out',required=True)
+    p.add_argument('--scheme',required=True)
+    p.add_argument('--digest',required=True,help='workflow.json中待确认方案的basis内容指纹')
+    p.add_argument('--by',required=True)
     p = sub.add_parser("negcheck")
     p.add_argument("--out", required=True, help="案卷目录（读其中 case.json 的规则）")
     p.add_argument("--cases", required=True, help="坏数据用例 JSON")
@@ -290,6 +295,14 @@ def main(argv=None) -> int:
         m = suggest(rs, [s for f in a.data for s in detect(f)], llm)
         print(yaml.safe_dump({k: v.model_dump(exclude_none=True) for k, v in m.items()}, allow_unicode=True, sort_keys=False))
         return 0
+    if a.cmd == 'confirm-totals':
+        from bonus_agent.case import ConfirmError,confirm_totals
+        try:
+            result=confirm_totals(Path(a.out),a.scheme,a.digest,a.by)
+        except ConfirmError as exc:
+            print(f'不能确认：{exc}');return 1
+        print(f'已确认 {result["scheme"]} 总额；用同一输出目录继续auto进行人员分配。')
+        return 0
     if a.cmd == "confirm":
         from bonus_agent.case import ConfirmError, confirm
         try:
@@ -471,6 +484,10 @@ def _agent(a, cfg) -> int:
         print(f"\n【状态】NEEDS_CONFIRMATION：{len(ar.pending)} 个问题等财务答复，本轮不出结果。")
         print(f"  下一步：在 {Path(a.out) / 'questions.yaml'} 的 answer 填写答复（有补充材料放进材料文件夹），"
               f"然后用同一个 --out 再运行一次，会从这一轮接着做。")
+    if ar.status == 'AWAITING_TOTAL_CONFIRMATION':
+        print('\n【等待总额确认】请核对总额预核算.xlsx，再在页面确认，或使用confirm-totals命令确认指定版本。人员正式金额尚未生成。')
+    if ar.status == 'AWAITING_REVIEW':
+        print('\n【等待独立复核】'+ar.ws.workflow.get('review_error',{}).get('error',''))
     if ar.error:
         from bonus_agent.failure import to_text
         print(f"\n未完成：{to_text(ar.error).replace('点「重试」', '用同一个 --out 再运行一次')}\n  详细信息：{ar.error}")
@@ -482,7 +499,7 @@ def _agent(a, cfg) -> int:
           + (f"；其中 {ar.deep_steps} 步出错后深度思考" if ar.deep_steps else ""))
     for r in ar.ws.triage_report():
         print(f"材料预筛：{r}")
-    return {"OK": 0, "NEEDS_CONFIRMATION": 3}.get(ar.status, 1)
+    return {"OK": 0, "NEEDS_CONFIRMATION": 3,'AWAITING_TOTAL_CONFIRMATION':3,'AWAITING_REVIEW':3}.get(ar.status, 1)
 
 
 if __name__ == "__main__":

@@ -307,7 +307,9 @@ class Runner:
                     if ar.outputs and hist.is_dir():
                         (hist / "expected_check.txt").write_text(text, encoding="utf-8")
             job.status, job.result = "done", ar.status
-            job.message = {"OK": "已出结果，请核对", "NEEDS_CONFIRMATION": f"有 {len(ar.pending)} 个问题等答复，本轮不出结果"
+            job.message = {"OK": "已出结果，请核对", "NEEDS_CONFIRMATION": f"有 {len(ar.pending)} 个问题等答复，本轮不出结果",
+                           "AWAITING_TOTAL_CONFIRMATION":"总额已独立复核，等待财务确认后继续人员分配",
+                           "AWAITING_REVIEW":"独立复核未完成，已保留工作区；恢复复核后才能继续"
                            }.get(ar.status, f"未完成：{ar.error}")
             if message:
                 made = bool(ar.outputs)          # 对话里改了东西才会生成新的一轮
@@ -378,6 +380,11 @@ def _round_status(ar) -> str:
         return (f"第 {ar.round} 轮暂停：有 {len(ar.pending)} 个问题需要你确认，确认前不出结果。\n"
                 + "\n".join(f"- {getattr(q, 'id', '')} {getattr(q, 'text', q)}" for q in qs)
                 + "\n请在下方「问题」里选择或填写答复，保存后点「运行下一轮」。")
+    if ar.status == 'AWAITING_TOTAL_CONFIRMATION':
+        return f'第 {ar.round} 轮已完成基础金额和总额独立复核。请核对「总额预核算」并确认，之后继续人员分配；尚未生成正式人员结果。'
+    if ar.status == 'AWAITING_REVIEW':
+        reason=getattr(ar.ws,'workflow',{}).get('review_error',{}).get('error','')
+        return f'第 {ar.round} 轮必要独立复核未完成，已保留工作区，尚未出正式金额。\n{reason}'
     return f"第 {ar.round} 轮已出结果，请核对。" + (f"\n{ar.ws.summary}" if getattr(ar.ws, "summary", "") else "")
 
 
@@ -869,6 +876,23 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
                 for h in hist) + "</details>" if hist else "")
         parts.append(f"<section><h2>本轮输出</h2>{res}</section>")
         # 确认
+        flow=(case or {}).get('workspace',{}).get('workflow',{})
+        if flow.get('enabled'):
+            from bonus_agent.recovery import fingerprint
+            blocks=[]
+            for name,basis in flow.get('basis',{}).items():
+                rec=flow.get('receipts',{}).get('review:'+name)
+                approved=flow.get('receipts',{}).get('approved:'+name)
+                if not rec or rec.get('version')!=flow.get('view_version') or approved and approved.get('version')==rec.get('version'):continue
+                amounts='<br>'.join(f'{e(k)}：{e(v)} 元' for k,v in {'奖金池':basis['pool'],**basis['totals']}.items())
+                block=f'<p><b>{e(name)}</b>：{amounts}<br>核算对象 {len(basis["objects"])} 个。请同时核对逐对象底稿和金额组成。</p>'
+                if approver and not busy:
+                    block+=form(f'/cases/{cid}/confirm-totals',
+                        f'<input type="hidden" name="scheme" value="{e(name)}">'
+                        f'<input type="hidden" name="digest" value="{e(fingerprint(basis))}">'
+                        '<button>确认本版本总额并继续人员分配</button>',csrf)
+                blocks.append(block)
+            if blocks:parts.append('<section><h2>总额预核算确认</h2>'+''.join(blocks)+'</section>')
         conf = (case or {}).get("confirmed")
         cbody = (f"<p class='ok'>已确认：第 {e(conf['round'])} 轮，{e(conf['by'])}，{e(conf['at'][:16])}"
                  + (f"，{e(conf['note'])}" if conf.get("note") else "") + "</p>") if conf else "<p class='mut'>尚未确认</p>"
@@ -1066,6 +1090,19 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         except RuntimeError as err:
             raise HTTPException(409, str(err)) from None
         return back(cid)
+
+    @app.post('/cases/{cid}/confirm-totals')
+    async def confirm_totals(cid: str, request: Request, u: dict = Depends(user)):
+        need(u,'approver');d=case_dir(cid);idle(cid)
+        f=await posted(request,u)
+        try:
+            result=cs.confirm_totals(d/'out',str(f.get('scheme','')),str(f.get('digest','')),u['display'])
+        except cs.ConfirmError as err:
+            store.audit(cid,u['display'],'总额确认被拒绝',reason=str(err))
+            return back(cid,f'不能确认：{err}')
+        store.audit(cid,u['display'],'确认核算总额',scheme=result['scheme'],digest=result['digest'])
+        runner.start(cid,u['display'])
+        return back(cid,'总额已确认，继续计算人员金额')
 
     @app.post("/cases/{cid}/confirm")
     async def confirm(cid: str, request: Request, u: dict = Depends(user)):

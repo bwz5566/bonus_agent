@@ -232,6 +232,8 @@ class LLM:
     checker_required: bool = False  # do not silently replace an explicitly required independent reviewer
     recovery_mode: str = "inline"   # advisor: isolated diagnosis; main tool loop stays on its primary model
     last_call: dict = field(default_factory=dict)
+    workflow_mode: str = 'staged'
+    max_input_tokens: int = 96000
 
     @classmethod
     def from_config(cls, name: str | None = None, config: dict | None = None, checker: str | None = None,
@@ -278,6 +280,10 @@ class LLM:
         c = (checker or m.get("checker")) if not _auxiliary else None
         llm.checker_required = bool(m.get("checker_required", False))
         llm.recovery_mode = m.get("recovery_mode", "inline")
+        llm.workflow_mode = m.get('workflow_mode','staged')
+        if llm.workflow_mode not in ('staged','legacy'):
+            raise LLMError('workflow_mode须为staged或legacy')
+        llm.max_input_tokens = int(m.get('max_input_tokens',96000))
         if c and c != name:
             if c not in cfg["models"]:
                 raise LLMError(f"交叉验证模型 {c} 没有配置，可选：{', '.join(cfg['models'])}")
@@ -334,7 +340,9 @@ class LLM:
             try:
                 for m in openai_client(self.base_url, self.api_key, 20).models.list():
                     if m.id == self.model:
-                        n = getattr(m, "max_model_len", None) or (getattr(m, "model_extra", None) or {}).get("max_model_len")
+                        extra=getattr(m,'model_extra',None) or {}
+                        n = getattr(m,'context_window',None) or extra.get('context_window') or getattr(m, "max_model_len", None) or extra.get("max_model_len")
+                        self._max_output_tokens=getattr(m,'max_output_tokens',None) or extra.get('max_output_tokens')
                         self._ctx = int(n) if n else None
             except Exception:
                 pass
@@ -351,6 +359,7 @@ class LLM:
             self.last_call = self.think_llm.last_call
             return out
         think, body, max_tokens = self._think(think, dict(self.extra_body or {}), max_tokens)
+        if getattr(self,'_max_output_tokens',None):max_tokens=min(max_tokens,int(self._max_output_tokens))
         kwargs = dict(model=self.model, messages=self._prepare(messages), temperature=temperature, max_tokens=max_tokens)
         if body:
             kwargs["extra_body"] = body
@@ -392,6 +401,7 @@ class LLM:
             self.last_call = self.think_llm.last_call
             return out
         think, body, max_tokens = self._think(think, _merge(self.extra_body, self.tools_extra_body), max_tokens)
+        if getattr(self,'_max_output_tokens',None):max_tokens=min(max_tokens,int(self._max_output_tokens))
         kwargs = dict(model=self.model, messages=self._prepare(messages), tools=tools, temperature=temperature,
                       max_tokens=max_tokens)
         if body:
@@ -420,6 +430,7 @@ class FakeLLM(LLM):
 
     def __init__(self, responder: Callable[[list[dict]], str] | list[str], name: str = "fake"):
         super().__init__(name, name, "", "")
+        self.workflow_mode = 'legacy'  # Existing scripted replays use the old protocol; staged tests opt in explicitly.
         self._responder = responder
         self._i = 0
         self.calls: list[list[dict]] = []

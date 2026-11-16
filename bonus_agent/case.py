@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import shutil
 from datetime import datetime
@@ -79,6 +80,8 @@ def _checkpoint(out: Path, case: dict) -> None:
 
 
 def snapshot(ws) -> dict:
+    flow=copy.deepcopy(ws.workflow)
+    if ws.staged:flow['view_version']=ws._flow().version()
     return {
         "datasets": {k: v.model_dump(mode="json", exclude_defaults=True) for k, v in ws.datasets.items()},
         "mapping": {k: v.model_dump(mode="json", exclude_defaults=True) for k, v in ws.mapping.items()},
@@ -93,7 +96,36 @@ def snapshot(ws) -> dict:
         "triage": ws.triage,
         "repairs": ws.repairs,
         "repair_attempts": ws.repair_attempts,
+        "workflow": flow,
+        "said": ws.said,
     }
+
+
+def confirm_totals(out: Path, scheme: str, digest: str, by: str) -> dict:
+    """Human-only boundary: recompute the exact pending basis before storing approval."""
+    from bonus_agent.agent import Workspace, ToolError
+    from bonus_agent.auto import build_inventory
+    from bonus_agent.llm import FakeLLM
+    from bonus_core.data.period import Period
+    from bonus_agent.workflow import Workflow
+    from bonus_core.engine.issues import EngineError
+    obj=load_case(out)
+    if not obj or not obj.get('rounds'):raise ConfirmError('没有待确认的案卷')
+    rnd=obj['rounds'][-1]
+    paths=[Path(x['path']) for x in rnd.get('source_inputs',[])]
+    if not paths or any(not p.is_file() for p in paths):raise ConfirmError('原轮输入缺失，须重新核算')
+    if fingerprint(paths)!=rnd.get('files'):raise ConfirmError('输入文件已变化，须重新核算')
+    ws=Workspace(FakeLLM([]),build_inventory(paths));restore(ws,obj['workspace'])
+    ws.period=Period.parse(rnd.get('period'))
+    if not ws.staged:raise ConfirmError('该案卷不是分阶段核算')
+    try:
+        record=Workflow(ws).approve(scheme,by,digest)
+    except (ToolError,EngineError,ValueError,KeyError) as exc:
+        raise ConfirmError(str(exc)) from None
+    obj['workspace']=snapshot(ws)
+    obj.setdefault('total_confirmations',[]).append({**record,'at':datetime.now().isoformat(timespec='seconds'),'round':rnd['n']})
+    save_case(out,obj)
+    return record
 
 
 def restore(ws, snap: dict) -> None:
@@ -113,6 +145,8 @@ def restore(ws, snap: dict) -> None:
     ws.triage = snap.get("triage", {})
     ws.repairs = snap.get("repairs", {})
     ws.repair_attempts = snap.get("repair_attempts", {})
+    ws.workflow = snap.get('workflow',{})
+    ws.said = snap.get('said','')
     from bonus_agent.agent import _verify_key
     ws.verified = {}
     for key, record in snap.get("verified", {}).items():

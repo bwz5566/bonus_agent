@@ -163,6 +163,17 @@ class Engine:
     """一次计算的上下文：建树、求权重和奖金池，然后按调整事件分配。"""
 
     def __init__(self, rs: RuleSet, data: Datasets, refs: dict | None = None, period=None):
+        self._prepare(rs, data, refs, period)
+        self._calculate_pool_and_weights()
+
+    @classmethod
+    def prepare(cls, rs: RuleSet, data: Datasets, refs: dict | None = None, period=None):
+        """Validate and build a context without calculating a pool, weights or payouts."""
+        eng = cls.__new__(cls)
+        eng._prepare(rs, data, refs, period)
+        return eng
+
+    def _prepare(self, rs, data, refs, period):
         issues = [i for i in validate(rs) if i.severity == "blocking"]
         if issues:
             raise EngineError(issues)
@@ -182,6 +193,10 @@ class Engine:
         self.period = period
         self.ev = Evaluator(rs, root, by_level, refs, period)
         self.nodes: dict[str, Node] = {n.id: n for n in root.walk()}
+        self.hash = input_hash(rs, data)
+
+    def _calculate_pool_and_weights(self):
+        rs, by_level = self.rs, self.by_level
         try:
             self.issues += self._checks()
             self.pool_exact = self._pool()
@@ -195,7 +210,30 @@ class Engine:
             raise EngineError([Issue.block("eval_error", str(e), e.where)]) from None
         if self.pool_exact < 0 and rs.pool.negative != "allow":
             raise EngineError([Issue.block("pool_negative", f"奖金池为负：{self.pool_exact}")])
-        self.hash = input_hash(rs, data)
+
+    def calculate_basis(self) -> dict:
+        """Pre-allocation amounts. Never calls allocate, payouts or recipient reporting."""
+        self.issues += self._checks()
+        self.pool_exact = self._pool()
+        if self.pool_exact < 0 and self.rs.pool.negative != 'allow':
+            raise EngineError([Issue.block('pool_negative', f'奖金池为负：{self.pool_exact}')])
+        targets = [self.root] if self.rs.pool.scope == 'global' else self.by_level[self.rs.pool.scope]
+        objects = {n.id: {'raw': self.ev.traces[f'{n.id}/奖金池'].value,
+                          'amount': str(round_pool(Decimal(self.ev.traces[f'{n.id}/奖金池'].value)))} for n in targets}
+        totals = {}
+        for item in (self.rs.report.totals if self.rs.report else []):
+            nodes = self._report_nodes(item.level)
+            if not nodes:
+                raise EngineError([Issue.block('basis_scope', f'汇总项 {item.name} 没有核算对象')])
+            totals[item.name] = str(round_pool(sum((self.ev.evaluate(item.expr,n,
+                f'{n.id}/预核算/{item.name}','basis') for n in nodes),Decimal(0))))
+        return {'pool_raw':str(self.pool_exact), 'pool':str(round_pool(self.pool_exact)),
+                'objects':objects, 'details':self._report_details(), 'totals':totals,
+                'data_hash':self.hash, 'rules_hash':rule_fingerprint(self.rs),
+                'identities':{n.id:{'parent':n.parent.id if n.parent else None,'key':n.key}
+                              for n in [*self.nodes.values(),*(x for t in (self.root.index or {}).values() for x in t.values())]},
+                'traces':{key:{'expr':t.expr,'rendered':t.rendered,'value':t.value,'rows':list(t.rows)}
+                          for key,t in self.ev.traces.items()}}
 
     def _pool(self) -> Decimal:
         """奖金池。scope 为某层级时，在该层每个对象上分别计算并四舍五入到分，上层为下级合计，这些对象的金额固定。"""

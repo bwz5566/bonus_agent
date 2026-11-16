@@ -73,6 +73,7 @@ MAX_REFLECT = 2                # 卡住时先让智能体停下来反思、换�
 KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保留全文
 BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
 READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate", "suggest_links", "validation_report", "read_parameter_table", "diagnose_datasets"}
+READ_ONLY |= {'read_workspace','query_dataset'}
 NO_IGNORE = ("查找表 ", "抵扣 ")    # 程序检查里不能写进 ignored 放过的项
 MUST_FIX = ("抵扣 ", "计算契约 ")              # 连提问也不能放过、只能改规则的项
 _CURRENCY_HEAD = re.compile(r"币种|币别|币制|结算币|外币|汇率|(?<![A-Za-z])(?:currency|exchange\s*rate|fx)(?![A-Za-z])", re.I)
@@ -93,6 +94,7 @@ VERIFY_TOL = Decimal("0.005")   # 按份额分配时，独立算式和引擎未�
 WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", "bind_facts", "compile_table", "validate_parameters", "review_calculation", "preview_repair", "verify_repair", "apply_repair", "remove_facts", "ask_question",
                "record_clauses", "cover_clauses",
                "answer_question", "update_dataset"}
+WRITE_TOOLS |= {'plan_calculation','prepare_data','compile_formulas','calculate_basis','review_basis'}
 RULE_SUFFIXES = {".docx", ".pptx", ".pdf", ".png", ".jpg", ".jpeg", ".txt", ".md"}   # 规则文档：要登记参数
 CHAT_SOURCE = "财务对话"       # 财务在对话里贴的规则原文、口径说明：和材料一样可以引用核对
 ANSWER_NOTE = "回答财务"       # 财务的说明里带了提问：智能体把回答记在这条笔记里，网页放在本轮回复的开头（没算完也显示）
@@ -152,6 +154,18 @@ TOOLS: list[dict] = [
      "parameters": _obj({"name":_S,"changes":{"type":"object","properties":{"key":{"type":["string","null"]},"link":{"type":["string","null"]},"period":_S,"window":_S,"filter":{"type":"object"},"population_from":_S,"fields":{"type":"object","description":"只提供要添加或修改的字段属性，其他字段保留"},"combine":{"type":"object","description":"要更新的合成键及组成原列；字段column须指向该合成列"}}}},["name","changes"])},
     {"name":"diagnose_datasets","description":"不建树、不算金额，检查数据表身份、主外键及期间覆盖，返回缺失编号、日期列候选和可执行局部修复建议。建树失败时先用本工具，不要反复evaluate。",
      "parameters":_obj({})},
+    {"name":"plan_calculation","description":"先盘点全部材料，声明核算目标、需要的输出和全部方案。files为文件名到rule/data/rule_and_data/reference/ignore的映射，不能漏文件。",
+     "parameters":_obj({'summary':_S,'outputs':{'type':'array','items':_S},'files':{'type':'object','additionalProperties':_S},'schemes':{'type':'array','items':_S},'ignored':{'type':'array','items':_obj({'ref':_S,'reason':_S},['ref','reason'])}},['summary','outputs','files','schemes'])},
+    {"name":"read_workspace","description":"分页检索facts/clauses/rules/variables/tables/mapping/basis。按name定位单个参数、条款、变量、表或数据集，scheme区分方案；大规则优先逐变量读取。",
+     "parameters":_obj({'section':_S,'scheme':_S,'name':_S,'offset':_I,'limit':_I},['section'])},
+    {"name":"query_dataset","description":"独立统计一张已定义原表，使用DSL聚合表达式，如sum(amount, of: \"销售明细\")。无需allocation，不受其他表的建树错误影响；不用于证明正式金额正确。",
+     "parameters":_obj({'dataset':_S,'expr':_S},['dataset','expr'])},
+    {"name":"prepare_data","description":"检查全部已声明数据的转换、有效范围、身份、关联和期间，程序签发当前数据版本的通过回执。失败必须修正，不能直接试算。","parameters":_obj({})},
+    {"name":"compile_formulas","description":"编译当前全部公式，检查依赖顺序、循环、字段、作用域及参数/条款绑定，签发公式版本回执。","parameters":_obj({})},
+    {"name":"calculate_basis","description":"仅计算当前方案基础金额、逐对象底稿及各类总额，不计算分配权重、人员分配或实发。须先通过prepare_data和compile_formulas。",
+     "parameters":_obj({'scheme':_S})},
+    {"name":"review_basis","description":"独立模型按原文重建当前方案的总额、逐对象及汇总公式，程序全量比较。通过后本轮停止，等待财务在页面确认总额；模型不能自行确认。",
+     "parameters":_obj({'scheme':_S})},
     {"name":"read_parameter_table", "description":"读取PPT指定页原始表格及精确table/row/column/line坐标，不依赖模型转写。按新老项目和区域定位后登记source_cell。",
      "parameters":_obj({"file":_S,"page":_I},["file","page"])},
     {"name": "record_facts",
@@ -693,8 +707,8 @@ for _t in TOOLS:          # 思考-行动-观察：每次行动都带上思考�
     _p["required"] = ["thought", *_p.get("required", [])]
 
 
-def openai_tools() -> list[dict]:
-    return [{"type": "function", "function": t} for t in TOOLS]
+def openai_tools(tool_definitions=None) -> list[dict]:
+    return [{"type": "function", "function": t} for t in (TOOLS if tool_definitions is None else tool_definitions)]
 
 
 # ---------------- 工作区 ----------------
@@ -769,6 +783,48 @@ class Workspace:
     repair_attempts: dict = field(default_factory=dict)
     repair_regressions: list[dict] = field(default_factory=list, repr=False)
     _source_version: dict = field(default_factory=dict)
+    workflow: dict = field(default_factory=dict)
+
+    @property
+    def staged(self):
+        return bool(self.workflow.get('enabled'))
+
+    def _flow(self):
+        from bonus_agent.workflow import Workflow
+        return Workflow(self)
+
+    def plan_calculation(self, summary: str, outputs: list[str], files: dict, schemes: list[str], ignored: list[dict] | None = None):
+        return self._flow().plan(summary,outputs,files,schemes,ignored)
+
+    def read_workspace(self, section: str, scheme: str | None = None, offset: int = 0, limit: int = 20, name: str | None = None):
+        from bonus_agent.context import workspace_view
+        return workspace_view(self,section,scheme,offset,limit,name)
+
+    def query_dataset(self, dataset: str, expr: str):
+        try:return self._flow().query_dataset(dataset,expr)
+        except EvalError as exc:raise ToolError('原表统计失败：'+str(exc)) from None
+
+    def prepare_data(self):
+        return self._flow().prepare_data()
+
+    def compile_formulas(self):
+        return self._flow().compile()
+
+    def calculate_basis(self, scheme: str | None = None):
+        try:return self._flow().calculate_basis(scheme)
+        except (EngineError,EvalError) as exc:raise ToolError('基础金额计算失败：'+str(exc)) from None
+
+    def review_basis(self, scheme: str | None = None):
+        try:
+            result=self._flow().review_basis(scheme)
+            self.workflow.pop('review_error',None)
+            return result
+        except LLMError as exc:
+            reason=str(exc)+(f'；{self.checker_down}' if self.checker_down else '')
+            self.workflow['review_error']={'version':self._flow().version(),'error':reason}
+            self.done=True
+            return {'status':'ERROR','error':reason,'next':'必要独立复核未完成，保留工作区等待复核恢复；不出正式金额'}
+        except (EngineError,EvalError) as exc:raise ToolError('独立金额公式执行失败：'+str(exc)) from None
 
     def __post_init__(self):
         self._source_version = cs.fingerprint(self.inv.files)
@@ -2478,6 +2534,8 @@ class Workspace:
 
     def _trial(self, name: str, _path: tuple = ()) -> str:
         self._check_source_version()
+        if self.staged:
+            self._flow().guard_allocation(name)
         rs = self._ruleset(name)
         guard = [str(i) for i in self._validate(name, rs) if i.code == "global_in_level" and i.severity == "blocking"]
         if guard:
@@ -2510,6 +2568,11 @@ class Workspace:
         self.untested.discard(name)
         self.untested |= {s for s in self.schemes if s != name and name in {d for d, _ in self._deps(s)}}  # 引用本方案的要重算
         base = res["R0"]
+        if self.staged:
+            basis=self.workflow['basis'][name]
+            if Decimal(base.pool)!=Decimal(basis['pool']) or base.details!=basis['details'] or dict(base.totals)!=basis['totals']:
+                self.results.pop(name,None);self.untested.add(name)
+                raise ToolError('workflow.gate：分配后的基础金额与已确认总额/底稿不一致，不能发布结果')
         lines = [f"方案「{name}」金额试算执行完成（尚未验收）。奖金池 {fmt(Decimal(base.pool))} 元（精确值 {base.pool_exact}）"]
         if prev is not None and Decimal(prev.pool) != 0 and Decimal(base.pool) != 0:
             k = abs(Decimal(base.pool) / Decimal(prev.pool))
@@ -3484,6 +3547,11 @@ class Workspace:
 
     def finish(self, summary: str, ignored: list[dict] | None = None, review: bool = True) -> str:
         self._check_source_version()
+        if self.staged and self._flow().has_plan():
+            ignored=[*self.workflow['plan'].get('ignored',[]),*(ignored or [])]
+        if self.staged and not self.pending:
+            if not self.schemes:raise ToolError('workflow.gate：尚未完成任务计划与规则构建')
+            for name in self.schemes:self._flow().guard_allocation(name)
         self._refresh_result_versions()
         stamp = self.validation_fingerprint()
         current = [{**i, "fingerprint": stamp, "rules": self._rules_print()} for i in (ignored or []) if isinstance(i, dict)]
@@ -3764,6 +3832,7 @@ class Workspace:
 
     def phase(self) -> int:
         """程序按工作区判断现在处在第几个阶段（0 起，见 PHASES）。规则改动后会退回前面的阶段。"""
+        if self.staged:return self._flow().stage()[0]
         skipped = {str(i.get("ref", "")) for i in self.ignored}
         if self.schemes and not self.dirty and not self._clause_gaps(skipped) and not self._binding_gaps():
             return 2 if self._verify_gaps() else 3
@@ -3774,6 +3843,8 @@ class Workspace:
 
     def next_hint(self) -> str:
         """程序根据工作区判断的下一步（模型原地打转或步数用得多时提示）。"""
+        if self.staged:
+            if self._flow().stage()[0]<8:return self._flow().hint()
         docs = [f.name for f in self.inv.files if f.suffix.lower() in RULE_SUFFIXES]
         bare = [d for d in docs if not any(f.file == d for f in self.facts)
                 and d not in {str(i.get("ref", "")) for i in self.ignored}]
@@ -3804,6 +3875,9 @@ class Workspace:
 
     def state(self) -> str:
         """每轮附在请求末尾的工作区摘要。"""
+        if self.staged:
+            from bonus_agent.context import task_card
+            return '【当前任务卡】'+task_card(self)
         lines = ["【当前工作区状态】" + (f"（{self.budget}）" if self.budget else "")]
         k = self.phase()
         lines.append(f"- 当前阶段 {k + 1}/{len(PHASES)}：{PHASES[k][0]}。要做：{PHASES[k][1]}。完成标准：{PHASES[k][2]}")
@@ -4050,7 +4124,7 @@ class AgentResult:
 
     @property
     def ok(self) -> bool:
-        return self.ws.done and self.result is not None
+        return not self.error and self.ws.done and self.result is not None
 
     @property
     def questions(self) -> list[Question]:
@@ -4061,6 +4135,10 @@ class AgentResult:
         """OK：已算出，可交财务复核；NEEDS_CONFIRMATION：有问题等财务答复，本轮不出结果；FAILED：未完成。"""
         if self.ws.done and self.pending:
             return "NEEDS_CONFIRMATION"
+        if self.ws.staged and self.ws.done and self.ws._flow().stage()[0]==6:
+            return 'AWAITING_TOTAL_CONFIRMATION'
+        if self.ws.staged and self.ws.done and self.ws.workflow.get('review_error',{}).get('version')==self.ws._flow().version():
+            return 'AWAITING_REVIEW'
         return "OK" if self.ok else "FAILED"
 
 
@@ -4145,7 +4223,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     if not files:
         raise ToolError("没有找到可处理的文件（支持 .docx .pptx .pdf .xlsx .xlsm .png .jpg .txt .md .json .csv）")
     ctx = llm.context_window()
-    if ctx is not None and ctx < MIN_CONTEXT:
+    if getattr(llm,'workflow_mode','legacy')!='staged' and ctx is not None and ctx < MIN_CONTEXT:
         raise ToolError(f"模型服务的上下文长度只有 {ctx} tokens（max_model_len），智能体每一步的输入就有约 4～5 万 tokens，"
                         f"至少要 {MIN_CONTEXT}，建议 131072。请管理员调大模型服务的上下文长度（vLLM 启动参数 --max-model-len；"
                         "超过模型原生长度的要同时开 YaRN），再重试")
@@ -4188,6 +4266,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         ws.questions = [Question(id=a.get("id") or f"q{i + 1}", text=a["text"], options=a.get("options") or [])
                         for i, a in enumerate(answers or []) if a.get("text") and a.get("answer") not in (None, "")]
     fresh = cs.apply_answers(ws.questions, answers)
+    ws.workflow['enabled']=getattr(llm,'workflow_mode','legacy')=='staged'
     ws.said = _said(chat, message, instruction)
     recovery = RecoveryJournal(out / 'recovery.json' if out else None,
                                {'files': prints, 'period': period_obj.label if period_obj else None,
@@ -4197,7 +4276,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     handlers = {t["name"]: getattr(ws, t["name"]) for t in TOOLS}
     ws.transcribe_all()
     ws.triage_all()
-    pack = ("\n\n【材料包】以下是本批次材料的内容（程序读取，图片已转写），每轮都附在这里、不会被裁剪。"
+    pack = '' if ws.staged else ("\n\n【材料包】以下是本批次材料的内容（程序读取，图片已转写），每轮都附在这里、不会被裁剪。"
             "标了“全文 / 整表”的不要再用工具读；数据表只附了前几行，define_dataset 会读取全部行。\n\n" + ws.briefing())
     if message:             # 对话：财务的一条消息。先按现有规则试算一遍，便于回答和查算式
         ws.chat_by = by or "财务"
@@ -4228,6 +4307,9 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     task += pack
     mode = llm.tool_mode
     sys = system_prompt()
+    if ws.staged:
+        sys += '\n\n'+prompt('workflow')
+        if ws._flow().stage()[0]==6:ws.done=True
     history: list[dict] = []
     steps: list[Step] = []
     error = recovery.error
@@ -4247,12 +4329,14 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     idle = 0                           # 连续只查询、没有改动工作区的次数（参数每次不同，上面的重复检测发现不了）
     reads = 0                          # 连续只读材料（读表、读文档、看图）、没有落下任何东西的次数
     reached = ws.phase()               # 本轮到过的最远阶段：往前推进到新阶段时清空对话历史；改规则退回前面的阶段再回来不清
+    reached_focus=ws._flow().stage() if ws.staged else None
     deep_why, deep_used = "", 0        # 下一步要深度思考的原因（空：普通模式）；本轮已用的深度思考步数
     from bonus_agent.progress import ProgressWatch
     saved_progress = recovery.state.get('progress', {})
     progress_watch = ProgressWatch(set(saved_progress.get('previous', [])), saved_progress.get('stagnant', 0))
     context_retries = 0
     for turn in range(max_steps if not error else 0):
+        if ws.done:break
         if should_stop and should_stop():
             error = f"已手动停止（第 {len(steps)} 步）"
             break
@@ -4301,9 +4385,15 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         body = [{"role": "user", "content": task, "_cache": True}] + history[:-1] \
             + ([{**history[-1], "_cache": True}] if history else [])
         t_model, u_in, u_out = time.time(), llm.usage.prompt_tokens, llm.usage.completion_tokens
+        flow=ws._flow() if ws.staged else None
+        stage=flow.stage()[0] if flow else None
+        available_tools=[t for t in TOOLS if flow is None or flow.allowed(t['name'],stage)]
         if mode == "json":
-            msgs = [{"role": "system", "content": sys + JSON_PROTOCOL + json.dumps(TOOLS, ensure_ascii=False)}] + body + tail
+            msgs = [{"role": "system", "content": sys + JSON_PROTOCOL + json.dumps(available_tools, ensure_ascii=False)}] + body + tail
             try:
+                if ws.staged:
+                    from bonus_agent.context import guard_messages
+                    guard_messages(msgs,llm)
                 text = llm.chat(msgs, json_out=True, temperature=AGENT_TEMPERATURE, **({"think": True} if think else {}))
             except LLMError as e:
                 if _context_overflow(str(e)) and context_retries < 2:
@@ -4333,7 +4423,10 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         else:
             msgs = [{"role": "system", "content": sys}] + body + tail
             try:
-                reply = llm.chat_tools(msgs, openai_tools(), temperature=AGENT_TEMPERATURE, **({"think": True} if think else {}))
+                if ws.staged:
+                    from bonus_agent.context import guard_messages
+                    guard_messages(msgs,llm,tools=openai_tools(available_tools))
+                reply = llm.chat_tools(msgs, openai_tools(available_tools), temperature=AGENT_TEMPERATURE, **({"think": True} if think else {}))
             except LLMError as e:
                 if _context_overflow(str(e)) and context_retries < 2:
                     context_retries += 1
@@ -4379,7 +4472,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         failed_now: set[str] = set()                  # 这次回复里已经算过一次失败的工具
         said = "" if mode == "json" else (reply.get("content") or "").strip()     # 原生工具调用时模型写在正文里的思考
         for c in calls:
-            if recovery.error:
+            if recovery.error or ws.done:
                 break  # no later write in the same model response may bypass the stop
             args, note, dup = {}, "", False
             thought, bare = _split_thought(c["arguments"])
@@ -4412,9 +4505,13 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 note = "\n".join(x for x in (note, args.pop("_fixed", "")) if x)
                 if fn is None:
                     raise ToolError(f"没有工具 {c['name']}，可用：{list(handlers)}")
+                if ws.staged and not ws._flow().allowed(c['name']):
+                    raise ToolError('workflow.gate：该操作的前置阶段尚未通过。下一步：'+ws._flow().hint())
                 value = fn(**args)
                 result = json.dumps(value, ensure_ascii=False, default=str) if isinstance(value, (dict, list)) else str(value)
                 result, ok = result + (f"\n{note}" if note else ""), True
+                if ws.staged and isinstance(value,dict) and value.get('status') in ('FAIL','ERROR'):
+                    ok=False
             except ToolError as e:
                 result, ok = f"错误：{e}", False
                 if c['name'] in {'evaluate','trial_run','explain'} and any(code in result for code in ('parent_unknown','link_unmatched')):
@@ -4588,11 +4685,13 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             break
         if ws.done:
             break
-        now = ws.phase() if not message else reached
-        if now > reached:
+        now = ws.phase() if not message or ws.staged else reached
+        focus=ws._flow().stage() if ws.staged else None
+        if (ws.staged and focus!=reached_focus) or (not ws.staged and now>reached):
             # 进入新阶段：上一阶段的结论都已存进工作区（台账、条款、规则、试算、验算），对话历史里的读数、试错不再需要，
             # 清掉腾出上下文，让模型只看材料包和工作区状态专心做这一阶段（小上下文的模型尤其需要）
             reached = now
+            reached_focus=focus
             note = _phase_note(ws, now)
             at = max((i for i, m in enumerate(history) if m["role"] == "assistant"), default=len(history))
             keep = history[at:]          # 刚完成的这一步（如试算结果和抽查）留着，接下来要看
@@ -4647,7 +4746,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     tested = {s: ws.results[s] for s in ws.schemes if s in ws.results and s not in ws.untested}
     rss = {s: ws._ruleset(s) for s in tested}
     draft = {}
-    if ws.pending:          # 还有问题等答复：不出正式结果，试算结果只作草稿留在内存
+    if ws.pending or (ws.staged and (not ws.done or error or ws._flow().stage()[0]<8)):
         draft, tested = tested, {}
     first = next(iter(tested), None)
     ar = AgentResult(ws, steps, rss.get(first), tested[first]["R0"] if first else None, error,
@@ -4757,6 +4856,10 @@ def _resume_task(ws: Workspace, last: dict | None, changes: dict | None, fresh: 
 
 
 def _phase_note(ws: Workspace, k: int) -> str:
+    if ws.staged:
+        from bonus_agent.workflow import STAGES
+        return (f'【当前阶段 {k+1}/{len(STAGES)}：{STAGES[k][0]}】下一步：{ws._flow().hint()}。'
+                '前置通过回执和完整证据仍在工作区，按read_workspace检索；只携带当前任务，修改会使后继回执失效。')
     done = "；".join(f"{PHASES[i][0]}（{PHASES[i][2]}）" for i in range(k))
     return (f"【进入第 {k + 1}/{len(PHASES)} 阶段：{PHASES[k][0]}】已完成：{done}。\n"
             "为了腾出上下文，之前的对话已清空（只留下刚完成的最后一步）。材料包仍在任务里；读过的结论在参数台账、条款清单、笔记和规则摘要里（见工作区状态），"
@@ -5065,6 +5168,8 @@ def _deep_reason(turn: list[Step], skipped: int, ws: Workspace, fails: dict[str,
         if st.tool.startswith("（"):
             continue
         head = st.result.removeprefix("错误：").split("\n", 1)[0][:300]
+        if not st.ok and st.tool in ('prepare_data','compile_formulas') and fails.get(st.tool,0)<2:
+            continue  # Program diagnostics already identify the first structural correction.
         if not st.ok and ('source.cell' in st.result or '【原始数据诊断】' in st.result) and fails.get(st.tool,0)<2:
             continue  # Native table coordinates are a deterministic repair, not an advisory task.
         if not st.ok and (not st.result.startswith(FORMAT_ERRORS) or fails.get(st.tool, 0) >= 2):
@@ -5144,9 +5249,31 @@ def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None =
     out.mkdir(parents=True, exist_ok=True)
     from bonus_agent import review as rv
     for old in [*out.glob("result*.xlsx"), *out.glob("草稿结果*.xlsx"), *out.glob("rules*.yaml"), *out.glob("adjust_*.yaml"),
+                out / 'results.json', out / 'workflow.json', out / '总额预核算.xlsx',
                 out / "待确认问题.xlsx", out / "expected_check.txt", out / rv.FILE]:
         old.unlink(missing_ok=True)       # 上一轮的输出已存档在 history/，不能留在顶层被误用
     ws, paths = ar.ws, {}
+    if ws.staged:
+        paths['workflow']=out/'workflow.json'
+        from bonus_agent.recovery import fingerprint
+        paths['workflow'].write_text(json.dumps({'state':ws._flow().summary(),'basis':ws.workflow.get('basis',{}),
+            'digests':{s:fingerprint(b) for s,b in ws.workflow.get('basis',{}).items()}},ensure_ascii=False,indent=2),encoding='utf-8')
+        current={s:b for s,b in ws.workflow.get('basis',{}).items() if ws._flow().current('basis:'+s)}
+        if current:
+            import openpyxl
+            wb=openpyxl.Workbook();sheet=wb.active;sheet.title='预核算总额'
+            sheet.append(['方案','核算项','金额','状态'])
+            detail=wb.create_sheet('逐对象底稿');detail.append(['方案','报告','对象','原值或金额','舍入后'])
+            trace_sheet=wb.create_sheet('公式与来源');trace_sheet.append(['方案','计算节点','公式','代入过程','值','来源行'])
+            for s,b in current.items():
+                status='已独立复核，待确认' if ws._flow().current('review:'+s) else '尚未通过独立复核'
+                if ws._flow().current('approved:'+s):status='总额已确认；人员金额仍须独立终检'
+                for k,v in {'奖金池':b['pool'],**b['totals']}.items():sheet.append([s,k,v,status])
+                for n,v in b['objects'].items():detail.append([s,'奖金池',n,v['raw'],v['amount']])
+                for report,rows in b['details'].items():
+                    for n,v in rows.items():detail.append([s,report,n,v['amount'],v['amount']])
+                for key,t in b.get('traces',{}).items():trace_sheet.append([s,key,t['expr'],t['rendered'],t['value'],'\n'.join(t['rows'])])
+            paths['basis']=out/'总额预核算.xlsx';wb.save(paths['basis']);wb.close()
     if ws.mapping:
         paths["mapping"] = out / "mapping.yaml"
         paths["mapping"].write_text(yaml.safe_dump({k: v.model_dump(exclude_none=True, exclude_defaults=True)
