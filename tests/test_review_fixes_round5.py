@@ -77,3 +77,13 @@ def test_review_fix_is_recorded_once_in_chat(tmp_path, monkeypatch):
     app.state.runner.jobs[cid].thread.join(5)
     said = [m for m in store.chat(cid) if m["role"] == "user" and "改正" in m["text"]]
     assert len(said) == 1
+
+
+def test_same_cell_with_a_different_quote_is_not_registered_twice(tmp_path):
+    ws = workspace(tmp_path)
+    fact = {"name": "西区首档", "file": FILE, "page": 2, "context": "西区", "value": "0.50%",
+            "source_cell": {"table": 1, "row": 2, "column": 2}}
+    ws.record_facts([{**fact, "quote": "首档\n新项目\n0.50%"}])
+    with pytest.raises(ToolError, match="之前已登记过"):
+        ws.record_facts([{**fact, "quote": "0.50%", "source_cell": {"table": 1, "row": 2, "column": 2, "line": 1}}])
+    assert len(ws.facts) == 1

@@ -1223,6 +1223,15 @@ class Workspace:
                 if fx.norm(f.context) not in fx.norm(body):
                     lines.append(f'第 {i} 条未登记：context 不在指定原文页；核对适用标题与页码')
                     continue
+            # 同名、同一单元格、同值、同原文版本的参数已经有了：引文写成单元格还是整行只是写法不同，不再登记第二条。
+            # 否则重读后换一种引文重录，台账里每个单元格出现两次（实测 144 条里多出 16 条），后续每次通读都更长
+            cell = lambda g: tuple(int((g.source_cell or {}).get(k, 1)) for k in ('table', 'row', 'column', 'line'))
+            if f.source_cell and any(g.name == f.name and g.file == f.file and g.page == f.page and g.source_cell
+                                     and cell(g) == cell(f) and fx.same_value(g) == fx.same_value(f)
+                                     and g.source_hash == f.source_hash and not fx.check_fact(g, corpus)
+                                     for g in self.facts):
+                dup += 1
+                continue
             same = [g for g in self.facts if (g.name,g.file,fx.norm(g.quote)) == (f.name,f.file,fx.norm(f.quote))]
             if same and all((fx.same_value(g),g.override,fx.norm(g.meaning),g.source_hash) ==
                             (fx.same_value(f),f.override,fx.norm(f.meaning),f.source_hash)
