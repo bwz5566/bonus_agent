@@ -113,3 +113,26 @@ def test_update_dataset_can_drop_a_field_as_the_distinct_error_advises(tmp_path)
     assert ws.datasets["客户"].key == "short" and set(ws.datasets["客户"].fields) == {"short"}
     with pytest.raises(ToolError, match="没有字段"):
         ws.update_dataset("客户", {"fields": {"code": None}})
+
+
+def test_misnamed_tool_runs_the_only_matching_read_tool_and_is_not_kept_across_rounds(tmp_path):
+    """实测：反思清掉历史后模型把参数名 thought 当成工具名，连续 3 次被记为同一问题，之后每轮一开始就被拦停。"""
+    import json as _json
+    from bonus_agent.agent import TOOLS, _guess_tool
+    handlers = {t["name"]: None for t in TOOLS}
+    hit = _guess_tool("thought", _json.dumps({"file": "a.xlsx", "sheet": "Sheet1", "rows": 35}), handlers)
+    assert hit and hit[0] == "read_sheet" and "thought 不是工具" in hit[1]
+    assert _guess_tool("thought", "{}", handlers) is None                     # 没有参数：猜不出
+    assert _guess_tool("read_sheet", '{"file": "a"}', handlers) is None        # 名字本来就对
+    assert _guess_tool("thought", '{"name": "x", "changes": {}}', handlers) is None   # 会写入的工具不猜
+
+    p = tmp_path / "policy.md"
+    p.write_text("甲组费率3%", encoding="utf8")
+    script = [{"tool": "thought", "args": {}} for _ in range(4)] + [{"tool": "note", "args": {"topic": "t", "text": "x"}}]
+    out = tmp_path / "out"
+    ar = run_agent(FakeLLM(script), [p], out, max_steps=6, reflect=0)
+    bad = [s for s in ar.steps if s.tool == "thought"]
+    assert bad and "thought 不是工具" in bad[0].result
+    path = out / "recovery.json"          # 没有记下任何失败时不会生成
+    journal = _json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"failures": {}}
+    assert not journal.get("halted") and not any(v["tool"] == "thought" for v in journal["failures"].values())

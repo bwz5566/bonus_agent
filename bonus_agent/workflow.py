@@ -183,7 +183,12 @@ class Workflow:
             level_keys = {lv.key for lv in rs.allocation}
             for n, d in rs.datasets.items():
                 if d.link and d.link not in keys | level_keys:
-                    issues.append(f'{n} 关联字段 {d.link} 没有父实体')
+                    # 只说“没有父实体”时，实测模型会把已有实体的 key 改成不唯一的字段（被拒），再原地反复查询直到卡住
+                    issues.append(f'{n} 关联字段 {d.link} 没有父实体：没有哪张实体表以 {d.link} 为 key。'
+                                  f'可另建一张按 {d.link} 合并的实体表（define_dataset，key={d.link}、distinct=true，'
+                                  f'fields 只放 {d.link} 和同一 {d.link} 下取值唯一的字段），'
+                                  f'或把 {n} 改为按已有实体的 key 关联（现有：{"、".join(sorted(keys | level_keys)) or "无"}）；'
+                                  '不要把已有实体的 key 改成不唯一的字段')
                 if d.key in level_keys and d.link:
                     issues.append(f'{n} 是分配实体，不能同时声明link')
             data, _ = self.ws._data(rs)

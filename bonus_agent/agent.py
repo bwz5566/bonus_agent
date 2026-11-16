@@ -169,6 +169,29 @@ def _split_thought(arguments: str) -> tuple[str, str]:
     return (t.strip() if isinstance(t, str) else ""), json.dumps(a, ensure_ascii=False, sort_keys=True)
 
 
+def _guess_tool(name: str, bare: str, handlers: dict) -> tuple[str, str] | None:
+    """工具名不存在、但参数恰好只对得上一个只读工具时，按那个工具执行：(工具名, 提示)。
+    只读工具读错了也不改动工作区，所以可以替模型纠正；会写入的工具不猜。"""
+    if name in handlers:
+        return None
+    try:
+        args = json.loads(bare or "{}")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(args, dict) or not args:
+        return None
+    hits = []
+    for t in TOOLS:
+        props = set(t["parameters"].get("properties") or {}) - {"thought"}      # thought 每个工具都有，不参与判断
+        need = set(t["parameters"].get("required") or []) - {"thought"}
+        if t["name"] in READ_ONLY and t["name"] in handlers and need <= set(args) <= props:
+            hits.append(t["name"])
+    if len(hits) != 1:
+        return None
+    return hits[0], (f"（工具名写成了「{name}」，程序按参数当作 {hits[0]} 执行。"
+                     "thought 不是工具，是每个工具里写思考的参数；下次直接调用 " + hits[0] + "。）")
+
+
 def _fix_arguments(text: str) -> str:
     """模型输出的参数不是合法 JSON 时尽量修复；修不好就换成说明错误的合法 JSON。
     历史里的参数必须是合法 JSON，否则服务端会拒绝之后的所有请求。修复过的参数带 _note，执行时告诉模型改了什么。"""
@@ -4450,6 +4473,9 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             args, note, dup = {}, "", False
             thought, bare = _split_thought(c["arguments"])
             thought = thought or said
+            renamed = _guess_tool(c["name"], bare, handlers)
+            if renamed:                          # 工具名写错（实测把参数名 thought 当成工具名），参数只对得上一个只读工具
+                c = {**c, "name": renamed[0]}
             sig = f"{c['name']}:{bare}"          # 思考不同、参数相同，仍是同一个调用
             if c["name"] in READ_ONLY and sig in seen:
                 repeats += 1
@@ -4457,7 +4483,11 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                 result = (f"这次调用与第 {seen[sig]} 步完全相同，内容没有变化，已跳过。不要重复调用；"
                           f"需要更多内容请换参数（如 start_row、offset），否则根据已有信息进行下一步。"
                           f"程序判断的下一步：{ws.next_hint()}")
-                steps.append(Step(c["name"], {}, result, False, thought))
+                try:
+                    shown = json.loads(bare)             # 日志里记下被拦下的实际参数，事后能看出重复的是什么
+                except json.JSONDecodeError:
+                    shown = {}
+                steps.append(Step(c["name"], shown if isinstance(shown, dict) else {}, result, False, thought))
                 if on_step:
                     on_step(len(steps), steps[-1])
                 history.append(
@@ -4478,9 +4508,11 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                 args.pop("thought", None)
                 note = args.pop("_note", "")
                 args = _coerce_args(c["name"], args)
-                note = "\n".join(x for x in (note, args.pop("_fixed", "")) if x)
+                note = "\n".join(x for x in (note, args.pop("_fixed", ""), renamed[1] if renamed else "") if x)
                 if fn is None:
-                    raise ToolError(f"没有工具 {c['name']}，可用：{list(handlers)}")
+                    raise ToolError(("thought 不是工具，是每个工具都有的参数：直接调用要用的工具，把思考写在它的 thought 参数里。"
+                                     if c["name"] == "thought" else f"没有工具 {c['name']}。")
+                                    + f"可用：{list(handlers)}")
                 if ws.staged and not ws._flow().allowed(c['name']):
                     raise ToolError('workflow.gate：该操作的前置阶段尚未通过。下一步：'+ws._flow().hint())
                 value = fn(**args)
@@ -4520,7 +4552,9 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                         at=time.strftime("%H:%M:%S", time.localtime(t_tool)), secs=round(time.time() - t_tool, 2),
                         request=dict(llm.last_call))
             failed_validation = ok and isinstance(value, dict) and value.get('status') == 'FAIL'
-            if not ok or failed_validation:
+            # 工具名不存在是调用协议的错，与案卷无关：本轮的卡住检测照常计数，但不写进跨轮的纠错记录，
+            # 否则下一轮一开始就被“同一问题累计失败”拦停，重新运行也没用
+            if (not ok or failed_validation) and c['name'] in handlers:
                 recovery.failure(c['name'], step.args, result, waiting=bool(ws.pending))
             if len(steps) == turn_steps:     # 本次回复的第一个调用：记上模型用时和 tokens
                 step.model_secs, (step.tokens_in, step.tokens_out) = round(model_secs, 2), model_tokens
