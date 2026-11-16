@@ -1653,8 +1653,15 @@ class Workspace:
         if not isinstance(patch.get('fields',{}),dict) or not isinstance(patch.get('combine',{}),dict):
             raise ToolError('dataset.patch：fields和combine须为对象')
         for key,value in patch.pop('fields',{}).items():
+            if value is None:     # 删除字段：报错建议“从 fields 去掉某字段”时，局部修改必须能照做，否则只能原地重试到卡住
+                if key not in fields:
+                    raise ToolError(f'dataset.patch：「{name}」没有字段 {key}，现有：{"、".join(fields)}')
+                if key in {patch.get(k, getattr(d, k)) for k in ('key', 'link', 'period')}:
+                    raise ToolError(f'dataset.patch：{key} 是「{name}」的 key/link/period；同一次修改里先把它换成别的字段再删除')
+                fields.pop(key)
+                continue
             if not isinstance(value, dict):
-                raise ToolError('dataset.patch：字段属性须为对象')
+                raise ToolError('dataset.patch：字段属性须为对象；删除字段写 null')
             fields[key]={**fields.get(key,{}),**value}
         if 'combine' in patch:
             args['combine']={**(args['combine'] or {}),**patch.pop('combine')}

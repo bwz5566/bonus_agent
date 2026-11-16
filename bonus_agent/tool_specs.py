@@ -43,8 +43,8 @@ TOOLS: list[dict] = [
      "description": "把读到的关键信息记在工作区（如某条规则、某个参数、文件用途、待核对事项）。笔记每轮都会附给你，"
                     "较早的对话会被裁剪，重要内容请及时记下。同一 topic 再次记录会覆盖，text 为空则删除。",
      "parameters": _obj({"topic": _S, "text": _S}, ["topic", "text"])},
-    {"name": "update_dataset", "description": "局部修改已保存的数据定义，支持补字段和修正合成键。fields按字段合并属性，combine按目标列合并；其他字段、筛选和展开方式保留，不重抄成功映射。",
-      "parameters": _obj({"name":_S,"changes":{"type":"object","properties":{"key":{"type":["string","null"]},"link":{"type":["string","null"]},"period":_S,"window":_S,"filter":{"type":"object"},"population_from":_S,"unpivot":{"type":"object","description":"仅合并要修正的展开属性，如share_from；保留已保存的columns/value等"},"fields":{"type":"object","description":"只提供要添加或修改的字段属性，其他字段保留"},"combine":{"type":"object","description":"要更新的合成键及组成原列；字段column须指向该合成列"}}}},["name","changes"])},
+    {"name": "update_dataset", "description": "局部修改已保存的数据定义，支持补字段和修正合成键。fields按字段合并属性（值写null删除字段），combine按目标列合并；其他字段、筛选和展开方式保留，不重抄成功映射。",
+      "parameters": _obj({"name":_S,"changes":{"type":"object","properties":{"key":{"type":["string","null"]},"link":{"type":["string","null"]},"period":_S,"window":_S,"filter":{"type":"object"},"population_from":_S,"unpivot":{"type":"object","description":"仅合并要修正的展开属性，如share_from；保留已保存的columns/value等"},"fields":{"type":"object","description":"只提供要添加、修改或删除的字段：值为属性对象表示添加/修改，值为null表示删除该字段；其他字段保留"},"combine":{"type":"object","description":"要更新的合成键及组成原列；字段column须指向该合成列"}}}},["name","changes"])},
     {"name":"diagnose_datasets","description":"不建树、不算金额，检查数据表身份、主外键及期间覆盖，返回缺失编号、日期列候选和可执行局部修复建议。建树失败时先用本工具，不要反复evaluate。",
      "parameters":_obj({})},
     {"name":"plan_calculation","description":"先盘点全部材料，声明核算目标、需要的输出和全部方案。files为文件名到rule/data/rule_and_data/reference/ignore的映射，不能漏文件。",

@@ -87,3 +87,29 @@ def test_same_cell_with_a_different_quote_is_not_registered_twice(tmp_path):
     with pytest.raises(ToolError, match="之前已登记过"):
         ws.record_facts([{**fact, "quote": "0.50%", "source_cell": {"table": 1, "row": 2, "column": 2, "line": 1}}])
     assert len(ws.facts) == 1
+
+
+def test_update_dataset_can_drop_a_field_as_the_distinct_error_advises(tmp_path):
+    """实测卡住：按客户简称合并客户表时客户编码不唯一，报错让去掉客户编码，但局部修改删不掉字段，只能原样重试到判为卡住。"""
+    import openpyxl
+    from bonus_agent.auto import build_inventory
+    from bonus_agent.agent import Workspace
+    p = tmp_path / "sales.xlsx"
+    wb = openpyxl.Workbook()
+    s = wb.active
+    s.title = "sales"
+    s.append(["code", "short", "amount"])
+    for row in [["1001", "甲(海外)", 1], ["1002", "甲(海外)", 2], ["2001", "乙", 3]]:
+        s.append(row)
+    wb.save(p)
+    ws = Workspace(FakeLLM([]), build_inventory([p]))
+    ws.define_dataset("客户", p.name, "sales", {"code": {"column": "code", "type": "id"},
+                                                "short": {"column": "short", "type": "text"}}, key="code", distinct=True)
+    with pytest.raises(ToolError, match=r'"code": null'):        # 建议里给出能照做的写法
+        ws.update_dataset("客户", {"key": "short"})
+    with pytest.raises(ToolError, match="key/link/period"):
+        ws.update_dataset("客户", {"fields": {"code": None}})     # 还是 key 时不能删
+    ws.update_dataset("客户", {"key": "short", "fields": {"code": None}})
+    assert ws.datasets["客户"].key == "short" and set(ws.datasets["客户"].fields) == {"short"}
+    with pytest.raises(ToolError, match="没有字段"):
+        ws.update_dataset("客户", {"fields": {"code": None}})

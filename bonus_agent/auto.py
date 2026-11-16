@@ -334,7 +334,8 @@ def check_dataset(name: str, pd: PlanDataset, st: SheetTable, field_types: dict[
                     k = cell_text(v[i])
                     if k and seen.setdefault(k, cell_text(v[j])) != cell_text(v[j]):
                         errors.append(f"「{name}」distinct 按 {pd.key} 合并时，{f} 在同一编号下取值不同（如 {k}："
-                                      f"{seen[k]} / {cell_text(v[j])}）：从 fields 去掉 {f}，需要它时在原表上按 link 汇总")
+                                      f"{seen[k]} / {cell_text(v[j])}）：从 fields 去掉 {f}（update_dataset 写 changes: {{\"fields\": {{\"{f}\": null}}}}），"
+                                      f"需要它时在原表上按 link 汇总；若 {f} 本身是该对象应有的编号，改用 {f} 作 key")
                         break
             warnings.append(f"按 {pd.key} 的不同取值建对象：{len(st.rows)} 行合成 "
                             f"{len({cell_text(v[i]) for _, v in st.rows if v[i] not in (None, '')})} 个")
