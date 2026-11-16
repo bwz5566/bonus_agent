@@ -326,8 +326,14 @@ class _ScopeCheck:
                     return
                 if ent is not None:
                     if ds != ent and ent not in self.lay.reach(ds):
+                        # 两边都能取到的关联实体（如「客户预算」「客户」都带客户简称、都能取到按客户简称建的表）：
+                        # 实测模型只看到“聚合不到”，就反复改 link，不知道该把变量放到那个实体上
+                        both = sorted(self.lay.reach(ds) & (self.lay.reach(ent) | {ent}) - {ent, ds})
+                        hint = (f"。「{ds}」的行能归到「{both[0]}」，「{ent}」的行也能取到「{both[0]}」："
+                                f"把这个变量的 scope 改成「{both[0]}」，「{ent}」及行里有它编号的表直接引用这个变量；不要再改 link"
+                                if both else "")
                         self._block("agg_unrelated", f"在「{ent}」作用域聚合「{ds}」：这张表的行没有{ent}的编号，"
-                                                     f"聚合不到属于本{ent}的行")
+                                                     f"聚合不到属于本{ent}的行{hint}")
                 else:
                     tl = self.lay.table_level[ds]
                     if tl < ctx and self._ref_aux(ds, ctx):

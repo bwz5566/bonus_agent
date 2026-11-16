@@ -211,3 +211,52 @@ def test_tier_band_cells_register_and_compile_by_coordinates(tmp_path):
         ws.record_facts([{"file": f, "page": 1, "name": "上界", "quote": "5000万以上", "value": "5000万以上", "component": "lower"}])
     with pytest.raises(ToolError, match=r'"row": 2, "column": 3'):
         ws.record_facts([{"file": f, "page": 1, "name": "老5000", "quote": "| 5000万以上 | 0.24% | 0.12% |", "value": "0.12%"}])
+
+
+def _customer_tables():
+    return {"项目": {"key": "project_id", "fields": {"project_id": {"type": "id"}, "cust_short": {"type": "text"}}},
+            "客户": {"key": "cust_code", "fields": {"cust_code": {"type": "id"}, "cust_short": {"type": "text"}}},
+            "呆滞库存": {"key": "cust_short", "fields": {"cust_short": {"type": "text"}, "stock": {"type": "money"}}},
+            "客户预算": {"link": "cust_short", "fields": {"cust_short": {"type": "text"}, "bud": {"type": "money"}}}}
+
+
+def test_scope_error_names_the_entity_both_tables_can_reach():
+    """实测：客户预算按客户简称挂在呆滞库存下，在客户（按编码）层汇总被拦，提示只说“聚合不到”，模型反复改 link。"""
+    from bonus_core.dsl.models import RuleSet
+    from bonus_core.dsl.validator import validate
+    rs = RuleSet.model_validate({"name": "t", "version": "1", "pool": {"expr": "0"}, "allocation": [{"level": "项目", "key": "project_id", "weight": "1"}],
+                                 "datasets": _customer_tables(),
+                                 "variables": {"rate": {"scope": "客户", "expr": 'sum(bud, of: "客户预算")'}}})
+    msg = next(i.message for i in validate(rs) if i.code == "agg_unrelated")
+    assert "scope 改成「呆滞库存」" in msg and "不要再改 link" in msg
+
+
+def test_unchanged_dataset_definition_says_where_the_table_hangs(tmp_path):
+    """实测同一个 update_dataset（link=cust_short）交了 7 次，每次只回“no-op：数据定义和映射未变化”，被判卡住。"""
+    import openpyxl
+    from bonus_agent.auto import build_inventory
+    from bonus_agent.agent import Workspace
+    p = tmp_path / "ref.xlsx"
+    wb = openpyxl.Workbook()
+    for title, head, row in (("stock", ["简称", "金额"], ["A", 1]), ("budget", ["简称", "预算"], ["A", 2])):
+        s = wb.create_sheet(title)
+        s.append(head)
+        s.append(row)
+    wb.save(p)
+    ws = Workspace(FakeLLM([]), build_inventory([p]))
+    ws.define_dataset("呆滞库存", p.name, "stock", {"cust_short": {"column": "简称", "type": "text"},
+                                                    "stock": {"column": "金额", "type": "money"}}, key="cust_short")
+    ws.define_dataset("客户预算", p.name, "budget", {"cust_short": {"column": "简称", "type": "text"},
+                                                    "bud": {"column": "预算", "type": "money"}}, link="cust_short")
+    out = ws.update_dataset("客户预算", {"link": "cust_short"})
+    assert out.startswith("no-op") and "挂在「呆滞库存」下" in out and "scope=「呆滞库存」" in out
+
+
+def test_identical_resubmission_loop_is_not_turned_into_a_question_for_finance():
+    from bonus_agent.failure import explain
+    from bonus_agent.stuck_question import program_issue
+    err = ("智能体卡住了，已停止以免继续消耗 tokens：反复提交相同的 update_dataset，结果：no-op：数据定义和映射未变化，未触发重新试算。。"
+           "已用 65 步，中途停下来反思、换做法 2 次仍没过去。请把这条信息反馈给开发，或在对话里告诉智能体怎么处理")
+    assert program_issue(err)
+    got = explain(err)
+    assert "不需要你回答" in got["title"] and not got["ask"] and "update_dataset" in got["where"]

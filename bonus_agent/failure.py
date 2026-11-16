@@ -79,8 +79,11 @@ def _explain(err: str) -> dict:
         return {"title": f"智能体对「{m.group(1)}」反复建了又删，拿不准这张表怎么定义，已自动停下。",
                 "advice": f"{SEND}。", "ask": f"「{m.group(1)}」的每一行代表什么？用哪一列和其他表关联？"}
     if "反复重复相同的调用" in err or "原样调用" in err or "反复调用" in err or "反复提交相同" in err:
-        return {"title": "智能体在原地打转（反复做同一件事），已自动停下。",
-                "advice": f"{SEND}，指出它下一步该做什么。", "ask": "它卡住的这一步，材料里是怎么规定的？"}
+        # 原样重复同一个调用是模型自己没看懂程序的回复，不是材料没写清：不再笼统地问“材料里是怎么规定的”
+        what = re.search(r"卡住了[^：]*：(.*?)。已用 \d+ 步", err, re.S)
+        return {"title": "智能体在原地打转（反复提交同一个操作），已自动停下。这是模型自身的问题，不需要你回答或补充材料。",
+                "where": (what.group(1) if what else err)[:300],
+                "advice": f"{RETRY}（下一轮会带上这次卡在哪）；连续几轮都卡在同一处，请把这条消息发给开发。"}
     if err.startswith("已手动停止"):
         return {"title": f"你{err.removeprefix('已')}，已做的部分都保存了。".replace("（", "，停在").replace("）", ""),
                 "advice": f"只是暂停的话，{RETRY}；如果是发现它方向不对，{SEND}。", "where": ""}

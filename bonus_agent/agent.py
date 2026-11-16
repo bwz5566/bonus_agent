@@ -1716,8 +1716,35 @@ class Workspace:
         self.datasets[name].population_from = population_from
         if self._rules_print() == before:
             self.untested = untested
-            return "no-op：数据定义和映射未变化，未触发重新试算。" + (f"\n{reuse}" if reuse else "")
+            place = self._dataset_place(name)
+            return ("no-op：数据定义和映射未变化，未触发重新试算。" + (f"\n{place}" if place else "")
+                    + (f"\n{reuse}" if reuse else ""))
         return out + (f"\n{reuse}" if reuse else "")
+
+    def _dataset_place(self, name: str) -> str:
+        """定义没变时说清这张表现在挂在哪、在别的层要怎么取它的数。
+        实测「客户预算」按客户简称挂在「呆滞库存」下，模型以为再提交 link 就能挂到客户层，同样的 update_dataset 交了 7 次被判卡住。"""
+        try:
+            rs = self._ruleset()
+            lay = Layout(rs)
+        except Exception:  # noqa: BLE001 - 只是补充说明，算不出来就不说
+            return ""
+        d = self.datasets.get(name)
+        if d is None:
+            return ""
+        kind, target, fld = lay.parent.get(name, ("root", None, None))
+        if kind == "aux":
+            users = [n for n, o in self.datasets.items() if fld in o.fields and n not in (name, target)][:3]
+            return (f"现在的结构：「{name}」link={fld}，挂在「{target}」下（以 {fld} 为主键的关联实体是「{target}」），"
+                    f"再提交同样的 link 不会有任何变化，不要再改 link。要在别处按 {fld} 取「{name}」的数：先定义 scope=「{target}」的变量"
+                    f"（如 x = sum(字段, of: \"{name}\")），行里有 {fld} 的表" + (f"（如 {'、'.join(users)}）" if users else "")
+                    + f"及其所在层都能直接引用 x（{fld} 在「{target}」里没有的对象取不到值，按材料定怎么算）")
+        if kind == "level":
+            return f"现在的结构：「{name}」按 {fld} 挂在「{rs.allocation[target].level}」层；再提交同样的定义不会有变化"
+        if name in lay.aux:
+            return (f"现在的结构：「{name}」是以 {d.key} 为主键的关联实体，行里有 {d.key} 的表能直接引用它的字段"
+                    f"和 scope=「{name}」的变量；再提交同样的定义不会有变化")
+        return ""
 
     def update_dataset(self, name: str, changes: dict) -> str:
         """Patch a saved definition without rewriting its successful identity mapping."""
