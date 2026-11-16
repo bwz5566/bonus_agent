@@ -126,7 +126,7 @@ def test_compile_origin_is_structural_but_business_threshold_requires_source(tmp
     ws.compile_table('A',[{'lower':'0','value':'rate'}],scheme='S')
     assert ws.drafts['S']['tables']['A']['steps'] == [['0','0.03']]
     before = json.dumps(ws.drafts, sort_keys=True)
-    with pytest.raises(ToolError,match='parameter.ref.*steps/1/0'):
+    with pytest.raises(ToolError,match='parameter.ref.*第 2 档'):
         ws.compile_table('A',[{'value':'rate'},{'lower':'25%','value':'rate'}],scheme='S')
     assert json.dumps(ws.drafts, sort_keys=True) == before
 

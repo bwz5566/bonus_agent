@@ -170,3 +170,44 @@ def test_update_dataset_can_set_unmatched_but_still_needs_material_basis(tmp_pat
     with pytest.raises(ToolError) as e:
         ws.update_dataset("参考", {"unmatched": "ignore"})
     assert "dataset.patch" not in str(e.value) and "unmatched_basis" in str(e.value)   # 进到依据核对，不是“不允许修改”
+
+
+def _tier_ppt(tmp_path):
+    """实测的档位表：档位格是“5000万以上 / 1000-5000万 / 200万以下”，表头有两行字。"""
+    from pptx import Presentation
+    from pptx.util import Inches
+    from bonus_agent.auto import build_inventory
+    from bonus_agent.agent import Workspace
+    path = tmp_path / "tier.pptx"
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    t = slide.shapes.add_table(4, 3, Inches(0), Inches(0), Inches(7), Inches(3)).table
+    for r, row in enumerate([["销售额阶梯", "新项目", "老客户\n（旧项目）"], ["5000万以上", "0.24%", "0.12%"],
+                             ["1000-5000万", "0.23%", "0.115%"], ["1000万以下", "0.20%", "0.10%"]]):
+        for c, text in enumerate(row):
+            t.cell(r, c).text = text
+    slide.shapes.add_textbox(Inches(0), Inches(4), Inches(7), Inches(1)).text_frame.text = "北区 提成阶梯"
+    prs.save(path)
+    return Workspace(FakeLLM([]), build_inventory([path])), path.name
+
+
+def test_tier_band_cells_register_and_compile_by_coordinates(tmp_path):
+    """实测约 30 步：区间格整批登记失败且不说哪一格 → 改 record_facts → “不存在、非数值或冲突尚未确认”。"""
+    ws, f = _tier_ppt(tmp_path)
+    cells = [{"row": r, "column": c} for c in (1, 2, 3) for r in (1, 2, 3, 4)]
+    out = ws.record_parameter_cells(f, 1, 1, cells, applies_to="北区")
+    assert out["status"] == "PARTIAL" and len(out["facts"]) == 9
+    assert any("R1C3" in x and "line 1「老客户」" in x for x in out["failed"])
+    assert {x["value"] for x in out["facts"] if x["source_cell"]["column"] == 1} == {"5000万", "1000-5000万", "1000万"}
+    cf = {"file": f, "page": 1, "table": 1}
+    msg = ws.compile_table("old", [{"value": "R4C3"}, {"lower": "R3C1", "value": "R3C3"}, {"lower": "R2C1", "value": "R2C3"}],
+                           kind="tier", mode="excess", cells_from=cf)
+    assert "10,000,000 至 50,000,000的部分按 0.115%" in msg
+    with pytest.raises(ToolError, match="R4C1"):
+        ws.compile_table("x", [{"value": "R4C2"}, {"lower": "10000000", "value": "R3C2"}], cells_from=cf)
+    with pytest.raises(ToolError, match="没有登记。名字相近"):
+        ws.compile_table("y", [{"key": "a", "value": "tier.pptx::P1.T1.R4.C2.L2"}], kind="lookup")
+    with pytest.raises(ToolError, match=r"去掉 component，value 写「5000万」"):
+        ws.record_facts([{"file": f, "page": 1, "name": "上界", "quote": "5000万以上", "value": "5000万以上", "component": "lower"}])
+    with pytest.raises(ToolError, match=r'"row": 2, "column": 3'):
+        ws.record_facts([{"file": f, "page": 1, "name": "老5000", "quote": "| 5000万以上 | 0.24% | 0.12% |", "value": "0.12%"}])

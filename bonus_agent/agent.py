@@ -1101,13 +1101,15 @@ class Workspace:
                             + (f'，而在第 {"、".join(map(str,elsewhere[:6]))} 页' if elsewhere else '，整份文件里也没有')
                             + '。相似的表容易选错页：先 read_parameter_table(file) 按真实页标题核对，再读正确的 page。本次未登记')
         returned=[]
+        failed=[]
         for cell in cells:
             if not isinstance(cell,dict) or set(cell)-{'row','column','line','unit'}:
                 raise ToolError('source.cell：只传row/column/line/unit，不能传自拟name/value/context')
             try:
                 record = parameter_cell(path, page, table, cell['row'], cell['column'], cell.get('line'))
             except (ValueError, KeyError, TypeError) as exc:
-                raise ToolError(str(exc)) from None
+                failed.append(f"R{cell.get('row')}C{cell.get('column')}：{exc}")      # 逐格说明，其余格照常登记
+                continue
             prior=[f for f in self.facts if f.file==file and f.page==page and f.source_cell and
                 all(f.source_cell.get(k,1)==record['locator'].get(k,1) for k in ('table','row','column','line')) and
                 f.component=='literal' and f.source_hash==source_hash and f.unit==cell.get('unit') and fx.norm(f.value)==fx.norm(record['value']) and
@@ -1124,16 +1126,24 @@ class Workspace:
                     self.record_facts([args])
                 except ToolError as exc:
                     if 'parameter.unit' in str(exc):
-                        raise ToolError('parameter.unit：当前单元格或行列标题没有支持所填单位的原文。'
-                                        f"选中原文={record['selected']!r}，行列标题={record['labels']!r}。"
-                                        '补充原文单位依据，或向财务确认；不能省略unit把比例当作普通系数绕过。') from None
-                    raise
+                        failed.append(f"R{cell['row']}C{cell['column']}：parameter.unit：当前单元格或行列标题没有支持所填单位的原文。"
+                                      f"选中原文={record['selected']!r}，行列标题={record['labels']!r}。"
+                                      '补充原文单位依据，或向财务确认；不能省略unit把比例当作普通系数绕过。')
+                        continue
+                    failed.append(f"R{cell['row']}C{cell['column']}：{str(exc).removeprefix('错误：')}")
+                    continue
                 self.changed=True
                 fact=next(f for f in self.facts if f.name==record['name'])
             returned.append({'name':fact.name,'value':fact.value,'page':page,'source_cell':fact.source_cell,
                              'meaning':fact.meaning,'reused':bool(prior)})
         self._fact_rejections=[]
-        return {'status':'PASS','file':file,'page':page,'page_context':index[page-1]['context'],'facts':returned}
+        if failed and not returned:
+            raise ToolError('没有登记任何单元格：\n' + '\n'.join(failed[:12]))
+        out={'status':'PARTIAL' if failed else 'PASS','file':file,'page':page,'page_context':index[page-1]['context'],'facts':returned}
+        if failed:
+            out['failed']=failed[:12]
+            out['next']='上面 facts 已登记；failed 里的格逐个按说明处理，不要整批重交'
+        return out
 
     def _wrong_page(self, f) -> str:
         """参数名里写了区分用的词（如区域、产品线），引用的原文却在另一页、那一页没有这个词：多半是抄错了页（如把南方国家区的阶梯当成美洲的）。"""
@@ -1208,22 +1218,26 @@ class Workspace:
                 try:
                     selected, labels = ppt_cell(self._file(f.file), f.page, f.source_cell)
                     if fx.norm(selected) not in fx.norm(f.quote):
-                        raise ValueError('source.cell：选中单元格行不在引用原文内')
+                        raise ValueError(f'source.cell：source_cell 指的格是「{selected}」，不在 quote 里；quote 要包含这一格（照抄这一行），或者改 source_cell 指到 quote 里的那一格' + self._cell_hint(f))
                     # The raw number must belong to this cell; a typed unit may be in its
                     # verified row/column heading rather than repeated inside the cell.
                     if fx.check_fact(
                         f.model_copy(update={'quote': selected, 'unit': None}), {f.file: fx.norm(selected)}
                     ):
-                        raise ValueError('source.cell：value与选中单元格行不一致，不能从其他区域或新老项目列取值')
+                        raise ValueError(f'source.cell：source_cell 指的格是「{selected}」（{" / ".join(labels)}），value「{f.value}」不在这一格里；不能从其他区域或新老项目列取值' + self._cell_hint(f))
                     native='\n'.join([*labels,selected])
                     if f.unit and fx.check_fact(f.model_copy(update={'quote': native}), {f.file: fx.norm(native)}):
-                        raise ValueError('source.cell：单位须来自当前单元格或行列标题，不能借用其他位置的单位')
+                        raise ValueError(f'source.cell：这一格「{selected}」和它的行列标题（{" / ".join(labels)}）里都没有单位「{f.unit}」，不能借用其他位置的单位；原文没写单位就不写 unit')
                     f.meaning = ' | '.join([*labels, selected])
                 except (ValueError, ArithmeticError) as exc:
                     lines.append(f'第 {i} 条「{f.name}」未登记：{exc}')
                     continue
             elif Path(f.file).suffix.lower() == '.pptx' and f.component == 'literal' and len(scalar_tokens(f.quote)) > 1 and '|' in f.quote:
-                lines.append(f'第 {i} 条「{f.name}」未登记：source.cell：引用表行包含多个数值，须提供source_cell的table/row/column/line，不能仅验证数字存在')
+                spots = self._cells_with(f) if f.page else []
+                lines.append(f'第 {i} 条「{f.name}」未登记：source.cell：引用的表格行里有多个数值，要用 source_cell 指明取哪一格'
+                             + (f"。按 quote 和 value 找到的格：{'；'.join(spots[:4])}，选对的那一格写进 source_cell（新老项目、"
+                                "不同区域在不同列，别选错列）" if spots else "，写 {table, row, column}（同一格多行再加 line）")
+                             + '；也可以直接用 record_parameter_cells 按坐标登记')
                 continue
             wrong = self._wrong_page(f)
             if wrong:
@@ -1302,10 +1316,10 @@ class Workspace:
             has, chosen = fx.chosen(spec['name'], self.conflicts, self.questions, self.facts)
             if has:
                 if chosen is None:
-                    raise ToolError("parameter.conflict：先解决该参数的原文冲突；不能通过绑定选择取值")
+                    raise ToolError(f"parameter.conflict：参数「{spec['name']}」原文里有不同的取值，还没确认用哪个" + self._conflict_wait(spec['name']) + "；确认前不能通过绑定选一个，先做不用它的部分")
                 found = [f for f in found if fx.same_value(f) == chosen]
                 if not found:
-                    raise ToolError("parameter.conflict：已确认取值没有当前原文支持，需要重新核对台账")
+                    raise ToolError(f"parameter.conflict：参数「{spec['name']}」确认的取值 {chosen} 在现在的台账里找不到原文（材料可能换过）；read_workspace(section='facts') 核对后重新登记这个取值的原文")
             for f in found:
                 import hashlib
                 current_hash = (hashlib.sha256(self._file(f.file).read_bytes()).hexdigest() if f.file != CHAT_SOURCE else
@@ -1390,8 +1404,61 @@ class Workspace:
                             f"cells=[{{row: {want[1]}, column: {want[2]}" + (f", line: {want[3]}" if m[3] else "")
                             + "}])，再编译；本次未保存")
         if len(names) > 1:
-            raise ToolError(f"parameter.ref：{where} 登记了多个参数（{'、'.join(names[:4])}），直接写其中一个参数名")
+            # 同一格先后用 record_parameter_cells 和 record_facts 登记过（实测常见）：取值相同就是同一个参数，直接用
+            vals = {fx.numeric(fx.binding_candidate(f, ["tables/x/steps/1/0"])) for f in self.facts if f.name in names}
+            if len(vals) == 1 and None not in vals:
+                return names[0]
+            raise ToolError(f"parameter.ref：{where} 登记了多个取值不同的参数（{'、'.join(names[:4])}），"
+                            "直接写其中一个参数名；不该存在的那条用 remove_facts 删掉")
         return names[0]
+
+    def _cells_with(self, f) -> list[str]:
+        """PPT 表格里内容是 value、且所在行出现在 quote 里的格，写成可直接复制的 source_cell。"""
+        from bonus_agent.source_cells import read_ppt_tables
+        try:
+            tables = read_ppt_tables(self._file(f.file), f.page)
+        except Exception:  # noqa: BLE001 - 只是给建议，读不到就不给
+            return []
+        want, quote, out = fx.norm(f.value), fx.norm(f.quote), []
+        for t in tables:
+            for r in t["rows"]:
+                if not all(fx.norm(" ".join(c["lines"])) in quote for c in r["cells"][:1]):
+                    continue
+                for c in r["cells"]:
+                    for n, text in enumerate([x for x in c["lines"] if x.strip()], 1):
+                        if want and want in fx.norm(text):
+                            line = f', "line": {n}' if len([x for x in c["lines"] if x.strip()]) > 1 else ""
+                            out.append(f'{{"table": {t["table"]}, "row": {r["row"]}, "column": {c["column"]}{line}}}（{text.strip()}）')
+        return out
+
+    def _cell_hint(self, f) -> str:
+        spots = self._cells_with(f) if f.page else []
+        return f"。按 quote 和 value 找到的格：{'；'.join(spots[:4])}" if spots else ""
+
+    def _conflict_wait(self, ref: str) -> str:
+        """参数冲突在等哪个问题的答复；没有对应问题时说明要先提问。"""
+        ids = [q.id for q in self.questions if not q.answer and not getattr(q, 'withdrawn', False)
+               and ref in (q.text + " " + " ".join(getattr(q, 'related', None) or []))]
+        return f"（等财务答复 {'、'.join(ids)}）" if ids else "（还没问财务：用 ask_question 列出各处原文和取值请财务定）"
+
+    def _ref_problem(self, ref: str) -> str:
+        """compile_table 引用的参数为什么用不了：说清是哪一种，以及怎么改。"""
+        originals = [f for f in self.facts if f.name == ref]
+        if not originals:
+            import difflib
+            near = difflib.get_close_matches(ref, sorted({f.name for f in self.facts}), n=4, cutoff=0.4)
+            return (f"参数「{ref}」没有登记。" + (f"名字相近的已登记参数：{'、'.join(near)}。" if near else "")
+                    + "名字要和登记时完全一致；有 cells_from 时也可以直接写单元格坐标（如 R4C1）；还没登记就先登记原文")
+        values = sorted({f.value for f in originals})
+        if len(values) > 1:
+            return (f"参数「{ref}」登记了不同的取值（{'、'.join(values[:4])}），冲突还没确认"
+                    + self._conflict_wait(ref) + "。确认前先做不用它的部分")
+        f = originals[-1]
+        if f.component != "literal" and fx.interval(f.value) is None:
+            return f"参数「{ref}」的取值「{f.value}」不是区间，却标成了区间的{f.component}；单个数不要写 component"
+        return (f"参数「{ref}」的取值「{f.value}」不是数值，不能编进表里。如果它是档位文字（如“5000万以上”），"
+                f"重新登记，value 只写数「{(re.search(r'[0-9.]+[%‰万亿元]*', f.value) or [''])[0] or '…'}」；"
+                "如果原文就是文字口径，就不能放进阶梯或查找表")
 
     def compile_table(self, name: str, rows: list[dict], scheme: str | None = None,
                       kind: str = "tier", mode: str = "whole", applies_when: str = "",
@@ -1413,7 +1480,7 @@ class Workspace:
             has, pick = fx.chosen(ref, self.conflicts, self.questions, self.facts)
             fs = [f for f in fs if fx.numeric(f) is not None and (not has or format(fx.numeric(f).normalize(), 'f') == pick)]
             if not fs or len({fx.numeric(f) for f in fs}) != 1:
-                raise ToolError(f"参数「{ref}」不存在、非数值或冲突尚未确认")
+                raise ToolError(self._ref_problem(ref) + "；本次未保存")
             f = fs[-1]
             if self._page_texts(f.file) and f.page is None:
                 raise ToolError(f"参数「{ref}」需先用 record_facts 补齐原文 page/context，再 compile_table；表未创建时不使用 bind_facts")
@@ -1434,12 +1501,16 @@ class Workspace:
                     if i == 0 and str(ref) in {"0", "0.0"}:
                         ref = None  # the documented implicit structural origin, never a business threshold
                     else:
-                        raise ToolError(f'parameter.ref：{prefix}/steps/{i}/0 的 lower={ref!r} 是数字，不是参数名。'
-                                        'lower 引用 record_facts 中的参数名；区间参数会投影为下界，首档0可省略。'
-                                        '请先登记该边界的原文，再用参数名编译；本次未保存。')
+                        raise ToolError(f'parameter.ref：第 {i + 1} 档的 lower={ref!r} 是数字，不是参数名。'
+                                        + ('有 cells_from 时，lower 直接写这一档档位所在单元格的坐标（如 R4C1）：'
+                                           '档位格是“200-1000万”这样的区间时自动取下界，“5000万以上”取 5000万，'
+                                           '格子没登记会提示先登记哪一格。' if cells_from else
+                                           'lower 写登记过的参数名（区间参数如“200-1000万”自动取下界），首档 0 可省略。'
+                                           '边界还没登记就先登记原文。')
+                                        + '本次未保存')
                 lower = take(ref, f'{prefix}/steps/{i}/0') if ref else "0"
                 if i and not row.get("lower"):
-                    raise ToolError("除首档隐含0起点外，每个阈值都必须引用登记的参数")
+                    raise ToolError(f"第 {i + 1} 档没写 lower：只有第 1 档可以省略（从 0 起），其余每档都要写下界" + ("（写这一档档位格的坐标，如 R4C1）" if cells_from else "（写登记过的参数名）") + "；本次未保存")
                 table["steps"].append([lower, take(row["value"], f'{prefix}/steps/{i}/1')])
         else:
             table["mapping"] = {}
@@ -1777,9 +1848,24 @@ class Workspace:
                         'matched':sum(matched(v) for v in narrowed),
                         'separator_only':sum(v not in wanted and counts[canon(v)]==1 for v in narrowed),
                         'action':{'tool':'update_dataset','args':{'name':child,'changes':{'period':f}}}})
+            # 实测只给数字和例子时模型反复诊断、反复改错地方：按对不上的形态直接说下一步
+            blank=[v for v in missing if not str(v).strip() or str(v).strip() in ('(空白)','（空白）','空白','合计','总计')]
+            if len(missing)==len(actual):
+                todo=(f'「{child}」的 {field} 和「{parent}」一个都对不上：多半映射错了列，或编号要由几列拼成。'
+                      f'read_sheet 对比两张表这一列的取值，再 update_dataset 改 fields/combine')
+            elif proposals:
+                todo='先按 period_candidates 里的 action 限定期间，再诊断'
+            elif blank and len(blank)==len(missing):
+                todo=f'对不上的只有空白/合计行：update_dataset 加 filter 去掉 {field} 为空或合计的行'
+            else:
+                todo=(f'有 {len(missing)} 个取值在「{parent}」里没有（如 {sorted(missing)[:3]}）。材料写明这类记录不参与时：'
+                      f'update_dataset(name="{child}", changes={{"unmatched": "ignore", "unmatched_basis": {{"file": 材料文件名, "quote": 逐字原文}}}})；'
+                      '材料没写：ask_question 问财务这些记录算不算（列出例子），先做不受影响的部分'
+                      + ('；如果是编号写法不同（分隔符、空格）就统一合成键' if strict else ''))
             issues.append({'code':'dataset.reference','dataset':child,'parent':parent,'field':field,
                            'expected_keys':len(wanted),'actual_keys':len(actual),'unmatched':len(missing),
-                           'examples':sorted(missing)[:3],'period_candidates':proposals,'exact_required':strict})
+                           'examples':sorted(missing)[:3],'period_candidates':proposals,'exact_required':strict,
+                           'next':todo})
             if strict and aliases:
                 identity={'code':'dataset.identity','dataset':child,'parent':parent,'field':field,
                           'separator_only_keys':len(aliases),
@@ -2531,7 +2617,12 @@ class Workspace:
             if Decimal(base.pool)!=Decimal(basis['pool']) or base.details!=basis['details'] or dict(base.totals)!=basis['totals']:
                 self.results.pop(name, None)
                 self.untested.add(name)
-                raise ToolError('workflow.gate：分配后的基础金额与已确认总额/底稿不一致，不能发布结果')
+                diff = [k for k, a, b in (('奖金池', Decimal(base.pool), Decimal(basis['pool'])),
+                                           ('对象明细', base.details, basis['details']),
+                                           ('合计', dict(base.totals), basis['totals'])) if a != b]
+                raise ToolError(f'workflow.gate：这次算出的{"、".join(diff)}和「核对计算基础」阶段确认的不一样'
+                                f'（确认时奖金池 {basis["pool"]}，这次 {base.pool}）。确认之后改过规则或数据：'
+                                '回到 calculate_basis 重新核对计算基础，再试算；不能直接发布')
         lines = [f"方案「{name}」金额试算执行完成（尚未验收）。奖金池 {fmt(Decimal(base.pool))} 元（精确值 {base.pool_exact}）"]
         if prev is not None and Decimal(prev.pool) != 0 and Decimal(base.pool) != 0:
             k = abs(Decimal(base.pool) / Decimal(prev.pool))
@@ -2965,7 +3056,7 @@ class Workspace:
                 raise ToolError(f'缺少待分配项「{pending.name}」的独立表达式 pending')
             nodes = [root] if pending.level == 'global' else by_level.get(pending.level) or []
             if not nodes or pending.name in out:
-                raise ToolError('待分配独立验算层级为空或名称与人员重复')
+                raise ToolError(f'待分配项「{pending.name}」' + ('和某个人员同名，换一个名字' if pending.name in out else f'所在层级「{pending.level}」没有对象，核对 level 写的是分配层级名'))
             out[pending.name] = sum(self._independent_eval(ev, expr, nodes, '待分配').values(), Decimal(0))
         return out
 
@@ -2982,7 +3073,7 @@ class Workspace:
             nodes=([root] if item.level=='global' else by_level.get(item.level) or
                    list((root.index or {}).get(item.level,{}).values()))
             if not nodes:
-                raise ToolError('对象金额独立验算没有可核对对象')
+                raise ToolError(f'对象金额报告「{item.name}」所在层级「{item.level}」没有对象：核对 level 写的是分配层级名（{[lv.level for lv in base.allocation]}）')
             values=self._independent_eval(ev,expr,nodes,'对象金额')
             out.update({json.dumps([item.name,nid],ensure_ascii=False):value.quantize(Decimal('.01'),ROUND_HALF_UP)
                         for nid,value in values.items()})
@@ -3510,7 +3601,7 @@ class Workspace:
             ignored=[*self.workflow['plan'].get('ignored',[]),*(ignored or [])]
         if self.staged and not self.pending:
             if not self.schemes:
-                raise ToolError('workflow.gate：尚未完成任务计划与规则构建')
+                raise ToolError('workflow.gate：还没有任何方案的规则，不能结束。当前阶段：' + self._flow().hint())
             for name in self.schemes:
                 self._flow().guard_allocation(name)
         self._refresh_result_versions()

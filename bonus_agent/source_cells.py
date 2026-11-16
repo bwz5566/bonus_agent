@@ -14,18 +14,28 @@ def ppt_cell(path, page, locator):
         row, col = int(locator['row']), int(locator['column'])
         if min(int(locator['table']), row, col) < 1:
             raise ValueError('坐标从1开始')
+        if not (1 <= row <= len(table.rows) and 1 <= col <= len(table.columns)):
+            raise IndexError
         cell = table.cell(row-1, col-1).text
         lines = [x.strip() for x in cell.splitlines() if x.strip()]
         if len(lines) > 1 and 'line' not in locator:
-            raise ValueError('单元格有多行适用条件，必须指定line')
+            raise ValueError(f'source.cell：R{row}C{col} 这一格有 {len(lines)} 行：'
+                             + '；'.join(f'line {i}「{x}」' for i, x in enumerate(lines[:6], 1)) + '。用 line 指定登记哪一行')
         line = int(locator.get('line', 1))
-        if line < 1:
-            raise ValueError('line从1开始')
+        if not 1 <= line <= max(len(lines), 1):
+            raise ValueError(f'source.cell：R{row}C{col} 只有 {len(lines)} 行，line 要在 1—{max(len(lines), 1)}')
+        if not lines:
+            raise ValueError(f'source.cell：R{row}C{col} 是空格，不是参数格')
         selected = lines[line-1]
         labels = [table.cell(row-1,0).text.strip(),table.cell(0,col-1).text.strip()]
         return selected, labels
     except (IndexError, KeyError, TypeError) as exc:
-        raise ValueError('source.cell：表格坐标不存在') from exc
+        try:
+            size = '；'.join(f'表 {i} 有 {len(t.rows)} 行 {len(t.columns)} 列' for i, t in enumerate(tables, 1)) or '这一页没有表格'
+        except NameError:
+            size = '页码不存在'
+        raise ValueError(f'source.cell：第 {page} 页没有这个坐标（{size}；行列从 1 数，含表头行）。'
+                         '先 read_parameter_table 看清坐标') from exc
 
 
 def scalar_tokens(text):
@@ -69,10 +79,20 @@ def parameter_cell(path,page,table,row,column,line=None):
     if line is not None:locator['line']=line
     selected,labels=ppt_cell(path,page,locator)
     # Extract only when the selected physical line has one unambiguous number/unit.
-    from bonus_agent.facts import _TOKEN
+    from bonus_agent.facts import _TOKEN, _RANGE, interval
+    import unicodedata
     matches=list(_TOKEN.finditer(selected))
-    if len(matches)!=1:raise ValueError('source.cell：选中行不是唯一数值；按原文分行定位，不能猜测数值')
-    match=matches[0];value=match.group(1)+(match.group(2) or '')
+    rng=_RANGE.search(unicodedata.normalize('NFKC',selected).replace(',',''))
+    if len(matches)==2 and rng and interval(rng.group()):
+        # 阶梯表的档位格（如“200-1000万”）：整段区间作为一个参数，编译阶梯时自动取下界
+        value=rng.group().strip()
+    elif len(matches)!=1:
+        raise ValueError(f'source.cell：R{row}C{column}' + (f'L{line}' if line else '') + f' 的内容「{selected}」'
+                         + ('没有数值，不是参数格（可能是标题或文字说明），不要登记' if not matches else
+                            f'里有 {len(matches)} 个数值，分不清登记哪一个；同一格分多行写的用 line 指定行，'
+                            '一行里有多个数的，用 record_facts 逐个登记（quote 写这一行，value 写其中一个数）'))
+    else:
+        match=matches[0];value=match.group(1)+(match.group(2) or '')
     return {'locator':locator,'value':value,'quote':'\n'.join([*labels,selected]),
             'name':f'{path.name}::P{page}.T{table}.R{row}.C{column}.L{line or 1}',
             'selected':selected,'labels':labels}

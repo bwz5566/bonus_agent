@@ -77,7 +77,7 @@ def test_native_tools_work_through_agent_dispatch(tmp_path):
 
 def test_multiline_requires_explicit_line_and_does_not_guess_units(tmp_path):
     ws=workspace(tmp_path);file='policy.pptx'
-    with pytest.raises(ToolError,match='必须指定line'):
+    with pytest.raises(ToolError,match='用 line 指定'):
         ws.record_parameter_cells(file,1,1,applies_to='北区',cells=[{'row':3,'column':2}])
     result=ws.record_parameter_cells(file,1,1,applies_to='北区',cells=[{'row':3,'column':2,'line':1},
                                               {'row':3,'column':2,'line':2,'unit':'%'}])

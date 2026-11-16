@@ -34,6 +34,7 @@ def test_period_diagnosis_requires_no_tree_and_keeps_input_unchanged(tmp_path,mo
     issue=report['issues'][0]
     assert issue['unmatched']==1
     proposal=issue['period_candidates'][0]
+    assert 'period_candidates' in issue['next']        # 每个关联问题都直接说下一步
     assert proposal['keys']==proposal['matched']==1
     assert case.snapshot(ws)==before
     ws.update_dataset(**proposal['action']['args'])
@@ -133,3 +134,17 @@ def test_first_tree_failure_returns_deterministic_feedback_before_advisor(tmp_pa
     step=next(s for s in result.steps if s.tool=='evaluate')
     assert not step.ok and '【原始数据诊断】' in step.result and 'period_field' in step.result
     assert result.ws.notes.get('next')=='inspect month'
+
+
+def test_reference_issue_says_what_to_do_for_partly_unmatched_keys(tmp_path):
+    """实测 11 次诊断只给数字和例子，模型反复改错地方：部分对不上时说清两条路（原文依据 / 问财务）。"""
+    p=tmp_path/'d.xlsx'
+    wb=openpyxl.Workbook();s=wb.active;s.title='cust'
+    s.append(['code','amount']);s.append(['A',1]);s.append(['B',2])
+    t=wb.create_sheet('stock');t.append(['code','stock']);t.append(['A',5]);t.append(['Z',7])
+    wb.save(p);wb.close()
+    ws=Workspace(FakeLLM([]),build_inventory([p]))
+    ws.define_dataset('cust',p.name,'cust',{'code':{'column':'code','type':'id'},'amount':{'column':'amount','type':'number'}},key='code')
+    ws.define_dataset('stock',p.name,'stock',{'code':{'column':'code','type':'id'},'stock':{'column':'stock','type':'number'}},link='code')
+    issue=next(i for i in ws.diagnose_datasets()['issues'] if i['code']=='dataset.reference')
+    assert "'Z'" in issue['next'] and 'unmatched_basis' in issue['next'] and 'ask_question' in issue['next']

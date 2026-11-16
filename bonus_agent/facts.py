@@ -256,7 +256,10 @@ def check_fact(f: Fact, corpus: dict[str, str]) -> str | None:
     if f.unit and numeric(f) is None:
         return "parameter.unit：原值与所声明单位冲突，或不是可转换的单个数值"
     if f.component != "literal" and interval(f.value) is None:
-        return "parameter.range：lower/upper 只能用于明确的数值区间"
+        one = _TOKEN.search(unicodedata.normalize('NFKC', f.value).replace(',', ''))
+        return (f"parameter.range：「{f.value}」不是“A-B”这样的区间，不能写 component={f.component}。"
+                + (f"它只有一个数：去掉 component，value 写「{one.group(1)}{one.group(2) or ''}」（编阶梯表时用作下界）"
+                   if one else "它没有数值，不能作为阶梯边界"))
     present = norm(f.value) in q
     if scalar:
         # A substring such as 1 in 1.05 is not an original scalar parameter.
