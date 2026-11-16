@@ -150,3 +150,23 @@ def test_unnamed_rule_writes_go_to_the_planned_scheme_and_empty_extra_schemes_ar
     ws.drafts["默认"] = {"tables": {"R": ws.drafts["九月提成"]["tables"]["R"]}, "variables": {}}   # 旧案卷里已经多出来的
     assert "已去掉计划外的空方案" in ws.set_rules(scheme="默认", tables={"R": None})
     assert ws.schemes == ["九月提成"]
+
+
+def test_update_dataset_can_set_unmatched_but_still_needs_material_basis(tmp_path):
+    """实测：模型 5 次用局部修改设 unmatched: ignore 都被拒（局部修改不支持），只能原地打转。"""
+    import openpyxl
+    from bonus_agent.auto import build_inventory
+    from bonus_agent.agent import Workspace
+    p = tmp_path / "ref.xlsx"
+    wb = openpyxl.Workbook()
+    s = wb.active
+    s.title = "ref"
+    s.append(["code", "amount"])
+    s.append(["A", 1])
+    wb.save(p)
+    ws = Workspace(FakeLLM([]), build_inventory([p]))
+    ws.define_dataset("参考", p.name, "ref", {"code": {"column": "code", "type": "id"},
+                                              "amount": {"column": "amount", "type": "number"}}, link="code")
+    with pytest.raises(ToolError) as e:
+        ws.update_dataset("参考", {"unmatched": "ignore"})
+    assert "dataset.patch" not in str(e.value) and "unmatched_basis" in str(e.value)   # 进到依据核对，不是“不允许修改”

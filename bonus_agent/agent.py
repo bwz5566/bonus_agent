@@ -1652,8 +1652,11 @@ class Workspace:
         import copy
         if name not in self.datasets or name not in self.mapping:
             raise ToolError('dataset.patch：没有已保存的数据定义')
-        if not changes or set(changes)-{'key','link','period','window','filter','population_from','fields','combine','unpivot'}:
-            raise ToolError('dataset.patch：只允许局部修改关联、期间、筛选、fields、combine和unpivot')
+        # unmatched/unmatched_basis：实测模型 5 次用局部修改设“对不上的行不参与”都被拒（只能整表重定义），白白打转；
+        # 允许局部修改，依据核对仍由 define_dataset 做（ignore 必须引用写明不参与的原文）
+        if not changes or set(changes)-{'key','link','period','window','filter','population_from','fields','combine','unpivot',
+                                          'unmatched','unmatched_basis'}:
+            raise ToolError('dataset.patch：只允许局部修改关联、期间、筛选、fields、combine、unpivot和unmatched（须带unmatched_basis原文依据）')
         d, m = self.datasets[name], self.mapping[name]
         st = self.inv.sheet(f'{Path(m.file).name}/{m.sheet}')
         dup = _dup_names(st.headers) if st else {}
