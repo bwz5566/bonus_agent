@@ -91,7 +91,10 @@ class Workflow:
         if any(not isinstance(x,dict) or x.get('ref') not in known or not str(x.get('reason','')).strip() for x in ignored):
             fail('忽略项须给真实文件名ref和非空reason')
         if {x['ref'] for x in ignored}!={n for n,r in files.items() if r=='ignore'}:
-            fail('每份ignore材料都须逐项写明不参与的依据，不能只改分类绕过规则覆盖')
+            extra={x['ref']:files[x['ref']] for x in ignored if files[x['ref']]!='ignore'}
+            missing=sorted(n for n,r in files.items() if r=='ignore' and n not in {x['ref'] for x in ignored})
+            fail(f'plan.ignore_role：ignored中用途不为ignore的文件及实际用途={extra}；缺少忽略依据={missing}。'
+                 'reference保留作参考时从ignored删除；真正不参与时才分类为ignore并写依据。两处必须一致')
         self.state['plan'] = {'summary':summary,'outputs':outputs,'files':files,'schemes':schemes,
                               'ignored':ignored,'files_version':fingerprint(self.ws._source_version)}
         return {'status':'PASS','plan':self.state['plan'],'next':self.hint()}

@@ -91,7 +91,7 @@ def _GATE_ORDER(key: str) -> int:
     return {"抵扣": 0, "查找表": 0, "取值": 1, "未用": 1, "同字段比较": 1, "分档": 2, "参数表": 2, "名称百分比": 2,
             "阶梯方式": 2, "币种": 2, "全零": 1, "金额": 3, "状态": 3}.get(head, 4 if head in ("常数", "百分号") else 3)
 VERIFY_TOL = Decimal("0.005")   # 按份额分配时，独立算式和引擎未舍入的份额之差不超过半分，才算尾差
-WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", "bind_facts", "compile_table", "validate_parameters", "review_calculation", "preview_repair", "verify_repair", "apply_repair", "remove_facts", "ask_question",
+WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", "record_parameter_cells", "bind_facts", "compile_table", "validate_parameters", "review_calculation", "preview_repair", "verify_repair", "apply_repair", "remove_facts", "ask_question",
                "record_clauses", "cover_clauses",
                "answer_question", "update_dataset"}
 WRITE_TOOLS |= {'plan_calculation','prepare_data','compile_formulas','calculate_basis','review_basis'}
@@ -151,13 +151,13 @@ TOOLS: list[dict] = [
                     "较早的对话会被裁剪，重要内容请及时记下。同一 topic 再次记录会覆盖，text 为空则删除。",
      "parameters": _obj({"topic": _S, "text": _S}, ["topic", "text"])},
     {"name": "update_dataset", "description": "局部修改已保存的数据定义，支持补字段和修正合成键。fields按字段合并属性，combine按目标列合并；其他字段、筛选和展开方式保留，不重抄成功映射。",
-     "parameters": _obj({"name":_S,"changes":{"type":"object","properties":{"key":{"type":["string","null"]},"link":{"type":["string","null"]},"period":_S,"window":_S,"filter":{"type":"object"},"population_from":_S,"fields":{"type":"object","description":"只提供要添加或修改的字段属性，其他字段保留"},"combine":{"type":"object","description":"要更新的合成键及组成原列；字段column须指向该合成列"}}}},["name","changes"])},
+      "parameters": _obj({"name":_S,"changes":{"type":"object","properties":{"key":{"type":["string","null"]},"link":{"type":["string","null"]},"period":_S,"window":_S,"filter":{"type":"object"},"population_from":_S,"unpivot":{"type":"object","description":"仅合并要修正的展开属性，如share_from；保留已保存的columns/value等"},"fields":{"type":"object","description":"只提供要添加或修改的字段属性，其他字段保留"},"combine":{"type":"object","description":"要更新的合成键及组成原列；字段column须指向该合成列"}}}},["name","changes"])},
     {"name":"diagnose_datasets","description":"不建树、不算金额，检查数据表身份、主外键及期间覆盖，返回缺失编号、日期列候选和可执行局部修复建议。建树失败时先用本工具，不要反复evaluate。",
      "parameters":_obj({})},
     {"name":"plan_calculation","description":"先盘点全部材料，声明核算目标、需要的输出和全部方案。files为文件名到rule/data/rule_and_data/reference/ignore的映射，不能漏文件。",
      "parameters":_obj({'summary':_S,'outputs':{'type':'array','items':_S},'files':{'type':'object','additionalProperties':_S},'schemes':{'type':'array','items':_S},'ignored':{'type':'array','items':_obj({'ref':_S,'reason':_S},['ref','reason'])}},['summary','outputs','files','schemes'])},
     {"name":"read_workspace","description":"分页检索facts/clauses/rules/variables/tables/mapping/basis。按name定位单个参数、条款、变量、表或数据集，scheme区分方案；大规则优先逐变量读取。",
-     "parameters":_obj({'section':_S,'scheme':_S,'name':_S,'offset':_I,'limit':_I},['section'])},
+     "parameters":_obj({'section':_S,'scheme':_S,'name':_S,'query':{**_S,'description':'全文片段检索，可按参数名称片段查已有项'},'file':_S,'page':_I,'offset':_I,'limit':_I},['section'])},
     {"name":"query_dataset","description":"独立统计一张已定义原表，使用DSL聚合表达式，如sum(amount, of: \"销售明细\")。无需allocation，不受其他表的建树错误影响；不用于证明正式金额正确。",
      "parameters":_obj({'dataset':_S,'expr':_S},['dataset','expr'])},
     {"name":"prepare_data","description":"检查全部已声明数据的转换、有效范围、身份、关联和期间，程序签发当前数据版本的通过回执。失败必须修正，不能直接试算。","parameters":_obj({})},
@@ -166,8 +166,10 @@ TOOLS: list[dict] = [
      "parameters":_obj({'scheme':_S})},
     {"name":"review_basis","description":"独立模型按原文重建当前方案的总额、逐对象及汇总公式，程序全量比较。通过后本轮停止，等待财务在页面确认总额；模型不能自行确认。",
      "parameters":_obj({'scheme':_S})},
-    {"name":"read_parameter_table", "description":"读取PPT指定页原始表格及精确table/row/column/line坐标，不依赖模型转写。按新老项目和区域定位后登记source_cell。",
-     "parameters":_obj({"file":_S,"page":_I},["file","page"])},
+    {"name":"read_parameter_table", "description":"省略page时列出PPT每页真实文字、标题候选、表格数、已登记参数；指定page则返回同页文字、原表与坐标。标题即使在表格下方也属于本页。结合page_context及行列标题核对适用条件后，优先record_parameter_cells按坐标登记，不转抄。",
+     "parameters":_obj({"file":_S,"page":_I},["file"])},
+    {"name":"record_parameter_cells","description":"按PPT已核对的页/表/单元格登记，value、quote、参数名和来源由程序生成；不传自拟的区域名、数值或原文。已有同坐标且验证有效的参数直接复用，返回compile_table可引用的name。多行单元格必须指定line，unit仅在原文明确时提供。",
+     "parameters":_obj({'file':_S,'page':_I,'table':_I,'cells':{'type':'array','items':_obj({'row':_I,'column':_I,'line':_I,'unit':_S},['row','column'])}},['file','page','table','cells'])},
     {"name": "record_facts",
      "description": "登记从材料里读到的参数和口径（比例、金额、阶梯、系数、门槛、日期、取数口径等），程序据此比对冲突。"
                     "每个文件里出现的都要登记，同一参数在几个文件（或一个文件的几处）出现就登记几次，用同一个 name；"
@@ -783,6 +785,7 @@ class Workspace:
     repair_attempts: dict = field(default_factory=dict)
     repair_regressions: list[dict] = field(default_factory=list, repr=False)
     _source_version: dict = field(default_factory=dict)
+    _fact_rejections: list[str] = field(default_factory=list)
     workflow: dict = field(default_factory=dict)
 
     @property
@@ -796,9 +799,10 @@ class Workspace:
     def plan_calculation(self, summary: str, outputs: list[str], files: dict, schemes: list[str], ignored: list[dict] | None = None):
         return self._flow().plan(summary,outputs,files,schemes,ignored)
 
-    def read_workspace(self, section: str, scheme: str | None = None, offset: int = 0, limit: int = 20, name: str | None = None):
+    def read_workspace(self, section: str, scheme: str | None = None, offset: int = 0, limit: int = 20, name: str | None = None,
+                       query: str | None = None, file: str | None = None, page: int | None = None):
         from bonus_agent.context import workspace_view
-        return workspace_view(self,section,scheme,offset,limit,name)
+        return workspace_view(self,section,scheme,offset,limit,name,query,file,page)
 
     def query_dataset(self, dataset: str, expr: str):
         try:return self._flow().query_dataset(dataset,expr)
@@ -884,6 +888,9 @@ class Workspace:
         return "\n".join(lines)
 
     def read_document(self, file: str, offset: int = 0, limit: int = MAX_RESULT_CHARS - 200, folded: bool = False) -> str:
+        if file==CHAT_SOURCE:
+            text=self._chat_text() or '本案尚无财务对话。这是虚拟来源，不是缺失文件。'
+            return text[max(0,offset):max(0,offset)+max(1,min(limit,MAX_RESULT_CHARS-200))]
         f = self._file(file)
         d = next((d for d in self.inv.docs if d.name == f.name), None)
         if d is None:
@@ -1267,12 +1274,58 @@ class Workspace:
                 out.setdefault(b.page, []).append(t)
         return {p: "\n".join(ts) for p, ts in out.items()}
 
-    def read_parameter_table(self, file: str, page: int) -> dict:
-        from bonus_agent.source_cells import read_ppt_tables
+    def read_parameter_table(self, file: str, page: int | None = None) -> dict:
+        from bonus_agent.source_cells import read_ppt_tables,ppt_page_index
+        self._check_source_version()
         try:
-            return {'file':file,'page':page,'tables':read_ppt_tables(self._file(file),page)}
+            path=self._file(file);index=ppt_page_index(path)
+            if page is not None and not 1<=page<=len(index):
+                raise ValueError(f'source.page：页码{page}不存在；有效范围1—{len(index)}。省略page读取真实标题索引，不要猜页码')
+            registered=[f for f in self.facts if f.file==file and f.source_cell and (page is None or f.page==page)]
+            if page is None:
+                return {'file':file,'page_count':len(index),'pages':[{**item,
+                    'registered':sum(f.page==item['page'] for f in registered)} for item in index]}
+            return {'file':file,'page':page,'page_count':len(index),'page_context':index[page-1]['context'],
+                    'page_scope':index[page-1]['scope'],
+                    'registered_count':len(registered),'registered_examples':[f.name for f in registered[:4]],
+                    'lookup':{'tool':'read_workspace','args':{'section':'facts','file':file,'page':page}},
+                    'tables':read_ppt_tables(path,page)}
         except ValueError as exc:
             raise ToolError(str(exc)) from exc
+
+    def record_parameter_cells(self, file: str, page: int, table: int, cells: list[dict]) -> dict:
+        from bonus_agent.source_cells import parameter_cell,ppt_page_index
+        self._check_source_version()
+        path=self._file(file);index=ppt_page_index(path)
+        import hashlib
+        source_hash=hashlib.sha256(path.read_bytes()).hexdigest()
+        if not 1<=page<=len(index):raise ToolError(f'source.page：页码不存在，有效范围1—{len(index)}')
+        if not cells:raise ToolError('source.cell：须提供至少一个单元格')
+        returned=[]
+        for cell in cells:
+            if not isinstance(cell,dict) or set(cell)-{'row','column','line','unit'}:
+                raise ToolError('source.cell：只传row/column/line/unit，不能传自拟name/value/context')
+            try:record=parameter_cell(path,page,table,cell['row'],cell['column'],cell.get('line'))
+            except (ValueError,KeyError,TypeError) as exc:raise ToolError(str(exc)) from None
+            prior=[f for f in self.facts if f.file==file and f.page==page and f.source_cell and
+                all(f.source_cell.get(k,1)==record['locator'].get(k,1) for k in ('table','row','column','line')) and
+                f.component=='literal' and f.source_hash==source_hash and f.unit==cell.get('unit') and fx.norm(f.value)==fx.norm(record['value']) and
+                not fx.check_fact(f,self._corpus()) and not self._wrong_page(f)]
+            if prior:
+                fact=prior[0]
+            else:
+                context=index[page-1]['scope']
+                quote=record['quote']
+                args={'name':record['name'],'file':file,'page':page,'context':context,
+                      'value':record['value'],'quote':quote,'source_cell':record['locator'],
+                      'unit':cell.get('unit'),'component':'literal'}
+                self.record_facts([args])
+                self.changed=True
+                fact=next(f for f in self.facts if f.name==record['name'])
+            returned.append({'name':fact.name,'value':fact.value,'page':page,'source_cell':fact.source_cell,
+                             'meaning':fact.meaning,'reused':bool(prior)})
+        self._fact_rejections=[]
+        return {'status':'PASS','file':file,'page':page,'page_context':index[page-1]['context'],'facts':returned}
 
     def _wrong_page(self, f) -> str:
         """参数名里写了区分用的词（如区域、产品线），引用的原文却在另一页、那一页没有这个词：多半是抄错了页（如把南方国家区的阶梯当成美洲的）。"""
@@ -1306,7 +1359,8 @@ class Workspace:
             if len(t) >= 2:
                 return (f"参数名里的「{term}」不在引用原文所在的第 {'、'.join(map(str, hit))} 页，而在第 {'、'.join(map(str, elsewhere[:6]))} 页。"
                         "这一条可能抄错了页（不同区域、产品线的表很像）。回到写着「" + term + "」的那一页核对取值再登记；"
-                        "如果页标题在图片里，先准确转写并核对适用条件，不能重复提交来绕过")
+                        "先read_parameter_table(file)核对真实标题索引，再读正确page，用record_parameter_cells按坐标登记；"
+                        "read_workspace(section=facts,file,page,query)可找已登记项，不能通过换名字或重复提交绕过。图片标题需另行核对")
         return ""
 
     def _corpus(self) -> dict[str, str]:
@@ -1319,6 +1373,7 @@ class Workspace:
     def record_facts(self, facts: list[dict]) -> str:
         self._check_source_version()
         corpus, lines, added, dup = self._corpus(), [], 0, 0
+        self._fact_rejections=lines
         for i, a in enumerate(facts, start=1):
             try:
                 f = fx.Fact.model_validate({**a, "round": self.round}) if isinstance(a, dict) else None
@@ -1346,8 +1401,13 @@ class Workspace:
                     selected, labels = ppt_cell(self._file(f.file), f.page, f.source_cell)
                     if fx.norm(selected) not in fx.norm(f.quote):
                         raise ValueError('source.cell：选中单元格行不在引用原文内')
-                    if fx.check_fact(f.model_copy(update={'quote': selected}), {f.file:fx.norm(selected)}):
+                    # The raw number must belong to this cell; a typed unit may be in its
+                    # verified row/column heading rather than repeated inside the cell.
+                    if fx.check_fact(f.model_copy(update={'quote': selected,'unit':None}), {f.file:fx.norm(selected)}):
                         raise ValueError('source.cell：value与选中单元格行不一致，不能从其他区域或新老项目列取值')
+                    native='\n'.join([*labels,selected])
+                    if f.unit and fx.check_fact(f.model_copy(update={'quote':native}),{f.file:fx.norm(native)}):
+                        raise ValueError('source.cell：单位须来自当前单元格或行列标题，不能借用其他位置的单位')
                     f.meaning = ' | '.join([*labels, selected])
                 except (ValueError, ArithmeticError) as exc:
                     lines.append(f'第 {i} 条「{f.name}」未登记：{exc}')
@@ -1747,8 +1807,8 @@ class Workspace:
         import copy
         if name not in self.datasets or name not in self.mapping:
             raise ToolError('dataset.patch：没有已保存的数据定义')
-        if not changes or set(changes)-{'key','link','period','window','filter','population_from','fields','combine'}:
-            raise ToolError('dataset.patch：只允许局部修改关联、期间、筛选、fields和combine')
+        if not changes or set(changes)-{'key','link','period','window','filter','population_from','fields','combine','unpivot'}:
+            raise ToolError('dataset.patch：只允许局部修改关联、期间、筛选、fields、combine和unpivot')
         d, m = self.datasets[name], self.mapping[name]
         st = self.inv.sheet(f'{Path(m.file).name}/{m.sheet}')
         dup = _dup_names(st.headers) if st else {}
@@ -1773,6 +1833,9 @@ class Workspace:
             fields[key]={**fields.get(key,{}),**value}
         if 'combine' in patch:
             args['combine']={**(args['combine'] or {}),**patch.pop('combine')}
+        if 'unpivot' in patch:
+            if not isinstance(patch['unpivot'],dict):raise ToolError('dataset.patch：unpivot须为对象')
+            args['unpivot']={**(args['unpivot'] or {}),**patch.pop('unpivot')}
         args.update(patch)
         return self.define_dataset(**args)
 
@@ -1969,7 +2032,11 @@ class Workspace:
             raise ToolError("未保存：写 window 时要同时写 period（记日期或月份的字段）")
         if period:
             if period not in d.fields:
-                raise ToolError(f"未保存：period 要写这张表里记日期或月份的字段名（现有字段：{'、'.join(d.fields)}）")
+                hit=[field for field,column in m.columns.items() if column==period]
+                if len(hit)!=1:
+                    raise ToolError(f"未保存：period 要写唯一的日期或月份字段名（现有字段：{'、'.join(d.fields)}）")
+                warnings.append(f'period列名{period}唯一对应字段{hit[0]}，已使用字段名')
+                period=hit[0]
             col = st.headers.index(m.columns[period]) if m.columns.get(period) in st.headers else None
             vals = [v[col] for _, v in st.rows if col is not None and col < len(v)]
             from bonus_core.data.period import Period
@@ -4547,6 +4614,9 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 result, ok = result + (f"\n{note}" if note else ""), True
                 if ws.staged and isinstance(value,dict) and value.get('status') in ('FAIL','ERROR'):
                     ok=False
+                if c['name']=='record_facts' and ws._fact_rejections:
+                    ok=False  # Preserve accepted rows, but never report a partly rejected batch as success.
+                    if result.startswith('已登记 '):ws.changed=True
             except ToolError as e:
                 result, ok = f"错误：{e}", False
                 if c['name'] in {'evaluate','trial_run','explain'} and any(code in result for code in ('parent_unknown','link_unmatched')):
@@ -5205,7 +5275,7 @@ def _deep_reason(turn: list[Step], skipped: int, ws: Workspace, fails: dict[str,
         head = st.result.removeprefix("错误：").split("\n", 1)[0][:300]
         if not st.ok and st.tool in ('prepare_data','compile_formulas') and fails.get(st.tool,0)<2:
             continue  # Program diagnostics already identify the first structural correction.
-        if not st.ok and ('source.cell' in st.result or '【原始数据诊断】' in st.result) and fails.get(st.tool,0)<2:
+        if not st.ok and any(x in st.result for x in ('source.cell','source.page','plan.ignore_role','【原始数据诊断】')) and fails.get(st.tool,0)<2:
             continue  # Native table coordinates are a deterministic repair, not an advisory task.
         if not st.ok and (not st.result.startswith(FORMAT_ERRORS) or fails.get(st.tool, 0) >= 2):
             return f"{st.tool} 失败：{head}"

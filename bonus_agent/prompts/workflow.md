@@ -2,6 +2,8 @@
 
 程序的当前任务卡决定下一步。先plan_calculation盘点全部文件、核算目标、输出与全部方案，再分别登记规则、定义数据、绑定公式。参数、条款和公式保存在工作区；read_workspace分页检索，原文用read_document/read_parameter_table/read_sheet。没有材料包全文时必须检索，不凭名称补业务规则。
 
+PPT参数优先走原生路径：read_parameter_table(file)查看真实页码和同页文字，再指定page读取表格。页标题可能在表格下方，不能按相邻页猜适用区域。核对适用条件后用record_parameter_cells(file,page,table,cells)按坐标登记；数值、原文和参数名由程序生成，返回的name直接用于compile_table/bind_facts。不要再换业务名称重录同一单元格。已登记项可按read_workspace(section=facts,file,page,query)检索，分页取完所需项；重试先查既有结果。scope是原文定位提示，适用条件须结合全部page_context与行列标题核对；图片标题另用view_image核实。无法唯一提取的区间、公式和文字规则仍按record_facts登记并逐字核对。
+
 计算顺序：prepare_data → compile_formulas → calculate_basis → review_basis → 财务确认总额 → trial_run → review_calculation/verify → finish。数据或公式变化会使相应回执失效，须重新通过。prepare_data失败时用diagnose_datasets/query_dataset定位，不能通过evaluate反复建立同一棵失败的树。query_dataset只统计指定原表，不代表其他数据已通过。
 
 set_rules按公式依赖逐个构建；每个变量明确scope、单位含义、适用条件、来源和舍入时点。编译检查全部参数绑定和条款覆盖。基础指标和逐对象金额由引擎计算，模型不心算、不填假设常数。材料要求按人员汇总舍入时，预核算需区分理论总额与最终人员舍入合计，差额按原文核验。
