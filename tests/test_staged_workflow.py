@@ -144,7 +144,7 @@ def test_bounded_context_has_indices_not_full_original_documents(tmp_path):
     assert '当前任务' not in text and 'read_workspace' in text
     assert '每个项目按销售金额的10%' not in text
     llm=FakeLLM([]);llm.max_input_tokens=100
-    with pytest.raises(LLMError,match='预算'):guard_messages([{'role':'user','content':'x'*200}],llm)
+    with pytest.raises(LLMError,match='预算'):guard_messages([{'role':'user','content':'数据'*200}],llm)
 
 
 def test_official_context_metadata_is_recognized(monkeypatch):

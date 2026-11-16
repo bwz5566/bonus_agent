@@ -4210,6 +4210,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     scenario：场景（scenarios.context.AgentScenario）。场景说明作为材料一起读，场景信息（输入模板检查、场景记忆）放进任务说明。
     period：核算期间（如 "2026-09"、"2026Q3"、"2026-07~2026-09"）。不写时沿用上一轮的期间；都没有就不按期间筛选。"""
     from bonus_core.data.period import Period, PeriodError
+    from bonus_agent.context import ContextBudgetError, guard_messages
     try:
         period_obj = Period.parse(period)
     except PeriodError as e:
@@ -4335,6 +4336,14 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     saved_progress = recovery.state.get('progress', {})
     progress_watch = ProgressWatch(set(saved_progress.get('previous', [])), saved_progress.get('stagnant', 0))
     context_retries = 0
+    def compact_local_context(msgs, body, tail, definitions):
+        # Check the immutable floor first. Trimming history cannot fix an oversized floor.
+        guard_messages(msgs[:1]+body[:1]+tail,llm,tools=definitions)
+        before=_size(history)
+        if not before:return False
+        _shrink(history,max(1500,before//2),keep=2)
+        if _size(history)>=before:history.clear()
+        return _size(history)<before
     for turn in range(max_steps if not error else 0):
         if ws.done:break
         if should_stop and should_stop():
@@ -4392,20 +4401,33 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             msgs = [{"role": "system", "content": sys + JSON_PROTOCOL + json.dumps(available_tools, ensure_ascii=False)}] + body + tail
             try:
                 if ws.staged:
-                    from bonus_agent.context import guard_messages
                     guard_messages(msgs,llm)
                 text = llm.chat(msgs, json_out=True, temperature=AGENT_TEMPERATURE, **({"think": True} if think else {}))
+            except ContextBudgetError as e:
+                try:
+                    compacted=context_retries<2 and compact_local_context(msgs,body,tail,None)
+                except ContextBudgetError as floor:
+                    error=f'{floor}；固定系统指令、工具定义与当前任务本身已超过配置预算，未调用模型，也不重试或升级Pro。'
+                    break
+                if not compacted:
+                    error=f'{e}；上下文没有可继续整理的空间，保留案卷，未调用Pro。'
+                    break
+                context_retries+=1;deep_why='';seen.clear()
+                steps.append(Step('（本地上下文整理）',{},'已按本地预算整理历史；材料仍在文件索引和工作区，不调用顾问判断材料缺失。',True))
+                if on_step:on_step(len(steps),steps[-1])
+                continue
             except LLMError as e:
                 if _context_overflow(str(e)) and context_retries < 2:
                     context_retries += 1
                     _shrink(history, max(1500, _size(history) // 2), keep=2)
-                    deep_why = "模型上下文超限，已压缩工具历史；按工作区结构化规则、参数和纠错进度继续，必要时使用配置的强模型"
-                    steps.append(Step("（上下文恢复）", {}, deep_why, False))
+                    deep_why = ''
+                    steps.append(Step("（上下文恢复）", {}, '服务返回上下文超限，已由程序整理历史；按工作区和原文引用继续，不升级业务顾问。', False))
                     if on_step:
                         on_step(len(steps), steps[-1])
                     continue
                 error = str(e)
                 break
+            context_retries=0
             reasoning = getattr(llm, "last_reasoning", "") if think else ""
             history.append({"role": "assistant", "content": _short_thought(text)})
             try:
@@ -4424,15 +4446,27 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             msgs = [{"role": "system", "content": sys}] + body + tail
             try:
                 if ws.staged:
-                    from bonus_agent.context import guard_messages
                     guard_messages(msgs,llm,tools=openai_tools(available_tools))
                 reply = llm.chat_tools(msgs, openai_tools(available_tools), temperature=AGENT_TEMPERATURE, **({"think": True} if think else {}))
+            except ContextBudgetError as e:
+                try:
+                    compacted=context_retries<2 and compact_local_context(msgs,body,tail,openai_tools(available_tools))
+                except ContextBudgetError as floor:
+                    error=f'{floor}；固定系统指令、工具定义与当前任务本身已超过配置预算，未调用模型，也不重试或升级Pro。'
+                    break
+                if not compacted:
+                    error=f'{e}；上下文没有可继续整理的空间，保留案卷，未调用Pro。'
+                    break
+                context_retries+=1;deep_why='';seen.clear()
+                steps.append(Step('（本地上下文整理）',{},'已按本地预算整理历史；材料仍在文件索引和工作区，不调用顾问判断材料缺失。',True))
+                if on_step:on_step(len(steps),steps[-1])
+                continue
             except LLMError as e:
                 if _context_overflow(str(e)) and context_retries < 2:
                     context_retries += 1
                     _shrink(history, max(1500, _size(history) // 2), keep=2)
-                    deep_why = "模型上下文超限，已压缩工具历史；按工作区结构化规则、参数和纠错进度继续，必要时使用配置的强模型"
-                    steps.append(Step("（上下文恢复）", {}, deep_why, False))
+                    deep_why = ''
+                    steps.append(Step("（上下文恢复）", {}, '服务返回上下文超限，已由程序整理历史；按工作区和原文引用继续，不升级业务顾问。', False))
                     if on_step:
                         on_step(len(steps), steps[-1])
                     continue
@@ -4444,6 +4478,7 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                     continue
                 error = str(e)
                 break
+            context_retries=0
             calls = [{**c, "raw": c["arguments"], "arguments": _fix_arguments(c["arguments"])} for c in reply["tool_calls"]]
             reasoning = (reply.get("reasoning") or "") if think else ""
             history.append({"role": "assistant", "content": reply["content"],

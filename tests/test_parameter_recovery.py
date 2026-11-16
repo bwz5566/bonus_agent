@@ -149,7 +149,7 @@ def test_required_checker_never_silently_self_verifies():
     assert not primary.calls
 
 
-def test_context_overflow_recovers_with_structured_workspace_and_thinking(tmp_path):
+def test_context_overflow_recovers_with_structured_workspace_without_thinking(tmp_path):
     from bonus_agent.agent import run_agent
     from bonus_agent.llm import LLMError
     class ContextLLM(FakeLLM):
@@ -165,7 +165,7 @@ def test_context_overflow_recovers_with_structured_workspace_and_thinking(tmp_pa
     p=tmp_path/'policy.md';p.write_text('按材料执行',encoding='utf8')
     llm=ContextLLM()
     result=run_agent(llm,[p],max_steps=2)
-    assert llm.flags == [False,True]
+    assert llm.flags == [False,False]
     assert any(s.tool=='（上下文恢复）' for s in result.steps)
 
 

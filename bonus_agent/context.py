@@ -1,21 +1,42 @@
 """Bounded task context; authoritative rules and raw rows stay in workspace tools."""
 import json
+import math
+import re
 
 from bonus_agent.llm import LLMError
 
 
+class ContextBudgetError(LLMError):
+    """A local estimate/policy decision; never evidence of a provider rejection."""
+
+
+_PIECES=re.compile(r'[A-Za-z_]+|[0-9]+|[ \t]+|\r?\n|[^\x00-\x7f]|.',re.S)
+
+
 def estimate_tokens(value):
-    # Every UTF-8 byte may be a token: conservative when a provider tokenizer is unavailable.
-    return len(json.dumps(value,ensure_ascii=False,default=str).encode('utf-8'))
+    """Conservative multilingual estimate, not bytes or a provider tokenizer count."""
+    text=json.dumps(value,ensure_ascii=False,default=str,separators=(',',':'))
+    total=0.0
+    for match in _PIECES.finditer(text):
+        part=match.group()
+        if part[0].isascii():
+            if part[0].isalnum() or part[0]=='_':total+=math.ceil(len(part)/3)
+            elif part[0] in ' \t':total+=math.ceil(len(part)/4)
+            else:total+=1
+        else:
+            total+=3 if ord(part)>0xffff else 1.5
+    return math.ceil(total)
 
 
 def guard_messages(messages, llm, *, output_tokens=8192, tools=None):
     maximum=llm.context_window()
-    estimate=estimate_tokens(messages)+(estimate_tokens(tools) if tools else 0)
+    baseline=estimate_tokens(messages)+(estimate_tokens(tools) if tools else 0)
+    estimate=math.ceil(baseline*max(1.0,getattr(llm,'_context_token_ratio',0)*1.2))
     budget=getattr(llm,'max_input_tokens',96000)
     if estimate>budget or (maximum and estimate+output_tokens>maximum):
-        raise LLMError(f'任务上下文预算不足：保守估算输入 {estimate} tokens，输入预算 {budget}，'
-                       f'服务窗口 {maximum or "未知"}，预留输出 {output_tokens}。请拆分任务或检索相关原文，不裁掉规则后继续核算')
+        raise ContextBudgetError(f'本地上下文预算拦截（估算，非服务端超限）：估算输入 {estimate} tokens，配置输入预算 {budget}，'
+                                 f'服务声明窗口 {maximum or "未知"}，预留输出 {output_tokens}。需整理任务上下文或调整预算；不能推断材料缺失')
+    llm._pending_context_estimate=baseline
     return estimate
 
 

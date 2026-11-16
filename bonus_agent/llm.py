@@ -300,6 +300,10 @@ class LLM:
         u = Usage(calls=1, latency_s=time.monotonic() - t0)
         if resp.usage:
             u.prompt_tokens, u.completion_tokens = resp.usage.prompt_tokens, resp.usage.completion_tokens
+            estimate=self.__dict__.pop('_pending_context_estimate',None)
+            if estimate and u.prompt_tokens:
+                self._context_token_ratio=max(getattr(self,'_context_token_ratio',0),u.prompt_tokens/estimate)
+                self.last_call.update(estimated_input_tokens=estimate,actual_input_tokens=u.prompt_tokens)
             details = getattr(resp.usage, "prompt_tokens_details", None)
             u.cached_tokens = (getattr(details, "cached_tokens", None) or 0) if details else 0
         self.usage += u

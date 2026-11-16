@@ -248,8 +248,8 @@ class Workflow:
             key=f'{name}:{signature}'
             attempts=self.state['attempts'].get(key,0)
             if attempts>=2:fail('同份独立复核输入已达预算，须补充证据或修复程序；修改主公式不能重置顾问预算')
-            self.state['attempts'][key]=attempts+1
             guard_messages(msgs,getattr(self.ws.llm,'checker_llm',None) or self.ws.llm,output_tokens=8192)
+            self.state['attempts'][key]=attempts+1
             from bonus_agent.llm import parse_json
             spec=parse_json(rr._ask(self.ws,msgs))
         if not isinstance(spec,dict) or not isinstance(spec.get('pool'),str) or spec.get('unclear'):
