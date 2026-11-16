@@ -4105,7 +4105,7 @@ def _answers_text(answers: list[dict] | None) -> str:
     return "\n".join(lines)
 
 
-def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = None, *,
+def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = None, *,
               answers: list[dict] | None = None, max_steps: int = 150, max_history_chars: int = 40000,
               max_files: int = MAX_FILES, max_tokens: int | None = 4_000_000, exclude: list[str | Path] = (),
               on_step: Callable[[int, Step], None] | None = None, resume: bool = True,
@@ -4794,6 +4794,25 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         ar.outputs["case"] = cs.save_case(out, case)
         cs.archive(out, rnd["n"], ar.outputs)
     return ar
+
+
+def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = None, **kw) -> AgentResult:
+    """处理一轮（参数见 _run_agent）。处理期间在输出目录放一份“正在处理中，请勿修改”的提示，结束或出错后删除。"""
+    notice = Path(out_dir) / cs.PROCESSING_NOTICE if out_dir is not None else None
+    if notice is not None:
+        notice.parent.mkdir(parents=True, exist_ok=True)
+        notice.write_text(
+            f"智能体正在处理本案卷（开始于 {time.strftime('%Y-%m-%d %H:%M:%S')}）。\n\n"
+            "处理结束前请勿修改、替换或删除：\n"
+            "- 本目录里的任何文件（规则、映射、结果、案卷记录）；\n"
+            "- 本次使用的材料文件。\n"
+            "需要补充或更正材料，请等本轮结束（本文件消失）后再上传，下一轮会自动比对变化。\n",
+            encoding="utf-8")
+    try:
+        return _run_agent(llm, paths, out_dir, **kw)
+    finally:
+        if notice is not None:
+            notice.unlink(missing_ok=True)
 
 
 def _said(chat: list[dict] | None, message: str | None, instruction: str | None) -> str:

@@ -9,7 +9,7 @@
                                            --out 是案卷目录：有问题时本轮停下等答复；在 questions.yaml 填答复、
                                            补充材料后用同一个目录再运行，从上一轮接着做（--new 从头开始）
                                            （--pipeline 改用固定流程：规划 → 抽取 → 计算）
-  confirm --out 案卷目录 --by 确认人 [--note 说明] [--no-review] [数据文件...]
+  confirm --out 案卷目录 --by 确认人 [--note 说明] [--no-review] [--only-result] [--revision 方案/修订 ...] [--no-revisions] [数据文件...]
                                            财务确认最新一轮结果：复算核对后把规则、映射和调整冻结为 案卷目录/template/，
                                            以后每期用 bonus run-template 计算，不再调用大模型
   negcheck --out 案卷目录 --cases negative_cases.json [--sheet 表名=工作表 ...] 材料...
@@ -90,6 +90,9 @@ def main(argv=None) -> int:
     p.add_argument("--by", required=True, help="确认人")
     p.add_argument("--note", default="", help="确认说明")
     p.add_argument("--no-review", action="store_true", help="口径单（口径单.json）已在线下逐条核对，不检查网页上的确认记录")
+    p.add_argument("--only-result", action="store_true", help="只确认本轮结果，不录入模板（已有模板不动）")
+    p.add_argument("--revision", action="append", default=None, help="录入模板的人工调整修订（方案/修订名，可写多次）；录入的调整以后每期都会自动带上")
+    p.add_argument("--no-revisions", action="store_true", help="本轮的人工调整修订都不录入模板")
     p.add_argument("data", nargs="*", help="复算用的数据文件（默认用该轮的输入文件）")
     p = sub.add_parser('confirm-totals',help='核对预核算后确认指定版本总额；不会调用模型')
     p.add_argument('--out',required=True)
@@ -304,12 +307,29 @@ def main(argv=None) -> int:
         print(f'已确认 {result["scheme"]} 总额；用同一输出目录继续auto进行人员分配。')
         return 0
     if a.cmd == "confirm":
-        from bonus_agent.case import ConfirmError, confirm
+        from bonus_agent.case import ConfirmError, confirm, confirm_options
+        opts = confirm_options(Path(a.out))
+        if not a.only_result:     # 录入前先列出要录入什么：规则改动、人工调整修订
+            print(f"第 {opts['round']} 轮将录入模板的规则" + ("（相对已有模板的改动）" if opts["has_template"] else "") + "：")
+            for line in opts["rule_changes"] or ["规则没有改动"]:
+                print(f"  - {line}")
+            for r in opts["revisions"]:
+                must = f"（方案 {'、'.join(r['required_by'])} 引用了它的结果，必须录入）" if r["required_by"] else ""
+                print(f"  修订 {r['key']}{'（本轮新增）' if r['new'] else ''}{must}：" + "；".join(
+                    f"{x['node']} {x['amount']}（{x['reason']}）" for x in r["adjustments"][:5])
+                      + ("……" if len(r["adjustments"]) > 5 else ""))
+        revisions = [] if a.no_revisions else a.revision
         try:
-            tpl = confirm(Path(a.out), a.by, a.note, [Path(x) for x in a.data] or None, review=not a.no_review)
+            tpl = confirm(Path(a.out), a.by, a.note, [Path(x) for x in a.data] or None, review=not a.no_review,
+                          save_template=not a.only_result, revisions=revisions)
         except ConfirmError as e:
             print(f"不能确认：{e}")
+            if opts["revisions"] and revisions is None and not a.only_result:
+                print("选择：--revision 方案/修订（可写多次）录入指定修订；--no-revisions 都不录入；--only-result 只确认结果不录入模板")
             return 1
+        if tpl is None:
+            print(f"已确认第 {opts['round']} 轮结果，未录入模板（已有模板不动）")
+            return 0
         print(f"已确认并冻结为模板：{tpl}（按模板复算，与该轮结果逐分一致）")
         print(f"以后每期：bonus run-template --template {tpl} --out 结果目录 数据文件...")
         print("属于某个场景时，发布成场景的规则版本：bonus-agent publish --scenario 场景 --out 案卷目录 --by 发布人")
@@ -375,6 +395,9 @@ def _scenario_cmd(a) -> int:
             case = load_case(out) or {}
             if not case.get("confirmed"):
                 print(f"{out} 还没有确认（先 bonus-agent confirm）")
+                return 1
+            if case["confirmed"].get("template", "") is None:
+                print(f"{out} 最近一次确认只确认了结果、没有录入模板，不能发布（重新确认并录入模板后再发布）")
                 return 1
             qs = yaml.safe_load((out / "questions.yaml").read_text(encoding="utf-8")) if (out / "questions.yaml").exists() else []
             rel = rl.publish(reg, a.scenario, out / "template", a.by, a.note, source=str(out), questions=qs,

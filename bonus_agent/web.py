@@ -758,6 +758,9 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         parts = [f"<h1>{e(m['name'])}</h1>"]
         if msg:
             parts.append(f"<section class='warn'>{e(msg)}</section>")
+        if busy:
+            parts.append("<section class='warn'>智能体正在处理中，请勿修改材料或案卷目录里的文件；"
+                         "需要补充或更正材料，请等本轮结束后再上传。</section>")
         if m.get("mode") == "compute":
             return page(m["name"], "".join(parts + compute_sections(cid, m, u)), u)
         if m.get("scenario"):
@@ -897,8 +900,21 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         cbody = (f"<p class='ok'>已确认：第 {e(conf['round'])} 轮，{e(conf['by'])}，{e(conf['at'][:16])}"
                  + (f"，{e(conf['note'])}" if conf.get("note") else "") + "</p>") if conf else "<p class='mut'>尚未确认</p>"
         if approver and not busy and last.get("status") == "OK" and not last.get("confirmed"):
-            cbody += form(f"/cases/{cid}/confirm", "<p><input type='text' name='note' placeholder='确认说明（可选）'></p>"
-                                                   f"<p><button>确认第 {e(last['n'])} 轮结果并冻结为模板</button></p>", csrf)
+            opts = cs.confirm_options(out)
+            ask = ("<p><b>录入模板的规则" + ("（相对已有模板的改动）" if opts["has_template"] else "") + "：</b><br>"
+                   + "<br>".join(e(x) for x in opts["rule_changes"] or ["规则没有改动"]) + "</p>")
+            if opts["revisions"]:
+                ask += "<p><b>人工调整修订</b>（勾选的录入模板，以后每期按模板计算都会自动带上；不勾选的只在本轮结果里）：</p>"
+                ask += "".join(
+                    f"<p><label><input type='checkbox' name='revision' value='{e(r['key'])}'"
+                    + (" checked disabled" if r["required_by"] else "") + f"> {e(r['key'])}"
+                    + ("（本轮新增）" if r["new"] else "")
+                    + (f"（方案 {e('、'.join(r['required_by']))} 引用了它的结果，必须录入）" if r["required_by"] else "") + "：" + e("；".join(f"{x['node']} {x['amount']}（{x['reason']}）"
+                                                                    for x in r["adjustments"][:5]))
+                    + ("……" if len(r["adjustments"]) > 5 else "") + "</label></p>" for r in opts["revisions"])
+            cbody += form(f"/cases/{cid}/confirm", ask + "<p><input type='text' name='note' placeholder='确认说明（可选）'></p>"
+                          f"<p><button name='save' value='template'>确认第 {e(last['n'])} 轮结果并录入模板</button> "
+                          "<button name='save' value='result'>只确认结果，不录入模板</button></p>", csrf)
         if (out / rv.FILE).exists():
             st = rv.status(out)
             cbody += (f"<p class='{'ok' if not st['pending'] else 'warn'}'>口径单：已确认 {st['confirmed']} / {st['total']} 行"
@@ -1112,14 +1128,16 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         idle(cid)
         f = await posted(request, u)
         note = str(f.get("note", "")).strip()[:500]
-        try:
-            tpl = cs.confirm(d / "out", by=u["display"], note=note)
+        save = str(f.get("save", "template")) != "result"
+        picked = [str(x) for x in f.getlist("revision")] if hasattr(f, "getlist") else []
+        try:   # 页面上没勾选就是都不录入：选择已经摆在表单里了
+            tpl = cs.confirm(d / "out", by=u["display"], note=note, save_template=save, revisions=picked)
         except cs.ConfirmError as err:
             store.audit(cid, u["display"], "确认被拒绝", reason=str(err))
             return back(cid, f"不能确认：{err}")
         store.audit(cid, u["display"], "确认结果", round=cs.load_case(d / "out")["confirmed"]["round"], note=note,
-                    template=str(tpl.relative_to(d)))
-        return back(cid, "已确认并冻结为模板")
+                    template=str(tpl.relative_to(d)) if tpl else "未录入", revisions=picked if tpl else [])
+        return back(cid, "已确认并录入模板" if tpl else "已确认结果，未录入模板")
 
     @app.post("/cases/{cid}/template")
     async def template(cid: str, request: Request, u: dict = Depends(user)):
@@ -1186,6 +1204,8 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         conf = case.get("confirmed")
         if not m.get("scenario") or not conf:
             return back(cid, "只有属于某个场景、已经确认的案卷才能发布")
+        if conf.get("template", "") is None:
+            return back(cid, "最近一次确认只确认了结果、没有录入模板，不能发布")
         if any(x.get("confirmed_at") == conf.get("at") for x in m.get("published") or []):
             return back(cid, "这次确认的结果已经发布过了")
         note = str(f.get("note", "")).strip()[:300]

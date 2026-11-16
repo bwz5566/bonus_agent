@@ -102,6 +102,8 @@ class Inventory:
 
 
 def build_inventory(files: list[Path]) -> Inventory:
+    from bonus_core.data.files import require_unique_names
+    require_unique_names(files)  # 材料按文件名识别：同名文件分不清
     docs, sheets, text = [], [], {}
     for f in files:
         if f.suffix.lower() in DATA_SUFFIXES:

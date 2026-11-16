@@ -203,7 +203,7 @@ def confirmed_case(tmp_path) -> Path:
     ar = run_agent(FakeLLM(_script()), [run_case.XLSX], out)
     assert ar.status == "OK"
     rv.mark(out, {r["key"]: (rv.OK, "") for r in rv.load(out)}, "财务甲")
-    confirm(out, "财务甲", "样例")
+    confirm(out, "财务甲", "样例", revisions=["QUARTER/R1", "QUARTER/R2"])
     return out
 
 

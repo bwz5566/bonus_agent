@@ -233,7 +233,7 @@ def test_confirm_freezes_template_and_runs_without_llm(tmp_path):
     with pytest.raises(ConfirmError, match="口径单还有"):          # 口径单逐条确认之前不能确认结果
         confirm(out, "财务甲")
     rv.mark(out, {r["key"]: (rv.OK, "") for r in rv.load(out)}, "财务甲")
-    tpl = confirm(out, "财务甲", "Q3 验收")
+    tpl = confirm(out, "财务甲", "Q3 验收", revisions=["QUARTER/R1", "QUARTER/R2"])
     m = yaml.safe_load((tpl / "manifest.yaml").read_text(encoding="utf-8"))
     order = [s["name"] for s in m["schemes"]]
     assert order.index("QUARTER") < order.index("ANNUAL") and m["confirmed"]["by"] == "财务甲"   # 被引用的先算
@@ -253,7 +253,7 @@ def test_confirm_freezes_template_and_runs_without_llm(tmp_path):
     wb = openpyxl.load_workbook(tmp_path / "下期" / "result_QUARTER_R2.xlsx")
     assert dict(wb["确认信息"].iter_rows(min_row=2, values_only=True))["确认人"] == "财务甲"
     with pytest.raises(ConfirmError, match="找不到"):          # 再次确认失败：已确认的模板不能被删掉
-        confirm(out, "财务乙", data=[tmp_path / "不存在.xlsx"])
+        confirm(out, "财务乙", data=[tmp_path / "不存在.xlsx"], revisions=[])
     assert Template.load(tpl) and not (out / "template.new").exists()
     (tpl / "rules_QUARTER.yaml").write_text("# 改过\n" + (tpl / "rules_QUARTER.yaml").read_text(encoding="utf-8"),
                                             encoding="utf-8")

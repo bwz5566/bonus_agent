@@ -161,6 +161,8 @@ def rebind_files(mapping: Mapping, files: list[str | Path]) -> Mapping:
 
 def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping, period=None) -> tuple[Datasets, list[Issue]]:
     """period：本次核算期间（bonus_core.data.period.Period）。写了 period 字段的数据表只取落在期间里的行。"""
+    from bonus_core.data.files import require_unique_names
+    require_unique_names(files)  # 映射按文件名找数据：同名文件分不清
     sheets = [s for f in files for s in detect(f)]
     data: Datasets = {}
     issues: list[Issue] = []
