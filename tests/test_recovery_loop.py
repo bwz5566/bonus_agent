@@ -78,7 +78,8 @@ def test_pro_diagnoses_without_taking_over_primary_tools(tmp_path):
 def test_advice_packet_is_bounded_and_does_not_contain_full_task():
     from bonus_agent.agent import Step
     seen = []
-    llm = FakeLLM(lambda messages: seen.append(messages) or '{"diagnosis":"need source"}')
+    llm = FakeLLM(lambda messages: seen.append(messages) or json.dumps({
+        'diagnosis':'need source','next_action':'read source','evidence_needed':'rate','acceptance':'exact binding'}))
     local_advice(llm, 'error', [Step('set_rules', {'huge':'x'*50000}, 'bad', False)], [], 'check source')
     assert len(seen[0][-1]['content']) <= 18000
 
@@ -89,7 +90,7 @@ def test_local_diagnosis_budget_does_not_reduce_critical_review_thinking(monkeyp
               think_max_tokens=8192, think_timeout=300)
     def respond(self, messages, **kw):
         captured.append((self.think_body, self.think_max_tokens, self.think_timeout, kw))
-        return {'diagnosis':'missing evidence'}
+        return {'diagnosis':'missing evidence','next_action':'read source','evidence_needed':'rate','acceptance':'exact binding'}
     monkeypatch.setattr(LLM, 'chat_json', respond)
     local_advice(llm, 'error', [], [], 'inspect source')
     body, tokens, timeout, kw = captured[0]

@@ -72,7 +72,7 @@ DEEP_LIMIT = 24                # 每一轮最多这么多步用深度思考（�
 MAX_REFLECT = 2                # 卡住时先让智能体停下来反思、换做法接着做，最多这么多次；再卡住才停下，把原因报给财务
 KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保留全文
 BRIEF_CHARS = 240              # 较早的工具结果保留的开头字数
-READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate", "suggest_links", "validation_report", "read_parameter_table"}
+READ_ONLY = {"list_files", "read_document", "read_sheet", "view_image", "explain", "evaluate", "suggest_links", "validation_report", "read_parameter_table", "diagnose_datasets"}
 NO_IGNORE = ("查找表 ", "抵扣 ")    # 程序检查里不能写进 ignored 放过的项
 MUST_FIX = ("抵扣 ", "计算契约 ")              # 连提问也不能放过、只能改规则的项
 _CURRENCY_HEAD = re.compile(r"币种|币别|币制|结算币|外币|汇率|(?<![A-Za-z])(?:currency|exchange\s*rate|fx)(?![A-Za-z])", re.I)
@@ -148,8 +148,10 @@ TOOLS: list[dict] = [
      "description": "把读到的关键信息记在工作区（如某条规则、某个参数、文件用途、待核对事项）。笔记每轮都会附给你，"
                     "较早的对话会被裁剪，重要内容请及时记下。同一 topic 再次记录会覆盖，text 为空则删除。",
      "parameters": _obj({"topic": _S, "text": _S}, ["topic", "text"])},
-    {"name": "update_dataset", "description": "局部修改已保存的数据定义。只补link/key/period等时使用，自动保留字段、筛选和完整复合键，不重抄成功映射。",
-     "parameters": _obj({"name":_S,"changes":{"type":"object","properties":{"key":_S,"link":_S,"period":_S,"window":_S,"filter":{"type":"object"},"population_from":_S}}},["name","changes"])},
+    {"name": "update_dataset", "description": "局部修改已保存的数据定义，支持补字段和修正合成键。fields按字段合并属性，combine按目标列合并；其他字段、筛选和展开方式保留，不重抄成功映射。",
+     "parameters": _obj({"name":_S,"changes":{"type":"object","properties":{"key":{"type":["string","null"]},"link":{"type":["string","null"]},"period":_S,"window":_S,"filter":{"type":"object"},"population_from":_S,"fields":{"type":"object","description":"只提供要添加或修改的字段属性，其他字段保留"},"combine":{"type":"object","description":"要更新的合成键及组成原列；字段column须指向该合成列"}}}},["name","changes"])},
+    {"name":"diagnose_datasets","description":"不建树、不算金额，检查数据表身份、主外键及期间覆盖，返回缺失编号、日期列候选和可执行局部修复建议。建树失败时先用本工具，不要反复evaluate。",
+     "parameters":_obj({})},
     {"name":"read_parameter_table", "description":"读取PPT指定页原始表格及精确table/row/column/line坐标，不依赖模型转写。按新老项目和区域定位后登记source_cell。",
      "parameters":_obj({"file":_S,"page":_I},["file","page"])},
     {"name": "record_facts",
@@ -1689,8 +1691,8 @@ class Workspace:
         import copy
         if name not in self.datasets or name not in self.mapping:
             raise ToolError('dataset.patch：没有已保存的数据定义')
-        if not changes or set(changes)-{'key','link','period','window','filter','population_from'}:
-            raise ToolError('dataset.patch：只允许修改key/link/period/window/filter/population_from')
+        if not changes or set(changes)-{'key','link','period','window','filter','population_from','fields','combine'}:
+            raise ToolError('dataset.patch：只允许局部修改关联、期间、筛选、fields和combine')
         d, m = self.datasets[name], self.mapping[name]
         st = self.inv.sheet(f'{Path(m.file).name}/{m.sheet}')
         dup = _dup_names(st.headers) if st else {}
@@ -1707,8 +1709,106 @@ class Workspace:
                     desc=d.desc,header_rows=m.header_rows,filter={alias(k):v for k,v in m.filter.items()},
                     distinct=d.distinct,unpivot=unpivot,unmatched=d.unmatched,period=d.period,window=d.window,
                     combine=combine or None,population_from=d.population_from)
-        args.update(copy.deepcopy(changes))
+        patch=copy.deepcopy(changes)
+        if not isinstance(patch.get('fields',{}),dict) or not isinstance(patch.get('combine',{}),dict):
+            raise ToolError('dataset.patch：fields和combine须为对象')
+        for key,value in patch.pop('fields',{}).items():
+            if not isinstance(value,dict):raise ToolError('dataset.patch：字段属性须为对象')
+            fields[key]={**fields.get(key,{}),**value}
+        if 'combine' in patch:
+            args['combine']={**(args['combine'] or {}),**patch.pop('combine')}
+        args.update(patch)
         return self.define_dataset(**args)
+
+    def diagnose_datasets(self) -> dict:
+        """Source-level diagnostics remain available even when allocation cannot build a tree."""
+        from collections import Counter
+        from bonus_core.engine.tree import _SEP
+        issues=[]
+        coverage=[]
+        def values(name,field,path=()):
+            if name in path:raise ToolError('dataset.population：对象范围循环引用')
+            own=set(self._values(name,field))
+            d=self.datasets[name]
+            if d.population_from and field==d.key:
+                own &= values(d.population_from,field,path+(name,))
+            return own
+        owners={d.key:name for name,d in self.datasets.items() if d.key}
+        for name,d in self.datasets.items():
+            if not d.key or d.population_from:continue
+            own=self.mapping[name]
+            for source,detail in self.datasets.items():
+                peer=self.mapping[source]
+                if source==name or detail.link!=d.key or not peer.filter:continue
+                if (own.file,own.sheet)!=(peer.file,peer.sheet):continue
+                if (own.combine or {}).get(d.key)!=(peer.combine or {}).get(d.key):continue
+                if not own.combine and own.columns.get(d.key)!=peer.columns.get(d.key):continue
+                extra=values(name,d.key)-values(source,d.key)
+                if extra:
+                    issues.append({'code':'dataset.population','dataset':name,'detail':source,'extra_keys':len(extra),
+                        'action':{'tool':'update_dataset','args':{'name':name,'changes':{'population_from':source}}},
+                        'condition':'仅在原文要求按有效明细建对象时应用；否则说明保留范围的依据'})
+        relations={(name,owners[d.link],d.link,d.link) for name,d in self.datasets.items() if d.link in owners}
+        strict_relations=set()
+        for scheme in self.schemes:
+            try:
+                levels=self._ruleset(scheme).allocation
+            except (ValueError,TypeError) as exc:
+                issues.append({'code':'dataset.schema','scheme':scheme,'error':str(exc)[:400]})
+                continue
+            for i,lv in enumerate(levels[1:],1):
+                child=owners.get(lv.key);parent=owners.get(levels[i-1].key)
+                if child and parent and lv.parent_key:
+                    relation=(child,parent,lv.parent_key,levels[i-1].key)
+                    relations.add(relation)
+                    strict_relations.add(relation)
+        for child,parent,field,parent_field in sorted(relations):
+            if field not in self.mapping[child].columns:continue
+            wanted=values(parent,parent_field); actual=values(child,field)
+            canon=lambda x:_SEP.sub('',str(x))
+            counts=Counter(canon(v) for v in wanted)
+            strict=(child,parent,field,parent_field) in strict_relations
+            matched=lambda v:v in wanted or (not strict and counts[canon(v)]==1)
+            aliases={v for v in actual if v not in wanted and counts[canon(v)]==1}
+            missing={v for v in actual if not matched(v)}
+            coverage.append({'dataset':child,'parent':parent,'field':field,'parent_keys':len(wanted),
+                             'child_keys':len(actual),'matched_keys':len(actual)-len(missing),'unmatched_keys':len(missing),
+                             'separator_only_keys':len(aliases),'exact_required':strict})
+            if not missing:continue
+            proposals=[]
+            for f in self.datasets[child].fields:
+                column=self.mapping[child].columns.get(f,'')
+                if not re.search(r'日期|月份|年月|period|month|date',f+' '+column,re.I):continue
+                try:
+                    narrowed=set(self._values(child,field,period_field=f))
+                except (ValueError,KeyError,TypeError):continue
+                if narrowed and len(narrowed)<len(actual):
+                    proposals.append({'period_field':f,'keys':len(narrowed),
+                        'matched':sum(matched(v) for v in narrowed),
+                        'separator_only':sum(v not in wanted and counts[canon(v)]==1 for v in narrowed),
+                        'action':{'tool':'update_dataset','args':{'name':child,'changes':{'period':f}}}})
+            issues.append({'code':'dataset.reference','dataset':child,'parent':parent,'field':field,
+                           'expected_keys':len(wanted),'actual_keys':len(actual),'unmatched':len(missing),
+                           'examples':sorted(missing)[:3],'period_candidates':proposals,'exact_required':strict})
+            if strict and aliases:
+                identity={'code':'dataset.identity','dataset':child,'parent':parent,'field':field,
+                          'separator_only_keys':len(aliases),
+                          'message':'分配层的父键必须完全一致；分隔符相似只供诊断，不能当成已匹配。按原文核对组成字段后统一合成键。'}
+                pm,cm=self.mapping[parent],self.mapping[child]
+                ingredients=[]
+                for column in (pm.combine or {}).get(pm.columns[parent_field],[]):
+                    fields=[f for f,c in pm.columns.items() if c==column and f in cm.columns]
+                    if len(fields)!=1:
+                        ingredients=[]
+                        break
+                    ingredients.append(cm.columns[fields[0]])
+                if ingredients:
+                    target='__linked_'+field
+                    identity['action']={'tool':'update_dataset','args':{'name':child,'changes':{
+                        'fields':{field:{'column':target}},'combine':{target:ingredients}}}}
+                issues.append(identity)
+        return {'status':'FAIL' if issues else 'PASS' if relations else 'INCOMPLETE','period':str(self.period),'issues':issues,'coverage':coverage,
+                'scope':'仅检查已声明数据关联，不代表金额或规则已验收'}
 
     def _define_dataset(self, name: str, file: str, sheet: str, fields: dict, key: str | None = None,
                         link: str | None = None, desc: str = "", header_rows: list[int] | None = None,
@@ -1991,7 +2091,7 @@ class Workspace:
                                 f"排除条款 {name}.{h}"))
         return out
 
-    def _values(self, name: str, fld: str, combine: dict | None = None) -> list[str]:
+    def _values(self, name: str, fld: str, combine: dict | None = None, *, period_field: str | None = None) -> list[str]:
         """数据表某个字段的全部取值（文字），用来判断表之间的关联。combine 给了就按它合成（试换一列时用）。"""
         from bonus_core.data.mapping import cell_text
         m = self.mapping[name]
@@ -2007,8 +2107,9 @@ class Workspace:
             st = add_row_ids(st)
         st, _ = filter_sheet(st, m.filter or None)
         ds = self.datasets[name]
-        if self.period and ds.period and ds.period in m.columns:
-            period_col = st.headers.index(m.columns[ds.period])
+        period_field=period_field or ds.period
+        if self.period and period_field and period_field in m.columns:
+            period_col = st.headers.index(m.columns[period_field])
             win = self.period.window(ds.window)
             st = replace(st, rows=[(n,v) for n,v in st.rows if win.contains(v[period_col])])
         i = st.headers.index(m.columns[fld])
@@ -4120,8 +4221,10 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     if period_obj is not None:
         task += (f"\n\n【核算期间】本次算 {period_obj.label}（{period_obj.start} 至 {period_obj.end}）。期间在计算时选，规则里不要写死月份或日期："
                  "业务明细表（销售、回款、出货等）有日期或月份列的，define_dataset 时写 period 指向那一列的字段，程序只取期间里的行；"
-                 "名单、预算、系数表这类跨期的表不写 period，要取当期的值时在表达式里用 period_start() / period_end()"
-                 "（如 month(period_end())）。材料里的口径要求按别的时间范围取数（如累计到当月）时照材料写，拿不准就提问")
+                  "名单、系数表也要检查月份和关联粒度：按月保存且挂到当期项目的记录，应声明 period；"
+                  "全年宽表预算或跨期有效的固定规则不按行筛月，取当期值时在表达式里用 period_start() / period_end()。"
+                  "材料要求累计时使用相应 window，不能为消除报错而擅自丢历史记录。建树失败先 diagnose_datasets，"
+                  "看原始编号及期间覆盖，用 update_dataset 局部修改 fields/combine/period 后再试算。口径拿不准就提问")
     task += pack
     mode = llm.tool_mode
     sys = system_prompt()
@@ -4175,7 +4278,8 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                     history.append({'role': 'user', 'content': '【只读纠错建议，必须经原文和程序验证后应用】' + content})
                     advice_ok = True
                 except (LLMError, ValueError) as exc:
-                    content, advice_ok = f'局部诊断未完成：{exc}；不修改工作区，停止本次运行。', False
+                    content, advice_ok = f'局部顾问不可用：{exc}；未应用建议，改按确定性诊断继续。关键独立复核仍须通过。下一步：{ws.next_hint()}', False
+                    history.append({'role':'user','content':content})
                 st = Step('（局部诊断）', {'reason': deep_why}, content, advice_ok, deep=True,
                           model_secs=round(time.time() - started_advice, 2),
                           tokens_in=llm.usage.prompt_tokens-before_advice[0],
@@ -4184,9 +4288,6 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 steps.append(st)
                 if on_step:
                     on_step(len(steps), st)
-                if not advice_ok:
-                    error = content
-                    break
                 if error := run_budget.check(llm):
                     break
                 if should_stop and should_stop():
@@ -4316,6 +4417,13 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 result, ok = result + (f"\n{note}" if note else ""), True
             except ToolError as e:
                 result, ok = f"错误：{e}", False
+                if c['name'] in {'evaluate','trial_run','explain'} and any(code in result for code in ('parent_unknown','link_unmatched')):
+                    try:
+                        diagnostic=json.dumps(ws.diagnose_datasets(),ensure_ascii=False,default=str)
+                    except (ToolError,ValueError,KeyError,TypeError) as exc:
+                        diagnostic=f'原始表诊断未完成：{exc}；先检查数据定义和原始列。'
+                    result=result[:2400]+'\n【原始数据诊断】\n'+_clip(diagnostic,6500)
+                    result += '\n下一步按诊断核对期间和父键；用 update_dataset 局部修复后再试算，完整诊断用 diagnose_datasets，不要重复 evaluate。'
             except json.JSONDecodeError as e:
                 result, ok = f"错误：参数不是合法 JSON：{e}", False
             except TypeError as e:
@@ -4957,6 +5065,8 @@ def _deep_reason(turn: list[Step], skipped: int, ws: Workspace, fails: dict[str,
         if st.tool.startswith("（"):
             continue
         head = st.result.removeprefix("错误：").split("\n", 1)[0][:300]
+        if not st.ok and ('source.cell' in st.result or '【原始数据诊断】' in st.result) and fails.get(st.tool,0)<2:
+            continue  # Native table coordinates are a deterministic repair, not an advisory task.
         if not st.ok and (not st.result.startswith(FORMAT_ERRORS) or fails.get(st.tool, 0) >= 2):
             return f"{st.tool} 失败：{head}"
         if st.ok and st.tool == "set_rules" and getattr(ws, "last_blocking", None):
