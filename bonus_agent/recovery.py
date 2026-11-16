@@ -67,12 +67,19 @@ class RecoveryJournal:
         self.save()
 
     def claim_advice(self, issue):
+        if self.state.get('advisor_disabled'):
+            return False
         key = fingerprint(issue)
         if key in self.state['advised'] or len(self.state['advised']) >= 6:
             return False
         self.state['advised'].append(key)
         self.save()
         return True
+
+    def disable_advice(self, reason):
+        """A malformed optional advisor must not be paid to repeat the same protocol failure."""
+        self.state['advisor_disabled']=str(reason)[:500]
+        self.save()
 
 
 def local_advice(llm, reason, steps, facts, hint):

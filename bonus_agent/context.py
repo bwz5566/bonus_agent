@@ -40,10 +40,14 @@ def guard_messages(messages, llm, *, output_tokens=8192, tools=None):
     return estimate
 
 
-def workspace_view(ws, section, scheme=None, offset=0, limit=20, name=None, query=None, file=None, page=None):
-    if not 0<=offset or not 1<=limit<=50:
+def workspace_view(ws, section, scheme=None, offset=0, limit=20, name=None, query=None, file=None, page=None,
+                   detail_offset=None):
+    if type(offset) is not int or offset<0 or type(limit) is not int or (detail_offset is not None and
+            (type(detail_offset) is not int or detail_offset<0)):
         from bonus_agent.workflow import fail
-        fail('读取范围须为offset>=0、1<=limit<=50')
+        fail('读取位置offset/detail_offset须为非负整数，limit须为整数')
+    requested_limit=limit
+    limit=max(1,min(limit,50))  # Read-only sizing is safe to normalize, never a business correction.
     if section=='facts':items=[f.model_dump(mode='json') for f in ws.facts]
     elif section=='clauses':items=[c.model_dump(mode='json') for c in ws.clauses]
     elif section=='rules':items=[{'scheme':s,'rule':ws._merged(s)} for s in ([ws._scheme(scheme)] if scheme else ws.schemes)]
@@ -62,8 +66,33 @@ def workspace_view(ws, section, scheme=None, offset=0, limit=20, name=None, quer
     if query is not None:
         from bonus_agent.facts import norm
         items=[item for item in items if norm(query) in norm(json.dumps(item,ensure_ascii=False))]
-    return {'section':section,'total':len(items),'offset':offset,'items':items[offset:offset+limit],
-            'next_offset':offset+limit if offset+limit<len(items) else None}
+    args={k:v for k,v in dict(section=section,scheme=scheme,name=name,query=query,file=file,page=page).items() if v is not None}
+    result={'section':section,'total':len(items),'offset':offset,'requested_limit':requested_limit,
+            'page_limit':limit,'items':[],'next_offset':None,'next_call':None}
+    if requested_limit!=limit:result['notice']=f'请求条数{requested_limit}已安全调整为{limit}；按next_call继续读取'
+    # Stay below the runner's character cap while preserving whole records and real offsets.
+    for item in items[offset:offset+limit] if detail_offset is None else []:
+        candidate={**result,'items':result['items']+[item]}
+        if len(json.dumps(candidate,ensure_ascii=False,default=str))>4500:break
+        result['items'].append(item)
+    if not result['items'] and offset<len(items):
+        # A single large definition needs explicit fragments, not a silently cut JSON object.
+        text=json.dumps(items[offset],ensure_ascii=False,default=str)
+        start=detail_offset or 0
+        part=text[start:start+1200]
+        end=start+len(part)
+        result['item_fragment']={'format':'json','offset':start,'text':part,
+                                 'next_detail_offset':end if end<len(text) else None}
+        if end<len(text):
+            result['next_offset']=offset
+            result['next_call']={'tool':'read_workspace','args':{**args,'offset':offset,'limit':1,'detail_offset':end}}
+            return result
+        consumed=1
+    else:consumed=len(result['items'])
+    if offset+consumed<len(items):
+        result['next_offset']=offset+consumed
+        result['next_call']={'tool':'read_workspace','args':{**args,'offset':offset+consumed,'limit':limit}}
+    return result
 
 
 def task_card(ws):

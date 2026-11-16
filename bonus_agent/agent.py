@@ -157,7 +157,7 @@ TOOLS: list[dict] = [
     {"name":"plan_calculation","description":"先盘点全部材料，声明核算目标、需要的输出和全部方案。files为文件名到rule/data/rule_and_data/reference/ignore的映射，不能漏文件。",
      "parameters":_obj({'summary':_S,'outputs':{'type':'array','items':_S},'files':{'type':'object','additionalProperties':_S},'schemes':{'type':'array','items':_S},'ignored':{'type':'array','items':_obj({'ref':_S,'reason':_S},['ref','reason'])}},['summary','outputs','files','schemes'])},
     {"name":"read_workspace","description":"分页检索facts/clauses/rules/variables/tables/mapping/basis。按name定位单个参数、条款、变量、表或数据集，scheme区分方案；大规则优先逐变量读取。",
-     "parameters":_obj({'section':_S,'scheme':_S,'name':_S,'query':{**_S,'description':'全文片段检索，可按参数名称片段查已有项'},'file':_S,'page':_I,'offset':_I,'limit':_I},['section'])},
+     "parameters":_obj({'section':_S,'scheme':_S,'name':_S,'query':{**_S,'description':'全文片段检索，可按参数名称片段查已有项'},'file':_S,'page':_I,'offset':{**_I,'minimum':0},'limit':{**_I,'minimum':1,'maximum':50,'description':'最多50条；同时按结果长度缩页，必须使用返回的next_call，不自行猜offset'},'detail_offset':{**_I,'minimum':0,'description':'单条过大时按next_call分片续读'}},['section'])},
     {"name":"query_dataset","description":"独立统计一张已定义原表，使用DSL聚合表达式，如sum(amount, of: \"销售明细\")。无需allocation，不受其他表的建树错误影响；不用于证明正式金额正确。",
      "parameters":_obj({'dataset':_S,'expr':_S},['dataset','expr'])},
     {"name":"prepare_data","description":"检查全部已声明数据的转换、有效范围、身份、关联和期间，程序签发当前数据版本的通过回执。失败必须修正，不能直接试算。","parameters":_obj({})},
@@ -800,9 +800,10 @@ class Workspace:
         return self._flow().plan(summary,outputs,files,schemes,ignored)
 
     def read_workspace(self, section: str, scheme: str | None = None, offset: int = 0, limit: int = 20, name: str | None = None,
-                       query: str | None = None, file: str | None = None, page: int | None = None):
+                       query: str | None = None, file: str | None = None, page: int | None = None,
+                       detail_offset: int | None = None):
         from bonus_agent.context import workspace_view
-        return workspace_view(self,section,scheme,offset,limit,name,query,file,page)
+        return workspace_view(self,section,scheme,offset,limit,name,query,file,page,detail_offset)
 
     def query_dataset(self, dataset: str, expr: str):
         try:return self._flow().query_dataset(dataset,expr)
@@ -1319,7 +1320,13 @@ class Workspace:
                 args={'name':record['name'],'file':file,'page':page,'context':context,
                       'value':record['value'],'quote':quote,'source_cell':record['locator'],
                       'unit':cell.get('unit'),'component':'literal'}
-                self.record_facts([args])
+                try:self.record_facts([args])
+                except ToolError as exc:
+                    if 'parameter.unit' in str(exc):
+                        raise ToolError('parameter.unit：当前单元格或行列标题没有支持所填单位的原文。'
+                                        f"选中原文={record['selected']!r}，行列标题={record['labels']!r}。"
+                                        '补充原文单位依据，或向财务确认；不能省略unit把比例当作普通系数绕过。') from None
+                    raise
                 self.changed=True
                 fact=next(f for f in self.facts if f.name==record['name'])
             returned.append({'name':fact.name,'value':fact.value,'page':page,'source_cell':fact.source_cell,
@@ -4438,7 +4445,9 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                     history.append({'role': 'user', 'content': '【只读纠错建议，必须经原文和程序验证后应用】' + content})
                     advice_ok = True
                 except (LLMError, ValueError) as exc:
+                    if isinstance(exc,ValueError):recovery.disable_advice(exc)
                     content, advice_ok = f'局部顾问不可用：{exc}；未应用建议，改按确定性诊断继续。关键独立复核仍须通过。下一步：{ws.next_hint()}', False
+                    if isinstance(exc,ValueError):content+='；本作业停止后续可选顾问调用，避免重复消耗'
                     history.append({'role':'user','content':content})
                 st = Step('（局部诊断）', {'reason': deep_why}, content, advice_ok, deep=True,
                           model_secs=round(time.time() - started_advice, 2),
@@ -5272,6 +5281,10 @@ def _deep_reason(turn: list[Step], skipped: int, ws: Workspace, fails: dict[str,
     for st in turn:
         if st.tool.startswith("（"):
             continue
+        if st.tool in ('read_workspace','read_parameter_table','read_document','read_sheet'):
+            continue  # Read-interface errors have native feedback; Pro cannot repair pagination or a wrong file type.
+        if not st.ok and 'parameter.unit' in st.result:
+            continue  # Missing source units need evidence/clarification, not another paid guess.
         head = st.result.removeprefix("错误：").split("\n", 1)[0][:300]
         if not st.ok and st.tool in ('prepare_data','compile_formulas') and fails.get(st.tool,0)<2:
             continue  # Program diagnostics already identify the first structural correction.

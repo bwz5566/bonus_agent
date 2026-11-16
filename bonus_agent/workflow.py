@@ -99,15 +99,23 @@ class Workflow:
                               'ignored':ignored,'files_version':fingerprint(self.ws._source_version)}
         return {'status':'PASS','plan':self.state['plan'],'next':self.hint()}
 
-    def rules_ready(self):
+    def rule_requirements(self):
         ws = self.ws
         plan = self.state.get('plan') or {}
         relevant = {n for n,r in plan.get('files',{}).items() if r in ('rule','rule_and_data')}
         from bonus_agent.agent import RULE_SUFFIXES
         relevant |= {p.name for p in ws.inv.files if p.suffix.lower() in RULE_SUFFIXES and p.name not in self.skipped()}
-        missing = [n for n in relevant if not any(f.file==n for f in ws.facts) or not any(c.file==n for c in ws.clauses)]
+        result=[]
+        for n in sorted(relevant):
+            facts=sum(f.file==n for f in ws.facts);clauses=sum(c.file==n for c in ws.clauses)
+            result.append({'file':n,'facts':facts,'clauses':clauses,
+                           'missing':(['facts'] if not facts else [])+(['clauses'] if not clauses else [])})
+        return result
+
+    def rules_ready(self):
+        missing=[item['file'] for item in self.rule_requirements() if item['missing']]
         # Automatic document coverage remains mandatory; model classification cannot exempt policy documents.
-        missing += ws._page_gaps(self.skipped())
+        missing += self.ws._page_gaps(self.skipped())
         return missing
 
     def prepare_data(self):
@@ -342,6 +350,15 @@ class Workflow:
 
     def hint(self):
         stage,scheme=self.stage()
+        if stage==1:
+            missing=[item for item in self.rule_requirements() if item['missing']]
+            if missing:
+                return '只补缺失项，不重读已登记的整份参数表：'+ '；'.join(
+                    f"《{item['file']}》已有{item['facts']}个参数、{item['clauses']}条条款，须用"
+                    +'/'.join('record_facts' if part=='facts' else 'record_clauses' for part in item['missing'])
+                    +'补齐原文登记' for item in missing[:3])
+            gaps=self.ws._page_gaps(self.skipped())
+            return '只核对并登记尚未覆盖的原文页：'+'；'.join(gaps[:3])
         last=self.state.get('data_report',{})
         if stage==2 and last.get('version')==self.version('data') and last.get('report',{}).get('status')=='FAIL':
             return '先按数据反例修正字段、期间、完整编号或有效对象范围，再prepare_data；不要原样重试：'+str(last['report']['issues'][:2])[:650]
@@ -350,6 +367,7 @@ class Workflow:
     def summary(self):
         index,scheme=self.stage()
         return {'stage':index,'name':STAGES[index][0],'scheme':scheme,'next':self.hint(),
+                'rule_requirements':self.rule_requirements() if index==1 else [],
                 'plan':self.state.get('plan'),
                 'receipts':{n:{'current':self.current(n),'at':r['at']} for n,r in self.state['receipts'].items()}}
 
