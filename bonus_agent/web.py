@@ -369,7 +369,9 @@ def usage_text(u: dict | None) -> str:
         return ""
     return (f"\n（本轮用时 {u.get('secs', 0) // 60} 分 {u.get('secs', 0) % 60} 秒，{u.get('steps', 0)} 步"
             + (f"，其中深度思考 {u['deep_steps']} 步" if u.get("deep_steps") else "")
-            + f"；调用模型 {u.get('calls', 0)} 次，输入 {u.get('prompt_tokens', 0):,} tokens，输出 {u.get('completion_tokens', 0):,} tokens）")
+            + f"；调用模型 {u.get('calls', 0)} 次，输入 {u.get('prompt_tokens', 0):,} tokens"
+            + (f"（其中命中缓存 {u['cached_tokens']:,}）" if u.get("cached_tokens") else "")
+            + f"，输出 {u.get('completion_tokens', 0):,} tokens）")
 
 
 def _round_status(ar) -> str:

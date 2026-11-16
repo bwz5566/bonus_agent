@@ -259,3 +259,30 @@ def test_new_material_version_requires_a_new_inventory_plan(tmp_path):
     clone=Workspace(FakeLLM([]),build_inventory([*ws.inv.files,extra]));case.restore(clone,saved)
     assert clone._flow().stage()[0]==0
     with pytest.raises(ToolError,match='材料清单'):clone.prepare_data()
+
+
+def _staged_llm(ws, script):
+    llm=FakeLLM(script)
+    llm.workflow_mode='staged';llm.checker_required=True;llm.checker_llm=ws.llm.checker_llm
+    return llm
+
+
+def test_edit_that_invalidates_passed_checks_is_rechecked_without_going_back(tmp_path):
+    """实测：编公式时补一条字段说明，数据回执失效，退回“准备数据”、清空对话，模型把检查和读取整套重做。"""
+    ws=prepared(make_workspace(tmp_path));out=tmp_path/'out';save_staged_case(ws,out)
+    edit={'tool':'update_dataset','args':{'name':'projects','changes':{'fields':{'amount':{'column':'amount','type':'money','desc':'销售金额'}}}}}
+    ar=run_agent(_staged_llm(ws,[edit,{'tool':'read_workspace','args':{'section':'facts'}}]),ws.inv.files,out,max_steps=2)
+    tools=[s.tool for s in ar.steps]
+    assert '（自动复核）' in tools and '（进入新阶段）' not in tools, [(s.tool,s.result[:200]) for s in ar.steps]
+    assert 'prepare_data 通过' in ar.steps[tools.index('（自动复核）')].result
+
+
+def test_unchanged_reads_are_carried_across_a_context_reset(tmp_path):
+    """实测每次清空对话后都把台账、条款原样再读一遍：没变的内容随说明带过去，再读只回一句。"""
+    ws=prepared(make_workspace(tmp_path));out=tmp_path/'out';save_staged_case(ws,out)
+    read={'tool':'read_workspace','args':{'section':'facts'}}
+    ar=run_agent(_staged_llm(ws,[read,{'tool':'calculate_basis','args':{'scheme':'S'}},read]),ws.inv.files,out,max_steps=3)
+    stage=next(s for s in ar.steps if s.tool=='（进入新阶段）')
+    assert '之前读过、内容没变的工作区内容' in stage.result and '提成率' in stage.result
+    again=[s for s in ar.steps if s.tool=='read_workspace'][-1]
+    assert again.ok and '不用再读' in again.result and '提成率' not in again.result

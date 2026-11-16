@@ -4288,7 +4288,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
     used0 = llm.usage.prompt_tokens + llm.usage.completion_tokens    # 本轮开始前的累计用量（自动接续时同一个模型对象接着用）
     from bonus_agent.recovery import RecoveryJournal, RunBudget, local_advice
     run_budget = run_budget or RunBudget(used0, max_tokens)
-    u0, t0 = (llm.usage.calls, llm.usage.prompt_tokens, llm.usage.completion_tokens), time.time()
+    u0, t0 = (llm.usage.calls, llm.usage.prompt_tokens, llm.usage.completion_tokens, getattr(llm.usage, "cached_tokens", 0)), time.time()
     ws = Workspace(llm, build_inventory(files))
     out = Path(out_dir) if out_dir is not None else None
     case = cs.load_case(out) if out is not None else None      # --new 也保留历次记录，只是不接着上一轮的工作区
@@ -4374,6 +4374,8 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
     error = recovery.error
     nudges = 0
     seen: dict[str, int] = {}          # 只读工具的调用 -> 第几步，用来发现原地打转
+    recent_reads: dict[str, tuple] = {}  # 上次清空对话以来读过的工作区内容，清空时仍没变的附在说明里
+    carried: dict[str, str] = {}         # 已附在说明里的读取 -> 内容；原样再读、内容没变就只回一句
     repeats = 0
     last_write: tuple[str, str] | None = None
     fails: dict[str, int] = {}         # 工具 -> 连续失败次数
@@ -4631,6 +4633,13 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                     raise ToolError('workflow.gate：该操作的前置阶段尚未通过。下一步：'+ws._flow().hint())
                 value = fn(**args)
                 result = json.dumps(value, ensure_ascii=False, default=str) if isinstance(value, (dict, list)) else str(value)
+                if c["name"] in CARRY_READS:
+                    if carried.get(sig) == result:      # 清空对话时已附上、内容没变：不再整段重发
+                        result = ("内容和上面说明里【之前读过、内容没变的工作区内容】附的那段完全一样，工作区没有变化，"
+                                  f"直接用那里的内容，不用再读。下一步（程序判断）：{ws.next_hint()}")
+                    else:
+                        recent_reads.pop(sig, None)
+                        recent_reads[sig] = (c["name"], dict(args), result)
                 result, ok = result + (f"\n{note}" if note else ""), True
                 if ws.staged and isinstance(value,dict) and value.get('status') in ('FAIL','ERROR'):
                     ok=False
@@ -4845,12 +4854,32 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             break
         now = ws.phase() if not message or ws.staged else reached
         focus=ws._flow().stage() if ws.staged else None
+        rechecked = []
+        if ws.staged and focus and reached_focus and focus[0] < reached_focus[0]:
+            # 改动让前面已通过的检查失效：程序自己重跑确定性检查，过了就原地接着做，不退阶段、不清对话
+            rechecked = ws._flow().recheck()
+            if rechecked:
+                focus = ws._flow().stage()
+                text = "；".join(f"{n} {'通过' if ok else '未通过'}" for n, ok, _ in rechecked)
+                if focus == reached_focus:
+                    history.append({"role": "user", "content": f"（刚才的修改让前面已通过的检查失效，程序已自动重新核对：{text}。"
+                                                               "阶段不变，接着做当前这一步，不用再调用这些检查）"})
+                    steps.append(Step("（自动复核）", {}, text, True))
+                    if on_step:
+                        on_step(len(steps), steps[-1])
         if (ws.staged and focus!=reached_focus) or (not ws.staged and now>reached):
             # 进入新阶段：上一阶段的结论都已存进工作区（台账、条款、规则、试算、验算），对话历史里的读数、试错不再需要，
             # 清掉腾出上下文，让模型只看材料包和工作区状态专心做这一阶段（小上下文的模型尤其需要）
             reached = now
             reached_focus=focus
             note = _phase_note(ws, now)
+            failed = [(n, issues) for n, ok, issues in rechecked if not ok]
+            if failed:      # 程序已经替它跑过：直接给出没通过的问题，不必再调用一次才看到
+                n, issues = failed[0]
+                note += (f"\n\n刚才的修改让前面的检查失效，程序已自动重跑 {n}，没有通过（不用再调用它，先按下面改）：\n"
+                         + "\n".join(f"- {str(i)[:400]}" for i in issues[:6]))
+            carry, carried = _carry_reads(ws, recent_reads)
+            note += carry
             at = max((i for i, m in enumerate(history) if m["role"] == "assistant"), default=len(history))
             keep = history[at:]          # 刚完成的这一步（如试算结果和抽查）留着，接下来要看
             history.clear()
@@ -4878,6 +4907,8 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             reflected += 1
             deep_why = f"卡住了：{stuck[:300]}"       # 反思后的第一步一定深度思考
             note = _reflection(ws, stuck, steps, reflected, reflect)
+            carry, carried = _carry_reads(ws, recent_reads)
+            note += carry
             history.clear()
             history.append({"role": "user", "content": note})
             repeats, last_write, stuck, idle, quiet = 0, None, "", 0, 0
@@ -4932,7 +4963,8 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
     ar.deep_steps = deep_used
     ar.usage = {"secs": round(time.time() - t0), "steps": len(steps), "deep_steps": deep_used,
                 "calls": llm.usage.calls - u0[0], "prompt_tokens": llm.usage.prompt_tokens - u0[1],
-                "completion_tokens": llm.usage.completion_tokens - u0[2]}
+                "completion_tokens": llm.usage.completion_tokens - u0[2],
+                "cached_tokens": getattr(llm.usage, "cached_tokens", 0) - u0[3]}
     ar.reply = ws.reply_text
     ar.pending = [q.model_dump() for q in ws.pending]
     if last and last.get("digest") is not None and tested:
@@ -5407,6 +5439,33 @@ def _deep_note(why: str, steps: list[Step] = ()) -> str:
             "\n2. 前几步是不是已经在同一处改过：是的话说明方向不对，回到材料原文和数据重新核对，不要在原写法上小修小补；"
             "\n3. 这次准备怎么改，为什么能解决；能用 explain / evaluate 看一眼中间数就先看，不要凭印象；"
             "\n4. 口径确实拿不准、或材料之间冲突，用 ask_question 把差异写给财务，不要硬凑。")
+
+
+CARRY_READS = {"read_workspace"}     # 纯读取、重跑一次很便宜，清空对话时能核对内容有没有变
+CARRY_CHARS = 8000
+
+
+def _carry_reads(ws: Workspace, recent: dict) -> tuple[str, dict]:
+    """清空对话（进入新阶段、停下来反思）时，把这一段读过、现在内容仍没变的工作区内容附在说明里。
+    实测每次清空后模型都把台账、条款、映射原样再读一遍（第 5 轮 51 次 read_workspace），每次重读都是一整步的输入。
+    最近读的优先，总共不超过 CARRY_CHARS 字；返回（附加文字，{调用签名: 内容}）。"""
+    parts, kept, size = [], {}, 0
+    for sig, (name, args, old) in reversed(list(recent.items())):
+        try:
+            value = getattr(ws, name)(**args)
+        except Exception:  # noqa: BLE001 - 读不了就不带，模型需要时自己再读
+            continue
+        now = json.dumps(value, ensure_ascii=False, default=str) if isinstance(value, (dict, list)) else str(value)
+        if now != old or size + len(now) > CARRY_CHARS:
+            continue
+        shown = json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)
+        parts.append(f"▸ {name} {shown}：\n{now}")
+        kept[sig] = now
+        size += len(now)
+    recent.clear()
+    if not parts:
+        return "", {}
+    return ("\n\n【之前读过、内容没变的工作区内容（直接用，不用再读）】\n" + "\n\n".join(reversed(parts))), kept
 
 
 def _reflection(ws: Workspace, stuck: str, steps: list[Step], n: int, limit: int) -> str:

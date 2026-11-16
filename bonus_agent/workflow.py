@@ -514,6 +514,30 @@ class Workflow:
         ):
             fail('金额基线与复核或确认回执不一致')
 
+    def recheck(self):
+        """改动让已通过的“准备数据 / 编译公式”回执失效时，程序自己重跑这两项确定性检查。
+        实测模型补一条分配层级或改一处规则就退回前一阶段、清空对话，再把整套检查和读取重做一遍，白耗步数和 tokens。
+        只重跑之前通过过的检查；返回 [(检查名, 是否通过, 未通过的问题)]。"""
+        done = []
+        for _ in range(2):
+            stage, _scheme = self.stage()
+            if stage == 2 and 'data' in self.state['receipts']:
+                name, run = 'prepare_data', self.prepare_data
+            elif stage == 3 and 'formulas' in self.state['receipts']:
+                name, run = 'compile_formulas', self.compile
+            else:
+                break
+            from bonus_agent.agent import ToolError
+            try:
+                report = run()
+                ok, issues = report.get('status') == 'PASS', report.get('issues') or []
+            except ToolError as exc:
+                ok, issues = False, [str(exc)]
+            done.append((name, ok, issues))
+            if not ok:
+                break
+        return done
+
     def stage(self):
         if not self.has_plan():
             return 0, None
