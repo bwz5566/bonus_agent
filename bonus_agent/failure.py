@@ -30,9 +30,17 @@ def explain(error: str) -> dict:
 
 def _explain(err: str) -> dict:
     if err.startswith("纠错预算耗尽"):
+        from bonus_agent.stuck_question import program_issue
+        if program_issue(err):
+            # 能问财务的卡点已在本轮改成具体问题（见 stuck_question），这里是程序或模型自身的问题：说清不需要回答
+            return {"title": "智能体同一处多次出错，已停止自动接续并保存工作区。这是程序或模型自身的问题，不需要你回答或补充材料。",
+                    "where": err.split('：', 1)[-1][:350],
+                    "advice": "请把这条消息发给开发；修复更新后点「运行下一轮」会自动接着做（不必新建案卷）。"
+                              "也可以在对话框里直接告诉智能体下一步该做什么，发送后它会换个做法接着做。"}
         return {"title": "同一问题多次纠错仍未解决，已停止自动接续并保存工作区。",
                 "where": err.split('：', 1)[-1][:350],
-                "advice": "请开发检查记录中的失败原因；补充材料、答复或更新修复代码后再运行。重复重试不会清空纠错记录。"}
+                "advice": "请先回答「问题」里列出的待确认问题，再点「运行下一轮」；没有待确认问题时，"
+                          "在对话框里写明这一步该怎么处理再点「发送」，回答后会从停下的地方接着做。"}
     if err.startswith("作业") and "上限" in err:
         return {"title": "本次作业达到总用量或时间上限，已停止并保存工作区。",
                 "where": err, "advice": "请先检查未解决的校验问题，再决定是否继续。"}

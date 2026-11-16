@@ -262,8 +262,18 @@ class Workflow:
         missing = self.rules_ready()
         if missing:
             fail('规则证据未齐：' + str(missing[:8]))
-        if set(self.ws.schemes) != set(self.state['plan']['schemes']):
-            fail('已声明方案与计划不一致；须落实全部方案，调整计划须依据原文')
+        planned, declared = self.state['plan']['schemes'], self.ws.schemes
+        empty = [s for s in declared if s not in planned and not any((self.ws.drafts.get(s) or {}).values())]
+        for s in empty:            # 计划外、没有任何内容的方案：直接去掉，不算不一致
+            self.ws.drafts.pop(s, None)
+        declared = self.ws.schemes
+        if set(declared) != set(planned):
+            extra, missing = sorted(set(declared) - set(planned)), sorted(set(planned) - set(declared))
+            fail(f'已声明方案与计划不一致：计划 {planned}，规则里 {declared}。'
+                 + (f'多出 {extra}：把其中的表和变量用 set_rules 写到计划里的方案，再在多出的方案里把这些项写成 null，'
+                    '清空后程序自动去掉。' if extra else '')
+                 + (f'缺少 {missing}：用 set_rules(scheme=…) 写出这些方案的规则。' if missing else '')
+                 + '确实要改方案，先依据原文用 plan_calculation 调整计划')
         issues = self.ws._binding_gaps() + self.ws._clause_gaps(self.skipped())
         graph = {}
         for s in self.ws.schemes:

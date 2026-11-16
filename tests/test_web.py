@@ -273,7 +273,7 @@ def test_failure_explained_with_retry(env):
     assert "停止自动接续" in page and ">重试<" in page and "详细信息" in page
     said = store.chat(cid)[-1]["text"]                 # 对话里先说原因，再说需要什么帮助、想了解什么
     assert said.index("停止自动接续") < said.index("怎么继续：")
-    assert "重复重试不会清空" in said and "想请你确认：" not in said
+    assert "不需要你回答" in said and "想请你确认：" not in said
     assert "程序内部出错" in explain("'list' object has no attribute 'items'")["title"]
     # 上一轮没完成时发文字：作为说明接着做这一轮（不是只回答问题的对话）
     scripts.append([{"tool": "finish", "args": {"summary": "x"}}])

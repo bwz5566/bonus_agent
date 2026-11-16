@@ -2269,11 +2269,25 @@ class Workspace:
         return f"已删除「{name}」"
 
     # ---- 规则（可以有多个方案，"共用" 方案合并进每个方案） ----
+    def _planned_schemes(self) -> list[str]:
+        """分阶段流程里 plan_calculation 声明的方案（没有计划时为空）。"""
+        return list(((self.workflow or {}).get('plan') or {}).get('schemes') or []) if self.staged else []
+
     def _scheme(self, scheme: str | None, *, for_write: bool = False) -> str:
+        planned = self._planned_schemes()
         if scheme:
             if not for_write and scheme not in self.schemes:
                 raise ToolError(f"没有方案「{scheme}」，已有方案：{self.schemes or '无'}")
+            if for_write and planned and scheme != SHARED and scheme not in planned and scheme not in self.schemes:
+                # 写进计划外的方案会让编译公式时“已声明方案与计划不一致”，实测因此连续被拦、判为卡住
+                raise ToolError(f"未保存：方案「{scheme}」不在计划里，计划的方案是 {planned}。写到计划里的方案"
+                                + ("（只有一个方案时 scheme 可省略）" if len(planned) == 1 else "")
+                                + "；确实要增加方案，先依据原文用 plan_calculation 调整计划")
             return scheme
+        if for_write and len(planned) == 1:
+            return planned[0]      # 省略 scheme 时写到计划里唯一的方案，不另建计划外的“默认”方案
+        if for_write and len(planned) > 1 and len(self.schemes) != 1:
+            raise ToolError(f"计划里有多个方案 {planned}，请用 scheme 指定写到哪一个")
         if for_write or not self.schemes:
             return self.schemes[0] if len(self.schemes) == 1 else DEFAULT_SCHEME
         if len(self.schemes) == 1:
@@ -2321,6 +2335,12 @@ class Workspace:
         if broken:       # 式子解析不了就不保存：存进去之后试算、查询都会报同一个错，又不知道是哪一条
             raise ToolError("未保存：这些式子解析不了，改好后再一起提交（其余部分也没保存）：\n"
                             + "\n".join(f"- {w}：{m}" for w, m in broken[:6]))
+        planned = self._planned_schemes()
+        if planned and name != SHARED and name not in planned and not any(draft.values()):
+            # 计划外的方案（如早先省略 scheme 时建的“默认”）清空后就去掉，不再挡住编译公式
+            self.drafts.pop(name, None)
+            self.untested.discard(name)
+            return f"已去掉计划外的空方案「{name}」；现有方案 {self.schemes}，计划 {planned}。"
         if draft == self.drafts.get(name):
             return "no-op：规则完全相同，没有保存新版本或触发重算；继续处理当前验证缺口。"
         self.drafts[name] = draft
@@ -4784,6 +4804,22 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             # 整轮只读、没有任何写入：自动接续只会把同样的读取再做一遍（不以“达到最大步数”开头，retryable 不接续）
             error = f"本轮没有进展（只读取，没有任何写入），不自动接续；达到最大步数 {max_steps} 仍未完成"
         error = error or f"达到最大步数 {max_steps} 仍未完成"
+
+    if error and error.startswith(("纠错预算耗尽", "智能体卡住了")) and not ws.pending:
+        # 卡住了不能只说“需要补充材料、明确答复”：把卡点变成一个具体问题（问什么、选项、怎么答）交给财务，
+        # 本轮按“等答复”结束。答复会进入纠错记录的上下文，卡住记录随之清除，下一轮接着做。
+        # 程序或模型自身的问题不问财务（build 返回 None），仍按失败结束并说明不需要你回答
+        from bonus_agent import stuck_question
+        asked = stuck_question.build(ws, llm, error, steps)
+        if asked:
+            q = Question(id=_next_qid(ws.questions), text=asked["text"] + (f"\n（为什么问：{asked['why']}）" if asked.get("why") else ""),
+                         options=asked["options"], blocking=True, round=ws.round)
+            ws.questions.append(q)
+            steps.append(Step("（向财务提问）", {}, f"卡在：{error[:400]}\n已改为向财务提问 {q.id}：{q.text}", True))
+            if on_step:
+                on_step(len(steps), steps[-1])
+            ws.summary = ws.summary or f"卡在一个材料口径问题上，已向财务提问 {q.id}，答复后接着做"
+            ws.done, error = True, ""
 
     if message and not ws.changed and not fresh and not any((changes or {}).values()):
         # 对话里只是问答、没有改动：不算新的一轮，不改案卷和输出

@@ -62,8 +62,8 @@ class RecoveryJournal:
         return item['attempts']
 
     def halt(self, reason):
-        self.state['halted'] = ('纠错预算耗尽（智能体卡住），已保留工作区并停止自动接续：' + reason
-                                + '。需要补充材料、明确答复或修复程序后再恢复；重复点击重试不会清空记录。')
+        # 只写卡在哪；问什么、怎么答由 stuck_question 生成具体问题，不再笼统写“补充材料、明确答复”
+        self.state['halted'] = '纠错预算耗尽（智能体卡住），已保留工作区并停止自动接续：' + reason
         self.save()
 
     def claim_advice(self, issue):

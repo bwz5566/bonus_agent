@@ -120,6 +120,7 @@ MODEL_FACING = [
     # 分阶段流程、工作区读取、恢复、原文坐标、独立复读和修复的反馈同样原样交给模型
     "bonus_agent/tool_specs.py", "bonus_agent/context.py", "bonus_agent/workflow.py", "bonus_agent/recovery.py",
     "bonus_agent/source_cells.py", "bonus_agent/reread.py", "bonus_agent/repair.py", "bonus_agent/facts.py",
+    "bonus_agent/stuck_question.py",
 ]
 
 

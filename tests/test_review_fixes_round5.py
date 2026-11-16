@@ -136,3 +136,17 @@ def test_misnamed_tool_runs_the_only_matching_read_tool_and_is_not_kept_across_r
     path = out / "recovery.json"          # 没有记下任何失败时不会生成
     journal = _json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"failures": {}}
     assert not journal.get("halted") and not any(v["tool"] == "thought" for v in journal["failures"].values())
+
+
+def test_unnamed_rule_writes_go_to_the_planned_scheme_and_empty_extra_schemes_are_dropped(tmp_path):
+    """实测：compile_table 省略 scheme 时建了计划外的“默认”方案，编译公式时“已声明方案与计划不一致”连续被拦。"""
+    ws = workspace(tmp_path)
+    ws.workflow.update(enabled=True, plan={"schemes": ["九月提成"]})
+    ws.record_parameter_cells(FILE, 2, 1, [{"row": 2, "column": 2}], applies_to="西区")
+    ws.compile_table("R", [{"key": "新", "value": "R2C2"}], kind="lookup", cells_from={"file": FILE, "page": 2, "table": 1})
+    assert ws.schemes == ["九月提成"] and "R" in ws.drafts["九月提成"]["tables"]
+    with pytest.raises(ToolError, match="不在计划里"):
+        ws.set_rules(scheme="另一个", tables={"X": {"kind": "lookup", "mapping": {"a": "1"}}})
+    ws.drafts["默认"] = {"tables": {"R": ws.drafts["九月提成"]["tables"]["R"]}, "variables": {}}   # 旧案卷里已经多出来的
+    assert "已去掉计划外的空方案" in ws.set_rules(scheme="默认", tables={"R": None})
+    assert ws.schemes == ["九月提成"]

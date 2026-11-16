@@ -377,9 +377,15 @@ def _round_status(ar) -> str:
         return f"第 {ar.round} 轮没做完。{to_text(ar.error)}"
     if ar.status == "NEEDS_CONFIRMATION":
         qs = [q for q in ar.pending][:8]
-        return (f"第 {ar.round} 轮暂停：有 {len(ar.pending)} 个问题需要你确认，确认前不出结果。\n"
-                + "\n".join(f"- {getattr(q, 'id', '')} {getattr(q, 'text', q)}" for q in qs)
-                + "\n请在下方「问题」里选择或填写答复，保存后点「运行下一轮」。")
+        def one(q):    # ar.pending 是 dict（model_dump）；原来按属性取，对话里显示成整段 dict
+            get = q.get if isinstance(q, dict) else (lambda k, d=None: getattr(q, k, d))
+            opts = get("options") or []
+            return (f"- {get('id', '')} {get('text', q)}"
+                    + "".join(f"\n  {chr(65 + i)}. {o}" for i, o in enumerate(opts[:6])))
+        return (f"第 {ar.round} 轮暂停：有 {len(ar.pending)} 个问题需要你回答，回答前不出结果。\n"
+                + "\n".join(one(q) for q in qs)
+                + "\n怎么回答：在下方「问题」里选一项（选“其他”时写明怎么处理），点「保存答复」再点「运行下一轮」；"
+                  "也可以直接在对话框回复，如“Q3 选 A”或“Q3：同一简称下的编码合并计算”。回答后从停下的地方接着做。")
     if ar.status == 'AWAITING_TOTAL_CONFIRMATION':
         return f'第 {ar.round} 轮已完成基础金额和总额独立复核。请核对「总额预核算」并确认，之后继续人员分配；尚未生成正式人员结果。'
     if ar.status == 'AWAITING_REVIEW':
