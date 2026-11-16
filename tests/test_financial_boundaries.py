@@ -131,6 +131,25 @@ def test_confirmation_accepts_unchanged_complete_baseline(tmp_path):
     assert (case.confirm(out,'reviewer',review=False)/'manifest.yaml').exists()
 
 
+@pytest.mark.parametrize('payout', [[], [{'id': 'c', 'scope': 'record', 'hold_ratio': '0'}],
+                                    [{'id': 'c', 'scope': 'record', 'hold_ratio': '0.4'}],
+                                    [{'id': 'c', 'scope': 'record', 'pay_ratio': '1'}],
+                                    [{'id': 'c', 'scope': 'record', 'pay_ratio': '0.6'}]])
+def test_negative_entitlement_is_never_held_and_reaches_payment(payout):
+    rs=RuleSet.model_validate({'name':'neg','version':'v1',
+      'datasets':{'records':{'key':'rid','fields':{'rid':{'type':'id'},'amount':{'type':'money'}}}},
+      'pool':{'expr':'amount','scope':'record','negative':'allow'},'allocation':[{'level':'record','key':'rid'}],
+      'payout':payout})
+    res=compute(rs,from_records(rs,{'records':[{'rid':'R','amount':-100},{'rid':'S','amount':100}]}))
+    neg,pos=(next(p for p in res.payouts.values() if D(p.final)==v) for v in (-100,100))
+    assert D(neg.held)==0 and D(neg.paid)==-100
+    assert all(e['node_id']!=neg.node_id for e in ledger_entries(res))     # nothing to release later
+    hold = {'hold_ratio':'0.4','pay_ratio':'0.6'}
+    expected = D(40) if payout and any(payout[0].get(k)==v for k,v in hold.items()) else D(0)
+    assert D(pos.held)==expected and D(pos.paid)==100-expected     # positive amounts unchanged
+    assert result_integrity(res).ok
+
+
 def test_negative_rollup_never_creates_negative_deduction():
     rs=RuleSet.model_validate({'name':'negative','version':'v1',
       'datasets':{'people':{'key':'eid','fields':{'eid':{'type':'id'}}},

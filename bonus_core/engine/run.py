@@ -128,14 +128,22 @@ class Result:
 
 def rule_fingerprint(rs: RuleSet) -> str:
     from pydantic import BaseModel
+
     def clean(value):
-        if isinstance(value,BaseModel):
-            return {k:clean(getattr(value,k)) for k in type(value).model_fields
-                    if k not in {'sources','desc','confidence','confirmed_by'} and not (isinstance(value,RuleSet) and k=='name')}
-        if isinstance(value,dict):return {k:clean(v) for k,v in value.items()}
-        if isinstance(value,(list,tuple)):return [clean(v) for v in value]
+        if isinstance(value, BaseModel):
+            return {
+                k: clean(getattr(value, k))
+                for k in type(value).model_fields
+                if k not in {'sources', 'desc', 'confidence', 'confirmed_by'}
+                and not (isinstance(value, RuleSet) and k == 'name')
+            }
+        if isinstance(value, dict):
+            return {k: clean(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [clean(v) for v in value]
         return value
-    return hashlib.sha256(json.dumps(clean(rs),sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
+
+    return hashlib.sha256(json.dumps(clean(rs), sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
 
 
 def input_hash(rs: RuleSet, data: Datasets) -> str:
@@ -218,22 +226,43 @@ class Engine:
         if self.pool_exact < 0 and self.rs.pool.negative != 'allow':
             raise EngineError([Issue.block('pool_negative', f'奖金池为负：{self.pool_exact}')])
         targets = [self.root] if self.rs.pool.scope == 'global' else self.by_level[self.rs.pool.scope]
-        objects = {n.id: {'raw': self.ev.traces[f'{n.id}/奖金池'].value,
-                          'amount': str(round_pool(Decimal(self.ev.traces[f'{n.id}/奖金池'].value)))} for n in targets}
+        objects = {
+            n.id: {
+                'raw': self.ev.traces[f'{n.id}/奖金池'].value,
+                'amount': str(round_pool(Decimal(self.ev.traces[f'{n.id}/奖金池'].value))),
+            }
+            for n in targets
+        }
         totals = {}
-        for item in (self.rs.report.totals if self.rs.report else []):
+        for item in self.rs.report.totals if self.rs.report else []:
             nodes = self._report_nodes(item.level)
             if not nodes:
                 raise EngineError([Issue.block('basis_scope', f'汇总项 {item.name} 没有核算对象')])
-            totals[item.name] = str(round_pool(sum((self.ev.evaluate(item.expr,n,
-                f'{n.id}/预核算/{item.name}','basis') for n in nodes),Decimal(0))))
-        return {'pool_raw':str(self.pool_exact), 'pool':str(round_pool(self.pool_exact)),
-                'objects':objects, 'details':self._report_details(), 'totals':totals,
-                'data_hash':self.hash, 'rules_hash':rule_fingerprint(self.rs),
-                'identities':{n.id:{'parent':n.parent.id if n.parent else None,'key':n.key}
-                              for n in [*self.nodes.values(),*(x for t in (self.root.index or {}).values() for x in t.values())]},
-                'traces':{key:{'expr':t.expr,'rendered':t.rendered,'value':t.value,'rows':list(t.rows)}
-                          for key,t in self.ev.traces.items()}}
+            totals[item.name] = str(
+                round_pool(
+                    sum(
+                        (self.ev.evaluate(item.expr, n, f'{n.id}/预核算/{item.name}', 'basis') for n in nodes),
+                        Decimal(0),
+                    )
+                )
+            )
+        return {
+            'pool_raw': str(self.pool_exact),
+            'pool': str(round_pool(self.pool_exact)),
+            'objects': objects,
+            'details': self._report_details(),
+            'totals': totals,
+            'data_hash': self.hash,
+            'rules_hash': rule_fingerprint(self.rs),
+            'identities': {
+                n.id: {'parent': n.parent.id if n.parent else None, 'key': n.key}
+                for n in [*self.nodes.values(), *(x for t in (self.root.index or {}).values() for x in t.values())]
+            },
+            'traces': {
+                key: {'expr': t.expr, 'rendered': t.rendered, 'value': t.value, 'rows': list(t.rows)}
+                for key, t in self.ev.traces.items()
+            },
+        }
 
     def _pool(self) -> Decimal:
         """奖金池。scope 为某层级时，在该层每个对象上分别计算并四舍五入到分，上层为下级合计，这些对象的金额固定。"""
@@ -344,16 +373,27 @@ class Engine:
     def _report_nodes(self, level):
         if level == 'global':
             return [self.root]
-        return self.by_level.get(level) or list((self.root.index or {}).get(level,{}).values())
+        return self.by_level.get(level) or list((self.root.index or {}).get(level, {}).values())
 
     def _report_details(self):
-        out={}
-        for item in (self.rs.report.details if self.rs.report else []):
-            nodes=self._report_nodes(item.level)
+        out = {}
+        for item in self.rs.report.details if self.rs.report else []:
+            nodes = self._report_nodes(item.level)
             if not nodes or not item.sources:
-                raise EngineError([Issue.block('report_detail_scope','对象金额报告缺少可验证对象或原文依据',item.name)])
-            out[item.name]={n.id:{'level':item.level,'key':str(n.key or n.id),'name':n.label,
-                'amount':str(round_pool(self.ev.evaluate(item.expr,n,f'{n.id}/明细核算/{item.name}','report.details')))} for n in nodes}
+                raise EngineError(
+                    [Issue.block('report_detail_scope', '对象金额报告缺少可验证对象或原文依据', item.name)]
+                )
+            out[item.name] = {
+                n.id: {
+                    'level': item.level,
+                    'key': str(n.key or n.id),
+                    'name': n.label,
+                    'amount': str(
+                        round_pool(self.ev.evaluate(item.expr, n, f'{n.id}/明细核算/{item.name}', 'report.details'))
+                    ),
+                }
+                for n in nodes
+            }
         return out
 
     def _report_totals(self) -> list[tuple[str, str]]:
@@ -423,39 +463,63 @@ class Engine:
 
     def _check_recipient_distribution(self, contract, pending, claimed, rep):
         """A declared recipient settlement keeps rounding effects visible, never reallocates them."""
-        fail = lambda code,message: EngineError([Issue.block(code,message,contract.name)])
-        if contract.level != 'global' or self.rs.pool.scope != self.rs.leaf.level or not rep.people or not contract.sources:
-            raise fail('recipient_rounding_scope','汇总后舍入须以人员为奖金池及最末层，在 global 对账并提供原文依据')
-        names=[]
-        raw=Decimal(0)
+        fail = lambda code, message: EngineError([Issue.block(code, message, contract.name)])
+        if (
+            contract.level != 'global'
+            or self.rs.pool.scope != self.rs.leaf.level
+            or not rep.people
+            or not contract.sources
+        ):
+            raise fail('recipient_rounding_scope', '汇总后舍入须以人员为奖金池及最末层，在 global 对账并提供原文依据')
+        names = []
+        raw = Decimal(0)
         for node in self.by_level[self.rs.pool.scope]:
-            name=self.ev._eval_traced(rep.people,node,f'{node.id}/舍入人员','report.people').v
-            if name in (None,''):
-                raise fail('recipient_rounding_person','汇总舍入的人员标识不能为空')
+            name = self.ev._eval_traced(rep.people, node, f'{node.id}/舍入人员', 'report.people').v
+            if name in (None, ''):
+                raise fail('recipient_rounding_person', '汇总舍入的人员标识不能为空')
             names.append(str(name))
             raw += Decimal(self.ev.traces[f'{node.id}/奖金池'].value)
         if len(set(names)) != len(names):
-            raise fail('recipient_rounding_duplicate','同一人员有多个奖金池；须先按人员聚合后再舍入，不能逐条记录舍入')
+            raise fail('recipient_rounding_duplicate', '同一人员有多个奖金池；须先按人员聚合后再舍入，不能逐条记录舍入')
         if len(set(contract.pending)) != len(contract.pending) or claimed & set(contract.pending):
-            raise fail('distribution_pending_duplicate','待分配项被重复计入去向对账')
+            raise fail('distribution_pending_duplicate', '待分配项被重复计入去向对账')
         claimed.update(contract.pending)
-        waiting=Decimal(0); rounded_waiting=Decimal(0)
+        waiting = Decimal(0)
+        rounded_waiting = Decimal(0)
         for name in contract.pending:
             if name not in pending:
-                raise fail('distribution_pending_missing',f'待分配项 {name} 不存在')
-            item=pending[name]; nodes=self._report_nodes(item.level)
+                raise fail('distribution_pending_missing', f'待分配项 {name} 不存在')
+            item = pending[name]
+            nodes = self._report_nodes(item.level)
             if not nodes or not item.sources:
-                raise fail('distribution_pending_missing',f'待分配项 {name} 缺少对象或原文依据')
-            value=sum((self.ev.evaluate(item.expr,n,f'{n.id}/待分配/{name}','report.pending') for n in nodes),Decimal(0))
-            waiting += value; rounded_waiting += round_pool(value)
-        total=self.ev.evaluate(contract.total,self.root,f'{self.root.id}/去向/{contract.name}/总额','report.distributions')
-        if abs(total-raw-waiting) > Decimal('0.000000000001'):
-            raise fail('distribution_unbalanced',f'舍入前金额去向不闭合：{total} != 人员原值 {raw} + 待分配原值 {waiting}')
-        allocated=sum((n.final for n in self.by_level[self.rs.pool.scope]),Decimal(0))
-        residual=round_pool(total)-allocated-rounded_waiting
-        self.rounding_checks.append({'name':contract.name,'mode':'after_sum','raw_total':str(total),
-            'raw_allocated':str(raw),'raw_pending':str(waiting),'total':str(round_pool(total)),
-            'allocated':str(allocated),'pending':str(rounded_waiting),'residual':str(residual)})
+                raise fail('distribution_pending_missing', f'待分配项 {name} 缺少对象或原文依据')
+            value = sum(
+                (self.ev.evaluate(item.expr, n, f'{n.id}/待分配/{name}', 'report.pending') for n in nodes), Decimal(0)
+            )
+            waiting += value
+            rounded_waiting += round_pool(value)
+        total = self.ev.evaluate(
+            contract.total, self.root, f'{self.root.id}/去向/{contract.name}/总额', 'report.distributions'
+        )
+        if abs(total - raw - waiting) > Decimal('0.000000000001'):
+            raise fail(
+                'distribution_unbalanced', f'舍入前金额去向不闭合：{total} != 人员原值 {raw} + 待分配原值 {waiting}'
+            )
+        allocated = sum((n.final for n in self.by_level[self.rs.pool.scope]), Decimal(0))
+        residual = round_pool(total) - allocated - rounded_waiting
+        self.rounding_checks.append(
+            {
+                'name': contract.name,
+                'mode': 'after_sum',
+                'raw_total': str(total),
+                'raw_allocated': str(raw),
+                'raw_pending': str(waiting),
+                'total': str(round_pool(total)),
+                'allocated': str(allocated),
+                'pending': str(rounded_waiting),
+                'residual': str(residual),
+            }
+        )
 
     def _report_people(self, payouts: dict[str, PayoutResult]) -> list[dict]:
         """分配人员金额：最末层每个对象按 report.people 的取值（人名）合计应得、暂缓、本次实发。"""
@@ -505,22 +569,31 @@ class Engine:
         return out
 
     def _auxiliary_inputs(self):
-        out={}
-        for scope,index in (self.root.index or {}).items():
-            variables=[name for name,v in self.rs.variables.items() if v.scope==scope]
+        out = {}
+        for scope, index in (self.root.index or {}).items():
+            variables = [name for name, v in self.rs.variables.items() if v.scope == scope]
             for node in index.values():
-                computed={name:self.ev.traces[f'{node.id}/{name}'].value for name in variables
-                          if f'{node.id}/{name}' in self.ev.traces}
+                computed = {
+                    name: self.ev.traces[f'{node.id}/{name}'].value
+                    for name in variables
+                    if f'{node.id}/{name}' in self.ev.traces
+                }
                 if not computed:
                     continue
-                values=dict(node.attrs)
-                for name,value in computed.items():
+                values = dict(node.attrs)
+                for name, value in computed.items():
                     try:
-                        number=Decimal(value)
-                        values[name]=number if number.is_finite() else value
-                    except (ArithmeticError,ValueError,TypeError):
-                        values[name]=value
-                out[node.id]={'level':scope,'key':node.key,'name':node.label,'source':str(node.attr_src),'values':values}
+                        number = Decimal(value)
+                        values[name] = number if number.is_finite() else value
+                    except (ArithmeticError, ValueError, TypeError):
+                        values[name] = value
+                out[node.id] = {
+                    'level': scope,
+                    'key': node.key,
+                    'name': node.label,
+                    'source': str(node.attr_src),
+                    'values': values,
+                }
         return out
 
     def preview(self, existing: list[Adjustment], new: Adjustment, actor_scopes=None) -> dict:
@@ -556,7 +629,11 @@ class Engine:
                     raise EngineError([Issue.block("eval_error", str(e), e.where)]) from None
                 if r < 0 or r > 1:
                     raise EngineError([Issue.block("hold_ratio_range", f"{cond.id} 的比例 {r} 不在 0~1 之间", n.id)])
-                if pay:   # 可发上限 = ROUND(应得 × 比例, 2)，挂起 = 应得 − 上限
+                if n.final <= 0:
+                    # 应得为负（规则允许负数照算，如退货冲销）：发放条件只暂缓正数金额，负数不挂起，原样带到本次实发。
+                    # 原来用 min(…, remaining) 封顶，remaining 为负时总取到它，整笔负数被记成“暂缓”、实发为 0
+                    h = Decimal(0)
+                elif pay:   # 可发上限 = ROUND(应得 × 比例, 2)，挂起 = 应得 − 上限
                     h = min(n.final - (n.final * r).quantize(CENT, ROUND_HALF_UP), remaining)
                 else:
                     h = min((n.final * r).quantize(CENT, ROUND_HALF_UP), remaining)

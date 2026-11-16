@@ -34,13 +34,13 @@ def test_native_page_scope_and_coordinate_registration_reuse(tmp_path):
     assert [p['scope'] for p in index['pages']]==['北区','西区','东区']
     assert ws.read_parameter_table(file,2)['page_context']==['提成规则\n西区']
     with pytest.raises(ToolError,match='有效范围1—3'):ws.read_parameter_table(file,4)
-    result=ws.record_parameter_cells(file,2,1,[{'row':2,'column':2}])
+    result=ws.record_parameter_cells(file,2,1,applies_to='西区',cells=[{'row':2,'column':2}])
     name=result['facts'][0]['name'];assert result['facts'][0]['value']=='0.50%'
     assert not result['facts'][0]['reused'] and ws.facts[0].context=='西区'
     assert ws.facts[0].source_cell=={'table':1,'row':2,'column':2}
     assert ws.read_parameter_table(file,2)['registered_count']==1
     clone=Workspace(FakeLLM([]),ws.inv);case.restore(clone,case.snapshot(ws))
-    result=clone.record_parameter_cells(file,2,1,[{'row':2,'column':2}])
+    result=clone.record_parameter_cells(file,2,1,applies_to='西区',cells=[{'row':2,'column':2}])
     assert result['facts'][0]['reused'] and result['facts'][0]['name']==name
     assert len(clone.facts)==1
     clone.compile_table('R',[{'value':name}],scheme='S')
@@ -56,9 +56,9 @@ def test_wrong_page_and_value_still_rejected_and_alias_fields_forbidden(tmp_path
     with pytest.raises(ToolError,match='source.cell'):
         ws.record_facts([{**bad,'name':'x','value':'0.10%'}])
     with pytest.raises(ToolError,match='不能传自拟'):
-        ws.record_parameter_cells(file,3,1,[{'row':2,'column':2,'name':'西区首档'}])
+        ws.record_parameter_cells(file,3,1,applies_to='东区',cells=[{'row':2,'column':2,'name':'西区首档'}])
     with pytest.raises(ToolError,match='整数'):
-        ws.record_parameter_cells(file,3,1,[{'row':2.5,'column':2}])
+        ws.record_parameter_cells(file,3,1,applies_to='东区',cells=[{'row':2.5,'column':2}])
     assert not ws.facts
 
 
@@ -67,7 +67,7 @@ def test_native_tools_work_through_agent_dispatch(tmp_path):
     name='policy.pptx::P2.T1.R2.C2.L1'
     result=run_agent(FakeLLM([
         {'tool':'read_parameter_table','args':{'file':'policy.pptx'}},
-        {'tool':'record_parameter_cells','args':{'file':'policy.pptx','page':2,'table':1,'cells':[{'row':2,'column':2}]}},
+        {'tool':'record_parameter_cells','args':{'file':'policy.pptx','page':2,'table':1,'applies_to':'西区','cells':[{'row':2,'column':2}]}},
         {'tool':'compile_table','args':{'name':'R','scheme':'S','rows':[{'value':name}]}},
         {'tool':'read_workspace','args':{'section':'facts','file':'policy.pptx','page':2,'query':name}},
     ]),ws.inv.files,tmp_path/'out',max_steps=4)
@@ -78,32 +78,32 @@ def test_native_tools_work_through_agent_dispatch(tmp_path):
 def test_multiline_requires_explicit_line_and_does_not_guess_units(tmp_path):
     ws=workspace(tmp_path);file='policy.pptx'
     with pytest.raises(ToolError,match='必须指定line'):
-        ws.record_parameter_cells(file,1,1,[{'row':3,'column':2}])
-    result=ws.record_parameter_cells(file,1,1,[{'row':3,'column':2,'line':1},
+        ws.record_parameter_cells(file,1,1,applies_to='北区',cells=[{'row':3,'column':2}])
+    result=ws.record_parameter_cells(file,1,1,applies_to='北区',cells=[{'row':3,'column':2,'line':1},
                                               {'row':3,'column':2,'line':2,'unit':'%'}])
     assert [f['value'] for f in result['facts']]==['40','42.5']
     assert ws.facts[0].unit is None and ws.facts[1].unit=='%'
     from bonus_agent.facts import numeric
     assert str(numeric(ws.facts[1]))=='0.425'
     # Removing an explicit unit must not inherit it from an earlier registration.
-    ws.record_parameter_cells(file,1,1,[{'row':3,'column':2,'line':2}])
+    ws.record_parameter_cells(file,1,1,applies_to='北区',cells=[{'row':3,'column':2,'line':2}])
     assert next(f for f in ws.facts if f.source_cell.get('line')==2).unit is None
     # An unrelated percentage elsewhere in the slide cannot supply a cell's unit.
     with pytest.raises(ToolError,match='单位'):
-        ws.record_parameter_cells(file,1,1,[{'row':3,'column':3,'unit':'万元'}])
+        ws.record_parameter_cells(file,1,1,applies_to='北区',cells=[{'row':3,'column':3,'unit':'万元'}])
 
 
 def test_fact_lookup_filters_before_pagination_and_reuses_legacy_name(tmp_path):
     ws=workspace(tmp_path);file='policy.pptx'
     ws.record_facts([{'name':'海外西区费率','file':file,'page':2,'context':'西区','quote':'首档\n新项目\n0.50%',
                      'value':'0.50%','source_cell':{'table':1,'row':2,'column':2}}])
-    ws.record_parameter_cells(file,1,1,[{'row':2,'column':2}])
+    ws.record_parameter_cells(file,1,1,applies_to='北区',cells=[{'row':2,'column':2}])
     out=ws.read_workspace('facts',file=file,page=2,query='西区',limit=1)
     assert out['total']==1 and out['items'][0]['name']=='海外西区费率'
-    assert ws.record_parameter_cells(file,2,1,[{'row':2,'column':2}])['facts'][0]['name']=='海外西区费率'
+    assert ws.record_parameter_cells(file,2,1,applies_to='西区',cells=[{'row':2,'column':2}])['facts'][0]['name']=='海外西区费率'
     assert len(ws.facts)==2
     ws.facts[0].source_hash='stale'
-    assert not ws.record_parameter_cells(file,2,1,[{'row':2,'column':2}])['facts'][0]['reused']
+    assert not ws.record_parameter_cells(file,2,1,applies_to='西区',cells=[{'row':2,'column':2}])['facts'][0]['reused']
 
 
 def test_partial_fact_batch_is_failed_in_agent_and_keeps_valid_rows(tmp_path):

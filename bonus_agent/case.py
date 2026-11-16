@@ -80,13 +80,18 @@ def _checkpoint(out: Path, case: dict) -> None:
 
 
 def snapshot(ws) -> dict:
-    flow=copy.deepcopy(ws.workflow)
-    if ws.staged:flow['view_version']=ws._flow().version()
+    flow = copy.deepcopy(ws.workflow)
+    if ws.staged:
+        flow['view_version'] = ws._flow().version()
     return {
         "datasets": {k: v.model_dump(mode="json", exclude_defaults=True) for k, v in ws.datasets.items()},
         "mapping": {k: v.model_dump(mode="json", exclude_defaults=True) for k, v in ws.mapping.items()},
-        "drafts": ws.drafts, "notes": ws.notes, "transcripts": ws.transcripts, "summary": ws.summary,
-        "ignored": ws.ignored, "questions": [q.model_dump() for q in ws.questions],
+        "drafts": ws.drafts,
+        "notes": ws.notes,
+        "transcripts": ws.transcripts,
+        "summary": ws.summary,
+        "ignored": ws.ignored,
+        "questions": [q.model_dump() for q in ws.questions],
         "facts": [f.model_dump() for f in ws.facts],
         "clauses": [c.model_dump() for c in ws.clauses],
         "conflicts": {k: c.model_dump() for k, c in ws.conflicts.items()},
@@ -109,22 +114,30 @@ def confirm_totals(out: Path, scheme: str, digest: str, by: str) -> dict:
     from bonus_core.data.period import Period
     from bonus_agent.workflow import Workflow
     from bonus_core.engine.issues import EngineError
-    obj=load_case(out)
-    if not obj or not obj.get('rounds'):raise ConfirmError('没有待确认的案卷')
-    rnd=obj['rounds'][-1]
-    paths=[Path(x['path']) for x in rnd.get('source_inputs',[])]
-    if not paths or any(not p.is_file() for p in paths):raise ConfirmError('原轮输入缺失，须重新核算')
-    if fingerprint(paths)!=rnd.get('files'):raise ConfirmError('输入文件已变化，须重新核算')
-    ws=Workspace(FakeLLM([]),build_inventory(paths));restore(ws,obj['workspace'])
-    ws.period=Period.parse(rnd.get('period'))
-    if not ws.staged:raise ConfirmError('该案卷不是分阶段核算')
+
+    obj = load_case(out)
+    if not obj or not obj.get('rounds'):
+        raise ConfirmError('没有待确认的案卷')
+    rnd = obj['rounds'][-1]
+    paths = [Path(x['path']) for x in rnd.get('source_inputs', [])]
+    if not paths or any(not p.is_file() for p in paths):
+        raise ConfirmError('原轮输入缺失，须重新核算')
+    if fingerprint(paths) != rnd.get('files'):
+        raise ConfirmError('输入文件已变化，须重新核算')
+    ws = Workspace(FakeLLM([]), build_inventory(paths))
+    restore(ws, obj['workspace'])
+    ws.period = Period.parse(rnd.get('period'))
+    if not ws.staged:
+        raise ConfirmError('该案卷不是分阶段核算')
     try:
-        record=Workflow(ws).approve(scheme,by,digest)
-    except (ToolError,EngineError,ValueError,KeyError) as exc:
+        record = Workflow(ws).approve(scheme, by, digest)
+    except (ToolError, EngineError, ValueError, KeyError) as exc:
         raise ConfirmError(str(exc)) from None
-    obj['workspace']=snapshot(ws)
-    obj.setdefault('total_confirmations',[]).append({**record,'at':datetime.now().isoformat(timespec='seconds'),'round':rnd['n']})
-    save_case(out,obj)
+    obj['workspace'] = snapshot(ws)
+    obj.setdefault('total_confirmations', []).append(
+        {**record, 'at': datetime.now().isoformat(timespec='seconds'), 'round': rnd['n']}
+    )
+    save_case(out, obj)
     return record
 
 

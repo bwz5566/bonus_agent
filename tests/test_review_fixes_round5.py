@@ -1,0 +1,79 @@
+"""Review round 5: page scope for coordinate facts, cell references in compile_table, partial fact batches,
+one-shot rejection feedback and a single chat entry for review fixes."""
+from decimal import Decimal
+
+import pytest
+
+from bonus_agent.agent import Step, ToolError, _deep_reason, run_agent
+from bonus_agent.llm import FakeLLM
+from tests.test_t14_parameter_cells import workspace
+
+FILE = "policy.pptx"
+
+
+def test_coordinate_registration_rejects_a_scope_that_is_not_on_the_chosen_page(tmp_path):
+    ws = workspace(tmp_path)          # pages 1..3 are captioned 北区 / 西区 / 东区 with identical tables
+    with pytest.raises(ToolError, match="而在第 2 页"):
+        ws.record_parameter_cells(FILE, 3, 1, [{"row": 2, "column": 2}], applies_to="西区")
+    with pytest.raises(ToolError, match="通用词"):
+        ws.record_parameter_cells(FILE, 2, 1, [{"row": 2, "column": 2}], applies_to="提成比例")
+    with pytest.raises(ToolError, match="applies_to"):
+        ws.record_parameter_cells(FILE, 2, 1, [{"row": 2, "column": 2}])
+    assert not ws.facts
+    ws.record_parameter_cells(FILE, 2, 1, [{"row": 2, "column": 2}], applies_to="西区")
+    assert ws.facts[0].context == "西区" and ws.facts[0].value == "0.50%"
+
+
+def test_compile_table_resolves_cell_coordinates_without_reading_the_ledger(tmp_path):
+    ws = workspace(tmp_path)
+    ws.record_parameter_cells(FILE, 2, 1, [{"row": 2, "column": 2}, {"row": 2, "column": 3}], applies_to="西区")
+    where = {"file": FILE, "page": 2, "table": 1}
+    ws.compile_table("R", [{"key": "新", "value": "R2C2"}, {"key": "老", "value": "r2c3"}], scheme="S",
+                     kind="lookup", cells_from=where)
+    table = ws.drafts["S"]["tables"]["R"]
+    assert {k: Decimal(v) for k, v in table["mapping"].items()} == {"新": Decimal("0.005"), "老": Decimal("0.001")}
+    assert all(f.targets for f in ws.facts)
+    with pytest.raises(ToolError, match="还没有登记.*record_parameter_cells"):
+        ws.compile_table("T", [{"key": "x", "value": "R3C3"}], scheme="S", kind="lookup", cells_from=where)
+    with pytest.raises(ToolError, match="cells_from"):
+        ws.compile_table("T", [{"key": "x", "value": "R2C2"}], scheme="S", kind="lookup", cells_from={"file": FILE})
+
+
+def _batch(i):
+    ok = {"name": f"ok{i}", "file": "policy.md", "quote": "甲组费率3%", "value": "3%"}
+    bad = {"name": f"bad{i}", "file": "policy.md", "quote": "甲组费率3%", "value": "7%"}
+    return {"tool": "record_facts", "args": {"facts": [ok, bad]}}
+
+
+def test_partially_accepted_batches_are_progress_not_stuck(tmp_path):
+    p = tmp_path / "policy.md"
+    p.write_text("甲组费率3%", encoding="utf8")
+    script = [_batch(i) for i in range(4)] + [{"tool": "note", "args": {"topic": "t", "text": "x"}}]
+    ar = run_agent(FakeLLM(script), [p], tmp_path / "out", max_steps=5)
+    steps = [s for s in ar.steps if s.tool == "record_facts"]
+    assert len(steps) == 4 and not any(s.ok for s in steps)               # still reported as not fully accepted
+    assert not any(s.tool in ("（反思）", "（局部诊断）") or s.deep for s in ar.steps)
+    assert "卡住" not in (ar.error or "")
+    assert ar.ws._fact_rejections == []                                    # shown once, not re-sent every step
+    assert _deep_reason([steps[0]], 0, ar.ws, {}) == ""
+
+
+def test_review_fix_is_recorded_once_in_chat(tmp_path, monkeypatch):
+    pytest.importorskip("fastapi")
+    from bonus_agent import web
+    from tests.test_web import post
+    app = web.create_app(tmp_path / "data", lambda: FakeLLM([]))
+    store = app.state.store
+    store.users.add("alice", "password-123", ["editor"], "张会计")
+    from fastapi.testclient import TestClient
+    c = TestClient(app)
+    c.sids = {}
+    cid = post(c, store, "/cases", {"name": "口径单"}).headers["location"].split("/")[-1].split("?")[0]
+    (store.dir(cid) / "materials" / "a.md").write_text("规则", encoding="utf8")
+    monkeypatch.setattr(web.rv, "instruction", lambda out: "改正：甲组费率应为 3%")
+    monkeypatch.setattr(web.rv, "mark_sent", lambda out: None)
+    app.state.runner._run = lambda *a, **k: None
+    assert post(c, store, f"/cases/{cid}/run").status_code == 303
+    app.state.runner.jobs[cid].thread.join(5)
+    said = [m for m in store.chat(cid) if m["role"] == "user" and "改正" in m["text"]]
+    assert len(said) == 1

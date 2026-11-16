@@ -4,7 +4,7 @@
 
 任务卡的rule_requirements逐文件列出已有参数数、条款数及缺失类别；只补缺项，已有参数不能代替原文计算条款。read_workspace会按条数和结果长度缩页，直接使用next_call续读，不能按请求limit猜下一页位置。单条过大时按item_fragment和next_call续读完整JSON。facts/clauses列表默认是简表（名称、取值、含义），需要原文和坐标时按name读单条或detail=true。只读分页、文件类型和页码错误按程序反馈处理，不需要升级纠错模型。可选顾问协议失败后本作业停止继续调用；这不影响必须通过的独立审核。
 
-PPT参数优先走原生路径：read_parameter_table(file)查看真实页码和同页文字，再指定page读取表格。页标题可能在表格下方，不能按相邻页猜适用区域。核对适用条件后用record_parameter_cells(file,page,table,cells)按坐标登记；数值、原文和参数名由程序生成，返回的name直接用于compile_table/bind_facts。不要再换业务名称重录同一单元格。已登记项可按read_workspace(section=facts,file,page,query)检索，只取当前这一步要用的几项，查到的名字立即用于compile_table/bind_facts或记入note，不要从头通读整个台账；重试先查既有结果。scope是原文定位提示，适用条件须结合全部page_context与行列标题核对；图片标题另用view_image核实。无法唯一提取的区间、公式和文字规则仍按record_facts登记并逐字核对。
+PPT参数优先走原生路径：read_parameter_table(file)查看真实页码和同页文字，再指定page读取表格。页标题可能在表格下方，不能按相邻页猜适用区域。核对适用条件后用record_parameter_cells(file,page,table,applies_to,cells)按坐标登记，applies_to写本页表适用的区分范围，程序核对它在该页原文里，不在就是选错了页；数值、原文和参数名由程序生成。compile_table可写cells_from={file,page,table}，rows里用R行C列（多行加L行号）引用已登记的单元格，返回的name也可直接用于compile_table/bind_facts。不要再换业务名称重录同一单元格。已登记项可按read_workspace(section=facts,file,page,query)检索，只取当前这一步要用的几项，查到的名字立即用于compile_table/bind_facts或记入note，不要从头通读整个台账；重试先查既有结果。scope是原文定位提示，适用条件须结合全部page_context与行列标题核对；图片标题另用view_image核实。无法唯一提取的区间、公式和文字规则仍按record_facts登记并逐字核对。
 
 计算顺序：prepare_data → compile_formulas → calculate_basis → review_basis → 财务确认总额 → trial_run → review_calculation/verify → finish。数据或公式变化会使相应回执失效，须重新通过。prepare_data失败时用diagnose_datasets/query_dataset定位，不能通过evaluate反复建立同一棵失败的树。query_dataset只统计指定原表，不代表其他数据已通过。
 

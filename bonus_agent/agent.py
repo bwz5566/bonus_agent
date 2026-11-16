@@ -115,259 +115,8 @@ class ToolError(Exception):
     """工具参数或执行出错，错误信息原样返回给模型。"""
 
 
-# ---------------- 工具定义 ----------------
-def _obj(props: dict, required: list[str] = ()) -> dict:
-    return {"type": "object", "properties": props, "required": list(required)}
-
-
-_S = {"type": "string"}
-_I = {"type": "integer"}
-FIELD_SCHEMA = _obj({"column": {**_S, "description": "Excel 表头原文"},
-                     "type": {"type": "string", "enum": ["money", "number", "int", "ratio", "text", "enum", "date", "id"]},
-                     "unit": {"type": "string", "enum": ["元", "万元"], "description": "money 字段必填"},
-                     "if_empty": {"type": "string", "description": "可选：这一列的空单元格按这个值处理（如 0）；写 skip 表示空格子所在的行当作没有"
-                                  "（材料说空着按“查不到 / 没有”处理时用，按对象取值时和查不到一样）。"
-                                  "只在材料写明或财务答复过时填，说明里写依据；拿不准先 ask_question"},
-                     "desc": _S}, ["column", "type"])
-
-TOOLS: list[dict] = [
-    {"name": "list_files", "description": "列出本批次所有文件；Excel 列出每个工作表及自动识别的表头。",
-     "parameters": _obj({})},
-    {"name": "read_document", "description": "读取 Word / PPT / 图片文件的文字和表格（图片显示为占位符，用 view_image 查看）。",
-     "parameters": _obj({"file": _S, "offset": {**_I, "description": "从第几个字符开始，默认 0"},
-                         "limit": {**_I, "description": "可选：最多读多少字，只看某一段时用（如 3000）"},
-                         "folded": {"type": "boolean", "description": "可选：true 时把预筛折叠起来的页（背景介绍、封面等）也一起返回"}},
-                        ["file"])},
-    {"name": "view_image", "description": "查看文件中的第 index 张图片（从 1 开始，默认 1），返回图片内容的逐字转写。",
-     "parameters": _obj({"file": _S, "index": _I, "focus": {**_S, "description": "可选：希望重点看清的内容"}},
-                        ["file"])},
-    {"name": "suggest_links",
-     "description": "挂接建议（只读）：比较参考表（预算、名单、各类系数和标记表）和主数据表（每行一笔业务记录的那张表）"
-                    "的编号类列（月份、客户、型号、区域），列出哪几列对得上、各能对上多少行、应挂在哪一层（项目 / 客户 / 区域），"
-                    "以及同名列哪一列对得上、表是否跨期间。define_dataset 定义参考表之前先用它，按结果写 combine / link / key。",
-     "parameters": _obj({"file": {**_S, "description": "参考表所在文件"}, "sheet": _S,
-                         "base_file": {**_S, "description": "主数据表所在文件（如销售单）"}, "base_sheet": _S},
-                        ["file", "sheet", "base_file", "base_sheet"])},
-    {"name": "read_sheet", "description": "查看 Excel 工作表的原始内容（带 Excel 行号），用于判断表头位置、合计行、说明文字等。",
-     "parameters": _obj({"file": _S, "sheet": _S, "start_row": _I, "rows": _I}, ["file", "sheet"])},
-    {"name": "note",
-     "description": "把读到的关键信息记在工作区（如某条规则、某个参数、文件用途、待核对事项）。笔记每轮都会附给你，"
-                    "较早的对话会被裁剪，重要内容请及时记下。同一 topic 再次记录会覆盖，text 为空则删除。",
-     "parameters": _obj({"topic": _S, "text": _S}, ["topic", "text"])},
-    {"name": "update_dataset", "description": "局部修改已保存的数据定义，支持补字段和修正合成键。fields按字段合并属性，combine按目标列合并；其他字段、筛选和展开方式保留，不重抄成功映射。",
-      "parameters": _obj({"name":_S,"changes":{"type":"object","properties":{"key":{"type":["string","null"]},"link":{"type":["string","null"]},"period":_S,"window":_S,"filter":{"type":"object"},"population_from":_S,"unpivot":{"type":"object","description":"仅合并要修正的展开属性，如share_from；保留已保存的columns/value等"},"fields":{"type":"object","description":"只提供要添加或修改的字段属性，其他字段保留"},"combine":{"type":"object","description":"要更新的合成键及组成原列；字段column须指向该合成列"}}}},["name","changes"])},
-    {"name":"diagnose_datasets","description":"不建树、不算金额，检查数据表身份、主外键及期间覆盖，返回缺失编号、日期列候选和可执行局部修复建议。建树失败时先用本工具，不要反复evaluate。",
-     "parameters":_obj({})},
-    {"name":"plan_calculation","description":"先盘点全部材料，声明核算目标、需要的输出和全部方案。files为文件名到rule/data/rule_and_data/reference/ignore的映射，不能漏文件。",
-     "parameters":_obj({'summary':_S,'outputs':{'type':'array','items':_S},'files':{'type':'object','additionalProperties':_S},'schemes':{'type':'array','items':_S},'ignored':{'type':'array','items':_obj({'ref':_S,'reason':_S},['ref','reason'])}},['summary','outputs','files','schemes'])},
-    {"name":"read_workspace","description":"分页检索facts/clauses/rules/variables/tables/mapping/basis。按name定位单个参数、条款、变量、表或数据集，scheme区分方案；大规则优先逐变量读取。",
-     "parameters":_obj({'section':_S,'scheme':_S,'name':_S,'query':{**_S,'description':'全文片段检索，可按参数名称片段查已有项'},'file':_S,'page':_I,'offset':{**_I,'minimum':0},'limit':{**_I,'minimum':1,'maximum':50,'description':'最多50条；同时按结果长度缩页，必须使用返回的next_call，不自行猜offset'},'detail_offset':{**_I,'minimum':0,'description':'单条过大时按next_call分片续读'},'detail':{'type':'boolean','description':'facts/clauses列表默认只给名称、取值、含义；true返回完整原文与坐标（条数少时用）'}},['section'])},
-    {"name":"query_dataset","description":"独立统计一张已定义原表，使用DSL聚合表达式，如sum(amount, of: \"销售明细\")。无需allocation，不受其他表的建树错误影响；不用于证明正式金额正确。",
-     "parameters":_obj({'dataset':_S,'expr':_S},['dataset','expr'])},
-    {"name":"prepare_data","description":"检查全部已声明数据的转换、有效范围、身份、关联和期间，程序签发当前数据版本的通过回执。失败必须修正，不能直接试算。","parameters":_obj({})},
-    {"name":"compile_formulas","description":"编译当前全部公式，检查依赖顺序、循环、字段、作用域及参数/条款绑定，签发公式版本回执。","parameters":_obj({})},
-    {"name":"calculate_basis","description":"仅计算当前方案基础金额、逐对象底稿及各类总额，不计算分配权重、人员分配或实发。须先通过prepare_data和compile_formulas。",
-     "parameters":_obj({'scheme':_S})},
-    {"name":"review_basis","description":"独立模型按原文重建当前方案的总额、逐对象及汇总公式，程序全量比较。通过后本轮停止，等待财务在页面确认总额；模型不能自行确认。",
-     "parameters":_obj({'scheme':_S})},
-    {"name":"read_parameter_table", "description":"省略page时列出PPT每页真实文字、标题候选、表格数、已登记参数；指定page则返回同页文字、原表与坐标。标题即使在表格下方也属于本页。结合page_context及行列标题核对适用条件后，优先record_parameter_cells按坐标登记，不转抄。",
-     "parameters":_obj({"file":_S,"page":_I},["file"])},
-    {"name":"record_parameter_cells","description":"按PPT已核对的页/表/单元格登记，value、quote、参数名和来源由程序生成；不传自拟的区域名、数值或原文。已有同坐标且验证有效的参数直接复用，返回compile_table可引用的name。多行单元格必须指定line，unit仅在原文明确时提供。",
-     "parameters":_obj({'file':_S,'page':_I,'table':_I,'cells':{'type':'array','items':_obj({'row':_I,'column':_I,'line':_I,'unit':_S},['row','column'])}},['file','page','table','cells'])},
-    {"name": "record_facts",
-     "description": "登记从材料里读到的参数和口径（比例、金额、阶梯、系数、门槛、日期、取数口径等），程序据此比对冲突。"
-                    "每个文件里出现的都要登记，同一参数在几个文件（或一个文件的几处）出现就登记几次，用同一个 name；"
-                    "取值不一致时程序会自动向财务提问，你不要自行取舍。value 写原文的写法（如 5%、30万元、1.2），"
-                    "quote 逐字复制包含该取值的原文（不超过 200 字），程序会核对 quote 在文件里、value 在 quote 里。",
-     "parameters": _obj({"facts": {"type": "array", "items": _obj({
-         "name": {**_S, "description": "参数名，写清适用范围，如 季度奖-部门净利润提成比例"},
-         "value": {**_S, "description": "原文写法，一条只写一个值（阶梯、系数表每一档分开登记）"},
-         "file": {**_S, "description": "出处文件名；财务在对话里发的内容写「财务对话」"}, "quote": _S,
-         "page": {**_I, "description": "多页文档的原文页码；参数表尚未创建时也可先登记页码"},
-         "context": {**_S, "description": "原文适用标题，须出现在引用所在页；用于区分重复参数表"},
-          "source_cell": {"type": "object", "description": "PPT多值表行必须精确定位，坐标从1开始；多行单元格指定line。value须对应选中行，不能整行挑数。",
-                          "properties": {"table": _I, "row": _I, "column": _I, "line": _I}, "required": ["table","row","column"]},
-         "meaning": {**_S, "description": "可选：文字口径的规范说法，如 含税"},
-         "component": {"type": "string", "enum": ["literal", "lower", "upper"], "description": "区间值选择下界或上界，保留原文如1000-3000万"},
-         "unit": {**_S, "description": "裸数的明确单位，如%，quote须同时包含单位表头；不得凭参数名猜测"},
-         "override": {"type": "boolean", "description": "原文明确写了修改旧规定（修改为 / 以本通知为准）时为 true，"
-                                                         "quote 要包含这句话"}}, ["name", "value", "file", "quote"])}},
-         ["facts"])},
-    {"name": "bind_facts", "description": "把已登记的参数绑定到精确规则位置；多页文档须给page和原文适用标题context。不能以另一处相同数字代替。",
-     "parameters": _obj({"bindings": {"type": "array", "items": _obj({"name": _S,
-         "targets": {"type": "array", "items": _S, "description": "如 tables.eu.steps.0.1 或 variables.bonus.expr"},
-         "page": _I, "context": _S, "component": {"type": "string", "enum": ["literal", "lower", "upper"]},
-         "unit": _S}, ["name", "targets"])}}, ["bindings"])},
-    {"name": "validate_parameters", "description": "局部参数预检：自动修正已声明阶梯下界绑定的共享单位区间投影，返回剩余缺口与具体动作；不重跑金额、不改规则数值。",
-     "parameters": _obj({"repair": {"type": "boolean"}})},
-    {"name": "validation_report", "description": "查看可复核的验证状态、覆盖缺口和失败反例；不调用模型、不更改规则。", "parameters": _obj({})},
-    {"name": "review_calculation", "description": "关键复核：独立模型只看材料和数据结构重新解释规则并全量复算，返回差异；不修改规则。首次金额试算后尽早执行，不必等证据全部齐全。",
-     "parameters": _obj({})},
-    {"name": "compile_table", "description": "从登记参数直接编译阶梯/查找表。value、lower引用参数名；首档lower可省略表示0。程序换算百分号和单位并绑定来源，不要重新抄比例。",
-     "parameters": _obj({"name": _S, "scheme": _S, "kind": {"type": "string", "enum": ["tier", "lookup"]},
-        "mode": {"type": "string", "enum": ["whole", "excess"]}, "applies_when": _S,
-        "lower_inclusive": {"type": "boolean"}, "below_first": {"type": "string", "enum": ["zero", "first"]},
-        "rows": {"type": "array", "items": _obj({"value": _S, "lower": _S, "key": _S}, ["value"])}}, ["name", "rows"])},
-    {"name": "preview_repair", "description": "隔离试算最小规则修复，返回反例和金额影响。原工作区不变；不允许改答案、输入、校验器或既有对账。每版本最多6次。",
-     "parameters": _obj({"scheme": _S, "parts": {"type": "object", "additionalProperties": True}, "reason": _S}, ["parts", "reason"])},
-    {"name": "verify_repair", "description": "在隔离修复候选上按原文验算缺失样本，原工作区不变。",
-     "parameters": _obj({"candidate": _S, "node": _S, "expr": _S, "basis": _S, "scheme": _S, "at": _S,
-         "amount": _S, "helpers": {"type": "object", "additionalProperties": True}}, ["candidate", "node", "expr", "basis"])},
-    {"name": "apply_repair", "description": "重新核验候选的证据、独立复算、样本、金额闭合及程序检查，全通过且原版本未变才应用。不能自行豁免。",
-     "parameters": _obj({"candidate": _S}, ["candidate"])},
-    {"name": "record_clauses",
-     "description": "读完一份规则文档后，把其中与计算有关的条款逐条摘进条款清单（取数口径、筛选和排除、公式、阶梯、系数、舍入、"
-                    "分配方法、发放和暂缓、抵扣、校验和报错要求、版本和调整要求等），一条一个要求，不要合并。"
-                    "清单每一步都附给你，不会被裁剪；写完规则后用 cover_clauses 标注每条落在哪里，finish 前程序会检查。",
-     "parameters": _obj({"clauses": {"type": "array", "items": _obj({
-         "point": {**_S, "description": "要点：用自己的话写这条要求什么（不超过 100 字）"},
-         "file": {**_S, "description": "出处文件名；财务在对话里发的内容写「财务对话」"},
-         "quote": {**_S, "description": "逐字复制原文关键句（不超过 200 字）"}}, ["point", "file", "quote"])}},
-         ["clauses"])},
-    {"name": "cover_clauses",
-     "description": "标注条款清单里每条落在规则的哪里：{\"C1\": \"variables.net_receipt\", \"C2\": \"checks.grade_known、pool\"}。"
-                    "可写 tables.名字 / variables.名字 / pool / allocation.层级 / payout.编号 / offsets.编号 / checks.编号 / "
-                    "revisions.R1 / datasets.表名（单位换算、筛选等在数据表定义里完成的）；"
-                    "引擎已自动保证的写「引擎自带：说明」（如 主键重复报错、最大余数法、各级合计等于上级）；"
-                    "本批不涉及的写「不适用：原因」；等财务答复的写「已提问 q1」。",
-     "parameters": _obj({"items": {"type": "object", "additionalProperties": _S}}, ["items"])},
-    {"name": "remove_facts",
-     "description": "删掉台账里某个参数名的全部登记（登记错了时用，如把阶梯几档登记成了同一个名字）；依据它的、还没答复的冲突问题会被撤回。",
-     "parameters": _obj({"name": _S}, ["name"])},
-    {"name": "define_dataset",
-     "description": "定义（或重新定义）一张数据表。实体表写 key（每行一个对象，如人员、团队，以及被别的表按编号引用的合同、订单）；"
-                    "明细表写 link（每行挂到某层级对象或某个实体上，如收款记录 link=合同编号字段）；公司级表 key、link 都不写。"
-                    "同名字段表示关联。一张工作表混放多类数据时（某一列区分这行属于哪类对象），"
-                    "用 filter 只取其中一类，并把通用的编号列映射成这类对象自己的编号字段名。返回校验结果和换算后的样例行。",
-     "parameters": _obj({"name": {**_S, "description": "中文表名，如 人员、合同明细"}, "file": _S, "sheet": _S,
-                         "header_rows": {"type": "array", "items": _I, "description": "可选：表头所在的 Excel 行号，多行表头写多个"},
-                         "key": _S, "link": _S, "desc": _S,
-                         "unmatched": {"type": "string", "enum": ["block", "ignore"], "description":
-                                       "可选：明细表的 link 编号在上级里找不到时怎么办。默认 block（试算阻断，要问财务）；"
-                                       "材料原文写明、或财务答复过“找不到的不参与 / 按默认值”后才可写 ignore，这些行不参与计算。"
-                                       "实体表作下一层分配对象（分配层级用 parent_key 挂到上一层）时也可以写"},
-                         "unmatched_basis": {**_obj({"file": _S, "quote": _S}, ["file", "quote"]), "description":
-                                             "写 unmatched: ignore 的依据在材料原文里时填：file 材料文件名，quote 逐字复制写明"
-                                             "“对不上的不参与”的那句原文；依据是财务答复时不用填"},
-                          "population_from": {**_S, "description": "实体范围来自有效明细时，写按本实体key关联的明细表名，共用过滤后的有效对象集合"},
-                          "distinct": {"type": "boolean", "description": "可选：按 key 的不同取值各建一个对象（同一编号的多行合成一个，"
-                                      "其余字段在同一编号下要一样）。没有单独的主表、又要按这个编号汇总时用，如从明细里得到每个客户一个“客户”"},
-                         "filter": {"type": "object", "description": '可选：只取这些行，{"列名": "取值"} 或 {"列名": ["取值1", "取值2"]}；'
-                                    '去掉某些行写 {"列名": {"not": ["取值"]}}（如材料说“剔除的不计算”“金额为 0 的不计算”：'
-                                    '{"状态": {"not": ["剔除"]}}、{"销售金额": {"not": ["0"]}}，数字按数值比）。'
-                                    '不要用它筛月份或日期，按期间取数用 period'},
-                         "period": {**_S, "description": "可选：记业务日期或月份的字段名。写了之后计算时只取落在本次核算期间里的行，"
-                                    "同一版规则换任何月份、季度都能算。业务明细（销售、回款、出货等）有日期或月份列时都要写；"
-                                    "名单、预算这类跨期的表不写，要取当期的值时在表达式里用 period_start() / period_end()"},
-                         "window": {"type": "string", "enum": ["period", "year_to_date", "to_date"], "description":
-                                    "可选，写了 period 才有用：取哪段时间的行。period（默认）只取本期；year_to_date 取本期末所在年份年初到本期末；"
-                                    "to_date 取本期末及以前全部行。规则要用累计或历史数据（如按年内累计算月均）时用；同一份明细既要当期又要累计，"
-                                    "就定义成两张表"},
-                         "combine": {"type": "object", "description":
-                                     '可选：几列合起来才能确定一个对象时（如 月份+客户编码+型号 才是一个项目），合成一个编号列：'
-                                     '{"新列名": ["列1", "列2", ...]}，各段用 | 连接；fields 里用新列名（类型 id），可作 key 或 link。'
-                                     '两张表要按同一组列关联时，两边都按同样的列顺序合成。不要只拿其中一列（如只按型号）去关联'},
-                         "unpivot": {"type": "object", "description":
-                                     '可选：几列放的是同一类值（如几个角色列各放一个人名）时展开成每个值一行：'
-                                     '{"columns": ["列1", "列2"], "value": "展开后的列名", "label": "记原列名的列名，如 角色"}。'
-                                     '空格子不展开；fields 和 filter 用展开后的列名。从这几列取全部对象时配合 key + distinct。'
-                                     '格子里写成“名字+百分比”（如 张三50%）、财务答复了怎么拆之后：加 "share": "记比例的列名"，名字和比例就拆开'
-                                     '（比例是小数，没写百分比的是 1，字段类型用 ratio，权重里乘上它）；财务说余下的部分记为“未分配”时再加 '
-                                     '"remainder": "{label}未分配"（{label} 换成原列名；余下的部分另记一行，比例是 1 − 写明的比例）。'
-                                     '空格子默认不展开；材料或财务说空着的那一份也要单列（如某个角色没填人，记为“××未分配”）时加 '
-                                     '"blank": "{label}未分配"，空格子也记一行。'
-                                     '几个人的比例集中写在表里另一列的文字里（如“甲60%，乙40%”）、人名格子里只有名字时：加 "share_from": "那一列的列名"，'
-                                     '按名字到那一列取比例（该列为空表示只有一个人、比例 1；格子里自己写了百分比的用格子里的）；要同时写 share。'
-                                     '这一列的比例只管其中几列（如两个技术支持列）时，用 "share_from_columns": ["列名"] 指明，其余列只认格子里自己写的比例。'
-                                     '写了 blank 时，某几列空着就是没有这个人（如第二个人那列）、不该记未分配的，把它们列进 "blank_except": ["列名"]。'
-                                     '展开后没有每行唯一的编号、又要当最末层时，加字段 {"column": "（行号）", "type": "id"} 作 key'},
-                         "fields": {"type": "object", "additionalProperties": FIELD_SCHEMA,
-                                    "description": "字段名（英文小写加下划线） -> 定义。重新定义同一张表、字段不变时可以不写（沿用上一次的）"}},
-                        ["name", "file", "sheet"])},
-    {"name": "remove_dataset", "description": "删除一张已定义的数据表。", "parameters": _obj({"name": _S}, ["name"])},
-    {"name": "set_rules",
-     "description": "写入或修改计算规则。只给出要改的部分：tables / variables 按名字合并（值为 null 表示删除），"
-                    "pool、allocation、payout、offsets、checks、revisions 整体替换。返回静态校验结果。"
-                    "一批文件里有多个方案（如季度奖、过程奖、年度奖）时，每个方案用 scheme 分别写 pool 等；"
-                    "各方案相同的部分（分配层级与权重、数据校验、共用的参数表和变量）写到 scheme=\"共用\"，会合并进每个方案。"
-                    "只有一个方案时不写 scheme。",
-     "parameters": _obj({"scheme": {**_S, "description": "方案名（按材料起，如 月度、年度）；共用部分写 共用"},
-                         "tables": {"type": "object"}, "variables": {"type": "object"}, "pool": {"type": "object"},
-                         "allocation": {"type": "array", "items": {"type": "object"}},
-                         "payout": {"type": "array", "items": {"type": "object"},
-                                    "description": '发放条件：[{"id": "cash", "scope": "个人", "pay_ratio": "可发比例表达式"}] '
-                                                   '或 hold_ratio（挂起比例）'},
-                         "offsets": {"type": "array", "items": {"type": "object"},
-                                     "description": '已发抵扣：[{"id": "prior", "scope": "个人", "expr": "已发金额表达式"}]，'
-                                                    '可用 scheme_paid("方案名", "修订名") 引用另一个方案某修订的本次实发'},
-                         "checks": {"type": "array", "items": {"type": "object"}},
-                         "report": {"type": "object", "description":
-                                    '结果文件的固定输出（汇总核算 + 分配人员金额），按材料或场景的输出要求写：'
-                                    '{"totals": [{"name": "核算类型名称", "level": "层级名或 global", "expr": "在该层每个对象上算、再合计的表达式"}], '
-                                    '"people": "最末层上表示人的字段或变量"}。totals 按要求的顺序列出各类金额（如各类暂扣、正常发放、合计）；'
-                                    'people 写了之后每人参与的各条合计成一行（未分配的行按它们的名称各成一行）。'
-                                    '各层的计算过程会自动写成「核算底稿」：每个对象一行，原始字段在前，能翻译的变量写成 Excel 公式'},
-                         "patches": {"type": "array", "items": {"type": "object"},
-                                     "description": '数据修订（只影响本方案）：并入补充表 {"kind": "append", "source": "补充表", "into": "原表", '
-                                                    '"unique": "单号字段", "values": {"flag_field": {"补充表写法": "原表写法"}}}；'
-                                                    '更正 {"kind": "correct", "source": "更正表", "target": "原表", "key": "编号字段", '
-                                                    '"field": "field_name", "value": "new_value", "labels": {"更正表里的字段写法": "原表字段名"}} 或 '
-                                                    '{"kind": "correct", "source": "修订表", "target": "原表", "key": "编号字段", '
-                                                    '"set": {"原表字段": "new_field"}, "expect": {"原表字段": "old_field"}}'},
-                         "revisions": {"type": "array", "items": {"type": "object"},
-                                       "description": '人工调整的修订版本，后一个包含前面的调整：[{"name": "R1", "adjust": '
-                                                      '[{"node": "团队:T01", "amount": 900000, "reason": "..."}]}]；R0 为不调整的基准'}})},
-    {"name": "trial_run", "description": "用当前数据表和规则试算，返回奖金池、各层级金额分布、各修订的变化和提示。不写 scheme 时试算全部方案。",
-     "parameters": _obj({"scheme": _S})},
-    {"name": "explain", "description": "查看计算链：节点 id（如 人员:S01、团队:T01、全部）或变量追踪 id 的公式、代入数值后的算式和结果。",
-     "parameters": _obj({"id": _S, "scheme": _S, "revision": {**_S, "description": "默认 R0"}}, ["id"])},
-    {"name": "evaluate", "description": "在某个节点上用引擎计算任意表达式（如 sum(amount)），用于核对数据和规则。"
-                                        "节点可以是层级对象或关联实体（如 合同:C01）。需要先在 set_rules 里设定 allocation。",
-     "parameters": _obj({"expr": _S, "node": {**_S, "description": "节点 id，默认 全部"}, "scheme": _S}, ["expr"])},
-    {"name": "ask_question",
-     "description": "向财务提问：材料之间有冲突、缺少必要的信息（参数、口径、数据）、或能有两种理解时使用。"
-                    "不要自行假设或补出算法；提问后继续做不受影响的部分，问完后调用 finish 结束本轮，"
-                    "财务答复后下一轮接着做。options 列出可选的理解，suggested 是你的建议（只供财务参考，不会被采用）。"
-                    "related 写受影响的方案或规则（如 方案名.offsets）；回应程序检查或复读的某一条时写它给的编号。blocking=false 只用于不影响任何金额的提示。",
-     "parameters": _obj({"text": _S, "options": {"type": "array", "items": _S}, "suggested": _I, "related": _S,
-                         "blocking": {"type": "boolean"},
-                         "evidence": {"type": "array", "description": "问题和建议的依据，显示在答复页上给财务对照：每条 file 写材料文件名"
-                                      "（财务在对话里说的写「财务对话」），quote 逐字复制原文或数据行里的取值（一句、一行）。"
-                                       "写了 suggested 时所有引用必须核对通过。Excel可改传sheet、row（原Excel行号）、columns（精确列名），程序生成真实引用；禁止省略号拼接。",
-                                       "items": _obj({"file": _S, "quote": _S, "sheet": _S, "row": _I,
-                                                      "columns": {"type": "array", "items": _S}}, ["file"])}}, ["text", "options"])},
-    {"name": "reply",
-     "description": "对话时用：回复财务这条消息并结束本次对话。改过规则、数据表或台账时，程序会先自动试算全部方案并做完成前检查，"
-                    "不通过会把原因返回给你修正。回复里的金额要来自 evaluate / explain / 试算结果，不要自己算。",
-     "parameters": _obj({"text": _S, "ignored": {"type": "array", "items": _obj({"ref": _S, "reason": _S})}}, ["text"])},
-    {"name": "answer_question",
-     "description": "记录待确认问题的答复，两种情况：① 对话时，财务在消息里明确答复了，把他的原话记为答复（没说清楚的不要替他选，用 reply 反问）；"
-                    "② 材料里（如后来补充的答复文件、确认单）已经明确答复了这个问题，file 写那个文件、quote 逐字复制答复原文，"
-                    "程序核对原文后关闭问题，口径单上会请财务确认。材料没有明确答复的，不能自己关闭。",
-     "parameters": _obj({"id": _S, "answer": {**_S, "description": "财务的原话、他选的选项，或材料答复的要点"},
-                         "file": {**_S, "description": "不在对话时必填：答复所在的材料文件"},
-                         "quote": {**_S, "description": "不在对话时必填：逐字复制的答复原文"}}, ["id", "answer"])},
-    {"name": "verify",
-     "description": "独立验算一个对象的金额：不看规则，按材料原文从原始字段另写一遍算式，由引擎在节点 at 上算出，和试算结果对到分。"
-                    "要验算哪些对象由程序指定（见工作区状态的“待独立验算”），全部通过才能 finish。算式里不能引用规则变量（只能用字段、"
-                    "参数表和函数）；at 默认是该对象自己（对自己的明细求和），按份额分配的对象在 全部 上用 where 按编号筛选计算。"
-                    "对不上时先想清楚是规则错了还是验算式写错了，改对的那一边；拿不准就 ask_question。",
-     "parameters": _obj({"node": {**_S, "description": "要验算的对象，如 人员:S01"}, "expr": _S,
-                         "basis": {**_S, "description": "依据的材料原文（条款号或原句）"},
-                         "at": {**_S, "description": "在哪个节点上计算，默认是 node 自己。一般不要写：上层的数用 scope 为上层的辅助变量在 node 上直接引用"}, "scheme": _S,
-                         "amount": {**_S, "enum": ["应得", "实发"], "description": "验算应得（默认）还是本次实发（扣暂缓、已发之后）"},
-                         "helpers": {"type": "object", "description": "可选：验算自己定义的辅助变量 {名字: {scope, expr}}，"
-                                     "写法同规则的 variables，不能和规则变量同名、不能引用规则变量。跨表的中间数先在对应层算出来，"
-                                     "如 {\"v_obj_amt\": {\"scope\": \"关联实体表名\", \"expr\": \"sum(amount, of: \\\"明细表名\\\")\"}}，"
-                                     "再在参与记录上引用 v_obj_amt * ratio_field。定义过的辅助变量会留着（见工作区状态），"
-                                     "后面的 verify 直接引用，只写新的或要改的；scope 写层级名、关联实体表名或 global。"
-                                     "验算里对本层或上层的实体表求和（如在最末层 sum(v_up_w, of: \"上层实体表\", where: 上上层编号字段 == \"某编号\")）"
-                                     "按上一层范围取同级再用 where 筛选；share(上层变量) 在下层求值时取所属上层对象在同级里的份额"}},
-                        ["node", "expr", "basis"])},
-    {"name": "finish", "description": "完成。要求每个方案在最近一次修改之后都已成功试算，程序指定的对象都已独立验算通过。",
-     "parameters": _obj({"summary": {**_S, "description": "两三句话说明：什么奖金、奖金池怎么来、怎么分、发放条件"},
-                         "ignored": {"type": "array", "items": _obj({"ref": _S, "reason": _S})}}, ["summary"])},
-]
+# 工具定义（发给模型的 schema）在 tool_specs.py；这里按原名导出，其他模块和测试照常从 agent 导入
+from bonus_agent.tool_specs import FIELD_SCHEMA, TOOLS, _I, _S, _obj  # noqa: E402,F401
 
 
 def _in_text(quote: str, text: str, least: int = 8) -> bool:
@@ -452,7 +201,7 @@ def _fix_arguments(text: str) -> str:
     near, hint = "", ""
     if pos is not None:
         near = f"，出错位置（▲处）：…{raw[max(0, pos - 80):pos]}▲{raw[pos:pos + 40]}…"
-        if raw[pos:pos + 1] == "{" and re.search(r"}\s*,\s*$", raw[:pos]):
+        if raw[pos : pos + 1] == "{" and re.search(r"}\s*,\s*$", raw[:pos]):
             hint = ("这里在一个对象里写了 }, { 把各项分成了几个对象。几项要写在同一个对象里："
                     "{\"a\": {...}, \"b\": {...}}，不要写成 {\"a\": {...}}, {\"b\": {...}}。")
     return json.dumps({"_invalid_json": f"参数不是合法 JSON（{err}{near}），未执行。{hint}请重新调用：字符串用双引号，"
@@ -470,7 +219,7 @@ def _split_objects(raw: str):
             break
         except json.JSONDecodeError as e:
             m = re.search(r"}\s*,\s*$", text[:e.pos])
-            if not (e.msg.startswith("Expecting property name") and text[e.pos:e.pos + 1] == "{" and m):
+            if not (e.msg.startswith("Expecting property name") and text[e.pos : e.pos + 1] == "{" and m):
                 return
             text = text[:m.start()] + ", " + text[e.pos + 1:]
             fixed += 1
@@ -649,7 +398,7 @@ def _not_found_hint(id: str, known: list[str]) -> str:
     parts = [p for p in re.split(r"[:：/\-\s]+", id) if p]
     hits = {p: [k for k in known if p in k] for p in parts}
     near = []
-    for p in sorted((p for p in parts if hits[p]), key=lambda p: len(hits[p])):   # 最少见的片段（如员工编号）优先
+    for p in sorted((p for p in parts if hits[p]), key=lambda p: len(hits[p])):  # 最少见的片段（如员工编号）优先
         near += [k for k in hits[p] if k not in near]
         if len(near) >= 8:
             break
@@ -810,8 +559,10 @@ class Workspace:
         return workspace_view(self,section,scheme,offset,limit,name,query,file,page,detail_offset,bool(detail))
 
     def query_dataset(self, dataset: str, expr: str):
-        try:return self._flow().query_dataset(dataset,expr)
-        except EvalError as exc:raise ToolError('原表统计失败：'+str(exc)) from None
+        try:
+            return self._flow().query_dataset(dataset, expr)
+        except EvalError as exc:
+            raise ToolError('原表统计失败：' + str(exc)) from None
 
     def prepare_data(self):
         return self._flow().prepare_data()
@@ -820,8 +571,10 @@ class Workspace:
         return self._flow().compile()
 
     def calculate_basis(self, scheme: str | None = None):
-        try:return self._flow().calculate_basis(scheme)
-        except (EngineError,EvalError) as exc:raise ToolError('基础金额计算失败：'+str(exc)) from None
+        try:
+            return self._flow().calculate_basis(scheme)
+        except (EngineError, EvalError) as exc:
+            raise ToolError('基础金额计算失败：' + str(exc)) from None
 
     def review_basis(self, scheme: str | None = None):
         try:
@@ -833,7 +586,8 @@ class Workspace:
             self.workflow['review_error']={'version':self._flow().version(),'error':reason}
             self.done=True
             return {'status':'ERROR','error':reason,'next':'必要独立复核未完成，保留工作区等待复核恢复；不出正式金额'}
-        except (EngineError,EvalError) as exc:raise ToolError('独立金额公式执行失败：'+str(exc)) from None
+        except (EngineError, EvalError) as exc:
+            raise ToolError('独立金额公式执行失败：' + str(exc)) from None
 
     def __post_init__(self):
         self._source_version = cs.fingerprint(self.inv.files)
@@ -1283,7 +1037,8 @@ class Workspace:
         from bonus_agent.source_cells import read_ppt_tables,ppt_page_index
         self._check_source_version()
         try:
-            path=self._file(file);index=ppt_page_index(path)
+            path = self._file(file)
+            index = ppt_page_index(path)
             if page is not None and not 1<=page<=len(index):
                 raise ValueError(f'source.page：页码{page}不存在；有效范围1—{len(index)}。省略page读取真实标题索引，不要猜页码')
             registered=[f for f in self.facts if f.file==file and f.source_cell and (page is None or f.page==page)]
@@ -1298,20 +1053,38 @@ class Workspace:
         except ValueError as exc:
             raise ToolError(str(exc)) from exc
 
-    def record_parameter_cells(self, file: str, page: int, table: int, cells: list[dict]) -> dict:
+    def record_parameter_cells(self, file: str, page: int, table: int, cells: list[dict],
+                               applies_to: str | None = None) -> dict:
         from bonus_agent.source_cells import parameter_cell,ppt_page_index
         self._check_source_version()
-        path=self._file(file);index=ppt_page_index(path)
+        path = self._file(file)
+        index = ppt_page_index(path)
         import hashlib
         source_hash=hashlib.sha256(path.read_bytes()).hexdigest()
-        if not 1<=page<=len(index):raise ToolError(f'source.page：页码不存在，有效范围1—{len(index)}')
-        if not cells:raise ToolError('source.cell：须提供至少一个单元格')
+        if not 1 <= page <= len(index):
+            raise ToolError(f'source.page：页码不存在，有效范围1—{len(index)}')
+        if not cells:
+            raise ToolError('source.cell：须提供至少一个单元格')
+        # 坐标生成的参数名不带区域、产品线等区分词，_wrong_page 按参数名找区分词的检查对它不起作用。
+        # 改由调用方写明适用范围，程序核对它确实在所选那一页：相似的表选错页时在登记阶段就拦下
+        scope=str(applies_to or '').strip()
+        if not scope or self._generic_only(scope):
+            raise ToolError('source.scope：applies_to 须写明这些单元格适用的区分范围（如区域、事业部、产品线或页标题），'
+                            '程序核对它在本页原文里；不能只写“提成比例”这类通用词。本次未登记')
+        pages=self._page_texts(file)
+        if fx.norm(scope) not in pages.get(page,''):
+            elsewhere=[p for p,t in sorted(pages.items()) if fx.norm(scope) in t]
+            raise ToolError(f'source.scope：「{scope}」不在第 {page} 页的原文里'
+                            + (f'，而在第 {"、".join(map(str,elsewhere[:6]))} 页' if elsewhere else '，整份文件里也没有')
+                            + '。相似的表容易选错页：先 read_parameter_table(file) 按真实页标题核对，再读正确的 page。本次未登记')
         returned=[]
         for cell in cells:
             if not isinstance(cell,dict) or set(cell)-{'row','column','line','unit'}:
                 raise ToolError('source.cell：只传row/column/line/unit，不能传自拟name/value/context')
-            try:record=parameter_cell(path,page,table,cell['row'],cell['column'],cell.get('line'))
-            except (ValueError,KeyError,TypeError) as exc:raise ToolError(str(exc)) from None
+            try:
+                record = parameter_cell(path, page, table, cell['row'], cell['column'], cell.get('line'))
+            except (ValueError, KeyError, TypeError) as exc:
+                raise ToolError(str(exc)) from None
             prior=[f for f in self.facts if f.file==file and f.page==page and f.source_cell and
                 all(f.source_cell.get(k,1)==record['locator'].get(k,1) for k in ('table','row','column','line')) and
                 f.component=='literal' and f.source_hash==source_hash and f.unit==cell.get('unit') and fx.norm(f.value)==fx.norm(record['value']) and
@@ -1319,12 +1092,13 @@ class Workspace:
             if prior:
                 fact=prior[0]
             else:
-                context=index[page-1]['scope']
+                context=scope       # 已核对在本页原文里
                 quote=record['quote']
                 args={'name':record['name'],'file':file,'page':page,'context':context,
                       'value':record['value'],'quote':quote,'source_cell':record['locator'],
                       'unit':cell.get('unit'),'component':'literal'}
-                try:self.record_facts([args])
+                try:
+                    self.record_facts([args])
                 except ToolError as exc:
                     if 'parameter.unit' in str(exc):
                         raise ToolError('parameter.unit：当前单元格或行列标题没有支持所填单位的原文。'
@@ -1355,15 +1129,15 @@ class Workspace:
         name = re.sub(r"[\d.%-]+", "|", name)
         cands = []
         for seg in [x for x in name.split("|") if len(x) >= 2]:
-          for i in range(len(seg)):
-            for j in range(min(len(seg), i + 8), i + 1, -1):
-                t = seg[i:j]
-                if t.isdigit() or self._generic_only(t) or any(t in c for c in cands):
-                    continue
-                on = [p for p, txt in pages.items() if t in txt]
-                if on and len(on) <= max(1, len(pages) // 2) and not any(t in pages[p] for p in hit):
-                    cands.append(t)
-                    break
+            for i in range(len(seg)):
+                for j in range(min(len(seg), i + 8), i + 1, -1):
+                    t = seg[i:j]
+                    if t.isdigit() or self._generic_only(t) or any(t in c for c in cands):
+                        continue
+                    on = [p for p, txt in pages.items() if t in txt]
+                    if on and len(on) <= max(1, len(pages) // 2) and not any(t in pages[p] for p in hit):
+                        cands.append(t)
+                        break
         for t in sorted(cands, key=len, reverse=True)[:1]:
             term = t
             elsewhere = sorted(p for p, txt in pages.items() if t in txt)
@@ -1414,10 +1188,12 @@ class Workspace:
                         raise ValueError('source.cell：选中单元格行不在引用原文内')
                     # The raw number must belong to this cell; a typed unit may be in its
                     # verified row/column heading rather than repeated inside the cell.
-                    if fx.check_fact(f.model_copy(update={'quote': selected,'unit':None}), {f.file:fx.norm(selected)}):
+                    if fx.check_fact(
+                        f.model_copy(update={'quote': selected, 'unit': None}), {f.file: fx.norm(selected)}
+                    ):
                         raise ValueError('source.cell：value与选中单元格行不一致，不能从其他区域或新老项目列取值')
                     native='\n'.join([*labels,selected])
-                    if f.unit and fx.check_fact(f.model_copy(update={'quote':native}),{f.file:fx.norm(native)}):
+                    if f.unit and fx.check_fact(f.model_copy(update={'quote': native}), {f.file: fx.norm(native)}):
                         raise ValueError('source.cell：单位须来自当前单元格或行列标题，不能借用其他位置的单位')
                     f.meaning = ' | '.join([*labels, selected])
                 except (ValueError, ArithmeticError) as exc:
@@ -1564,14 +1340,40 @@ class Workspace:
         return {"status": "FAIL" if gaps or errors else "PASS", "repaired": repaired, "gaps": gaps,
                 "errors": errors, "next": "修正所列参数类型、单位或目标；证据问题不需要重跑金额" if gaps or errors else "参数检查通过；继续其他未完成检查"}
 
+    _CELL_REF = re.compile(r"R(\d+)C(\d+)(?:L(\d+))?", re.I)
+
+    def _cell_ref(self, ref, cells_from: dict):
+        """compile_table 里的 R行C列[L行号] → 该单元格已登记参数的名字（模型不必为了找名字通读台账）。不是坐标写法的原样返回。"""
+        m = self._CELL_REF.fullmatch(str(ref or "").strip())
+        if not m:
+            return ref
+        file, page, table = cells_from["file"], cells_from["page"], cells_from["table"]
+        want = (table, int(m[1]), int(m[2]), int(m[3] or 1))
+        names = sorted({f.name for f in self.facts if f.file == file and f.page == page and f.source_cell
+                        and (f.source_cell.get("table"), f.source_cell.get("row"), f.source_cell.get("column"),
+                             f.source_cell.get("line", 1)) == want})
+        where = f"《{file}》第 {page} 页表 {table} 的 {str(ref).strip().upper()}"
+        if not names:
+            raise ToolError(f"parameter.ref：{where} 还没有登记。先 record_parameter_cells(file, page, table, applies_to, "
+                            f"cells=[{{row: {want[1]}, column: {want[2]}" + (f", line: {want[3]}" if m[3] else "")
+                            + "}])，再编译；本次未保存")
+        if len(names) > 1:
+            raise ToolError(f"parameter.ref：{where} 登记了多个参数（{'、'.join(names[:4])}），直接写其中一个参数名")
+        return names[0]
+
     def compile_table(self, name: str, rows: list[dict], scheme: str | None = None,
                       kind: str = "tier", mode: str = "whole", applies_when: str = "",
-                      lower_inclusive: bool = True, below_first: str = "zero") -> str:
+                      lower_inclusive: bool = True, below_first: str = "zero", cells_from: dict | None = None) -> str:
         """Compile table cells from registered facts instead of retyping business numbers."""
         if kind not in ("tier", "lookup") or not rows:
             raise ToolError("compile_table 需要非空 rows，kind 为 tier 或 lookup")
         escape = lambda s: str(s).replace('~', '~0').replace('/', '~1')
         bindings, sources = [], []
+        if cells_from is not None:
+            if not isinstance(cells_from, dict) or {"file", "page", "table"} - set(cells_from):
+                raise ToolError("parameter.ref：cells_from 要写 {file, page, table}")
+            rows = [{k: (self._cell_ref(v, cells_from) if k in ("value", "lower") else v) for k, v in row.items()}
+                    for row in rows]
 
         def take(ref, path):
             originals = [f for f in self.facts if f.name == ref]
@@ -1830,8 +1632,10 @@ class Workspace:
         unpivot = copy.deepcopy(m.unpivot)
         if unpivot:
             unpivot['columns'] = [alias(c) for c in unpivot['columns']]
-            if unpivot.get('share_from'): unpivot['share_from'] = alias(unpivot['share_from'])
-            if unpivot.get('share_from_columns'): unpivot['share_from_columns'] = [alias(c) for c in unpivot['share_from_columns']]
+            if unpivot.get('share_from'):
+                unpivot['share_from'] = alias(unpivot['share_from'])
+            if unpivot.get('share_from_columns'):
+                unpivot['share_from_columns'] = [alias(c) for c in unpivot['share_from_columns']]
         args = dict(name=name,file=Path(m.file).name,sheet=m.sheet,fields=fields,key=d.key,link=d.link,
                     desc=d.desc,header_rows=m.header_rows,filter={alias(k):v for k,v in m.filter.items()},
                     distinct=d.distinct,unpivot=unpivot,unmatched=d.unmatched,period=d.period,window=d.window,
@@ -1840,12 +1644,14 @@ class Workspace:
         if not isinstance(patch.get('fields',{}),dict) or not isinstance(patch.get('combine',{}),dict):
             raise ToolError('dataset.patch：fields和combine须为对象')
         for key,value in patch.pop('fields',{}).items():
-            if not isinstance(value,dict):raise ToolError('dataset.patch：字段属性须为对象')
+            if not isinstance(value, dict):
+                raise ToolError('dataset.patch：字段属性须为对象')
             fields[key]={**fields.get(key,{}),**value}
         if 'combine' in patch:
             args['combine']={**(args['combine'] or {}),**patch.pop('combine')}
         if 'unpivot' in patch:
-            if not isinstance(patch['unpivot'],dict):raise ToolError('dataset.patch：unpivot须为对象')
+            if not isinstance(patch['unpivot'], dict):
+                raise ToolError('dataset.patch：unpivot须为对象')
             args['unpivot']={**(args['unpivot'] or {}),**patch.pop('unpivot')}
         args.update(patch)
         return self.define_dataset(**args)
@@ -1857,7 +1663,8 @@ class Workspace:
         issues=[]
         coverage=[]
         def values(name,field,path=()):
-            if name in path:raise ToolError('dataset.population：对象范围循环引用')
+            if name in path:
+                raise ToolError('dataset.population：对象范围循环引用')
             own=set(self._values(name,field))
             d=self.datasets[name]
             if d.population_from and field==d.key:
@@ -1865,14 +1672,19 @@ class Workspace:
             return own
         owners={d.key:name for name,d in self.datasets.items() if d.key}
         for name,d in self.datasets.items():
-            if not d.key or d.population_from:continue
+            if not d.key or d.population_from:
+                continue
             own=self.mapping[name]
             for source,detail in self.datasets.items():
                 peer=self.mapping[source]
-                if source==name or detail.link!=d.key or not peer.filter:continue
-                if (own.file,own.sheet)!=(peer.file,peer.sheet):continue
-                if (own.combine or {}).get(d.key)!=(peer.combine or {}).get(d.key):continue
-                if not own.combine and own.columns.get(d.key)!=peer.columns.get(d.key):continue
+                if source == name or detail.link != d.key or not peer.filter:
+                    continue
+                if (own.file, own.sheet) != (peer.file, peer.sheet):
+                    continue
+                if (own.combine or {}).get(d.key) != (peer.combine or {}).get(d.key):
+                    continue
+                if not own.combine and own.columns.get(d.key) != peer.columns.get(d.key):
+                    continue
                 extra=values(name,d.key)-values(source,d.key)
                 if extra:
                     issues.append({'code':'dataset.population','dataset':name,'detail':source,'extra_keys':len(extra),
@@ -1887,14 +1699,17 @@ class Workspace:
                 issues.append({'code':'dataset.schema','scheme':scheme,'error':str(exc)[:400]})
                 continue
             for i,lv in enumerate(levels[1:],1):
-                child=owners.get(lv.key);parent=owners.get(levels[i-1].key)
+                child = owners.get(lv.key)
+                parent = owners.get(levels[i - 1].key)
                 if child and parent and lv.parent_key:
                     relation=(child,parent,lv.parent_key,levels[i-1].key)
                     relations.add(relation)
                     strict_relations.add(relation)
         for child,parent,field,parent_field in sorted(relations):
-            if field not in self.mapping[child].columns:continue
-            wanted=values(parent,parent_field); actual=values(child,field)
+            if field not in self.mapping[child].columns:
+                continue
+            wanted = values(parent, parent_field)
+            actual = values(child, field)
             canon=lambda x:_SEP.sub('',str(x))
             counts=Counter(canon(v) for v in wanted)
             strict=(child,parent,field,parent_field) in strict_relations
@@ -1904,14 +1719,17 @@ class Workspace:
             coverage.append({'dataset':child,'parent':parent,'field':field,'parent_keys':len(wanted),
                              'child_keys':len(actual),'matched_keys':len(actual)-len(missing),'unmatched_keys':len(missing),
                              'separator_only_keys':len(aliases),'exact_required':strict})
-            if not missing:continue
+            if not missing:
+                continue
             proposals=[]
             for f in self.datasets[child].fields:
                 column=self.mapping[child].columns.get(f,'')
-                if not re.search(r'日期|月份|年月|period|month|date',f+' '+column,re.I):continue
+                if not re.search(r'日期|月份|年月|period|month|date', f + ' ' + column, re.I):
+                    continue
                 try:
                     narrowed=set(self._values(child,field,period_field=f))
-                except (ValueError,KeyError,TypeError):continue
+                except (ValueError, KeyError, TypeError):
+                    continue
                 if narrowed and len(narrowed)<len(actual):
                     proposals.append({'period_field':f,'keys':len(narrowed),
                         'matched':sum(matched(v) for v in narrowed),
@@ -1938,7 +1756,7 @@ class Workspace:
                         'fields':{field:{'column':target}},'combine':{target:ingredients}}}}
                 issues.append(identity)
         return {'status':'FAIL' if issues else 'PASS' if relations else 'INCOMPLETE','period':str(self.period),'issues':issues,'coverage':coverage,
-                'scope':'仅检查已声明数据关联，不代表金额或规则已验收'}
+                'scope':'仅检查已声明数据关联，不代表金额或规则已通过核对'}
 
     def _define_dataset(self, name: str, file: str, sheet: str, fields: dict, key: str | None = None,
                         link: str | None = None, desc: str = "", header_rows: list[int] | None = None,
@@ -2649,7 +2467,8 @@ class Workspace:
         if self.staged:
             basis=self.workflow['basis'][name]
             if Decimal(base.pool)!=Decimal(basis['pool']) or base.details!=basis['details'] or dict(base.totals)!=basis['totals']:
-                self.results.pop(name,None);self.untested.add(name)
+                self.results.pop(name, None)
+                self.untested.add(name)
                 raise ToolError('workflow.gate：分配后的基础金额与已确认总额/底稿不一致，不能发布结果')
         lines = [f"方案「{name}」金额试算执行完成（尚未验收）。奖金池 {fmt(Decimal(base.pool))} 元（精确值 {base.pool_exact}）"]
         if prev is not None and Decimal(prev.pool) != 0 and Decimal(base.pool) != 0:
@@ -3628,8 +3447,10 @@ class Workspace:
         if self.staged and self._flow().has_plan():
             ignored=[*self.workflow['plan'].get('ignored',[]),*(ignored or [])]
         if self.staged and not self.pending:
-            if not self.schemes:raise ToolError('workflow.gate：尚未完成任务计划与规则构建')
-            for name in self.schemes:self._flow().guard_allocation(name)
+            if not self.schemes:
+                raise ToolError('workflow.gate：尚未完成任务计划与规则构建')
+            for name in self.schemes:
+                self._flow().guard_allocation(name)
         self._refresh_result_versions()
         stamp = self.validation_fingerprint()
         current = [{**i, "fingerprint": stamp, "rules": self._rules_print()} for i in (ignored or []) if isinstance(i, dict)]
@@ -3910,7 +3731,8 @@ class Workspace:
 
     def phase(self) -> int:
         """程序按工作区判断现在处在第几个阶段（0 起，见 PHASES）。规则改动后会退回前面的阶段。"""
-        if self.staged:return self._flow().stage()[0]
+        if self.staged:
+            return self._flow().stage()[0]
         skipped = {str(i.get("ref", "")) for i in self.ignored}
         if self.schemes and not self.dirty and not self._clause_gaps(skipped) and not self._binding_gaps():
             return 2 if self._verify_gaps() else 3
@@ -3922,7 +3744,8 @@ class Workspace:
     def next_hint(self) -> str:
         """程序根据工作区判断的下一步（模型原地打转或步数用得多时提示）。"""
         if self.staged:
-            if self._flow().stage()[0]<8:return self._flow().hint()
+            if self._flow().stage()[0] < 8:
+                return self._flow().hint()
         docs = [f.name for f in self.inv.files if f.suffix.lower() in RULE_SUFFIXES]
         bare = [d for d in docs if not any(f.file == d for f in self.facts)
                 and d not in {str(i.get("ref", "")) for i in self.ignored}]
@@ -4059,8 +3882,11 @@ def _json_data_summary(path: Path) -> str:
         obj = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return ""
-    arrays = ({k: v for k, v in obj.items() if isinstance(v, list)} if isinstance(obj, dict)
-              else {"（顶层）": obj} if isinstance(obj, list) else {})
+    arrays = (
+        {k: v for k, v in obj.items() if isinstance(v, list)}
+        if isinstance(obj, dict)
+        else {"（顶层）": obj} if isinstance(obj, list) else {}
+    )
     if not arrays:
         return ""
     lines = ["结构摘要（程序生成）："]
@@ -4388,7 +4214,8 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     sys = system_prompt()
     if ws.staged:
         sys += '\n\n'+prompt('workflow')
-        if ws._flow().stage()[0]==6:ws.done=True
+        if ws._flow().stage()[0] == 6:
+            ws.done = True
     history: list[dict] = []
     steps: list[Step] = []
     error = recovery.error
@@ -4420,12 +4247,15 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         # Check the immutable floor first. Trimming history cannot fix an oversized floor.
         guard_messages(msgs[:1]+body[:1]+tail,llm,tools=definitions)
         before=_size(history)
-        if not before:return False
+        if not before:
+            return False
         _shrink(history,max(1500,before//2),keep=2)
-        if _size(history)>=before:history.clear()
+        if _size(history) >= before:
+            history.clear()
         return _size(history)<before
     for turn in range(max_steps if not error else 0):
-        if ws.done:break
+        if ws.done:
+            break
         if should_stop and should_stop():
             error = f"已手动停止（第 {len(steps)} 步）"
             break
@@ -4451,9 +4281,11 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                     history.append({'role': 'user', 'content': '【只读纠错建议，必须经原文和程序验证后应用】' + content})
                     advice_ok = True
                 except (LLMError, ValueError) as exc:
-                    if isinstance(exc,ValueError):recovery.disable_advice(exc)
+                    if isinstance(exc, ValueError):
+                        recovery.disable_advice(exc)
                     content, advice_ok = f'局部顾问不可用：{exc}；未应用建议，改按确定性诊断继续。关键独立复核仍须通过。下一步：{ws.next_hint()}', False
-                    if isinstance(exc,ValueError):content+='；本作业停止后续可选顾问调用，避免重复消耗'
+                    if isinstance(exc, ValueError):
+                        content += '；本作业停止后续可选顾问调用，避免重复消耗'
                     history.append({'role':'user','content':content})
                 st = Step('（局部诊断）', {'reason': deep_why}, content, advice_ok, deep=True,
                           model_secs=round(time.time() - started_advice, 2),
@@ -4494,9 +4326,12 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 if not compacted:
                     error=f'{e}；上下文没有可继续整理的空间，保留案卷，未调用Pro。'
                     break
-                context_retries+=1;deep_why='';seen.clear()
+                context_retries += 1
+                deep_why = ''
+                seen.clear()
                 steps.append(Step('（本地上下文整理）',{},'已按本地预算整理历史；材料仍在文件索引和工作区，不调用顾问判断材料缺失。',True))
-                if on_step:on_step(len(steps),steps[-1])
+                if on_step:
+                    on_step(len(steps), steps[-1])
                 continue
             except LLMError as e:
                 if _context_overflow(str(e)) and context_retries < 2:
@@ -4539,9 +4374,12 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 if not compacted:
                     error=f'{e}；上下文没有可继续整理的空间，保留案卷，未调用Pro。'
                     break
-                context_retries+=1;deep_why='';seen.clear()
+                context_retries += 1
+                deep_why = ''
+                seen.clear()
                 steps.append(Step('（本地上下文整理）',{},'已按本地预算整理历史；材料仍在文件索引和工作区，不调用顾问判断材料缺失。',True))
-                if on_step:on_step(len(steps),steps[-1])
+                if on_step:
+                    on_step(len(steps), steps[-1])
                 continue
             except LLMError as e:
                 if _context_overflow(str(e)) and context_retries < 2:
@@ -4588,6 +4426,8 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
         turn_steps = len(steps)                       # 本轮第一步的位置：深度思考的内容记在它上面，并据本轮结果决定下一步是否思考
         failed_now: set[str] = set()                  # 这次回复里已经算过一次失败的工具
         said = "" if mode == "json" else (reply.get("content") or "").strip()     # 原生工具调用时模型写在正文里的思考
+        # 上一批参数的拒绝原因已经在工具结果里、并在刚才这一步的任务卡里给过一次：不再每步重发（会引着模型反复重试）
+        ws._fact_rejections = []
         for c in calls:
             if recovery.error or ws.done:
                 break  # no later write in the same model response may bypass the stop
@@ -4604,8 +4444,11 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                 steps.append(Step(c["name"], {}, result, False, thought))
                 if on_step:
                     on_step(len(steps), steps[-1])
-                history.append({"role": "user", "content": f"【{c['name']} 的结果】\n{result}"} if mode == "json"
-                               else {"role": "tool", "tool_call_id": c["id"], "content": result})
+                history.append(
+                    {"role": "user", "content": f"【{c['name']} 的结果】\n{result}"}
+                    if mode == "json"
+                    else {"role": "tool", "tool_call_id": c["id"], "content": result}
+                )
                 skipped += 1
                 continue
             t_tool = time.time()
@@ -4631,7 +4474,8 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                     ok=False
                 if c['name']=='record_facts' and ws._fact_rejections:
                     ok=False  # Preserve accepted rows, but never report a partly rejected batch as success.
-                    if result.startswith('已登记 '):ws.changed=True
+                    if result.startswith('已登记 '):
+                        ws.changed = True
             except ToolError as e:
                 result, ok = f"错误：{e}", False
                 if c['name'] in {'evaluate','trial_run','explain'} and any(code in result for code in ('parent_unknown','link_unmatched')):
@@ -4702,12 +4546,16 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             what = str((args or {}).get("name") or (args or {}).get("node") or (args or {}).get("scheme") or "") \
                 if isinstance(args, dict) else ""
             why = re.sub(r"\d+", "", result.removeprefix("错误：").split("\n", 1)[0])[:15] + "|" + what
-            if ok:
+            # 一批参数里有登记上的、也有被拒的：步骤标为失败（不能当成整批通过），但有进展，不计入连续失败。
+            # 否则去掉数字后每批的第一行都是“已登记 条（台账共 条）”，逐批推进也会被当成同一原因连续失败、判为卡住；
+            # 同一条反复被拒仍由 recovery.failure 按完整原因计数拦下
+            partial = _partial_facts(c["name"], ok, result)
+            if ok or partial:
                 fails[c["name"]] = 0
             elif c["name"] not in failed_now:
                 fails[c["name"]] = fails.get(c["name"], 0) + 1 if fail_why.get(c["name"]) == why else 1
                 failed_now.add(c["name"])
-            fail_why[c["name"]] = None if ok else why
+            fail_why[c["name"]] = None if ok or partial else why
             if ok and c["name"] in ("remove_dataset", "remove_facts"):     # 建了又删、删了又建：没有进展的来回改
                 what = str((args or {}).get("name", ""))
                 undo[(c["name"], what)] = undo.get((c["name"], what), 0) + 1
@@ -5310,6 +5158,11 @@ def _context_overflow(message: str) -> bool:
     return bool(re.search(r'context[_ ]length|maximum context|context window|too many tokens|上下文.{0,12}(?:超|不足)', message, re.I))
 
 
+def _partial_facts(tool: str, ok: bool, result: str) -> bool:
+    """record_facts 一批里登记上了一部分、另有被拒的：标为失败，但有进展（被拒原因已逐条写明）。"""
+    return tool == "record_facts" and not ok and result.startswith("已登记 ")
+
+
 def _deep_reason(turn: list[Step], skipped: int, ws: Workspace, fails: dict[str, int]) -> str:
     """这一步的结果是否要求下一步深度思考：失败（参数格式小错第一次除外）、被拦下的原样重复、
     程序提醒快要卡住、保存的规则还有阻断问题。返回原因（给模型看的一句话），不需要时返回空。"""
@@ -5320,6 +5173,8 @@ def _deep_reason(turn: list[Step], skipped: int, ws: Workspace, fails: dict[str,
             continue  # Read-interface errors have native feedback; Pro cannot repair pagination or a wrong file type.
         if not st.ok and 'parameter.unit' in st.result:
             continue  # Missing source units need evidence/clarification, not another paid guess.
+        if _partial_facts(st.tool, st.ok, st.result):
+            continue  # Rows were registered; each rejection already says what to fix. No paid deep step.
         head = st.result.removeprefix("错误：").split("\n", 1)[0][:300]
         if not st.ok and st.tool in ('prepare_data','compile_formulas') and fails.get(st.tool,0)<2:
             continue  # Program diagnostics already identify the first structural correction.
@@ -5414,18 +5269,25 @@ def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None =
         current={s:b for s,b in ws.workflow.get('basis',{}).items() if ws._flow().current('basis:'+s)}
         if current:
             import openpyxl
-            wb=openpyxl.Workbook();sheet=wb.active;sheet.title='预核算总额'
+            wb = openpyxl.Workbook()
+            sheet = wb.active
+            sheet.title = '预核算总额'
             sheet.append(['方案','核算项','金额','状态'])
             detail=wb.create_sheet('逐对象底稿');detail.append(['方案','报告','对象','原值或金额','舍入后'])
             trace_sheet=wb.create_sheet('公式与来源');trace_sheet.append(['方案','计算节点','公式','代入过程','值','来源行'])
             for s,b in current.items():
                 status='已独立复核，待确认' if ws._flow().current('review:'+s) else '尚未通过独立复核'
-                if ws._flow().current('approved:'+s):status='总额已确认；人员金额仍须独立终检'
-                for k,v in {'奖金池':b['pool'],**b['totals']}.items():sheet.append([s,k,v,status])
-                for n,v in b['objects'].items():detail.append([s,'奖金池',n,v['raw'],v['amount']])
+                if ws._flow().current('approved:' + s):
+                    status = '总额已确认；人员金额仍须独立终检'
+                for k, v in {'奖金池': b['pool'], **b['totals']}.items():
+                    sheet.append([s, k, v, status])
+                for n, v in b['objects'].items():
+                    detail.append([s, '奖金池', n, v['raw'], v['amount']])
                 for report,rows in b['details'].items():
-                    for n,v in rows.items():detail.append([s,report,n,v['amount'],v['amount']])
-                for key,t in b.get('traces',{}).items():trace_sheet.append([s,key,t['expr'],t['rendered'],t['value'],'\n'.join(t['rows'])])
+                    for n, v in rows.items():
+                        detail.append([s, report, n, v['amount'], v['amount']])
+                for key, t in b.get('traces', {}).items():
+                    trace_sheet.append([s, key, t['expr'], t['rendered'], t['value'], '\n'.join(t['rows'])])
             paths['basis']=out/'总额预核算.xlsx';wb.save(paths['basis']);wb.close()
     if ws.mapping:
         paths["mapping"] = out / "mapping.yaml"
@@ -5625,11 +5487,25 @@ def _sheets(ar: AgentResult, qrows: list[dict]):
             {"问题": 60, "选项": 40, "智能体建议（未采用）": 20, "依据原文": 60})]
     if ws.facts:
         conflicted = {c.name: c.question for c in ws.conflicts.values()}
-        out.append(("参数台账", ["参数", "原文取值", "换算", "文件", "原文", "登记轮次", "冲突问题"],
-                    [[f.name, fx.label(f), fx.same_value(f) if fx.numeric(f) is not None else "", f.file, f.quote,
-                      f.round, conflicted.get(f.name, "以此为准（原文明确修改）" if f.override else "")]
-                     for f in sorted(ws.facts, key=lambda f: f.name)],
-                    {"参数": 30, "原文": 60}))
+        out.append(
+            (
+                "参数台账",
+                ["参数", "原文取值", "换算", "文件", "原文", "登记轮次", "冲突问题"],
+                [
+                    [
+                        f.name,
+                        fx.label(f),
+                        fx.same_value(f) if fx.numeric(f) is not None else "",
+                        f.file,
+                        f.quote,
+                        f.round,
+                        conflicted.get(f.name, "以此为准（原文明确修改）" if f.override else ""),
+                    ]
+                    for f in sorted(ws.facts, key=lambda f: f.name)
+                ],
+                {"参数": 30, "原文": 60},
+            )
+        )
     if ar.compared:
         out.append(("与上一轮对比", ["方案", "修订", "对象", "名称", "上一轮应得", "本轮应得", "差额", "上一轮实发", "本轮实发"],
                     ar.diff_rows or [["（所有对象金额与上一轮相同）"]], {"对象": 16, "名称": 14}))

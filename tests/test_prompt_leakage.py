@@ -117,6 +117,9 @@ MODEL_FACING = [
     "bonus_agent/agent.py", "bonus_agent/auto.py", "bonus_agent/extract_rules.py", "bonus_agent/fixes.py",
     "bonus_agent/lint.py", "bonus_agent/failure.py", "bonus_core/dsl/validator.py",
     "bonus_core/dsl/functions.py", "bonus_core/dsl/scope.py", "bonus_core/engine/evaluator.py",
+    # 分阶段流程、工作区读取、恢复、原文坐标、独立复读和修复的反馈同样原样交给模型
+    "bonus_agent/tool_specs.py", "bonus_agent/context.py", "bonus_agent/workflow.py", "bonus_agent/recovery.py",
+    "bonus_agent/source_cells.py", "bonus_agent/reread.py", "bonus_agent/repair.py", "bonus_agent/facts.py",
 ]
 
 

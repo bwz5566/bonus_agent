@@ -1041,8 +1041,7 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             return back(cid, "还没有材料，请先上传")
         fix = rv.instruction(d / "out") if f.get("new") != "1" else ""
         try:
-            if fix:                   # 口径单上标了有误：作为修改要求交给智能体，改完重新试算
-                store.chat_add(cid, "user", u["display"], fix)
+            if fix:                   # 口径单上标了有误：作为修改要求交给智能体，改完重新试算（start 会把它记进对话，这里不再重复记）
                 runner.start(cid, u["display"], message=fix)
                 rv.mark_sent(d / "out")
                 return back(cid)
@@ -1093,16 +1092,18 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
 
     @app.post('/cases/{cid}/confirm-totals')
     async def confirm_totals(cid: str, request: Request, u: dict = Depends(user)):
-        need(u,'approver');d=case_dir(cid);idle(cid)
-        f=await posted(request,u)
+        need(u, 'approver')
+        d = case_dir(cid)
+        idle(cid)
+        f = await posted(request, u)
         try:
-            result=cs.confirm_totals(d/'out',str(f.get('scheme','')),str(f.get('digest','')),u['display'])
+            result = cs.confirm_totals(d / 'out', str(f.get('scheme', '')), str(f.get('digest', '')), u['display'])
         except cs.ConfirmError as err:
-            store.audit(cid,u['display'],'总额确认被拒绝',reason=str(err))
-            return back(cid,f'不能确认：{err}')
-        store.audit(cid,u['display'],'确认核算总额',scheme=result['scheme'],digest=result['digest'])
-        runner.start(cid,u['display'])
-        return back(cid,'总额已确认，继续计算人员金额')
+            store.audit(cid, u['display'], '总额确认被拒绝', reason=str(err))
+            return back(cid, f'不能确认：{err}')
+        store.audit(cid, u['display'], '确认核算总额', scheme=result['scheme'], digest=result['digest'])
+        runner.start(cid, u['display'])
+        return back(cid, '总额已确认，继续计算人员金额')
 
     @app.post("/cases/{cid}/confirm")
     async def confirm(cid: str, request: Request, u: dict = Depends(user)):
