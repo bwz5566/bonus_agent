@@ -1413,6 +1413,32 @@ class Workspace:
                             "直接写其中一个参数名；不该存在的那条用 remove_facts 删掉")
         return names[0]
 
+    # 档位格是上限写法（“<25%”“200万以下”）：它是这一档的上限，不是下界
+    _UPPER_BAND = re.compile(r"^\s*[<＜≤≦]|以下|以内|低于|不足|未满|不超过|不到")
+
+    def _band_cells(self, cells_from: dict) -> list:
+        """cells_from 那张表里登记过的档位格（第 1 行或第 1 列的格）：[(坐标, 原文, 投影后的下界, 是否上限写法)]。"""
+        out = []
+        for f in self.facts:
+            sc = f.source_cell or {}
+            if f.file != cells_from["file"] or f.page != cells_from["page"] or sc.get("table") != cells_from["table"]:
+                continue
+            if sc.get("row") != 1 and sc.get("column") != 1:
+                continue
+            text = (f.quote or "").splitlines()[-1] if f.quote else str(f.value)
+            lower = fx.numeric(fx.binding_candidate(f, ["tables/x/steps/1/0"]))
+            out.append((f"R{sc.get('row')}C{sc.get('column')}" + (f"L{sc['line']}" if sc.get("line", 1) != 1 else ""),
+                        text, lower, bool(self._UPPER_BAND.search(text)), f.name))
+        return sorted(out, key=lambda x: (x[0].split("C")[0], len(x[0]), x[0]))
+
+    def _band_hint(self, cells_from: dict) -> str:
+        cells = self._band_cells(cells_from)
+        if not cells:
+            return ""
+        return ("这张表登记过的档位格：" + "；".join(
+            f"{c}「{t}」" + ("是上限写法，不能当 lower" if up else f"→ 下界 {low}")
+            for c, t, low, up, _ in cells[:8]) + "。档位是“<A、A–B、…、X以上”时：第 1 档 lower 写 0，第 2 档写「A–B」那一格，依次类推")
+
     def _cells_with(self, f) -> list[str]:
         """PPT 表格里内容是 value、且所在行出现在 quote 里的格，写成可直接复制的 source_cell。"""
         from bonus_agent.source_cells import read_ppt_tables
@@ -1498,6 +1524,23 @@ class Workspace:
             table.update(mode=mode, lower_inclusive=lower_inclusive, below_first=below_first, steps=[])
             for i, row in enumerate(rows):
                 ref = row.get("lower")
+                if (cells_from and ref and not any(f.name == ref for f in self.facts)
+                        and re.fullmatch(r'[+-]?\d+(?:\.\d+)?%?', str(ref)) and not (i == 0 and str(ref) in {"0", "0.0"})):
+                    # 模型常直接写数（0.25）：这张表的档位格里恰好有一格的下界就是这个数，就用那一格（数仍来自原文）
+                    want = fx.number(str(ref))
+                    if want is None:
+                        try:
+                            want = Decimal(str(ref))
+                        except InvalidOperation:
+                            want = None
+                    hits = [c for c in self._band_cells(cells_from) if not c[3] and c[2] == want]
+                    if len(hits) == 1:
+                        ref = hits[0][4]
+                if cells_from and ref:
+                    band = next((c for c in self._band_cells(cells_from) if c[4] == ref), None)
+                    if band and band[3]:
+                        raise ToolError(f"parameter.ref：第 {i + 1} 档的 lower 用了 {band[0]}「{band[1]}」，这是上限写法"
+                                        f"（“<A”“A以下”指 A 以内都在这一档），不是这一档的下界。{self._band_hint(cells_from)}；本次未保存")
                 if ref and not any(f.name == ref for f in self.facts) and re.fullmatch(r'[+-]?\d+(?:\.\d+)?%?', str(ref)):
                     if i == 0 and str(ref) in {"0", "0.0"}:
                         ref = None  # the documented implicit structural origin, never a business threshold
@@ -1505,7 +1548,7 @@ class Workspace:
                         raise ToolError(f'parameter.ref：第 {i + 1} 档的 lower={ref!r} 是数字，不是参数名。'
                                         + ('有 cells_from 时，lower 直接写这一档档位所在单元格的坐标（如 R4C1）：'
                                            '档位格是“200-1000万”这样的区间时自动取下界，“5000万以上”取 5000万，'
-                                           '格子没登记会提示先登记哪一格。' if cells_from else
+                                           '格子没登记会提示先登记哪一格。' + self._band_hint(cells_from) + '。' if cells_from else
                                            'lower 写登记过的参数名（区间参数如“200-1000万”自动取下界），首档 0 可省略。'
                                            '边界还没登记就先登记原文。')
                                         + '本次未保存')

@@ -203,8 +203,10 @@ def test_tier_band_cells_register_and_compile_by_coordinates(tmp_path):
     msg = ws.compile_table("old", [{"value": "R4C3"}, {"lower": "R3C1", "value": "R3C3"}, {"lower": "R2C1", "value": "R2C3"}],
                            kind="tier", mode="excess", cells_from=cf)
     assert "10,000,000 至 50,000,000的部分按 0.115%" in msg
-    with pytest.raises(ToolError, match="R4C1"):
-        ws.compile_table("x", [{"value": "R4C2"}, {"lower": "10000000", "value": "R3C2"}], cells_from=cf)
+    # 直接写数、这张表的档位格里恰好一格的下界是它：按那一格编（数仍来自原文）
+    ws.compile_table("x", [{"value": "R4C2"}, {"lower": "10000000", "value": "R3C2"}], cells_from=cf)
+    with pytest.raises(ToolError, match="R4C1「1000万以下」，这是上限写法"):
+        ws.compile_table("x", [{"lower": "R4C1", "value": "R4C2"}, {"lower": "R3C1", "value": "R3C2"}], cells_from=cf)
     with pytest.raises(ToolError, match="没有登记。名字相近"):
         ws.compile_table("y", [{"key": "a", "value": "tier.pptx::P1.T1.R4.C2.L2"}], kind="lookup")
     with pytest.raises(ToolError, match=r"去掉 component，value 写「5000万」"):
@@ -263,15 +265,15 @@ def test_identical_resubmission_loop_is_not_turned_into_a_question_for_finance()
 
 
 def test_recompiling_a_table_drops_the_bindings_of_its_previous_version(tmp_path):
-    """实测首档 lower 先写档位格、再改成 0：旧绑定留在 steps/0/0 上，编译公式一直报“与原文不一致”。"""
+    """实测首档 lower 先写档位格、再改成 0：旧绑定留在 steps/0/0 上，编译公式一直报“与原文不一致”。这里去掉最后一档。"""
     ws, f = _tier_ppt(tmp_path)
     ws.record_parameter_cells(f, 1, 1, [{"row": r, "column": c} for c in (1, 3) for r in (2, 3, 4)], applies_to="北区")
     cf = {"file": f, "page": 1, "table": 1}
-    ws.compile_table("old", [{"lower": "R4C1", "value": "R4C3"}, {"lower": "R3C1", "value": "R3C3"},
+    ws.compile_table("old", [{"value": "R4C3"}, {"lower": "R3C1", "value": "R3C3"},
                              {"lower": "R2C1", "value": "R2C3"}], kind="tier", mode="excess", cells_from=cf)
-    first = next(x for x in ws.facts if x.name.endswith("R4.C1.L1"))
-    assert any(t.endswith("/tables/old/steps/0/0") for t in first.targets)
-    ws.compile_table("old", [{"value": "R4C3"}, {"lower": "R3C1", "value": "R3C3"}, {"lower": "R2C1", "value": "R2C3"}],
+    first = next(x for x in ws.facts if x.name.endswith("R2.C1.L1"))
+    assert any(t.endswith("/tables/old/steps/2/0") for t in first.targets)
+    ws.compile_table("old", [{"value": "R4C3"}, {"lower": "R3C1", "value": "R3C3"}],
                      kind="tier", mode="excess", cells_from=cf)
     assert not first.targets
     from bonus_agent import facts as fx
@@ -326,3 +328,41 @@ def test_stop_on_own_binding_gaps_does_not_ask_finance_how_the_rule_works():
            '已用 74 步，中途停下来反思、换做法 2 次仍没过去。')
     got = explain(err)
     assert "不需要你回答" in got["title"] and not got["ask"]
+
+
+def _rate_ppt(tmp_path):
+    """实测第 9 页：档位在第 1 行，首格是上限写法“<25% (含)”。"""
+    from pptx import Presentation
+    from pptx.util import Inches
+    from bonus_agent.auto import build_inventory
+    from bonus_agent.agent import Workspace
+    path = tmp_path / "rate.pptx"
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    t = slide.shapes.add_table(2, 6, Inches(0), Inches(0), Inches(9), Inches(2)).table
+    for r, row in enumerate([["", "<25% (含)", "25 – 50% (含)", "50-75% (含)", "75-100% ", "100% (含)+"],
+                             ["区域销售任务", "0.7", "0.8", "0.9", "1.0", "1.05"]]):
+        for c, text in enumerate(row):
+            t.cell(r, c).text = text
+    slide.shapes.add_textbox(Inches(0), Inches(3), Inches(7), Inches(1)).text_frame.text = "年度销售预算金额(当月)"
+    prs.save(path)
+    ws = Workspace(FakeLLM([]), build_inventory([path]))
+    ws.record_parameter_cells(path.name, 1, 1, [{"row": r, "column": c} for r in (1, 2) for c in range(2, 7)],
+                              applies_to="年度销售预算金额(当月)")
+    return ws, {"file": path.name, "page": 1, "table": 1}
+
+
+def test_band_header_with_an_upper_bound_first_cell_compiles_from_numbers_or_says_which_cell(tmp_path):
+    """实测第 5 轮：把“<25%”当首档下界（档位错位）或直接写 0.25（被拒），来回 5 次被判卡住。"""
+    ws, cf = _rate_ppt(tmp_path)
+    values = ["R2C2", "R2C3", "R2C4", "R2C5", "R2C6"]
+    with pytest.raises(ToolError, match=r"R1C2「<25% \(含\)」，这是上限写法") as e:
+        ws.compile_table("区域任务系数", [{"lower": "R1C2", "value": values[0]}] +
+                         [{"lower": f"R1C{c}", "value": v} for c, v in zip(range(3, 7), values[1:])], cells_from=cf)
+    assert "R1C3「25 – 50% (含)」→ 下界 0.25" in str(e.value)
+    ws.compile_table("区域任务系数", [{"lower": low, "value": v} for low, v in zip(["0", "0.25", "0.5", "0.75", "1.0"], values)],
+                     cells_from=cf)
+    steps = ws.drafts["默认" if "默认" in ws.drafts else next(iter(ws.drafts))]["tables"]["区域任务系数"]["steps"]
+    assert [Decimal(str(s[0])) for s in steps] == [Decimal(x) for x in ("0", "0.25", "0.5", "0.75", "1")]
+    band = next(f for f in ws.facts if f.name.endswith("R1.C3.L1"))
+    assert any(t.endswith("/steps/1/0") for t in band.targets)          # 数仍来自原文那一格，并建了绑定
