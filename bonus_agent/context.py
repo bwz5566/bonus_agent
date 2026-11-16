@@ -40,8 +40,28 @@ def guard_messages(messages, llm, *, output_tokens=8192, tools=None):
     return estimate
 
 
+# Each read_workspace call re-sends the whole prompt, so a page should carry as much as the runner's
+# result cap allows (agent.MAX_RESULT_CHARS = 6000, minus room for notes the runner appends).
+PAGE_CHARS = 5400
+FRAGMENT_CHARS = 3800     # raw JSON text; escaping inside the result makes it longer
+# Listing views of the ledger: enough to pick a name and see what it means. Full records (quote, source
+# coordinates, hashes) are ~4x larger and made a 135-fact ledger unreadable within the history budget.
+_BRIEF = {'facts': ('name', 'value', 'unit', 'page', 'context', 'meaning'),
+          'clauses': ('id', 'file', 'point', 'where')}
+
+
+def _brief(section, item):
+    out = {k: item[k] for k in _BRIEF[section] if item.get(k) not in (None, '', [])}
+    if section == 'facts':
+        if not str(item.get('name', '')).startswith(f"{item.get('file')}::"):
+            out['file'] = item.get('file')       # coordinate names already carry the file
+        if item.get('targets'):
+            out['bound'] = len(item['targets'])
+    return out
+
+
 def workspace_view(ws, section, scheme=None, offset=0, limit=20, name=None, query=None, file=None, page=None,
-                   detail_offset=None):
+                   detail_offset=None, detail=False):
     if type(offset) is not int or offset<0 or type(limit) is not int or (detail_offset is not None and
             (type(detail_offset) is not int or detail_offset<0)):
         from bonus_agent.workflow import fail
@@ -66,20 +86,25 @@ def workspace_view(ws, section, scheme=None, offset=0, limit=20, name=None, quer
     if query is not None:
         from bonus_agent.facts import norm
         items=[item for item in items if norm(query) in norm(json.dumps(item,ensure_ascii=False))]
-    args={k:v for k,v in dict(section=section,scheme=scheme,name=name,query=query,file=file,page=page).items() if v is not None}
+    brief=section in _BRIEF and name is None and not detail
+    if brief:items=[_brief(section,item) for item in items]   # filters above still search the full records
+    args={k:v for k,v in dict(section=section,scheme=scheme,name=name,query=query,file=file,page=page,
+                              detail=detail or None).items() if v is not None}
     result={'section':section,'total':len(items),'offset':offset,'requested_limit':requested_limit,
             'page_limit':limit,'items':[],'next_offset':None,'next_call':None}
+    if brief:
+        result['view']='brief：单条完整记录（原文、坐标）用 name 读取，或 detail=true'
     if requested_limit!=limit:result['notice']=f'请求条数{requested_limit}已安全调整为{limit}；按next_call继续读取'
     # Stay below the runner's character cap while preserving whole records and real offsets.
     for item in items[offset:offset+limit] if detail_offset is None else []:
         candidate={**result,'items':result['items']+[item]}
-        if len(json.dumps(candidate,ensure_ascii=False,default=str))>4500:break
+        if len(json.dumps(candidate,ensure_ascii=False,default=str))>PAGE_CHARS:break
         result['items'].append(item)
     if not result['items'] and offset<len(items):
         # A single large definition needs explicit fragments, not a silently cut JSON object.
         text=json.dumps(items[offset],ensure_ascii=False,default=str)
         start=detail_offset or 0
-        part=text[start:start+1200]
+        part=text[start:start+FRAGMENT_CHARS]
         end=start+len(part)
         result['item_fragment']={'format':'json','offset':start,'text':part,
                                  'next_detail_offset':end if end<len(text) else None}

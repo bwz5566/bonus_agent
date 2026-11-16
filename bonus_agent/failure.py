@@ -80,6 +80,9 @@ def _explain(err: str) -> dict:
     if m:
         return {"title": f"本轮用量达到上限（{int(m.group(2)):,} tokens），已停止，通常是材料太多或反复返工。",
                 "advice": f"{RETRY}；经常出现时请管理员调大上限或换更强的模型。", "where": ""}
+    if err.startswith("本轮没有进展"):
+        return {"title": "本轮步数用完了，而且整轮只在读取、没有任何登记或改动，已停下，没有自动接续。",
+                "advice": f"{SEND}，指出它该先做哪一步（如先登记哪份材料的参数、先定义哪张表）。", "where": ""}
     if "达到最大步数" in err:
         return {"title": "本轮步数用完了，还没做完。", "advice": f"{RETRY}。", "where": ""}
     low = err.lower()

@@ -68,6 +68,10 @@ QUERY_TOOLS = {"evaluate", "explain"}
 READ_TOOLS = {"read_document", "read_sheet", "view_image"}
 READ_WARN = 15                 # 连续这么多次只读材料、没有登记、定义或写规则：提醒先把读到的落下来
 READ_AGAIN = 10                # 之后每读这么多次再提醒一次（只提醒，不算卡住：材料多时开头确实要读很多）
+# 连续只读（含 read_workspace、查数）不写入：提醒 / 算卡住。正常读材料最长一段约 25 步；
+# 曾有案卷 read_workspace 从头翻参数台账连续 78～178 步，四轮烧掉约 1600 万 tokens 而没有一次写入
+QUIET_WARN = 25
+QUIET_STUCK = 40
 DEEP_LIMIT = 24                # 每一轮最多这么多步用深度思考（出错、卡住的那几步），防止一直思考把时间和 tokens 用完
 MAX_REFLECT = 2                # 卡住时先让智能体停下来反思、换做法接着做，最多这么多次；再卡住才停下，把原因报给财务
 KEEP_FULL_RESULTS = 6          # 整理历史时，最近几条工具结果保留全文
@@ -157,7 +161,7 @@ TOOLS: list[dict] = [
     {"name":"plan_calculation","description":"先盘点全部材料，声明核算目标、需要的输出和全部方案。files为文件名到rule/data/rule_and_data/reference/ignore的映射，不能漏文件。",
      "parameters":_obj({'summary':_S,'outputs':{'type':'array','items':_S},'files':{'type':'object','additionalProperties':_S},'schemes':{'type':'array','items':_S},'ignored':{'type':'array','items':_obj({'ref':_S,'reason':_S},['ref','reason'])}},['summary','outputs','files','schemes'])},
     {"name":"read_workspace","description":"分页检索facts/clauses/rules/variables/tables/mapping/basis。按name定位单个参数、条款、变量、表或数据集，scheme区分方案；大规则优先逐变量读取。",
-     "parameters":_obj({'section':_S,'scheme':_S,'name':_S,'query':{**_S,'description':'全文片段检索，可按参数名称片段查已有项'},'file':_S,'page':_I,'offset':{**_I,'minimum':0},'limit':{**_I,'minimum':1,'maximum':50,'description':'最多50条；同时按结果长度缩页，必须使用返回的next_call，不自行猜offset'},'detail_offset':{**_I,'minimum':0,'description':'单条过大时按next_call分片续读'}},['section'])},
+     "parameters":_obj({'section':_S,'scheme':_S,'name':_S,'query':{**_S,'description':'全文片段检索，可按参数名称片段查已有项'},'file':_S,'page':_I,'offset':{**_I,'minimum':0},'limit':{**_I,'minimum':1,'maximum':50,'description':'最多50条；同时按结果长度缩页，必须使用返回的next_call，不自行猜offset'},'detail_offset':{**_I,'minimum':0,'description':'单条过大时按next_call分片续读'},'detail':{'type':'boolean','description':'facts/clauses列表默认只给名称、取值、含义；true返回完整原文与坐标（条数少时用）'}},['section'])},
     {"name":"query_dataset","description":"独立统计一张已定义原表，使用DSL聚合表达式，如sum(amount, of: \"销售明细\")。无需allocation，不受其他表的建树错误影响；不用于证明正式金额正确。",
      "parameters":_obj({'dataset':_S,'expr':_S},['dataset','expr'])},
     {"name":"prepare_data","description":"检查全部已声明数据的转换、有效范围、身份、关联和期间，程序签发当前数据版本的通过回执。失败必须修正，不能直接试算。","parameters":_obj({})},
@@ -801,9 +805,9 @@ class Workspace:
 
     def read_workspace(self, section: str, scheme: str | None = None, offset: int = 0, limit: int = 20, name: str | None = None,
                        query: str | None = None, file: str | None = None, page: int | None = None,
-                       detail_offset: int | None = None):
+                       detail_offset: int | None = None, detail: bool = False):
         from bonus_agent.context import workspace_view
-        return workspace_view(self,section,scheme,offset,limit,name,query,file,page,detail_offset)
+        return workspace_view(self,section,scheme,offset,limit,name,query,file,page,detail_offset,bool(detail))
 
     def query_dataset(self, dataset: str, expr: str):
         try:return self._flow().query_dataset(dataset,expr)
@@ -4403,6 +4407,8 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
     reflected = 0
     idle = 0                           # 连续只查询、没有改动工作区的次数（参数每次不同，上面的重复检测发现不了）
     reads = 0                          # 连续只读材料（读表、读文档、看图）、没有落下任何东西的次数
+    rereads: dict[str, int] = {}       # 只读调用（不计 limit）自上次写入以来的次数；历史整理时不清空
+    quiet = 0                          # 连续成功的只读调用（含读工作区、查数），任何成功写入清零
     reached = ws.phase()               # 本轮到过的最远阶段：往前推进到新阶段时清空对话历史；改规则退回前面的阶段再回来不清
     reached_focus=ws._flow().stage() if ws.staged else None
     deep_why, deep_used = "", 0        # 下一步要深度思考的原因（空：普通模式）；本轮已用的深度思考步数
@@ -4753,6 +4759,32 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                     step.result = result
             elif c["name"] not in READ_ONLY and ok:
                 reads = 0
+            if c["name"] in READ_ONLY and ok:
+                # 历史整理会清掉 seen（较早的结果被省略，重读一次是合理的），所以上面的原样重复检测在整理后失效。
+                # 同一位置在两次写入之间读到第三次，就是读到后面、前面已被整理掉、又从头再翻：按卡住处理。
+                # limit 不同但位置相同算同一次读取（模型会把 50 改成 45 再翻一遍）
+                rsig = c["name"] + ":" + json.dumps({k: v for k, v in (args or {}).items() if k != "limit"},
+                                                    ensure_ascii=False, sort_keys=True, default=str)
+                rereads[rsig] = rereads.get(rsig, 0) + 1
+                quiet += 1
+                if rereads[rsig] >= MAX_STUCK:
+                    repeats = MAX_STUCK
+                    stuck = (f"同一内容（{c['name']} {rsig.split(':', 1)[1][:120]}）在没有任何改动的情况下读了 {rereads[rsig]} 次："
+                             "读到后面，前面读过的已被整理掉，又从头再读")
+                elif quiet >= QUIET_STUCK:
+                    repeats = MAX_STUCK
+                    stuck = f"连续 {quiet} 步只读取，没有登记、定义数据、写规则或提问，工作区没有进展"
+                elif rereads[rsig] == MAX_STUCK - 1 or quiet == QUIET_WARN:
+                    result += (f"\n注意：" + (f"这一页在没有任何改动的情况下已经读过 {rereads[rsig]} 次（较早的结果被整理掉了）。"
+                                             if rereads[rsig] == MAX_STUCK - 1 else f"已经连续 {quiet} 步只读取、没有任何写入。")
+                               + "不要从头通读：台账、条款列表默认是简表，按 name 或 query 只查这一步要用的几项，"
+                                 "查到的名字马上用于 compile_table / bind_facts / set_rules，或用 note 记下；"
+                                 "同一页再读一次、或再连续只读下去就算卡住。"
+                               + f"下一步（程序判断）：{ws.next_hint()}")
+                    step.result = result
+            elif c["name"] not in READ_ONLY and ok:
+                rereads.clear()
+                quiet = 0
             steps.append(step)
             if on_step:
                 on_step(len(steps), step)
@@ -4811,8 +4843,8 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             keep = history[at:]          # 刚完成的这一步（如试算结果和抽查）留着，接下来要看
             history.clear()
             history += [{"role": "user", "content": note}] + keep
-            repeats, last_write, stuck, idle = 0, None, "", 0
-            for d in (fails, fail_why, seen, undo, again):
+            repeats, last_write, stuck, idle, quiet = 0, None, "", 0, 0
+            for d in (fails, fail_why, seen, undo, again, rereads):
                 d.clear()
             same_block, prev_full, long_block, prev_block = 0, set(), 0, set()
             deep_why = ""
@@ -4836,8 +4868,8 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
             note = _reflection(ws, stuck, steps, reflected, reflect)
             history.clear()
             history.append({"role": "user", "content": note})
-            repeats, last_write, stuck, idle = 0, None, "", 0
-            for d in (fails, fail_why, seen, undo, again):
+            repeats, last_write, stuck, idle, quiet = 0, None, "", 0, 0
+            for d in (fails, fail_why, seen, undo, again, rereads):
                 d.clear()
             same_block, prev_full, long_block, prev_block = 0, set(), 0, set()
             steps.append(Step("（反思）", {}, note, True))
@@ -4850,6 +4882,9 @@ def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = No
                      + "。请把这条信息反馈给开发，或在对话里告诉智能体怎么处理")
             break
     else:
+        if not error and not any(st.ok and st.tool in WRITE_TOOLS for st in steps):
+            # 整轮只读、没有任何写入：自动接续只会把同样的读取再做一遍（不以“达到最大步数”开头，retryable 不接续）
+            error = f"本轮没有进展（只读取，没有任何写入），不自动接续；达到最大步数 {max_steps} 仍未完成"
         error = error or f"达到最大步数 {max_steps} 仍未完成"
 
     if message and not ws.changed and not fresh and not any((changes or {}).values()):
