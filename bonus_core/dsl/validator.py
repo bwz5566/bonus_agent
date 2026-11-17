@@ -207,6 +207,8 @@ def validate(rs: RuleSet) -> list[Issue]:
                     t = rs.tables.get(a0.id) if isinstance(a0, Name) else None
                     if t is None or t.kind != want:
                         issues.append(Issue.block("fn_table", f"{node.fn} 的第一个参数必须是{'阶梯表' if want == 'tier' else '查找表'}名", where))
+                    elif node.fn == 'tier' and getattr(t, 'purpose', '') == 'coefficient':
+                        issues.append(Issue.block('fn_table', '区间系数表使用tier_rate取系数，不能用tier把指标乘系数当作金额', where))
         unknown = names(ast) - known
         for n in unknown:
             hint = f"：{n} 是数据表名，对它的字段聚合，表名写在 of 里，如 sum(字段, of: \"{n}\")" if n in rs.datasets else ""

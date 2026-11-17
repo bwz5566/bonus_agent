@@ -100,7 +100,7 @@ WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", 
                "record_clauses", "cover_clauses",
                "answer_question", "update_dataset"}
 WRITE_TOOLS |= {'plan_calculation','prepare_data','compile_formulas','calculate_basis','review_basis'}
-WRITE_TOOLS |= {'plan_formula_tasks', 'check_formula_task'}
+WRITE_TOOLS |= {'plan_formula_tasks', 'check_formula_task', 'compile_coefficient_table'}
 RULE_SUFFIXES = {".docx", ".pptx", ".pdf", ".png", ".jpg", ".jpeg", ".txt", ".md"}   # 规则文档：要登记参数
 CHAT_SOURCE = "财务对话"       # 财务在对话里贴的规则原文、口径说明：和材料一样可以引用核对
 ANSWER_NOTE = "回答财务"       # 财务的说明里带了提问：智能体把回答记在这条笔记里，网页放在本轮回复的开头（没算完也显示）
@@ -1122,7 +1122,7 @@ class Workspace:
                 continue
             prior=[f for f in self.facts if f.file==file and f.page==page and f.source_cell and
                 all(f.source_cell.get(k,1)==record['locator'].get(k,1) for k in ('table','row','column','line')) and
-                f.source_hash==source_hash and ('unit' not in cell or f.unit==cell['unit']) and fx.norm(f.value)==fx.norm(record['value']) and
+                f.source_hash==source_hash and f.unit==cell.get('unit') and fx.norm(f.value)==fx.norm(record['value']) and
                 not fx.check_fact(f,self._corpus()) and not self._wrong_page(f)]
             if prior:
                 fact=prior[0]
@@ -1525,6 +1525,14 @@ class Workspace:
                 f"重新登记，value 只写数「{(re.search(r'[0-9.]+[%‰万亿元]*', f.value) or [''])[0] or '…'}」；"
                 "如果原文就是文字口径，就不能放进阶梯或查找表")
 
+    def compile_coefficient_table(self, name: str, rows: list[dict], cells_from: dict,
+                                  applies_to: str, scheme: str | None = None) -> dict:
+        from bonus_agent.coefficient import compile_coefficients
+        try:
+            return compile_coefficients(self, name, rows, cells_from, applies_to, scheme)
+        except (ValueError, TypeError, KeyError, IndexError) as exc:
+            raise ToolError(str(exc)) from None
+
     def compile_table(self, name: str, rows: list[dict], scheme: str | None = None,
                       kind: str = "tier", mode: str | None = None, applies_when: str = "",
                       lower_inclusive: bool = True, below_first: str = "zero", cells_from: dict | None = None,
@@ -1534,7 +1542,14 @@ class Workspace:
             raise ToolError("compile_table 需要非空 rows，kind 为 tier 或 lookup")
         if algorithm_basis:
             from bonus_agent.semantics import mode_basis
-            expected = mode_basis(self, algorithm_basis)
+            try:
+                expected = mode_basis(self, algorithm_basis)
+            except ToolError as exc:
+                if str(exc).startswith('algorithm.source') and mode in (None, 'whole') and cells_from:
+                    from bonus_agent.coefficient import suggestion
+                    hint = suggestion(self, name, rows, cells_from, self._scheme(scheme, for_write=True))
+                    raise ToolError(str(exc) + hint) from None
+                raise
             if mode is not None and mode != expected:
                 raise ToolError(f'algorithm.mode：所选{mode}与引用原文要求{expected}不一致；本次未保存。按原文重编')
             mode = expected
@@ -3289,7 +3304,7 @@ class Workspace:
         if holes:
             raise ToolError("；".join(
                 f"分档表 {n} 有 {k} 个传入值不在任何一档里（第一档从 {lint._fmt(lo)} 起"
-                f"{'、不含下限' if not rs.tables[n].lower_inclusive else ''}，最小传入值 {lint._fmt(low)}），比例按 0 算了。"
+                f"{'、不含下限' if not rs.tables[n].includes_lower(0) else ''}，最小传入值 {lint._fmt(low)}），比例按 0 算了。"
                 f"按材料补上这一段：材料规定这些值按第一档算，就在表上写 \"below_first\": \"first\"；规定不发就加一档比例 0"
                 for n, lo, k, low in holes))
 
@@ -5663,6 +5678,10 @@ def _deep_reason(turn: list[Step], skipped: int, ws: Workspace, fails: dict[str,
             continue
         if st.tool in ('read_workspace','read_parameter_table','read_document','read_sheet'):
             continue  # Read-interface errors have native feedback; Pro cannot repair pagination or a wrong file type.
+        if not st.ok and st.tool == 'compile_table' and 'next_call=' in st.result:
+            continue  # A source-coordinate coefficient repair is already available; no paid guess is needed.
+        if not st.ok and st.tool == 'compile_coefficient_table':
+            continue  # Ambiguous source boundaries need evidence; the compiler provides the exact counterexample.
         if not st.ok and 'parameter.unit' in st.result:
             continue  # Missing source units need evidence/clarification, not another paid guess.
         if st.result.startswith('草稿已保存，校验未通过'):

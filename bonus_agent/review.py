@@ -170,19 +170,23 @@ def _call(c: Call, nm: Names) -> str:
 def tier_text(t: dict) -> str:
     steps = [(Decimal(str(lo)), Decimal(str(r))) for lo, r in t.get("steps") or []]
     inc = t.get("lower_inclusive", True)
+    edges = t.get('step_inclusive') or [inc] * len(steps)
     parts = []
     if steps and t.get("below_first") == "first":
         parts.append(f"低于 {_num(steps[0][0])}：按第一档比例照算")
     elif steps and steps[0][0] > 0:
         parts.append(f"{'不到' if inc else '不超过'} {_num(steps[0][0])}：0")
     for i, (lo, r) in enumerate(steps):
+        inc = edges[i]
         hi = steps[i + 1][0] if i + 1 < len(steps) else None
         if hi is None:
             rng = f"{'达到' if inc else '超过'} {_num(lo)}"
         else:
-            rng = f"{_num(lo)}（{'含' if inc else '不含'}）至 {_num(hi)}（{'不含' if inc else '含'}）"
+            rng = f"{_num(lo)}（{'含' if inc else '不含'}）至 {_num(hi)}（{'不含' if edges[i+1] else '含'}）"
         parts.append(f"{rng}：{_num(r)}")
     how = "超额累进：各段分别按本段比例计算后相加" if t.get("mode") == "excess" else "全额：整个数按所在档计算"
+    if t.get('purpose') == 'coefficient':
+        how = '区间取系数：只返回所在档系数，低端无界用第一档覆盖，不使用人造负下界'
     return f"{how}。" + "；".join(parts)
 
 

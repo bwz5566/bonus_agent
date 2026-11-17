@@ -29,7 +29,7 @@ _CORE = Path(__file__).resolve().parent.parent / 'bonus_core'
 _EXECUTION_PROFILE = hashlib.sha256(
     b''.join(p.read_bytes() for p in sorted(_CORE.rglob('*.py'))) + Path(__file__).read_bytes()
     + b''.join(Path(__file__).with_name(n).read_bytes() for n in
-               ('lint.py', 'facts.py', 'clauses.py', 'source_cells.py', 'agent.py', 'context.py', 'recovery.py', 'construction.py', 'semantics.py', 'progress.py'))
+               ('lint.py', 'facts.py', 'clauses.py', 'source_cells.py', 'coefficient.py', 'agent.py', 'context.py', 'recovery.py', 'construction.py', 'semantics.py', 'progress.py'))
 ).hexdigest()
 
 
