@@ -101,13 +101,13 @@ def review_signature(ws, text):
     return signature(text)
 
 
-def _ask(ws, msgs: list[dict]) -> str:
+def _ask(ws, msgs: list[dict], *, max_tokens: int = 8192) -> str:
     """交叉验证：配置了另一个模型就让它来复读、写独立算式（和主流程的模型错法不同，验得更真）；
     它调用失败时退回主模型，并记下来，不让整轮失败。"""
     other = getattr(ws.llm, "checker_llm", None)
     if other is not None and not getattr(ws, "checker_down", ""):
         try:
-            return other.chat(msgs, json_out=True, temperature=0, max_tokens=8192, think=True)
+            return other.chat(msgs, json_out=True, temperature=0, max_tokens=max_tokens, think=True)
         except LLMError as e:
             ws.checker_down = (f"交叉验证模型 {other.name} 调用失败（{str(e)[:120]}）" +
                                ('，关键复核阻断' if getattr(ws.llm, 'checker_required', False) else f'，改用主模型 {ws.llm.name} 验证'))
@@ -116,7 +116,7 @@ def _ask(ws, msgs: list[dict]) -> str:
             raise LLMError('关键复核模型未配置；独立复核不能标记通过')
         raise LLMError(f'关键复核模型 {other.name} 不可用；本轮不降级为主模型自验')
     think = not bool(getattr(ws, 'checker_down', '') and getattr(ws.llm, 'think_llm', None))
-    return ws.llm.chat(msgs, json_out=True, temperature=0, max_tokens=8192, think=think)
+    return ws.llm.chat(msgs, json_out=True, temperature=0, max_tokens=max_tokens, think=think)
 
 
 def run(ws) -> dict:

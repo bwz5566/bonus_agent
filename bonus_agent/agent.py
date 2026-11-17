@@ -101,6 +101,7 @@ WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", 
                "answer_question", "update_dataset"}
 WRITE_TOOLS |= {'plan_calculation','prepare_data','compile_formulas','calculate_basis','review_basis'}
 WRITE_TOOLS |= {'plan_formula_tasks', 'check_formula_task'}
+WRITE_TOOLS |= {'request_module_repair','finish_module_repair','patch_rule_component'}
 RULE_SUFFIXES = {".docx", ".pptx", ".pdf", ".png", ".jpg", ".jpeg", ".txt", ".md"}   # 规则文档：要登记参数
 CHAT_SOURCE = "财务对话"       # 财务在对话里贴的规则原文、口径说明：和材料一样可以引用核对
 ANSWER_NOTE = "回答财务"       # 财务的说明里带了提问：智能体把回答记在这条笔记里，网页放在本轮回复的开头（没算完也显示）
@@ -603,6 +604,18 @@ class Workspace:
     def check_formula_task(self, task: str):
         from bonus_agent.construction import TaskBoard
         return TaskBoard(self).check(task)
+
+    def request_module_repair(self, kind: str, reason: str, task: str | None = None):
+        from bonus_agent.team_support import request_repair
+        return request_repair(self,kind,reason,task)
+
+    def finish_module_repair(self, repair: str):
+        from bonus_agent.team_support import finish_repair
+        return finish_repair(self,repair)
+
+    def patch_rule_component(self, scheme: str, path: str, value, bindings: list[dict] | None = None):
+        from bonus_agent.team_support import patch_component
+        return patch_component(self,scheme,path,value,bindings)
 
     def calculate_basis(self, scheme: str | None = None):
         try:
@@ -4694,7 +4707,8 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         t_model, u_in, u_out = time.time(), llm.usage.prompt_tokens, llm.usage.completion_tokens
         flow=ws._flow() if ws.staged else None
         stage=flow.stage()[0] if flow else None
-        available_tools=[t for t in TOOLS if flow is None or flow.allowed(t['name'],stage)]
+        available_tools=[t for t in TOOLS if (flow is None or flow.allowed(t['name'],stage)) and
+                         (team or t['name'] not in {'request_module_repair','finish_module_repair','patch_rule_component'})]
         if mode == "json":
             msgs = [{"role": "system", "content": sys + JSON_PROTOCOL + json.dumps(available_tools, ensure_ascii=False)}] + body + tail
             try:
@@ -4923,10 +4937,15 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                         request=dict(c.get('_request', llm.last_call)), agent=c.get('_owner', ''))
             if team:
                 team.observe(c, result, ok)
+                if c.get('_deferred'):
+                    steps.append(step)
+                    if on_step:on_step(len(steps),step)
+                    history.append({'role':'tool','tool_call_id':c['id'],'content':result})
+                    continue  # Scheduling invalidation is neither a write nor a repair failure.
             failed_validation = ok and isinstance(value, dict) and value.get('status') == 'FAIL'
             # 工具名不存在是调用协议的错，与案卷无关：本轮的卡住检测照常计数，但不写进跨轮的纠错记录，
             # 否则下一轮一开始就被“同一问题累计失败”拦停，重新运行也没用
-            if (not ok or failed_validation) and not saved_draft and c['name'] in handlers:
+            if (not ok or failed_validation) and not saved_draft and c['name'] in handlers and not (team and c.get('_routed')):
                 recovery.failure(c['name'], step.args, result, waiting=bool(ws.pending))
             if len(steps) == turn_steps:     # 本次回复的第一个调用：记上模型用时和 tokens
                 step.model_secs, (step.tokens_in, step.tokens_out) = round(model_secs, 2), model_tokens

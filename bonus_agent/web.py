@@ -895,7 +895,7 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         if flow.get('execution_mode') == 'multi_agent':
             team_state = flow.get('team', {})
             labels = {'READY':'待执行','RUNNING':'执行中','VALIDATING':'校验中','PASSED':'局部检查通过',
-                      'BLOCKED':'已阻塞','STALE':'已过期','PENDING':'待修复'}
+                      'BLOCKED':'已阻塞','STALE':'已过期，等待重排','PENDING':'待修复','WAITING':'等待前置修复'}
             rows = ''.join(f'<tr><td>{e(name)}</td><td>{e(labels.get(t.get("status"), t.get("status", "")))}</td>'
                            f'<td>{e(t.get("problem", t.get("last_result", ""))[:600])}</td></tr>'
                            for name,t in team_state.get('tasks',{}).items())

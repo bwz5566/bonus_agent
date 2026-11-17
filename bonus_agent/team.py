@@ -17,7 +17,7 @@ READS = {'read_document', 'read_sheet', 'read_parameter_table', 'read_workspace'
 EVIDENCE = {'record_facts', 'record_parameter_cells', 'record_clauses', 'cover_clauses',
             'bind_facts', 'validate_parameters', 'remove_facts', 'answer_question', 'ask_question', 'note'}
 DATA = {'define_dataset', 'update_dataset', 'remove_dataset', 'set_rules', 'prepare_data'}
-FORMULA = {'set_rules', 'compile_table', 'bind_facts', 'check_formula_task'}
+FORMULA = {'set_rules', 'compile_table', 'bind_facts', 'check_formula_task','patch_rule_component'}
 
 
 class Meter:
@@ -52,6 +52,10 @@ class Meter:
         local.think_llm = None
         local.usage = Usage()
         output = kwargs.get('max_tokens', 8192)
+        if kwargs.get('think') and getattr(local,'think_body',None):
+            output=max(output,local.think_max_tokens)
+        if getattr(local,'_max_output_tokens',None):output=min(output,int(local._max_output_tokens))
+        kwargs['max_tokens']=output
         tools = kwargs.get('tools')
         estimate = guard_messages(messages, local, output_tokens=output, tools=tools)
         reserve = estimate + output
@@ -113,6 +117,7 @@ class TeamSession:
     def __init__(self, ws, maximum, stop=None):
         self.ws = ws
         self.state = ws.workflow.setdefault('team', {'tasks': {}, 'histories': {}, 'meter': {}})
+        for key in ('tasks','histories','meter'):self.state.setdefault(key,{})
         self.meter = Meter(self.state['meter'], ws.llm.usage, maximum, stop)
         self.primary = ws.llm
         ws.llm = BudgetModel(ws.llm, self.meter)
@@ -122,6 +127,8 @@ class TeamSession:
 
     def owners(self):
         from bonus_agent.construction import TaskBoard
+        pending=next((r for r in reversed(list(self.state.get('repairs',{}).values())) if r['status']=='PENDING'),None)
+        if pending:return [('repair:'+pending['id'],None)]
         stage = self.ws._flow().stage()[0]
         board = TaskBoard(self.ws)
         if stage == 3:
@@ -138,21 +145,24 @@ class TeamSession:
         if spec:
             return fingerprint({'component':TaskBoard(self.ws).statuses()[spec['id']]['version'],
                 'financial_context':self.ws.said,
-                'answers':[(q.id,q.answer,q.withdrawn) for q in self.ws.questions],
-                'facts':[f.model_dump(mode='json',exclude={'targets'}) for f in self.ws.facts],
-                'clauses':[c.model_dump(mode='json',exclude={'where','checked'}) for c in self.ws.clauses]})
+                'answers':[(q.id,q.answer,q.withdrawn) for q in self.ws.questions]})
         return self.ws._flow().version()
 
     def tools(self, definitions, spec, owner):
         from bonus_agent.agent import READ_ONLY
+        common={'request_module_repair'}
+        if owner.startswith('repair:'):
+            owner=self.state['repairs'][owner.split(':',1)[1]]['kind']
+            common.add('finish_module_repair')
         if spec:
-            return [t for t in definitions if t['name'] in READ_ONLY | FORMULA | {'ask_question', 'note'}]
+            return [t for t in definitions if t['name'] in READ_ONLY | FORMULA | common | {'ask_question', 'note'}]
         allowed = {'rules': EVIDENCE, 'data': DATA | EVIDENCE,
                    'basis': {'calculate_basis', 'ask_question', 'note'},
                    'review': {'review_basis', 'ask_question', 'note'},
                    'allocation': {'trial_run', 'ask_question', 'note'}}.get(owner)
         if allowed is not None:
-            return [t for t in definitions if t['name'] in READ_ONLY | allowed]
+            return [t for t in definitions if t['name'] in READ_ONLY | allowed | common |
+                    ({'patch_rule_component'} if owner=='data' else set())]
         return definitions
 
     def propose(self, system, task, definitions):
@@ -163,18 +173,27 @@ class TeamSession:
         owners = self.owners()
         stage, scheme = self.ws._flow().stage()
         program_tool = {4:'calculate_basis', 5:'review_basis', 7:'trial_run'}.get(stage)
+        if owners[0][0].startswith('repair:'):program_tool=None
+        if owners[0][0].startswith('repair:'):program_tool=None
         # Capture all immutable packets before worker threads start.
         packets = []
         for owner, spec in owners:
             version = self.version(spec)
             record = self.state['tasks'].setdefault(owner, {'attempts': {}, 'status': 'READY'})
             if record.get('version') != version:
+                if record.get('problem'):
+                    record['previous_problem']={'version':record.get('version'),'problem':record.pop('problem')}
+                record.pop('diagnosis_pending',None)
                 record.update(version=version, status='READY')
             if record['status'] == 'BLOCKED':
                 if record.pop('diagnosis_pending', False) and getattr(self.primary, 'think_llm', None) is not None:
                     from bonus_agent.recovery import local_advice
-                    record['diagnosis'] = local_advice(BudgetModel(self.primary.think_llm, self.meter),
-                        record.get('problem', ''), [], self.ws.facts, self.ws.next_hint())
+                    try:
+                        record['diagnosis'] = local_advice(BudgetModel(self.primary.think_llm, self.meter),
+                            record.get('problem', ''), [], self.ws.facts, self.ws.next_hint())
+                    except (LLMError,ValueError) as exc:
+                        record['diagnosis_error']=str(exc)
+                    self.checkpoint()
                 raise LLMError('team.blocked：' + owner + '；' + record.get('problem', ''))
             history = self.state['histories'].setdefault(owner, [])
             # Completed action/result pairs only; no other agent's reasoning is transferred.
@@ -182,20 +201,39 @@ class TeamSession:
                 del history[:2]
             packet = {'role': owner, 'owned_target': spec, 'state': copy.deepcopy(card),
                       'instruction': task, 'version': version}
+            if owner.startswith('repair:'):
+                packet['repair']=copy.deepcopy(self.state['repairs'][owner.split(':',1)[1]])
             if spec:
                 packet['state']['workflow']['construction']['active'] = spec
                 packet['state'].pop('current_task_evidence', None)
                 packet['state']['evidence'].pop('uncovered', None)
             messages = [{'role': 'system', 'content': system + '\n你是受限模块Agent。只处理owned_target；'
                           '依赖不满足就反馈，不猜测规则，不直接口算金额。每次调用1至4个允许的工具；按依赖顺序提交。'
-                         '任务局部通过不等于整案正确。需要变更公共口径时ask_question，不修改其他目标。'},
+                          '任务局部通过不等于整案正确。证据、映射或组件缺失用request_module_repair内部退回；'
+                          '只有原文政策有歧义才ask_question。大分配、报表用patch_rule_component分块写入，不重抄整根。'},
                         {'role': 'user', 'content': json.dumps(packet, ensure_ascii=False)}] + copy.deepcopy(history)
             current_hint = (f'当前任务{spec["id"]}，只处理{spec["scheme"]}::{spec["target"]}，绑定证据后check_formula_task；不修改其他目标。'
                             if spec else self.ws._flow().hint())
+            if owner.startswith('repair:'):
+                rec=packet['repair']
+                current_hint=f'内部修复{rec["id"]}：{rec["reason"]}；有实质修改后finish_module_repair(repair="{rec["id"]}")，返回原任务重新校验。'
+            if owner.startswith('repair:'):
+                request=packet['repair']
+                current_hint=f'内部修复{request["id"]}：{request["reason"]}。检查原文并修复后finish_module_repair(repair="{request["id"]}")返回原任务；笔记不是修复完成证明。'
+            if owner.startswith('repair:'):
+                current_hint='修复转派：'+packet['repair']['reason']+'；完成实质修复后finish_module_repair(repair="'+packet['repair']['id']+'")返回原任务重新校验。'
             messages.append({'role':'user', 'content':'以当前程序状态为准继续，不要因上一工具成功就结束。当前下一步：'
                              + current_hint + '\n优先补程序列出的缺失材料；已有登记先查索引，不从头遍历所有已读材料。'
                              '\n只处理本角色允许范围；没有可执行动作时用note或ask_question说明具体阻塞，不以纯文本代替工具。'})
             packets.append((owner, spec, version, messages, self.tools(definitions, spec, owner)))
+
+        if stage==2 and not self.ws.datasets and owners[0][0]=='data':
+            owner,spec,version,_,_=packets[0]
+            if self.state.get('data_manifest_version')!=version:
+                self.serial+=1
+                self.state['data_manifest_version']=version
+                return {'content':'','tool_calls':[{'id':f'team_inputs_{self.serial}','name':'list_files','arguments':'{}',
+                    '_owner':owner,'_spec':None,'_version':version}]}
 
         if program_tool:
             owner, spec, version, _, _ = packets[0]
@@ -294,12 +332,39 @@ class TeamSession:
         expected = self.batch_versions.get(call.get('_batch'), call['_version'])
         if expected != self.version(spec):
             raise ToolError('team.stale：输入或依赖已变化，拒绝提交旧候选')
+        owner=call['_owner']
+        if owner.startswith('repair:'):
+            repair_id=owner.split(':',1)[1]
+            if call['name']=='finish_module_repair' and args.get('repair')!=repair_id:
+                raise ToolError('team.permission：只能返回自己的转派')
+            if call['name']=='request_module_repair':
+                ancestor=self.state['repairs'][repair_id]
+                visited=set()
+                while ancestor:
+                    if ancestor['kind']==args.get('kind'):
+                        raise ToolError('repair.cycle：同一修复链不能返回已访问角色；保留当前问题继续定位')
+                    visited.add(ancestor['id'])
+                    parent=ancestor.get('parent')
+                    ancestor=self.state['repairs'].get(parent) if parent and parent not in visited else None
+            owner=self.state['repairs'][repair_id]['kind']
+            if call['name']=='request_module_repair':
+                ancestor=repair_id
+                while ancestor:
+                    rec=self.state['repairs'][ancestor]
+                    if rec['kind']==args.get('kind'):raise ToolError('repair.cycle：转派链不可回到已在等待的角色')
+                    ancestor=rec.get('parent')
+        if call['name']=='request_module_repair' and spec and args.get('task') not in (None,spec['id']):
+            raise ToolError('team.permission：只能为当前任务请求修复')
         if not spec:
-            if call['_owner'] == 'data' and call['name'] == 'set_rules' and set(args) - {'scheme','allocation','patches','bindings'}:
+            if owner == 'data' and call['name'] == 'set_rules' and set(args) - {'scheme','allocation','patches','bindings'}:
                 raise ToolError('team.permission：数据角色只能声明实体结构和数据修补，不修改金额公式')
+            if owner=='data' and call['name']=='patch_rule_component' and target_parts(args.get('path',''))[:1]!=['allocation']:
+                raise ToolError('team.permission：数据角色只能分块声明allocation实体结构')
             return
         name = call['name']
         parts = target_parts(spec['target'])
+        if name=='patch_rule_component' and (args.get('scheme')!=spec['scheme'] or target_parts(args.get('path',''))[:len(parts)]!=parts):
+            raise ToolError('team.permission：分块路径超出任务目标')
         if name == 'check_formula_task' and args.get('task') != spec['id']:
             raise ToolError('team.permission：只能检查自己的任务')
         if name in {'set_rules', 'compile_table'}:
@@ -326,7 +391,25 @@ class TeamSession:
     def execute(self, call, args):
         """Validate on a private workspace; exceptions never publish partial changes."""
         self.meter.check()
-        self.authorize(call, args)
+        from bonus_agent.agent import ToolError
+        if call['name']=='finish' and any(r.get('deferred') for r in self.state.get('requirements',{}).values()):
+            if self.state.get('final_coverage_version')!=self.ws.validation_fingerprint():
+                raise ToolError('coverage.final：人员、实发或抵扣条款须先完成当前版本review_calculation全量复核，再finish')
+        try:
+            self.authorize(call, args)
+        except ToolError as exc:
+            if not str(exc).startswith('team.stale'):raise
+            rec=self.state['tasks'].setdefault(call['_owner'],{'attempts':{}})
+            rec['reschedules']=rec.get('reschedules',0)+1
+            if rec['reschedules']>3:raise ToolError('team.contention：连续候选过期，暂停检查依赖；未计业务修复次数')
+            call['_deferred']=True
+            return {'status':'STALE','next':'已丢弃候选；按当前输入和依赖重新调度，不计算金额、不累计业务纠错失败'}
+        if call['name']=='request_module_repair' and call.get('_spec'):
+            args={**args,'task':call['_spec']['id']}
+        if call['name']=='request_module_repair' and call['_owner'].startswith('repair:'):
+            args={**args,'task':self.state['repairs'][call['_owner'].split(':',1)[1]]['task']}
+        if call['name']=='request_module_repair' and call['_owner'].startswith('repair:'):
+            args={**args,'task':self.state['repairs'][call['_owner'].split(':',1)[1]]['task']}
         # Inventory and caches must be private as well; LLM budget remains shared.
         clone = copy.deepcopy(self.ws, {id(self.ws.llm): self.ws.llm})
         from bonus_agent.agent import ToolError
@@ -341,12 +424,21 @@ class TeamSession:
                     'issues':copy.deepcopy(clone._fact_rejections), 'candidate_result':value,
                     'notice':'本批未提交任何修改；candidate_result仅为隔离草稿反馈，其登记数量不是实际已保存数量。修正拒绝项后重新提交整批。'}
         self.authorize(call, args)
+        if call['name']=='request_module_repair' and call['_owner'].startswith('repair:'):
+            value['repair']['parent']=call['_owner'].split(':',1)[1]
         # Helper model calls updated the live ledger while this draft was private.
         # Never replace their usage with the pre-call copy in the draft.
-        clone.workflow['team'] = self.state
+        live_meter=self.state['meter']
+        if call['name']=='review_calculation' and isinstance(value,dict) and value.get('status')=='PASS':
+            checks=value.get('validation',{}).get('checks',[])
+            if any(x.get('id')=='independent.full' and x.get('status')=='PASS' for x in checks):
+                clone.workflow['team']['final_coverage_version']=clone.validation_fingerprint()
+        # Program-owned repair queue mutations belong to the candidate; model-call usage belongs to live state.
+        clone.workflow['team']['meter'] = live_meter
         self.ws.__dict__.update(clone.__dict__)
         self.state = self.ws.workflow['team']
         self.meter.state = self.state['meter']
+        self.state['tasks'].setdefault(call['_owner'],{'attempts':{}})['reschedules']=0
         if call.get('_batch') in self.batch_versions:
             self.batch_versions[call['_batch']] = self.version(spec=call.get('_spec'))
         return value
@@ -360,10 +452,28 @@ class TeamSession:
         # cannot inherit missing reasoning_content or dangling tool_call_ids.
         history.extend([{'role': 'user', 'content': '程序记录的上一候选动作：' + json.dumps({'tool':call['name'], 'args':call['arguments']}, ensure_ascii=False)},
                         {'role': 'user', 'content': result}])
+        if call.get('_deferred'):
+            record['status']='STALE'
+            self.checkpoint()
+            return
         record.update(status='READY' if ok else 'PENDING', last_tool=call['name'], last_result=result[:1200])
+        if ok and call['name']=='request_module_repair':record['status']='WAITING'
         if ok and call['name'] == 'check_formula_task':
             record['status'] = 'PASSED'
         if not ok:
+            route=('rules' if any(s in result for s in ('construction.constant','source_hash','原文版本变化','需要重新登记','bind_facts 需要已登记')) else
+                   'data' if any(s in result for s in ('parent_unknown','link_unmatched','关联字段没有父实体','coverage.grain')) else
+                   'coordinator' if any(s in result for s in ('逐对象奖金池或对象集合不一致','各类汇总金额不一致','逐对象明细金额或覆盖集合不一致')) else None)
+            if route and not owner.startswith('repair:'):
+                from bonus_agent.team_support import request_repair
+                try:
+                    request_repair(self.ws,route,result[:2000],call['_spec']['id'] if call.get('_spec') else None)
+                    call['_routed']=True
+                    record.update(status='WAITING',problem='已自动退回'+route+'角色修复')
+                    self.checkpoint()
+                    return
+                except Exception as exc:
+                    record['transfer_error']=str(exc)
             key = fingerprint([call['_version'], call['name'], result[:1000]])
             record['attempts'][key] = record['attempts'].get(key, 0) + 1
             if record['attempts'][key] >= 2:

@@ -194,6 +194,10 @@ def workspace_view(
                               if isinstance(entry, list) else [{'name': tool, 'field': field, 'value': entry}])
             else:
                 items += [{'name': tool, 'index': i, 'value': item} for i, item in enumerate(value)]
+    elif section == 'review':
+        items=[{'scheme':s,'report':v.get('report'),'independent_reference':v.get('spec'),
+                'notice':'独立基线供定位反例；修改生产规则不会覆盖基线，仍须重新核验。'}
+               for s,v in ws.workflow.get('references',{}).items() if scheme is None or s==scheme]
     elif section == 'construction':
         from bonus_agent.construction import TaskBoard
         board = TaskBoard(ws)
@@ -203,7 +207,7 @@ def workspace_view(
     else:
         from bonus_agent.workflow import fail
 
-        fail('section须为facts/clauses/rules/variables/tables/mapping/basis/checks/tool_results/construction')
+        fail('section须为facts/clauses/rules/variables/tables/mapping/basis/checks/tool_results/construction/review')
     if name is not None and section not in ('variables', 'tables'):
         items = [
             item

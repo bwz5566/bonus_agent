@@ -20,6 +20,12 @@ FIELD_SCHEMA = _obj({"column": {**_S, "description": "Excel 表头原文"},
                      "desc": _S}, ["column", "type"])
 
 TOOLS: list[dict] = [
+    {'name':'request_module_repair','description':'内部修复转派：缺证据交rules，数据关联交data，缺组件或计划交coordinator；自动保存原任务，修复后返回，不向财务索要程序内部操作。',
+     'parameters':_obj({'kind':{'type':'string','enum':['rules','data','coordinator']},'reason':_S,'task':_S},['kind','reason'])},
+    {'name':'finish_module_repair','description':'修复角色提交返回请求；程序确认输入有实质变化后返回原任务重新校验，不授予金额通过。',
+     'parameters':_obj({'repair':_S},['repair'])},
+    {'name':'patch_rule_component','description':'大组件分块构建：只提交一个JSON子路径和值，如/allocation/0、/report/details/0、/report/people。程序合并到现有草稿并校验，避免重抄整份分配或报表。父列表项须先建立。',
+     'parameters':_obj({'scheme':_S,'path':_S,'value':{},'bindings':{'type':'array','items':{'type':'object'}}},['scheme','path','value'])},
     {"name": "list_files", "description": "列出本批次所有文件；Excel 列出每个工作表及自动识别的表头。",
      "parameters": _obj({})},
     {"name": "read_document", "description": "读取 Word / PPT / 图片文件的文字和表格（图片显示为占位符，用 view_image 查看）。",
@@ -49,7 +55,7 @@ TOOLS: list[dict] = [
      "parameters":_obj({})},
     {"name":"plan_calculation","description":"先盘点全部材料，声明核算目标、需要的输出和全部方案。files为文件名到rule/data/rule_and_data/reference/ignore的映射，不能漏文件。",
      "parameters":_obj({'summary':_S,'outputs':{'type':'array','items':_S},'files':{'type':'object','additionalProperties':_S},'schemes':{'type':'array','items':_S},'ignored':{'type':'array','items':_obj({'ref':_S,'reason':_S},['ref','reason'])}},['summary','outputs','files','schemes'])},
-    {"name":"read_workspace","description":"分页检索facts/clauses/rules/variables/tables/mapping/basis/checks/tool_results/construction。construction按name=任务id读取计划和局部检查；checks读整体编译问题；tool_results按工具名读取其最近一次完整长结果。",
+    {"name":"read_workspace","description":"分页检索facts/clauses/rules/variables/tables/mapping/basis/checks/tool_results/construction/review。review读取冻结的独立复核基线和反例供定位；construction按name=任务id读取计划和局部检查；checks读整体编译问题；tool_results按工具名读取最近一次完整长结果。",
      "parameters":_obj({'section':_S,'scheme':_S,'name':_S,'query':{**_S,'description':'全文片段检索，可按参数名称片段查已有项'},'file':_S,'page':_I,'offset':{**_I,'minimum':0},'limit':{**_I,'minimum':1,'maximum':50,'description':'最多50条；同时按结果长度缩页，必须使用返回的next_call，不自行猜offset'},'detail_offset':{**_I,'minimum':0,'description':'单条过大时按next_call分片续读'},'detail':{'type':'boolean','description':'facts/clauses列表默认只给名称、取值、含义；true返回完整原文与坐标（条数少时用）'}},['section'])},
     {"name":"query_dataset","description":"独立统计一张已定义原表，使用DSL聚合表达式，如sum(amount, of: \"明细表\")。无需allocation，不受其他表的建树错误影响；不用于证明正式金额正确。",
      "parameters":_obj({'dataset':_S,'expr':_S},['dataset','expr'])},

@@ -51,8 +51,8 @@ def test_single_writer_preserves_unrelated_updates_and_rejects_stale(tmp_path):
     team.execute(a, {'scheme':'S','variables':{'a':{'scope':'项目','expr':'amount'}}})
     team.execute(b, {'scheme':'S','variables':{'b':{'scope':'项目','expr':'amount'}}})
     assert {'a','b'} <= ws.drafts['S']['variables'].keys()
-    with pytest.raises(ToolError, match='stale'):
-        team.execute(a, {'scheme':'S','variables':{'a':{'scope':'项目','expr':'0'}}})
+    stale=team.execute(a, {'scheme':'S','variables':{'a':{'scope':'项目','expr':'0'}}})
+    assert stale['status']=='STALE' and ws.drafts['S']['variables']['a']['expr']=='amount'
 
 
 def test_binding_cannot_remove_other_targets(tmp_path):
@@ -209,8 +209,7 @@ def test_changed_public_policy_rejects_outstanding_formula(tmp_path):
     ws,team=session(tmp_path)
     call=action(team)
     ws.said='财务补充了新的本案口径'
-    with pytest.raises(ToolError,match='stale'):
-        team.execute(call,{'scheme':'S','variables':{'a':{'scope':'项目','expr':'amount'}}})
+    assert team.execute(call,{'scheme':'S','variables':{'a':{'scope':'项目','expr':'amount'}}})['status']=='STALE'
 
 
 def test_program_stage_obeys_same_stop_boundary(tmp_path,monkeypatch):

@@ -29,7 +29,7 @@ _CORE = Path(__file__).resolve().parent.parent / 'bonus_core'
 _EXECUTION_PROFILE = hashlib.sha256(
     b''.join(p.read_bytes() for p in sorted(_CORE.rglob('*.py'))) + Path(__file__).read_bytes()
     + b''.join(Path(__file__).with_name(n).read_bytes() for n in
-               ('lint.py', 'facts.py', 'clauses.py', 'source_cells.py', 'agent.py', 'context.py', 'recovery.py', 'construction.py', 'semantics.py', 'progress.py', 'team.py'))
+               ('lint.py', 'facts.py', 'clauses.py', 'source_cells.py', 'agent.py', 'context.py', 'recovery.py', 'construction.py', 'semantics.py', 'progress.py', 'team.py', 'team_support.py', 'tool_specs.py', 'reread.py'))
 ).hexdigest()
 
 
@@ -179,6 +179,10 @@ class Workflow:
             fail('尚未定义数据表')
         issues = []
         counts = {}
+        if self.state.get('execution_mode')=='multi_agent':
+            for scheme in self.state.get('plan',{}).get('schemes',[]):
+                if not self.ws._merged(scheme).get('allocation'):
+                    issues.append('structure.required：'+scheme+' 尚未声明实体层级、key和parent_key；先set_rules声明结构，再prepare_data')
         names = self.ws.schemes or [None]
         for name in names:
             rs = self.ws._ruleset(name) if name else self._data_rules()
@@ -413,9 +417,18 @@ class Workflow:
                 + self._dsl(),
             },
         ]
+        if self.ws.workflow.get('execution_mode') == 'multi_agent':
+            msgs[0]['content'] += ('\n还必须返回sources_reviewed（逐项列出全部规则文件名），requirements数组。'
+                '每项给file、quote（逐字原文）、point（业务要求）、targets（对应你独立构建的pool/helpers.变量/tables.表/details.报告名/totals.报告名）。'
+                '人员分配、实发和抵扣要求分别指向allocation/report.people/payout/offsets/checks，留待最终全量复核，不混入奖金池。'
+                '逐项检查期间、关联、汇总粒度、系数分支、缺失值、负数、暂扣和舍入等原文要求；不可凭生产规则或答案补写。')
+            msgs[0]['content'] += ('\n再给data_contracts数组：逐数据集给dataset、key、link、period、window、population_from、file、quote。'
+                '按原始业务要求独立判断主键、关联和期间窗口，不能机械照抄结构；无值明确null。file/quote提供原文依据。')
         signature = fingerprint({'messages': msgs, 'execution_profile': _EXECUTION_PROFILE})
         prior = self.state.get('references', {}).get(name)
         cached = bool(prior and prior.get('input_signature') == signature)
+        if cached and self.ws.workflow.get('execution_mode')=='multi_agent':
+            cached=not any(str(i).startswith('coverage.') for i in prior.get('report',{}).get('issues',[]))
         if cached:
             spec = copy.deepcopy(prior['spec'])
         else:
@@ -423,11 +436,14 @@ class Workflow:
             attempts = self.state['attempts'].get(key, 0)
             if attempts >= 2:
                 fail('同份独立复核输入已达预算，须补充证据或修复程序；修改主公式不能重置顾问预算')
-            guard_messages(msgs, getattr(self.ws.llm, 'checker_llm', None) or self.ws.llm, output_tokens=8192)
+            review_tokens=(min(32768,max(8192,512*len(self.ws.clauses)+1024*len(self.ws.datasets)))
+                           if self.ws.workflow.get('execution_mode')=='multi_agent' else 8192)
+            guard_messages(msgs, getattr(self.ws.llm, 'checker_llm', None) or self.ws.llm, output_tokens=review_tokens)
             self.state['attempts'][key] = attempts + 1
             from bonus_agent.llm import parse_json
 
-            spec = parse_json(rr._ask(self.ws, msgs))
+            spec = parse_json(rr._ask(self.ws,msgs,max_tokens=review_tokens) if self.ws.workflow.get('execution_mode')=='multi_agent'
+                              else rr._ask(self.ws,msgs))
         if not isinstance(spec, dict) or not isinstance(spec.get('pool'), str) or spec.get('unclear'):
             fail(
                 '独立复核没有完整公式或存在未明确口径，保持阻断：'
@@ -438,6 +454,14 @@ class Workflow:
         pools = self.ws._independent_eval(ev, spec['pool'], targets, '预核算奖金池')
         actual = {k: Decimal(v['amount']) for k, v in basis['objects'].items()}
         issues = []
+        if self.ws.workflow.get('execution_mode') == 'multi_agent':
+            from bonus_agent.team_support import coverage, deferred_requirements
+            coverage_issues=coverage(self.ws,spec)
+            issues.extend(coverage_issues)
+            self.state.setdefault('team',{}).setdefault('requirements',{})[name]={
+                'version':version,'items':copy.deepcopy(spec.get('requirements',[])),
+                'deferred':deferred_requirements(spec),
+                'sources_reviewed':spec.get('sources_reviewed',[]),'issues':coverage_issues}
         reference_pools = {k: round_pool(v) for k, v in pools.items()}
         examples = []
 
@@ -611,6 +635,9 @@ class Workflow:
             gaps = self.ws._page_gaps(self.skipped())
             return '只核对并登记尚未覆盖的原文页：' + '；'.join(gaps[:3])
         last = self.state.get('data_report', {})
+        if stage==2 and not self.ws.datasets:
+            return ('先list_files查看原始Excel的sheet和表头，再read_sheet核对列名，define_dataset定义主业务表及参考表。'
+                    '当前尚无数据集，mapping为空是正常状态；不要重复读取空mapping或通读参数，prepare_data不会替你创建数据集。')
         if (
             stage == 2
             and last.get('version') == self.version('data')
