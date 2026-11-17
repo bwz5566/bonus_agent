@@ -81,6 +81,30 @@ def _drop_empty(value):
     return value
 
 
+def tool_result(ws, tool, value, limit=5400):
+    """Keep large structured feedback as valid JSON with a persistent, pageable full result."""
+    text = json.dumps(value, ensure_ascii=False, default=str)
+    if len(text) <= limit:
+        return text
+    from bonus_agent.recovery import fingerprint
+    # Serialize once: stored Decimal/date values must replay exactly as they were shown.
+    stored = json.loads(text)
+    ws.workflow.setdefault('tool_reports', {})[tool] = stored
+    result = {'tool': tool, 'status': value.get('status', 'READ') if isinstance(value, dict) else 'READ',
+              'digest': fingerprint(stored), 'notice': '完整结果已保存，按next_call读取；不重复执行原工具。',
+              'next_call': {'tool': 'read_workspace', 'args': {'section': 'tool_results', 'name': tool, 'limit': 10}}}
+    if isinstance(value, dict):
+        result['counts'] = {k: len(v) for k, v in value.items() if isinstance(v, list)}
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _bounded_page(result):
+    if len(json.dumps(result, ensure_ascii=False, default=str)) > 5800:
+        return {'section': result['section'], 'status': 'QUERY_TOO_LARGE', 'items': [],
+                'notice': '查询名称或过滤参数过长，无法容纳完整分页回执；缩短query/name，或按file/page分批查询。原记录未截断。'}
+    return result
+
+
 def workspace_view(
     ws,
     section,
@@ -136,10 +160,32 @@ def workspace_view(
         ]
     elif section == 'basis':
         items = [{'scheme': s, **v} for s, v in ws.workflow.get('basis', {}).items() if not scheme or s == scheme]
+    elif section == 'checks':
+        from bonus_agent.workflow import Workflow
+        saved = ws.workflow.get('formula_report', {})
+        if not saved:
+            return {'section': 'checks', 'status': 'NOT_RUN', 'items': [],
+                    'next_call': {'tool': 'compile_formulas', 'args': {}}, 'notice': '尚无公式检查，先compile_formulas'}
+        if saved.get('version') != Workflow(ws).version():
+            return {'section': 'checks', 'status': 'STALE', 'items': [],
+                    'next_call': {'tool': 'compile_formulas', 'args': {}}, 'notice': '规则或证据已变化，重新compile_formulas；不能把旧检查当当前结论'}
+        items = [{'kind': 'issue', 'index': i, 'message': message} for i, message in enumerate(saved['report']['issues'])]
+        items += [{'kind': 'warning', 'index': i, 'message': message} for i, message in enumerate(saved['report']['warnings'])]
+    elif section == 'tool_results':
+        reports = ws.workflow.get('tool_reports', {})
+        chosen = {name: reports[name]} if name in reports else (reports if name is None else {})
+        items = []
+        for tool, value in chosen.items():
+            if isinstance(value, dict):
+                for field, entry in value.items():
+                    items += ([{'name': tool, 'field': field, 'index': i, 'value': item} for i, item in enumerate(entry)]
+                              if isinstance(entry, list) else [{'name': tool, 'field': field, 'value': entry}])
+            else:
+                items += [{'name': tool, 'index': i, 'value': item} for i, item in enumerate(value)]
     else:
         from bonus_agent.workflow import fail
 
-        fail('section须为facts/clauses/rules/variables/tables/mapping/basis')
+        fail('section须为facts/clauses/rules/variables/tables/mapping/basis/checks/tool_results')
     if name is not None and section not in ('variables', 'tables'):
         items = [
             item
@@ -205,6 +251,10 @@ def workspace_view(
         # A single large definition needs explicit fragments, not a silently cut JSON object.
         text = json.dumps(items[offset], ensure_ascii=False, default=str)
         start = detail_offset or 0
+        if start >= len(text):
+            result.update(status='INVALID_OFFSET', notice=f'detail_offset={start}超出本条长度{len(text)}；按next_call从本条开头重新读取',
+                          next_call={'tool': 'read_workspace', 'args': {**args, 'offset': offset, 'limit': 1, 'detail_offset': 0}})
+            return _bounded_page(result)
         part = text[start : start + FRAGMENT_CHARS]
         end = start + len(part)
         result['item_fragment'] = {
@@ -212,21 +262,27 @@ def workspace_view(
             'offset': start,
             'text': part,
             'next_detail_offset': end if end < len(text) else None,
+            'total_chars': len(text),
         }
+        # JSON escaping can make a short fragment exceed the runner cap. Size the actual envelope.
+        while len(json.dumps(result, ensure_ascii=False, default=str)) > PAGE_CHARS and len(part) > 1:
+            part = part[:max(1, len(part) // 2)]
+            end = start + len(part)
+            result['item_fragment'].update(text=part, next_detail_offset=end if end < len(text) else None)
         if end < len(text):
             result['next_offset'] = offset
             result['next_call'] = {
                 'tool': 'read_workspace',
                 'args': {**args, 'offset': offset, 'limit': 1, 'detail_offset': end},
             }
-            return result
+            return _bounded_page(result)
         consumed = 1
     else:
         consumed = len(result['items'])
     if offset + consumed < len(items):
         result['next_offset'] = offset + consumed
         result['next_call'] = {'tool': 'read_workspace', 'args': {**args, 'offset': offset + consumed, 'limit': limit}}
-    return result
+    return _bounded_page(result)
 
 
 def task_card(ws):
@@ -257,4 +313,12 @@ def task_card(ws):
         'notes': {k: v[:800] for k, v in list(ws.notes.items())[-8:]},
         'lookup': '原文按文件read_document/read_parameter_table；台账/条款/映射/公式/预核算按read_workspace分页读取。覆盖索引完整保存在工作区，不能按当前摘录判断无其他规则。',
     }
+    report = ws.workflow.get('formula_report', {})
+    if report:
+        data['last_formula_check'] = {
+            'current': report.get('version') == flow.version(),
+            'issue_count': len(report['report']['issues']),
+            'first_issues': [x[:450] for x in report['report']['issues'][:3]],
+            'lookup': 'read_workspace(section="checks")；current=false须先重新compile_formulas',
+        }
     return json.dumps(data, ensure_ascii=False, default=str)

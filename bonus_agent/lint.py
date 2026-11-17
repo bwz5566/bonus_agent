@@ -923,10 +923,13 @@ def compile_warnings(rs: RuleSet, reached_elsewhere: set[str] | None = None) -> 
             if not isinstance(node, Call) or node.fn != 'count_distinct' or not node.args:
                 continue
             dataset = node.kw().get('of')
-            if not isinstance(dataset, Str) or not isinstance(node.args[0], Name):
+            period_arg = node.args[0]
+            if isinstance(period_arg, Call) and period_arg.fn in ('month', 'year') and len(period_arg.args) == 1:
+                period_arg = period_arg.args[0]
+            if not isinstance(dataset, Str) or not isinstance(period_arg, Name):
                 continue
             definition = rs.datasets.get(dataset.value)
-            if definition and definition.period == node.args[0].id and definition.window == 'period':
+            if definition and definition.period == period_arg.id and definition.window == 'period':
                 out.append(f'{where} 对当前期间表「{dataset.value}」统计期间值；若字段是月份编码且本次为单月，结果最多为1。'
                            '材料要求累计平均时，应另定义累计窗口；本期平均则可保留。')
     return list(dict.fromkeys(out))
@@ -936,6 +939,12 @@ def static_gates(rs: RuleSet) -> list[tuple[str, str]]:
     """不用数据就能看出不起作用的写法：[(去重键, 说明)]。编译公式阶段和试算后的检查共用。"""
     out = []
     for where, ast in _parsed(rs):
+        # A calendar month is not a fixed number of days. Descriptions are a risk signal, not a policy default.
+        var = rs.variables.get(where.removeprefix('variables.')) if where.startswith('variables.') else None
+        if var and re.search(r'月数|个月|月份.*(?:差|对比)|(?:差|对比).*月份|months?.*(?:diff|age)', var.desc or '', re.I) and any(
+                isinstance(n, Call) and n.fn == 'days_between' for n in walk(ast)):
+            out.append((f'日期量纲 {where}', f'{where} 的说明按月份判断，表达式却用days_between按天数比较；'
+                        '核对材料：按年月差使用months_between，按天数则修正说明并提供天数阈值来源，不能用固定天数代替月份'))
         # 字段和自己比较（id == id）：永远成立，多半是想按当前对象筛选却写错了
         same = self_compares(ast)
         if same:

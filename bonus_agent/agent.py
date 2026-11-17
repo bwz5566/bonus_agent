@@ -1113,7 +1113,7 @@ class Workspace:
                 continue
             prior=[f for f in self.facts if f.file==file and f.page==page and f.source_cell and
                 all(f.source_cell.get(k,1)==record['locator'].get(k,1) for k in ('table','row','column','line')) and
-                f.component=='literal' and f.source_hash==source_hash and f.unit==cell.get('unit') and fx.norm(f.value)==fx.norm(record['value']) and
+                f.source_hash==source_hash and ('unit' not in cell or f.unit==cell['unit']) and fx.norm(f.value)==fx.norm(record['value']) and
                 not fx.check_fact(f,self._corpus()) and not self._wrong_page(f)]
             if prior:
                 fact=prior[0]
@@ -1136,7 +1136,8 @@ class Workspace:
                 self.changed=True
                 fact=next(f for f in self.facts if f.name==record['name'])
             returned.append({'name':fact.name,'value':fact.value,'page':page,'source_cell':fact.source_cell,
-                             'meaning':fact.meaning,'reused':bool(prior)})
+                             'meaning':fact.meaning,'unit':fact.unit,'numeric':str(fx.numeric(fact)) if fx.numeric(fact) is not None else None,
+                             'reused':bool(prior)})
         self._fact_rejections=[]
         if failed and not returned:
             raise ToolError('没有登记任何单元格：\n' + '\n'.join(failed[:12]))
@@ -1184,9 +1185,15 @@ class Workspace:
 
     def _corpus(self) -> dict[str, str]:
         """每个文件规范化后的全文，用来核对引用。"""
+        key = (tuple(sorted(self._source_version.items())),
+               json.dumps(self.transcripts, ensure_ascii=False, sort_keys=True), self._chat_text())
+        cached = getattr(self, '_source_corpus_cache', None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
         out = {f.name: fx.norm("".join(self._lines(f.name))) for f in self.inv.files}
         if self._chat_text():
             out[CHAT_SOURCE] = fx.norm("".join(self._lines(CHAT_SOURCE)))
+        self._source_corpus_cache = (key, out)
         return out
 
     def record_facts(self, facts: list[dict]) -> str:
@@ -1279,7 +1286,7 @@ class Workspace:
                 dup += 1
                 continue
             if same and any(g.source_hash == f.source_hash and fx.same_value(g) != fx.same_value(f)
-                            and fx.norm(g.value) != fx.norm(f.value) for g in same):
+                            and fx.norm(g.value) != fx.norm(f.value) and not fx.check_fact(g, corpus) for g in same):
                 lines.append(f'第 {i} 条未登记：同名参数在同一引用里有多个不同值；逐项改名登记，更正旧登记先 remove_facts。')
                 continue
             if same:
@@ -1336,8 +1343,14 @@ class Workspace:
                 body = pages.get(page, self._corpus().get(f.file, ""))
                 if context and fx.norm(context) not in fx.norm(body):
                     raise ToolError(f"{f.name} 的适用条件 context 不在指定原文位置")
-                candidate = fx.binding_candidate(f, list(spec["targets"]), spec.get("component"), spec.get("unit"))
+                candidate = fx.binding_candidate(f, list(spec["targets"]), spec.get("component"), spec.get("unit"), spec.get('unit_basis'))
                 candidate.page, candidate.context = page, context
+                if candidate.unit_basis:
+                    basis = dict(candidate.unit_basis)
+                    body = (self._chat_text().encode() if basis.get('file') == CHAT_SOURCE else
+                            self._file(basis.get('file', '')).read_bytes())
+                    basis['source_hash'] = hashlib.sha256(body).hexdigest()
+                    candidate.unit_basis = basis
                 error = fx.check_fact(candidate, self._corpus())
                 errors = fx.binding_errors([candidate], scopes)
                 if error or errors:
@@ -1351,6 +1364,7 @@ class Workspace:
                 changed += 1
             f.targets, f.page, f.context = targets, page, context
             f.component, f.unit = candidate.component, candidate.unit
+            f.unit_basis = candidate.unit_basis
             # Compile evidence into the target table; the model never has to copy its rate again.
             for target in targets:
                 qualifier, path = fx.split_target(target)
@@ -1376,6 +1390,8 @@ class Workspace:
         self._check_source_version()
         repaired, errors = [], []
         if repair:
+            scopes = {s: self._merged(s) for s in self.schemes}
+            repaired += fx.prune_orphan_targets(self.facts, scopes)
             for f in self.facts:
                 if f.targets and fx.numeric(f) is None and fx.interval(f.value) is not None:
                     try:
@@ -1556,6 +1572,9 @@ class Workspace:
                 if i and not row.get("lower"):
                     raise ToolError(f"第 {i + 1} 档没写 lower：只有第 1 档可以省略（从 0 起），其余每档都要写下界" + ("（写这一档档位格的坐标，如 R4C1）" if cells_from else "（写登记过的参数名）") + "；本次未保存")
                 table["steps"].append([lower, take(row["value"], f'{prefix}/steps/{i}/1')])
+            if any(Decimal(a[0]) >= Decimal(b[0]) for a, b in zip(table['steps'], table['steps'][1:])):
+                raise ToolError('parameter.order：档位下界必须严格递增，本次未保存表或绑定；核对档位列与比例列，'
+                                '不要把新项目比例当下界、老项目比例当取值。按原文档位从小到大列出rows')
         else:
             table["mapping"] = {}
             for row in rows:
@@ -1589,6 +1608,12 @@ class Workspace:
             current = hashes[f.file]
             if not f.source_hash or f.source_hash != current:
                 gaps.append(f"{f.name}：原文版本变化或缺少指纹，需要重新登记")
+            if f.unit_basis:
+                basis = f.unit_basis
+                body = (self._chat_text().encode() if basis.get('file') == CHAT_SOURCE else
+                        self._file(basis.get('file', '')).read_bytes())
+                if basis.get('source_hash') != hashlib.sha256(body).hexdigest() or fx.check_fact(f, self._corpus()):
+                    gaps.append(f'{f.name}：parameter.unit，单位确认来源已变化或无效，须重新bind_facts核对unit_basis')
         # Numeric parameters read directly from data tables retain their data-source binding.
         read = set().union(*(self.read_nums.get(s, set()) for s in self.schemes))
         active = []
@@ -1602,6 +1627,11 @@ class Workspace:
                         active.append(f)
                 continue
             if not f.targets and f.name in ignored:
+                continue
+            error = fx.check_fact(f, self._corpus())
+            if error:
+                gaps.append(f'{f.name}：parameter.source_literal，旧登记不符合当前原文校验：{error}；'
+                            '用record_facts按同名同出处重新登记正确原文值，旧的无效证明和绑定会被替换，不能直接沿用')
                 continue
             has, chosen = fx.chosen(f.name, self.conflicts, self.questions, self.facts)
             if has and chosen != format(v.normalize(), 'f'):
@@ -2481,7 +2511,7 @@ class Workspace:
         """要计算的方案（不含共用部分）。"""
         return [s for s in self.drafts if s != SHARED]
 
-    def set_rules(self, scheme: str | None = None, **parts) -> str:
+    def set_rules(self, scheme: str | None = None, bindings: list[dict] | None = None, **parts) -> str:
         name = self._scheme(scheme, for_write=True)
         if name == SHARED and parts.get("pool") is not None:
             raise ToolError("pool 是每个方案自己的，不能写在共用部分")
@@ -2517,17 +2547,32 @@ class Workspace:
         if broken:       # 式子解析不了就不保存：存进去之后试算、查询都会报同一个错，又不知道是哪一条
             raise ToolError("未保存：这些式子解析不了，改好后再一起提交（其余部分也没保存）：\n"
                             + "\n".join(f"- {w}：{m}" for w, m in broken[:6]))
+        # Validate proposed evidence against the proposed rules before committing either side.
+        if bindings:
+            import copy
+            preview = copy.copy(self)
+            preview.drafts = copy.deepcopy({**self.drafts, name: draft})
+            preview.facts = [f.model_copy(deep=True) for f in self.facts]
+            preview.bind_facts(bindings)
+            draft = preview.drafts[name]
         planned = self._planned_schemes()
         if planned and name != SHARED and name not in planned and not any(draft.values()):
             # 计划外的方案（如早先省略 scheme 时建的“默认”）清空后就去掉，不再挡住编译公式
             self.drafts.pop(name, None)
             self.untested.discard(name)
             return f"已去掉计划外的空方案「{name}」；现有方案 {self.schemes}，计划 {planned}。"
-        if draft == self.drafts.get(name):
+        if draft == self.drafts.get(name) and (not bindings or preview.facts == self.facts):
             return "no-op：规则完全相同，没有保存新版本或触发重算；继续处理当前验证缺口。"
         self.drafts[name] = draft
+        if bindings:
+            self.facts = preview.facts
+        deleted = {(section, key) for section in ('tables', 'variables')
+                   for key, value in (parts.get(section) or {}).items() if value is None}
+        detached = fx.detach_targets(self.facts, name, deleted, {s: self._merged(s) for s in self.schemes})
         self.untested |= set(targets) - {SHARED}
         out = [f"已保存{'共用部分' if name == SHARED else f'方案「{name}」'}。"]
+        if detached:
+            out.append(f'已同步清理指向本次删除对象的{detached}条绑定；原文参数仍保留，继续绑定到正确位置。')
         self.last_blocking = set()
         for t, rs in rss.items():
             full = self._merged(t)
@@ -2549,6 +2594,9 @@ class Workspace:
                     later += (f"共用部分引用的 {'、'.join(names_later)} 还没有定义：如果由各方案自己定义，写入各方案后会合并校验；"
                               "否则在共用部分的 variables 里补上。")
             blocking = [str(i) for i in issues if i.severity == "blocking"]
+            static = lint.static_gates(rs)
+            blocking += [message for _, message in static]
+            self.last_blocking |= {(t, 'static', key) for key, _ in static}
             warns = [str(i) for i in issues if i.severity == "warning"]
             head = f"「{t}」" + ("（尚未设定 pool）" if "pool" not in full else "")
             self.last_blocking |= {(t, i.code, i.where) for i in issues if i.severity == "blocking"}
@@ -2559,6 +2607,9 @@ class Workspace:
                 out.append(head + "静态校验通过。" + ("\n提示：\n" + "\n".join(f"- {w}" for w in warns) if warns else ""))
             if later:
                 out.append(later)
+            warnings = lint.compile_warnings(rs)
+            if warnings:
+                out.append('结构提示：\n' + '\n'.join(warnings[:3]))
         tiers = [_tier_text(n, t) for n, t in (parts.get("tables") or {}).items() if isinstance(t, dict) and t.get("kind") == "tier"]
         if tiers:
             out.append("阶梯表按下面的意思计算，请和材料原文逐档核对：\n" + "\n".join(f"- {t}" for t in tiers if t))
@@ -3853,6 +3904,16 @@ class Workspace:
     def blocker_frontier(self) -> set[str]:
         """No model calls and no full recalculation; stable unresolved work survives history pruning."""
         if not self.results:
+            if self.staged and (self.workflow.get('formula_report') or
+                                self.workflow.get('data_report', {}).get('report', {}).get('status') == 'PASS'):
+                # Suggestions and wrong values can change after an unrelated write; the unresolved object has not changed.
+                out = {'parameter:' + x.split('：', 1)[0].split('=', 1)[0] for x in self._binding_gaps()}
+                out.update('clause:' + x.split('：', 1)[0] for x in self._clause_gaps(self._flow().skipped()))
+                for scheme in self.schemes:
+                    rs = self._ruleset(scheme)
+                    out.update(f'{scheme}:{i.code}:{i.where}' for i in self._validate(scheme, rs) if i.severity == 'blocking')
+                    out.update(f'{scheme}:static:{key}' for key, _ in lint.static_gates(rs))
+                return out
             return set()
         bindings = self._binding_gaps()
         table_gaps = {m.group() for g in bindings if (m := re.search(r'/tables/\S+?(?==)', g))}
@@ -4712,6 +4773,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                 skipped += 1
                 continue
             t_tool = time.time()
+            saved_draft = False
             try:
                 args = json.loads(c["arguments"] or "{}")
                 fn = handlers.get(c["name"])
@@ -4730,7 +4792,12 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                 if ws.staged and not ws._flow().allowed(c['name']):
                     raise ToolError('workflow.gate：该操作的前置阶段尚未通过。下一步：'+ws._flow().hint())
                 value = fn(**args)
-                result = json.dumps(value, ensure_ascii=False, default=str) if isinstance(value, (dict, list)) else str(value)
+                if isinstance(value, (dict, list)):
+                    from bonus_agent.context import tool_result
+                    result = (json.dumps(value, ensure_ascii=False, default=str) if c['name'] == 'read_workspace'
+                              else tool_result(ws, c['name'], value))
+                else:
+                    result = str(value)
                 if c["name"] in CARRY_READS:
                     if carried.get(sig) == result:      # 清空对话时已附上、内容没变：不再整段重发
                         result = ("内容和上面说明里【之前读过、内容没变的工作区内容】附的那段完全一样，工作区没有变化，"
@@ -4745,6 +4812,12 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                     ok=False  # Preserve accepted rows, but never report a partly rejected batch as success.
                     if result.startswith('已登记 '):
                         ws.changed = True
+                if c['name'] == 'record_parameter_cells' and isinstance(value, dict) and value.get('status') == 'PARTIAL':
+                    ok = False
+                    saved_draft = any(not row.get('reused') for row in value.get('facts', []))
+                if c['name'] in ('set_rules', 'compile_table') and getattr(ws, 'last_blocking', None) and 'no-op' not in result:
+                    saved_draft, ok = True, False
+                    result = '草稿已保存，校验未通过；尚不能计算金额。\n' + result
             except ToolError as e:
                 result, ok = f"错误：{e}", False
                 if c['name'] in {'evaluate','trial_run','explain'} and any(code in result for code in ('parent_unknown','link_unmatched')):
@@ -4775,7 +4848,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             failed_validation = ok and isinstance(value, dict) and value.get('status') == 'FAIL'
             # 工具名不存在是调用协议的错，与案卷无关：本轮的卡住检测照常计数，但不写进跨轮的纠错记录，
             # 否则下一轮一开始就被“同一问题累计失败”拦停，重新运行也没用
-            if (not ok or failed_validation) and c['name'] in handlers:
+            if (not ok or failed_validation) and not saved_draft and c['name'] in handlers:
                 recovery.failure(c['name'], step.args, result, waiting=bool(ws.pending))
             if len(steps) == turn_steps:     # 本次回复的第一个调用：记上模型用时和 tokens
                 step.model_secs, (step.tokens_in, step.tokens_out) = round(model_secs, 2), model_tokens
@@ -4834,7 +4907,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                 fail_issues[c["name"]] = listed
             elif ok:
                 fail_issues.pop(c["name"], None)
-            partial = _partial_facts(c["name"], ok, result)
+            partial = _partial_facts(c["name"], ok, result) or saved_draft
             if ok or partial:
                 fails[c["name"]] = 0
             elif c["name"] not in failed_now:
@@ -4851,7 +4924,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                     result += (f"\n注意：「{what}」已经删了 {MAX_STUCK - 1} 次。先想清楚它该怎么定义再动手，"
                                f"再删一次就算卡住；拿不准就用 ask_question 问财务")
                     step.result = result
-            if ok and c["name"] == "set_rules":      # 保存了但阻断问题一直没改掉：同样算没有进展
+            if (ok or saved_draft) and c["name"] == "set_rules":
                 # 每次都改掉了几个（阻断问题在减少）是在推进，只是一次没改完，不算卡住；
                 # 一个也没改掉才算原地打转。某一个问题一直挂着、别的在改，放宽到两倍次数再停
                 now = getattr(ws, "last_blocking", set())
@@ -4935,8 +5008,9 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             first = steps[turn_steps]
             first.model_secs, (first.tokens_in, first.tokens_out) = round(model_secs, 2), model_tokens
         deep_why = _deep_reason(steps[turn_steps:], skipped, ws, fails)
-        if any(st.tool in {"bind_facts", "compile_table", "validate_parameters", "trial_run", "finish", "set_rules", "apply_repair"}
-               for st in steps[turn_steps:]):
+        if (ws.staged and ws.drafts) or any(
+                st.tool in {"bind_facts", "compile_table", "validate_parameters", "trial_run", "finish", "set_rules", "apply_repair"}
+                for st in steps[turn_steps:]):
             frontier = ws.blocker_frontier()
             stagnant = progress_watch.observe(frontier)
             recovery.state['progress'] = {'previous': sorted(progress_watch.previous), 'stagnant': stagnant}
@@ -4948,7 +5022,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                                       "禁止通过改答案、降低校验或把分配池归零消除问题。")
             elif not stagnant:
                 ws.notes.pop("纠错进度", None)
-            if stagnant >= 5:
+            if stagnant >= (12 if ws.staged and not ws.results else 5):
                 if ws.pending:
                     repeats, stuck = MAX_STUCK, deep_why
                 else:
@@ -5040,6 +5114,8 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         if not error and not any(st.ok and st.tool in WRITE_TOOLS for st in steps):
             # 整轮只读、没有任何写入：自动接续只会把同样的读取再做一遍（不以“达到最大步数”开头，retryable 不接续）
             error = f"本轮没有进展（只读取，没有任何写入），不自动接续；达到最大步数 {max_steps} 仍未完成"
+        if not error and ws.staged and progress_watch.previous and progress_watch.stagnant >= 2:
+            error = '本轮结束时仍未消除既有校验问题，不自动接续；先修复：' + '；'.join(sorted(progress_watch.previous)[:3])
         error = error or f"达到最大步数 {max_steps} 仍未完成"
 
     if error and error.startswith(("纠错预算耗尽", "智能体卡住了")) and not ws.pending:
@@ -5528,6 +5604,14 @@ def _deep_reason(turn: list[Step], skipped: int, ws: Workspace, fails: dict[str,
             continue  # Read-interface errors have native feedback; Pro cannot repair pagination or a wrong file type.
         if not st.ok and 'parameter.unit' in st.result:
             continue  # Missing source units need evidence/clarification, not another paid guess.
+        if st.result.startswith('草稿已保存，校验未通过'):
+            continue  # The explicit blocker list and progress watch decide recovery; a saved draft is not a pass.
+        if not st.ok and any(code in st.result for code in ('parameter.ref', 'parameter.order', 'source.scope')):
+            continue  # Native registration/compilation feedback already provides the supported correction.
+        if not st.ok and st.tool == 'record_parameter_cells':
+            continue  # Partial native batches retain valid cells and identify exact rejections; no paid guessing.
+        if not st.ok and st.tool == 'define_dataset' and fails.get(st.tool, 0) < 2:
+            continue
         if _partial_facts(st.tool, st.ok, st.result):
             continue  # Rows were registered; each rejection already says what to fix. No paid deep step.
         head = st.result.removeprefix("错误：").split("\n", 1)[0][:300]
@@ -5542,6 +5626,8 @@ def _deep_reason(turn: list[Step], skipped: int, ws: Workspace, fails: dict[str,
         if st.ok and st.tool == "trial_run" and not ws.reread and "no-op" not in st.result:
             return "首次金额试算完成：现在是关键复核节点，调用 review_calculation 先独立核对原文与全量金额；工具执行完成不等于验收通过"
     if skipped:
+        if all(st.tool in READ_ONLY or st.tool.startswith('（') for st in turn):
+            return ''  # A repeated read cannot be fixed by another paid advisor.
         return "又原样做了一遍之前做过的操作，结果和之前一样"
     return ""
 

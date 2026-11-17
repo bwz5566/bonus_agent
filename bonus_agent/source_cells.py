@@ -79,13 +79,15 @@ def parameter_cell(path,page,table,row,column,line=None):
     if line is not None:locator['line']=line
     selected,labels=ppt_cell(path,page,locator)
     # Extract only when the selected physical line has one unambiguous number/unit.
-    from bonus_agent.facts import _TOKEN, _RANGE, interval
-    import unicodedata
+    from bonus_agent.facts import _TOKEN, interval, band_text
     matches=list(_TOKEN.finditer(selected))
-    rng=_RANGE.search(unicodedata.normalize('NFKC',selected).replace(',',''))
-    if len(matches)==2 and rng and interval(rng.group()):
+    cleaned = band_text(selected)
+    if interval(selected) is not None:
         # 阶梯表的档位格（如“200-1000万”）：整段区间作为一个参数，编译阶梯时自动取下界
-        value=rng.group().strip()
+        value=selected
+    elif len(matches) > 1 and len(list(_TOKEN.finditer(cleaned))) == 1:
+        match = next(_TOKEN.finditer(cleaned))
+        value = match.group(1) + (match.group(2) or '')
     elif len(matches)!=1:
         raise ValueError(f'source.cell：R{row}C{column}' + (f'L{line}' if line else '') + f' 的内容「{selected}」'
                          + ('没有数值，不是参数格（可能是标题或文字说明），不要登记' if not matches else

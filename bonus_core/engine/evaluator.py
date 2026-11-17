@@ -424,11 +424,13 @@ class Evaluator:
                 raise EvalError(f"between 的三个参数类型要一致（数字或日期）：{x.text}, {lo.text}, {hi.text}", ctx.where)
             deps, rows = _merge(x, lo, hi)
             return Val(lo.v <= x.v <= hi.v, f"{lo.text} ≤ {x.text} ≤ {hi.text}", deps, rows)
-        if fn in ("years_between", "days_between"):
+        if fn in ("years_between", "days_between", "months_between"):
             a, b = self.ev(c.args[0], ctx), self.ev(c.args[1], ctx)
             d1, d2 = self._date(a, ctx), self._date(b, ctx)
             if fn == "days_between":
                 r = Decimal((d2 - d1).days)
+            elif fn == 'months_between':
+                r = Decimal((d2.year - d1.year) * 12 + d2.month - d1.month)
             else:
                 r = Decimal(d2.year - d1.year - ((d2.month, d2.day) < (d1.month, d1.day)))
             deps, rows = _merge(a, b)

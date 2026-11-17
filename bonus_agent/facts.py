@@ -48,6 +48,7 @@ class Fact(BaseModel):
     source_cell: dict | None = None  # verified physical table coordinates, 1-based
     component: Literal["literal", "lower", "upper"] = "literal"
     unit: Literal["%", "‰", "万", "万元", "亿", "亿元", "元"] | None = None
+    unit_basis: dict | None = None  # Explicit source/finance confirmation of a bare number's unit.
 
 
 def target_parts(path: str):
@@ -85,6 +86,11 @@ def table_cells(tables: dict):
 def binding_errors(facts: list[Fact], drafts: dict) -> list[str]:
     """A number at another rule position does not satisfy a declared parameter binding."""
     errors = []
+    positions = {}
+    def spots_for(value):
+        if value not in positions:
+            positions[value] = _spots(value, drafts)
+        return positions[value]
     for f in facts:
         value = numeric(f)
         if value is None:
@@ -94,9 +100,17 @@ def binding_errors(facts: list[Fact], drafts: dict) -> list[str]:
             if not f.targets:
                 continue  # an unbound narrative clause is not a numeric parameter
         if not f.targets:
-            spots = _spots(value, drafts)
+            spots = spots_for(value)
+            if (value is not None and not f.unit and _NUM.fullmatch(f.value.strip())
+                    and _NUM.fullmatch(f.value.strip()).group(2) is None
+                    and re.search(r'比例|占比|分成|百分', f.context + f.quote + f.meaning)
+                    and spots_for(value / 100) and not spots):
+                errors.append(f'{f.name}：parameter.unit，原文裸数 {f.value} 与公式中的百分数系数相差100倍。'
+                              '先核对该表单位；原文有明确%表头时补入quote并用bind_facts(unit="%")绑定；'
+                              '原文未明确单位则ask_question确认，不能删掉参数或凭相似数字自动换算')
+                continue
             errors.append(f"{f.name}：缺少精确规则位置，用 bind_facts 绑定参数"
-                          + (f"（规则里取值 {f.value} 的位置：{'、'.join(spots)}；选对应的那个写进 targets）" if spots else
+                          + (f"（仅按数值检索的候选，尚未证明业务含义相同：{'、'.join(spots)}；须核对适用条件后绑定）" if spots else
                              f"（规则里还没有用到 {f.value} 的位置：先在规则里用上它，或确认这条不是计算参数后 remove_facts）"))
             continue
         for target in f.targets:
@@ -141,6 +155,46 @@ def binding_errors(facts: list[Fact], drafts: dict) -> list[str]:
     return errors
 
 
+def detach_targets(facts: list[Fact], scheme: str, deleted: set[tuple[str, str]], drafts: dict | None = None) -> int:
+    """Remove only bindings to objects explicitly deleted in this write, with exact path boundaries."""
+    count = 0
+    for fact in facts:
+        keep = []
+        for target in fact.targets:
+            qualifier, path = split_target(target)
+            parts = target_parts(path)
+            if qualifier in (None, scheme) and len(parts) >= 2 and tuple(parts[:2]) in deleted:
+                count += 1
+                # An unqualified target also covered other schemes. Preserve their surviving evidence explicitly.
+                if qualifier is None and drafts:
+                    for other, draft in drafts.items():
+                        candidate = fact.model_copy(update={'targets': [f'{other}::{path}']})
+                        if other != scheme and not binding_errors([candidate], {other: draft}):
+                            keep.append(f'{other}::{path}')
+            else:
+                keep.append(target)
+        fact.targets = list(dict.fromkeys(keep))
+    return count
+
+
+def prune_orphan_targets(facts: list[Fact], drafts: dict) -> list[str]:
+    """Migrate old deleted-object bindings only when the same fact has a verified surviving binding."""
+    removed = []
+    for fact in facts:
+        valid = [t for t in fact.targets if not binding_errors([fact.model_copy(update={'targets': [t]})], drafts)]
+        if not valid:
+            continue
+        for target in list(fact.targets):
+            qualifier, path = split_target(target)
+            parts = target_parts(path)
+            owners = [d for s, d in drafts.items() if qualifier is None or s == qualifier]
+            if (len(parts) >= 2 and parts[0] in ('tables', 'variables') and owners
+                    and all(parts[1] not in (d.get(parts[0]) or {}) for d in owners)):
+                fact.targets.remove(target)
+                removed.append(f'{fact.name} → {target}')
+    return removed
+
+
 def _spots(value: Decimal, drafts: dict, limit: int = 3) -> list[str]:
     """规则里取值等于 value 的位置（参数表的格、变量表达式里的数），写成 bind_facts 的 targets。
     实测场景说明里的“查不到预算系数为 1”“销售金额为 0 不计算”只报“缺少精确规则位置”，模型不知道能绑到变量的表达式上。"""
@@ -183,9 +237,26 @@ def number(value: str) -> Decimal | None:
 _RANGE = re.compile(r"(?<![\d.])([-+]?\d+(?:\.\d+)?)\s*(亿元|万元|亿|万|元|%|‰)?\s*(?:-|~|～|—|–|至|到)\s*([-+]?\d+(?:\.\d+)?)\s*(亿元|万元|亿|万|元|%|‰)?(?![\d.])")
 
 
+def band_text(text: str) -> str:
+    """Strip only endpoint inclusion annotations; never erase an unrelated number or condition."""
+    text = unicodedata.normalize('NFKC', text).strip().replace(',', '')
+    def strip(match):
+        boundary = match.group(1)
+        outside = text[:match.start()] + text[match.end():]
+        bounds = _RANGE.fullmatch(outside.strip())
+        endpoints = [number(m.group()) for m in _TOKEN.finditer(outside)]
+        if bounds:
+            a, ua, b, ub = bounds.groups()
+            endpoints = [Decimal(a) * _SCALE[ua or ub], Decimal(b) * _SCALE[ub or ua]]
+        if boundary is None or number(boundary) in endpoints:
+            return ''
+        return match.group()
+    return re.sub(r'\(\s*含\s*(\d+(?:\.\d+)?\s*(?:%|‰|万元|万|亿元|亿|元)?)?\s*\)', strip, text).strip()
+
+
 def interval(text: str):
     """A shared unit belongs to both ends; keep the original text as evidence."""
-    m = _RANGE.fullmatch(unicodedata.normalize("NFKC", text).strip().replace(",", ""))
+    m = _RANGE.fullmatch(band_text(text))
     if not m:
         return None
     a, ua, b, ub = m.groups()
@@ -217,7 +288,7 @@ def numeric(f: Fact) -> Decimal | None:
     return value
 
 
-def binding_candidate(f: Fact, targets: list[str], component=None, unit=None) -> Fact:
+def binding_candidate(f: Fact, targets: list[str], component=None, unit=None, unit_basis=None) -> Fact:
     """Only a tier lower-bound slot has an unambiguous automatic range projection."""
     changes = {"targets": targets}
     if component is not None:
@@ -227,6 +298,8 @@ def binding_candidate(f: Fact, targets: list[str], component=None, unit=None) ->
             changes["component"] = "lower"
     if unit is not None:
         changes["unit"] = unit
+    if unit_basis is not None:
+        changes['unit_basis'] = unit_basis
     return Fact.model_validate({**f.model_dump(), **changes})
 
 
@@ -256,6 +329,19 @@ def label(f: Fact) -> str:
     return f.value + (f"（{f.meaning}）" if f.meaning and f.meaning != f.value else "")
 
 
+def quote_scalars(text: str):
+    """Distinguish a binary minus in a source formula from a negative literal amount."""
+    text = unicodedata.normalize('NFKC', text).replace(',', '')
+    for match in _TOKEN.finditer(text):
+        value, unit = match.groups()
+        prefix = text[:match.start()].rstrip()
+        line = prefix.rsplit('\n', 1)[-1]
+        if (value.startswith(('-', '+')) and prefix and re.search(r'[\w)]$', prefix)
+                and re.search(r'[=/*×÷]', line)):
+            value = value[1:]  # e.g. rate - 0.05: minus is the operator, 0.05 is the source literal.
+        yield Decimal(value), unit
+
+
 def check_fact(f: Fact, corpus: dict[str, str]) -> str | None:
     """引用是否真实：返回错误原因，没问题返回 None。corpus：文件名 -> 规范化后的全文。"""
     if not f.name.strip() or not f.value.strip():
@@ -276,7 +362,15 @@ def check_fact(f: Fact, corpus: dict[str, str]) -> str | None:
         without_values = re.sub(r'[-+]?\d+(?:\.\d+)?\s*(亿元|万元|亿|万|元|%|‰)', '',
                                 unicodedata.normalize('NFKC', f.quote))
         if f.unit not in without_values:
-            return "parameter.unit：quote 必须同时包含数值及明确的单位表头，其他数字的单位不能代替"
+            basis = f.unit_basis or {}
+            quote = str(basis.get('quote', ''))
+            body = corpus.get(basis.get('file'), '')
+            explicit = f.unit in re.sub(r'[-+]?\d+(?:\.\d+)?\s*(亿元|万元|亿|万|元|%|‰)', '', quote)
+            explicit = explicit or f.unit == '%' and bool(re.search(r'百分比|百分数|百分率', quote))
+            scoped = any(norm(x) in norm(quote) for x in (f.name, f.context) if x)
+            if not (quote and len(quote) <= MAX_QUOTE and norm(quote) in body and explicit and scoped):
+                return ('parameter.unit：quote须有明确单位表头；或unit_basis={file,quote}提供明确写出该参数名/适用标题和单位的原文或财务确认。'
+                        '不能借用其他数字的单位；没有依据就ask_question，不能猜测百分数')
     if f.unit and numeric(f) is None:
         return "parameter.unit：原值与所声明单位冲突，或不是可转换的单个数值"
     if f.component != "literal" and interval(f.value) is None:
@@ -287,8 +381,7 @@ def check_fact(f: Fact, corpus: dict[str, str]) -> str | None:
     present = norm(f.value) in q
     if scalar:
         # A substring such as 1 in 1.05 is not an original scalar parameter.
-        present = any(Decimal(m.group(1)) == Decimal(scalar.group(1)) and m.group(2) == scalar.group(2)
-                      for m in _TOKEN.finditer(unicodedata.normalize('NFKC', f.quote).replace(',', '')))
+        present = (Decimal(scalar.group(1)), scalar.group(2)) in quote_scalars(f.quote)
     if not present:
         # A scalar endpoint with the shared unit is a faithful projection of this quote.
         wanted = number(f.value)

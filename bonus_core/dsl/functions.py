@@ -38,6 +38,7 @@ FUNCTIONS: dict[str, FnSpec] = {
     "between": FnSpec(3, 3, doc='between(x, 下限, 上限) 两端都包含，如 between(biz_date, "2025-01-01", "2025-03-31")'),
     "years_between": FnSpec(2, 2, doc='years_between(起始日期, 截止日期) 已满整年数，如 years_between(onboard_date, "2025-03-31")'),
     "days_between": FnSpec(2, 2, doc="days_between(起始日期, 截止日期) 相差天数"),
+    "months_between": FnSpec(2, 2, doc="months_between(起始日期, 截止日期) 年月编号之差，忽略日；不是完整月龄，不将月份换成固定天数"),
     "year": FnSpec(1, 1, doc="日期的年份"),
     "month": FnSpec(1, 1, doc="日期的月份"),
     "quarter": FnSpec(1, 1, doc="日期所在季度 1~4"),

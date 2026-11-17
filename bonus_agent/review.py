@@ -148,6 +148,8 @@ def _call(c: Call, nm: Names) -> str:
         return f"从 {a[0]} 到 {a[1]} 已满整年数"
     if fn == "days_between":
         return f"从 {a[0]} 到 {a[1]} 相差天数"
+    if fn == 'months_between':
+        return f'从 {a[0]} 到 {a[1]} 年月编号之差（忽略日）'
     if fn == "share":
         return f"{a[0]} 占同级合计的比例"
     if fn == "minmax":

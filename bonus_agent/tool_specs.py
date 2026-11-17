@@ -49,7 +49,7 @@ TOOLS: list[dict] = [
      "parameters":_obj({})},
     {"name":"plan_calculation","description":"先盘点全部材料，声明核算目标、需要的输出和全部方案。files为文件名到rule/data/rule_and_data/reference/ignore的映射，不能漏文件。",
      "parameters":_obj({'summary':_S,'outputs':{'type':'array','items':_S},'files':{'type':'object','additionalProperties':_S},'schemes':{'type':'array','items':_S},'ignored':{'type':'array','items':_obj({'ref':_S,'reason':_S},['ref','reason'])}},['summary','outputs','files','schemes'])},
-    {"name":"read_workspace","description":"分页检索facts/clauses/rules/variables/tables/mapping/basis。按name定位单个参数、条款、变量、表或数据集，scheme区分方案；大规则优先逐变量读取。",
+    {"name":"read_workspace","description":"分页检索facts/clauses/rules/variables/tables/mapping/basis/checks/tool_results。checks读取完整当前编译问题和提示；规则变化后重新compile_formulas。tool_results按name=工具名读取其最近一次完整长结果，无须重跑原工具。大规则优先逐变量读取。",
      "parameters":_obj({'section':_S,'scheme':_S,'name':_S,'query':{**_S,'description':'全文片段检索，可按参数名称片段查已有项'},'file':_S,'page':_I,'offset':{**_I,'minimum':0},'limit':{**_I,'minimum':1,'maximum':50,'description':'最多50条；同时按结果长度缩页，必须使用返回的next_call，不自行猜offset'},'detail_offset':{**_I,'minimum':0,'description':'单条过大时按next_call分片续读'},'detail':{'type':'boolean','description':'facts/clauses列表默认只给名称、取值、含义；true返回完整原文与坐标（条数少时用）'}},['section'])},
     {"name":"query_dataset","description":"独立统计一张已定义原表，使用DSL聚合表达式，如sum(amount, of: \"明细表\")。无需allocation，不受其他表的建树错误影响；不用于证明正式金额正确。",
      "parameters":_obj({'dataset':_S,'expr':_S},['dataset','expr'])},
@@ -86,7 +86,7 @@ TOOLS: list[dict] = [
      "parameters": _obj({"bindings": {"type": "array", "items": _obj({"name": _S,
          "targets": {"type": "array", "items": _S, "description": "如 tables.eu.steps.0.1 或 variables.bonus.expr"},
          "page": _I, "context": _S, "component": {"type": "string", "enum": ["literal", "lower", "upper"]},
-         "unit": _S}, ["name", "targets"])}}, ["bindings"])},
+          "unit": _S, "unit_basis": _obj({'file': _S, 'quote': {**_S, 'description': '原文或财务确认，必须明确提及此参数名/适用标题和单位；不能借用其他数字的百分号'}}, ['file', 'quote'])}, ["name", "targets"])}}, ["bindings"])},
     {"name": "validate_parameters", "description": "局部参数预检：自动修正已声明阶梯下界绑定的共享单位区间投影，返回剩余缺口与具体动作；不重跑金额、不改规则数值。",
      "parameters": _obj({"repair": {"type": "boolean"}})},
     {"name": "validation_report", "description": "查看可复核的验证状态、覆盖缺口和失败反例；不调用模型、不更改规则。", "parameters": _obj({})},
@@ -180,9 +180,12 @@ TOOLS: list[dict] = [
                     "pool、allocation、payout、offsets、checks、revisions 整体替换。返回静态校验结果。"
                     "一批文件里有多个方案（如季度奖、过程奖、年度奖）时，每个方案用 scheme 分别写 pool 等；"
                     "各方案相同的部分（分配层级与权重、数据校验、共用的参数表和变量）写到 scheme=\"共用\"，会合并进每个方案。"
-                    "只有一个方案时不写 scheme。",
+                    "只有一个方案时不写 scheme。bindings可同时提交参数绑定，绑定不合法则规则和绑定都不保存；工具保存草稿不等于公式通过。",
      "parameters": _obj({"scheme": {**_S, "description": "方案名（按材料起，如 月度、年度）；共用部分写 共用"},
                          "tables": {"type": "object"}, "variables": {"type": "object"}, "pool": {"type": "object"},
+                          "bindings": {'type': 'array', 'items': _obj({'name': _S, 'targets': {'type': 'array', 'items': _S},
+                              'page': _I, 'context': _S, 'unit': _S, 'component': {'type': 'string', 'enum': ['literal', 'lower', 'upper']},
+                              'unit_basis': _obj({'file': _S, 'quote': _S}, ['file', 'quote'])}, ['name', 'targets'])},
                          "allocation": {"type": "array", "items": {"type": "object"}},
                          "payout": {"type": "array", "items": {"type": "object"},
                                     "description": '发放条件：[{"id": "cash", "scope": "个人", "pay_ratio": "可发比例表达式"}] '

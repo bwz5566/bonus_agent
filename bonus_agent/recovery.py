@@ -89,8 +89,37 @@ def local_advice(llm, reason, steps, facts, hint):
     relevant = [f for f in facts if f.name in text or any(t in text for t in f.targets)]
     packet = {'problem': reason[:2000], 'recent': recent, 'next_action': hint[:1600],
               'facts': [f.model_dump() for f in relevant[:12]]}
+    from bonus_agent.tool_specs import TOOLS
+    failed_tools = {s.tool for s in steps[-4:] if not s.ok}
+    packet['tool_contracts'] = [
+        {'name': t['name'], 'required': t['parameters'].get('required', []),
+         'parameters': list(t['parameters'].get('properties', {}))}
+        for t in TOOLS if t['name'] in failed_tools | {'set_rules', 'bind_facts', 'read_workspace', 'ask_question', 'validate_parameters'}
+    ]
+    packet['constraints'] = ('define_dataset.file必须是真实Excel文件名，不能引用其他数据集作为file；'
+                             'combine引用原始Excel列名，fields.column也是原列名；'
+                             '只使用tool_contracts列出的工具参数，不发明数据集派生接口。')
     # Bound *all* fields, including model-produced arguments and source quotations.
-    payload = json.dumps(packet, ensure_ascii=False, default=str)[:18000]
+    packet['recent_is_excerpt'] = True
+    for item in packet['recent']:
+        args = json.dumps(item['args'], ensure_ascii=False, default=str)
+        if len(args) > 2400:
+            item['args'] = {'excerpt': args[:2400], 'notice': '参数摘录，非可执行JSON，不代表完整调用'}
+    payload = json.dumps(packet, ensure_ascii=False, default=str)
+    while len(payload) > 18000 and (packet['facts'] or len(packet['recent']) > 1):
+        if packet['facts']:
+            packet['facts'].pop()
+        else:
+            packet['recent'].pop(0)
+        payload = json.dumps(packet, ensure_ascii=False, default=str)
+    if len(payload) > 18000:
+        packet['problem'] = packet['problem'][:1000]
+        packet['next_action'] = packet['next_action'][:800]
+        for item in packet['recent']:
+            item['tool'] = item['tool'][:80]
+            item['args'] = {'excerpt': str(item['args'])[:800]}
+            item['result'] = item['result'][:800]
+        payload = json.dumps(packet, ensure_ascii=False, default=str)
     advisor = copy.copy(llm)
     advisor.think_max_tokens = 4096
     advisor.think_timeout = min(llm.think_timeout, 180)
@@ -103,6 +132,7 @@ def local_advice(llm, reason, steps, facts, hint):
              '输入是局部诊断包，不是完整案卷；recent或facts里没列出的内容不代表原文件缺失。'
              '只有显式文件清单或读取失败能支持缺文件结论，不得据局部上下文要求重新上传整批材料。'
              '缺证据就指出缺口，不猜测业务政策，不改验算迎合引擎，不降低校验。'
+             '下一步必须遵守tool_contracts和constraints，不得建议工具不支持的操作。'
              '只返回JSON：diagnosis(原因)、next_action(一个可执行修复步骤)、evidence_needed(缺少的原文)、'
              'acceptance(修复后必须验证什么)。'},
             {'role': 'user', 'content': payload}], think=True, max_tokens=4096)

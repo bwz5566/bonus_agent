@@ -28,7 +28,8 @@ STAGES = (
 _CORE = Path(__file__).resolve().parent.parent / 'bonus_core'
 _EXECUTION_PROFILE = hashlib.sha256(
     b''.join(p.read_bytes() for p in sorted(_CORE.rglob('*.py'))) + Path(__file__).read_bytes()
-    + Path(__file__).with_name('lint.py').read_bytes()
+    + b''.join(Path(__file__).with_name(n).read_bytes() for n in
+               ('lint.py', 'facts.py', 'source_cells.py', 'agent.py', 'context.py', 'recovery.py'))
 ).hexdigest()
 
 
@@ -275,7 +276,9 @@ class Workflow:
                     '清空后程序自动去掉。' if extra else '')
                  + (f'缺少 {missing}：用 set_rules(scheme=…) 写出这些方案的规则。' if missing else '')
                  + '确实要改方案，先依据原文用 plan_calculation 调整计划')
-        issues = self.ws._binding_gaps() + self.ws._clause_gaps(self.skipped())
+        repaired = self.ws.validate_parameters(repair=True)['repaired']
+        evidence = self.ws._binding_gaps() + self.ws._clause_gaps(self.skipped())
+        issues = []
         graph = {}
         warnings = []
         from bonus_agent.lint import compile_warnings, reached
@@ -294,10 +297,33 @@ class Workflow:
                 order = []
             graph[s] = {'order': order, 'dependencies': {n: sorted(v) for n, v in deps.items()}}
         self.ws._order(self.ws.schemes)  # Inter-scheme cycles are also invalid.
-        report = {'status': 'FAIL' if issues else 'PASS', 'issues': issues, 'warnings': warnings, 'graph': graph}
+        # Structural blockers must remain visible even with hundreds of evidence gaps.
+        issues = list(dict.fromkeys(issues + evidence))
+        report = {'status': 'FAIL' if issues else 'PASS', 'issues': issues, 'warnings': warnings,
+                  'graph': graph, 'repaired': repaired}
+        self.state['formula_report'] = {'version': self.version(), 'report': copy.deepcopy(report)}
         if not issues:
             self.receipt('formulas', report)
-        return report
+        return self.compile_summary(report)
+
+    def compile_summary(self, report):
+        """Bound tool output without losing the full diagnostic or its continuation address."""
+        preview, chars = [], 0
+        for issue in report['issues']:
+            if len(preview) >= 6 or chars + len(issue) > 3000:
+                break
+            preview.append(issue)
+            chars += len(issue)
+        return {
+            'status': report['status'], 'issues': preview, 'issue_count': len(report['issues']),
+            'warnings': report['warnings'][:3], 'warning_count': len(report['warnings']),
+            'repaired': report.get('repaired', [])[:3],
+            'graph': {s: {'variables': len(v['order'])} for s, v in report['graph'].items()},
+            'next_call': {'tool': 'read_workspace', 'args': {'section': 'checks', 'offset': len(preview), 'limit': 6}}
+                         if len(preview) < len(report['issues']) or len(report['warnings']) > 3 else None,
+            'next': '按issues逐项修复；完整检查见read_workspace(section="checks")。草稿保存不等于校验通过。'
+                    if report['issues'] else 'calculate_basis',
+        }
 
     def references(self, name):
         refs = {}
