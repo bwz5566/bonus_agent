@@ -9,6 +9,15 @@ from bonus_core.dsl.parser import parse, walk, Name, ExprError, Num
 ROOTS = {'tables', 'variables', 'pool', 'allocation', 'report', 'payout', 'offsets', 'checks'}
 
 
+def _semantic(value):
+    """Descriptions are not executable inputs; financial fields and policies are."""
+    if isinstance(value, dict):
+        return {k: _semantic(v) for k, v in value.items() if k != 'desc'}
+    if isinstance(value, list):
+        return [_semantic(v) for v in value]
+    return value
+
+
 def _strings(value):
     if isinstance(value, dict):
         for key, part in value.items():
@@ -34,6 +43,11 @@ class TaskBoard:
             if not isinstance(item, dict) or not all(isinstance(item.get(k), str) and item[k].strip() for k in ('id', 'scheme', 'target')):
                 raise ToolError('construction.plan：每项须给非空id、scheme、target')
             spec = {k: copy.deepcopy(item[k]) for k in ('id', 'scheme', 'target', 'title', 'depends_on', 'clauses', 'facts') if k in item}
+            for ident, prior in list(proposed.items()):
+                if ident.startswith('auto:') and ident != spec['id'] and (prior['scheme'], prior['target']) == (spec['scheme'], spec['target']):
+                    proposed.pop(ident)
+                    for other in proposed.values():
+                        other['depends_on'] = [spec['id'] if d == ident else d for d in other.get('depends_on', [])]
             parts = fx.target_parts(spec['target'])
             if (spec['scheme'] not in schemes or not spec['target'].startswith('/') or not parts or parts[0] not in ROOTS
                     or len(parts) != (2 if parts[0] in ('tables', 'variables') else 1)):
@@ -60,7 +74,57 @@ class TaskBoard:
         self.state['tasks'] = proposed
         for scheme in {s['scheme'] for s in proposed.values()}:
             self.ws.drafts.setdefault(scheme, {})
+        self.sync_targets()
         return {'status': 'PLANNED', **self.summary()}
+
+    def sync_targets(self):
+        """Enroll existing components without inventing formulas or clause ownership."""
+        if not self.state['tasks']:
+            return
+        owned = {(s['scheme'], s['target']) for s in self.state['tasks'].values()}
+        schemes = self.ws.workflow.get('plan', {}).get('schemes', self.ws.schemes)
+        for scheme in schemes:
+            for root, value in self.ws._merged(scheme).items():
+                if root not in ROOTS or not value:
+                    continue
+                for name in (list(value) if root in ('tables', 'variables') else [None]):
+                    target = '/' + root + ('/' + name.replace('~', '~0').replace('/', '~1') if name else '')
+                    if (scheme, target) in owned:
+                        continue
+                    ident = f'auto:{scheme}:{target}'
+                    ref = root + ('.' + name if name else '')
+                    self.state['tasks'][ident] = {'id': ident, 'scheme': scheme, 'target': target,
+                        'title': '已有组件的程序检查', 'depends_on': [], 'facts': [],
+                        'clauses': [c.id for c in self.ws.clauses if ref in cl.refs(c.where)]}
+                    owned.add((scheme, target))
+
+    def data_inputs(self, spec):
+        """Conservative dependency closure, including entity and reference relationships."""
+        draft = self.ws._merged(spec['scheme'])
+        fields, text = set(), list(_strings(self.value(spec)))
+        for expression in text:
+            try:
+                fields |= {n.id for n in walk(parse(expression)) if isinstance(n, Name)}
+            except ExprError:
+                pass
+        fields -= set(draft.get('variables', {})) | set(draft.get('tables', {}))
+        data = {n: _semantic(d.model_dump(mode='json')) for n, d in self.ws.datasets.items()}
+        selected = {n for n, d in data.items() if fields & set(d.get('fields', {})) or any(n in t for t in text)}
+        # Roots can change allocation topology; their signatures must cover the entire graph.
+        if spec['target'] in ('/allocation', '/report', '/payout', '/offsets', '/checks'):
+            selected = set(data)
+        changed = True
+        while changed:
+            changed = False
+            keys = {data[n].get('key') for n in selected} - {None}
+            links = {data[n].get('link') for n in selected} - {None}
+            for n, d in data.items():
+                if n not in selected and (d.get('key') in links or d.get('link') in keys or
+                                          any(data[s].get('population_from') == n for s in selected)):
+                    selected.add(n)
+                    changed = True
+        return {n: data[n] for n in sorted(selected)}, {
+            n: _semantic(self.ws.mapping[n].model_dump(mode='json')) for n in sorted(selected) if n in self.ws.mapping}
 
     def value(self, spec):
         try:
@@ -91,11 +155,12 @@ class TaskBoard:
             if fact.name in spec['facts'] or any(self.owns(spec, t) for t in fact.targets):
                 related.append(fact.model_copy(update={'targets':[t for t in fact.targets if self.owns(spec,t)]}).model_dump(mode='json'))
         from bonus_agent.workflow import _EXECUTION_PROFILE
+        datasets, mapping = ({}, {}) if spec['target'].startswith('/tables/') else self.data_inputs(spec)
         return fingerprint({'profile': _EXECUTION_PROFILE, 'files': self.ws._source_version, 'period': str(self.ws.period),
             'spec': spec, 'value': self.value(spec), 'facts': related,
             'clauses': [(c.id, c.file, c.quote) for c in self.ws.clauses if c.id in spec['clauses']],
-            'datasets': {n:d.model_dump(mode='json') for n,d in self.ws.datasets.items()} if not spec['target'].startswith('/tables/') else {},
-            'mapping': {n:m.model_dump(mode='json') for n,m in self.ws.mapping.items()} if not spec['target'].startswith('/tables/') else {},
+            'datasets': datasets, 'mapping': mapping,
+            'structure': _semantic(self.ws._merged(spec['scheme']).get('allocation', [])) if not spec['target'].startswith('/tables/') else None,
             'dependencies': dependencies})
 
     def owns(self, spec, target):
@@ -129,6 +194,8 @@ class TaskBoard:
             return [f'construction.missing：先用set_rules/compile_table构建{spec["scheme"]}::{spec["target"]}']
         rs = self.ws._ruleset(spec['scheme'])
         parts = fx.target_parts(spec['target'])
+        if parts[0] in ('variables', 'pool') and not rs.allocation:
+            return ['construction.structure：先用set_rules声明allocation实体层级及主键，再检查公式作用域；尚未验证的结构不能签发PASS']
         prefix = '.'.join(parts)
         own = lambda where: where == prefix or where.startswith(prefix + '.')
         issues = [str(i) for i in self.ws._validate(spec['scheme'], rs) if i.severity == 'blocking' and own(i.where)
@@ -147,9 +214,14 @@ class TaskBoard:
             local = candidate.model_copy(update={'targets':[spec['scheme'] + '::' + fx.split_target(t)[1]
                                                           if fx.split_target(t)[0] == '共用' else t for t in bindings]})
             issues += fx.binding_errors([local], {spec['scheme']:self.ws._merged(spec['scheme'])})
-        for gap in self.ws._binding_gaps():
-            if any(gap.startswith(f.name + '：') for f in related) or spec['target'] in gap:
-                issues.append(gap)
+        # Candidate locations in a global error are suggestions, never ownership evidence.
+        # Global unbound facts remain blocking at compile; local tasks inspect only assigned/bound facts.
+        import hashlib
+        from bonus_agent.agent import CHAT_SOURCE
+        for fact in related:
+            source = self.ws._chat_text().encode() if fact.file == CHAT_SOURCE else self.ws._file(fact.file).read_bytes()
+            if not fact.source_hash or fact.source_hash != hashlib.sha256(source).hexdigest():
+                issues.append(f'{fact.name}：原文版本变化或缺少指纹，需要重新登记')
         sourced = {fx.numeric(f) for f in related if any(self.owns(spec,t) for t in f.targets)}
         constants = {number for number,where in lint.constants(rs) if own(where)} - lint.FREE
         for number in constants - sourced:
@@ -157,7 +229,7 @@ class TaskBoard:
         issues += target_mode_issues(self.ws, spec['scheme'], spec['target'], spec['clauses'])
         return list(dict.fromkeys(issues))
 
-    def check(self, task):
+    def check(self, task, *, include_next=True):
         from bonus_agent.agent import ToolError
         if task not in self.state['tasks']:
             raise ToolError('construction.task：任务不存在，先plan_formula_tasks')
@@ -180,8 +252,19 @@ class TaskBoard:
                            if c.id in spec['clauses'] and not c.where.startswith((cl.BUILTIN, cl.NOT_APPLY, cl.ASKED))}
                 if updates:
                     self.ws.cover_clauses(updates)
-        report['next'] = self.summary()['next']
+        if include_next:
+            report['next'] = self.summary()['next']
         return report
+
+    def refresh(self):
+        """Recheck stale receipts in dependency order, without spending a model turn per item."""
+        self.sync_targets()
+        for name in list(self.statuses()):
+            status = self.statuses()[name]
+            previous = self.state['reports'].get(name, {})
+            if (status['status'] == 'PENDING' and name in self.state['receipts']
+                    and not (previous.get('version') == status['version'] and previous.get('status') == 'FAIL')):
+                self.check(name, include_next=False)
 
     def coverage_gaps(self):
         tasks = self.state['tasks']
@@ -223,6 +306,7 @@ class TaskBoard:
             self.check(name)
 
     def summary(self):
+        self.refresh()
         tasks, statuses = self.state['tasks'], self.statuses()
         active = next((n for n,s in statuses.items() if s['status']=='PENDING'), None)
         if not tasks:
@@ -232,9 +316,16 @@ class TaskBoard:
             return {'total':len(tasks),'passed':sum(s['status']=='PASS' for s in statuses.values()),'active':None,
                     'next':gaps[0] if gaps else 'compile_formulas'}
         spec = tasks[active]
+        if not self.ws._merged(spec['scheme']).get('allocation') and any(
+                s['target'].startswith('/variables/') or s['target'] == '/pool' for s in tasks.values()):
+            return {'total': len(tasks), 'passed': sum(s['status']=='PASS' for s in statuses.values()),
+                    'active': {**spec, 'status': statuses[active]['status']},
+                    'next': 'set_rules：先声明allocation的实体层级、key和parent_key；结构是公式作用域检查的前置条件，不需要先计算金额'}
         action = 'check_formula_task' if self.value(spec) is not None else ('compile_table' if spec['target'].startswith('/tables/') else 'set_rules')
         last = self.state['reports'].get(active,{})
+        gaps = self.coverage_gaps()
         return {'total':len(tasks),'passed':sum(s['status']=='PASS' for s in statuses.values()),
+                'coverage_gap_count': len(gaps), 'coverage_gaps': gaps[:4],
                 'active':{**spec,'status':statuses[active]['status'],
                           'last_issues':last.get('issues',[])[:3] if last.get('version') == statuses[active]['version'] else []},
                 'next':f'{action}：当前任务{active}，只处理{spec["scheme"]}::{spec["target"]}，依赖已通过；完成后check_formula_task(task="{active}")'}
@@ -244,8 +335,6 @@ class TaskBoard:
         if not self.state['tasks']:
             return ['construction.plan：先plan_formula_tasks，逐个构建并check_formula_task，再整体编译']
         # A changed version of a previously checked component can be rechecked locally without another model round.
-        for name, status in self.statuses().items():
-            if status['status'] == 'PENDING' and name in self.state['receipts']:
-                self.check(name)
+        self.refresh()
         return self.coverage_gaps() + [f'construction.task：{n}未通过局部检查或已失效，调用check_formula_task'
                                        for n,s in self.statuses().items() if s['status'] != 'PASS']

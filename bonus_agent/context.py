@@ -146,6 +146,18 @@ def workspace_view(
         items = [c.model_dump(mode='json') for c in ws.clauses]
     elif section == 'rules':
         items = [{'scheme': s, 'rule': ws._merged(s)} for s in ([ws._scheme(scheme)] if scheme else ws.schemes)]
+        # A component query must not return fragments starting at the beginning of the entire rule.
+        from bonus_agent.construction import ROOTS
+        component = name if name is not None and name not in ws.schemes else query
+        if component in ROOTS:
+            items = [{'scheme': item['scheme'], 'name': component, 'definition': item['rule'].get(component)} for item in items]
+            query = component
+            name = None
+        elif component and any(component in (item['rule'].get(root) or {}) for item in items for root in ('variables', 'tables')):
+            items = [{'scheme': item['scheme'], 'name': component, 'definition': item['rule'][root][component]}
+                     for item in items for root in ('variables', 'tables') if component in (item['rule'].get(root) or {})]
+            query = component
+            name = None
     elif section in ('variables', 'tables'):
         items = [
             {'scheme': s, 'name': n, 'definition': v}
