@@ -506,6 +506,7 @@ class Step:
     tokens_in: int = 0            # 这次模型回复的输入 / 输出 tokens（同上）
     tokens_out: int = 0
     request: dict = field(default_factory=dict)  # actual serving model, finish reason and request id
+    agent: str = ''
 
 
 @dataclass
@@ -4448,7 +4449,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
               should_stop: Callable[[], bool] | None = None, instruction: str | None = None,
               message: str | None = None, by: str = "", chat: list[dict] | None = None,
               reflect: int = MAX_REFLECT, deep: int = DEEP_LIMIT, scenario=None, period: str | None = None,
-              run_budget=None) -> AgentResult:
+              run_budget=None, execution_mode: str = 'staged') -> AgentResult:
     """max_steps 和 max_tokens 都是安全上限：模型调用 finish 就结束，正常不会用满。
     reflect：卡住时在本轮内反思、换做法的次数上限（清掉打转的对话历史，带上卡在哪、试过什么，工作区保留），用完再停下。
     deep：按需深度思考的步数上限。平时不思考；上一步出错、被拦下、原样重复或停下来反思后，下一步先分析错在哪、
@@ -4516,6 +4517,17 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         ws.questions = [Question(id=a.get("id") or f"q{i + 1}", text=a["text"], options=a.get("options") or [])
                         for i, a in enumerate(answers or []) if a.get("text") and a.get("answer") not in (None, "")]
     fresh = cs.apply_answers(ws.questions, answers)
+    if execution_mode not in ('staged', 'multi_agent'):
+        raise ToolError('未知execution_mode：' + execution_mode)
+    saved_mode = ws.workflow.get('execution_mode', 'staged')
+    if resumed and execution_mode != saved_mode:
+        raise ToolError('案卷执行模式不能静默切换，请使用新的实验输出目录')
+    if execution_mode == 'multi_agent' and getattr(llm, 'workflow_mode', 'legacy') != 'staged':
+        raise ToolError('multi_agent要求staged阶段门禁')
+    ws.workflow['execution_mode'] = execution_mode
+    rnd['execution_mode'] = execution_mode
+    rnd['limits'] = {'max_tokens':max_tokens,'max_steps':max_steps}
+    rnd['checker'] = getattr(getattr(llm, 'checker_llm', None), 'name', None)
     ws.workflow['enabled']=getattr(llm,'workflow_mode','legacy')=='staged'
     ws.said = _said(chat, message, instruction)
     recovery = RecoveryJournal(out / 'recovery.json' if out else None,
@@ -4524,8 +4536,26 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                                 'code': rnd['code'], 'financial_context': ws.said})
     ws.notes.pop(ANSWER_NOTE, None)          # 上一轮的回答不带到这一轮
     handlers = {t["name"]: getattr(ws, t["name"]) for t in TOOLS}
-    ws.transcribe_all()
-    ws.triage_all()
+    team = None
+    if execution_mode == 'multi_agent':
+        from bonus_agent.team import TeamSession
+        team = TeamSession(ws, max_tokens, should_stop)
+        llm = ws.llm
+        def checkpoint_team():
+            if out is not None:
+                live = {**(case or {'created':rnd['at']}),
+                        'rounds':[*((case or {}).get('rounds', [])), {**rnd, 'status':'RUNNING'}],
+                        'workspace':cs.snapshot(ws)}
+                cs.save_case(out, live)
+        team.checkpoint = checkpoint_team
+    preprocessing_error = ''
+    try:
+        ws.transcribe_all()
+        ws.triage_all()
+    except LLMError as exc:
+        if not team:
+            raise
+        preprocessing_error = str(exc)
     pack = '' if ws.staged else ("\n\n【材料包】以下是本批次材料的内容（程序读取，图片已转写），每轮都附在这里、不会被裁剪。"
             "标了“全文 / 整表”的不要再用工具读；数据表只附了前几行，define_dataset 会读取全部行。\n\n" + ws.briefing())
     if message:             # 对话：财务的一条消息。先按现有规则试算一遍，便于回答和查算式
@@ -4555,7 +4585,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                   "材料要求累计时使用相应 window，不能为消除报错而擅自丢历史记录。建树失败先 diagnose_datasets，"
                   "看原始编号及期间覆盖，用 update_dataset 局部修改 fields/combine/period 后再试算。口径拿不准就提问")
     task += pack
-    mode = llm.tool_mode
+    mode = 'native' if team else llm.tool_mode
     sys = system_prompt()
     if ws.staged:
         sys += '\n\n'+prompt('workflow')
@@ -4567,7 +4597,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
     carry_chars = max(CARRY_CHARS, max_history_chars // 4)
     history: list[dict] = []
     steps: list[Step] = []
-    error = recovery.error
+    error = recovery.error or preprocessing_error
     nudges = 0
     seen: dict[str, int] = {}          # 只读工具的调用 -> 第几步，用来发现原地打转
     recent_reads: dict[str, tuple] = {}  # 上次清空对话以来读过的工作区内容，清空时仍没变的附在说明里
@@ -4716,9 +4746,10 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         else:
             msgs = [{"role": "system", "content": sys}] + body + tail
             try:
-                if ws.staged:
+                if ws.staged and not team:
                     guard_messages(msgs,llm,tools=openai_tools(available_tools))
-                reply = llm.chat_tools(msgs, openai_tools(available_tools), temperature=AGENT_TEMPERATURE, **({"think": True} if think else {}))
+                reply = (team.propose(sys, task, available_tools) if team else
+                         llm.chat_tools(msgs, openai_tools(available_tools), temperature=AGENT_TEMPERATURE, **({"think": True} if think else {})))
             except ContextBudgetError as e:
                 try:
                     compacted=context_retries<2 and compact_local_context(msgs,body,tail,openai_tools(available_tools))
@@ -4736,6 +4767,9 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                     on_step(len(steps), steps[-1])
                 continue
             except LLMError as e:
+                if team:
+                    error = str(e)
+                    break
                 if _context_overflow(str(e)) and context_retries < 2:
                     context_retries += 1
                     _shrink(history, max(1500, _size(history) // 2), keep=2)
@@ -4803,6 +4837,8 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                 except json.JSONDecodeError:
                     shown = {}
                 steps.append(Step(c["name"], shown if isinstance(shown, dict) else {}, result, False, thought))
+                if team:
+                    team.observe(c, result, False)
                 if on_step:
                     on_step(len(steps), steps[-1])
                 history.append(
@@ -4831,7 +4867,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                                     + f"可用：{list(handlers)}")
                 if ws.staged and not ws._flow().allowed(c['name']):
                     raise ToolError('workflow.gate：该操作的前置阶段尚未通过。下一步：'+ws._flow().hint())
-                value = fn(**args)
+                value = team.execute(c, args) if team else fn(**args)
                 if isinstance(value, (dict, list)):
                     from bonus_agent.context import tool_result
                     result = (json.dumps(value, ensure_ascii=False, default=str) if c['name'] == 'read_workspace'
@@ -4884,7 +4920,9 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                 result += "\n（提醒：每次调用都先在 thought 里写思考：上一步观察到了什么、为什么做这一步、预期看到什么。）"
             step = Step(c["name"], args if isinstance(args, dict) else {}, result, ok, thought,
                         at=time.strftime("%H:%M:%S", time.localtime(t_tool)), secs=round(time.time() - t_tool, 2),
-                        request=dict(llm.last_call))
+                        request=dict(c.get('_request', llm.last_call)), agent=c.get('_owner', ''))
+            if team:
+                team.observe(c, result, ok)
             failed_validation = ok and isinstance(value, dict) and value.get('status') == 'FAIL'
             # 工具名不存在是调用协议的错，与案卷无关：本轮的卡住检测照常计数，但不写进跨轮的纠错记录，
             # 否则下一轮一开始就被“同一问题累计失败”拦停，重新运行也没用

@@ -121,7 +121,12 @@ def main(argv=None) -> int:
     p = sub.add_parser("regress-compare")
     p.add_argument("old", help="上一次回归的输出目录或 summary.json")
     p.add_argument("new", help="这一次回归的输出目录或 summary.json")
+    p = sub.add_parser('agent-compare', help='离线比较单Agent与多Agent案卷，不调用模型')
+    p.add_argument('old')
+    p.add_argument('new')
+    p.add_argument('--out', required=True)
     p = sub.add_parser("serve")
+    p.add_argument('--execution-mode', choices=['staged','multi_agent'], default='staged')
     p.add_argument("--data", required=True, help="数据目录：用户、案卷、材料和结果都在这里")
     p.add_argument("--host", default="127.0.0.1", help="默认只监听本机；内网访问请放在 HTTPS 反向代理后面")
     p.add_argument("--port", type=int, default=8080, help="默认 8080（8000 留给本地 vLLM）")
@@ -139,6 +144,7 @@ def main(argv=None) -> int:
     p.add_argument("--display", default="", help="显示的姓名（记入答复人、确认人）")
     p.add_argument("--password-stdin", action="store_true", help="从标准输入读口令（脚本用）")
     p = sub.add_parser("auto")
+    p.add_argument('--execution-mode', choices=['staged','multi_agent'], default='staged')
     p.add_argument("--scenario", help="场景（编制模式）：带上场景说明、输入模板检查和场景记忆；不写按通用流程")
     p.add_argument("--scenario-dir", action="append", default=[], **scen_dir)
     p.add_argument("--no-memory", action="store_true", help="不使用场景记忆（评测时用，避免沿用以前的答复）")
@@ -156,6 +162,14 @@ def main(argv=None) -> int:
     p.add_argument("--pipeline", action="store_true", help="使用固定流程（规划 → 抽取 → 计算），不让模型自主调度")
     p.add_argument("paths", nargs="+", help="本批次的规则文档、Excel 数据，或只包含它们的文件夹")
     a = ap.parse_args(argv)
+    if a.cmd == 'auto' and a.pipeline and a.execution_mode == 'multi_agent':
+        ap.error('--pipeline与--execution-mode multi_agent不能同时使用')
+    if a.cmd == 'agent-compare':
+        from bonus_agent.team_report import compare_runs
+        report = compare_runs(a.old, a.new)
+        Path(a.out).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+        print('对照报告已保存：' + a.out)
+        return 0
 
     if a.cmd in {"scenarios", "publish", "compute", "impact"}:
         return _scenario_cmd(a)
@@ -234,7 +248,7 @@ def main(argv=None) -> int:
     if a.cmd == "serve":
         from bonus_agent.web import serve
         serve(a.data, a.host, a.port, a.model, max_parallel=a.max_parallel, checker=a.checker,
-              max_steps=a.max_steps, max_tokens=a.max_tokens)
+              max_steps=a.max_steps, max_tokens=a.max_tokens, execution_mode=a.execution_mode)
         return 0
     cfg = load_config()
     if a.cmd == "models":
@@ -472,7 +486,8 @@ def _agent(a, cfg) -> int:
         ar = run_agent(llm, a.paths, a.out, answers=answers, max_steps=a.max_steps, max_tokens=a.max_tokens,
                        exclude=[a.expected] if a.expected else [],
                        max_history_chars=hist, resume=not a.new,
-                       max_files=a.max_files, on_step=show, scenario=scenario, period=a.period)
+                       max_files=a.max_files, on_step=show, scenario=scenario, period=a.period,
+                       execution_mode=a.execution_mode)
     except ToolError as e:
         print(f"失败：{e}")
         return 1

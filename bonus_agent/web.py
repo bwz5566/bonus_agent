@@ -283,7 +283,8 @@ class Runner:
                                max_tokens=self.max_tokens, message=message, by=job.by,
                                chat=self.store.chat(job.cid)[:-1] if message else self.store.chat(job.cid),
                                on_step=lambda n, s: self._step(job, d / "out", n, s), should_stop=lambda: job.cancel,
-                               instruction=instruction, scenario=scenario, period=meta.get("period"), run_budget=budget)
+                               instruction=instruction, scenario=scenario, period=meta.get("period"), run_budget=budget,
+                               execution_mode=getattr(self, 'execution_mode', 'staged'))
                 auto = 0
                 # 仅步数用完允许续跑；重复失败和无进展是终止条件，不能在外层清零重试。
                 while not message and not instruction and auto < self.auto_continue and retryable(ar.error) and not job.cancel:
@@ -296,7 +297,8 @@ class Runner:
                     ar = run_agent(llm, [d / "materials"], d / "out", resume=True, max_steps=self.max_steps,
                                    max_tokens=self.max_tokens, by=job.by, chat=self.store.chat(job.cid),
                                    on_step=lambda n, s: self._step(job, d / "out", n, s), should_stop=lambda: job.cancel,
-                                   scenario=scenario, period=meta.get("period"), run_budget=budget)
+                                   scenario=scenario, period=meta.get("period"), run_budget=budget,
+                                   execution_mode=getattr(self, 'execution_mode', 'staged'))
                 expected = sorted((d / "expected").glob("*.xlsx"))
                 if expected and ar.results:
                     from bonus_agent.compare import compare_expected, report
@@ -552,7 +554,8 @@ def review_section(cid: str, out: Path, csrf: str, can_mark: bool) -> str:
 
 
 def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_parallel: int = 2, model_name: str = "",
-               max_steps: int = 150, max_tokens: int = 4_000_000, scenario_dirs: list[str | Path] | None = None):
+               max_steps: int = 150, max_tokens: int = 4_000_000, scenario_dirs: list[str | Path] | None = None,
+               execution_mode: str = 'staged'):
     """scenario_dirs：另外的场景目录（如财务维护的共享目录）；数据目录下的 scenarios/ 总会用上，规则版本和记忆默认写在那里。"""
     from fastapi import Depends, FastAPI, HTTPException, Request
     from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
@@ -562,6 +565,7 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
     from bonus_agent.scenarios import releases as rl
     registry = Registry([store.root / "scenarios", *(scenario_dirs or [])])
     runner = Runner(store, llm_factory, max_parallel, max_steps, max_tokens, registry=registry)
+    runner.execution_mode = execution_mode
     app = FastAPI(title="奖金计算", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store, app.state.runner, app.state.registry = store, runner, registry
     sessions: dict[str, tuple[str, float]] = {}            # 会话号 -> (用户名, 到期时间)；服务重启后要重新登录
@@ -888,6 +892,15 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         parts.append(f"<section><h2>本轮输出</h2>{res}</section>")
         # 确认
         flow=(case or {}).get('workspace',{}).get('workflow',{})
+        if flow.get('execution_mode') == 'multi_agent':
+            team_state = flow.get('team', {})
+            labels = {'READY':'待执行','RUNNING':'执行中','VALIDATING':'校验中','PASSED':'局部检查通过',
+                      'BLOCKED':'已阻塞','STALE':'已过期','PENDING':'待修复'}
+            rows = ''.join(f'<tr><td>{e(name)}</td><td>{e(labels.get(t.get("status"), t.get("status", "")))}</td>'
+                           f'<td>{e(t.get("problem", t.get("last_result", ""))[:600])}</td></tr>'
+                           for name,t in team_state.get('tasks',{}).items())
+            parts.append('<section><h2>模块处理进度</h2><p>局部检查通过不代表最终核算通过。累计Token：'
+                         + e(team_state.get('meter',{}).get('tokens',0)) + '</p><table>' + rows + '</table></section>')
         if flow.get('enabled'):
             from bonus_agent.recovery import fingerprint
             blocks=[]
