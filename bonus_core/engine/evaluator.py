@@ -672,20 +672,22 @@ def tier_band(t: TierTable, x: Decimal) -> int:
     """x 落在第几档（从 0 起），低于第一档的下限为 -1。"""
     band = -1
     for i, (lo, _) in enumerate(t.steps):
-        if x > lo or (t.lower_inclusive and x == lo):
+        if x > lo or (t.includes_lower(i) and x == lo):
             band = i
     return band
 
 
 def tier_rate(t: TierTable, x: Decimal) -> Decimal:
     rate = t.steps[0][1] if t.below_first == "first" and t.steps else Decimal(0)
-    for lo, r in t.steps:
-        if x > lo or (t.lower_inclusive and x == lo):
+    for i, (lo, r) in enumerate(t.steps):
+        if x > lo or (t.includes_lower(i) and x == lo):
             rate = r
     return rate
 
 
 def tier_amount(t: TierTable, x: Decimal) -> Decimal:
+    if t.purpose == 'coefficient':
+        raise EvalError('区间系数表使用tier_rate取系数，不能用tier直接计算金额')
     if t.mode == "whole":
         return x * tier_rate(t, x)
     total = Decimal(0)

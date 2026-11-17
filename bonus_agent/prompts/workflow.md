@@ -18,6 +18,7 @@ calculate_basis不执行分配权重或发放。review_basis在独立会话中�
 - 准备数据通过后先用plan_formula_tasks规划构建任务，每项只指向一个/variables/名称、/tables/名称或/pool、/allocation、/report，列出depends_on、clauses和facts。按id分批补充；先基础后上层，不必一次输出全部公式。
 - 只完成任务卡中的active任务：查该任务的原文，set_rules或compile_table写入，bind_facts或set_rules(bindings=...)绑定，再check_formula_task。局部通过后程序推进下一项；新增公式也须安排任务。不要只通读台账或在没有公式时反复compile_formulas。
 - 表格算法由明确原文决定。超额累进使用excess，整额分档使用whole；compile_table可给algorithm_basis={file,quote,page}。省略mode时按明确原文选择，与原文矛盾则拒绝。系数表和金额阶梯分别核对，不能把所有表统一成一种算法。
+- 指标区间取系数使用compile_coefficient_table(name,scheme,cells_from,applies_to,rows=[{range:"R1C2",value:"R2C2"},...])，水平表引用同列表头，竖直表引用同行区间。程序一次读取端点及系数并登记绑定，不必反复补区间格；原文不明或冲突时不保存。用tier_rate(表,指标)取系数，禁止用tier把达成率乘系数当奖金。不把普通标题当algorithm_basis，不编造负下界。错误有next_call时先核对原文用途再执行该修复路径，不原样重试。
 - 新证据的首次分页读取会被记录；换limit/query重读同一条不算进展。数据修复退回前一步时保留已构建任务和上下文。未通过的未来分配层不作为当前基础公式的停滞依据；必要审核和最终整体编译仍必须通过。
 
 - set_rules可同时传bindings（与bind_facts格式一致）。程序对新规则和绑定一起校验；绑定无效时都不保存。删除表或变量时程序清理对应旧绑定，原文参数保留。

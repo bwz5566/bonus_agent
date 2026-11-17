@@ -17,7 +17,7 @@ READS = {'read_document', 'read_sheet', 'read_parameter_table', 'read_workspace'
 EVIDENCE = {'record_facts', 'record_parameter_cells', 'record_clauses', 'cover_clauses',
             'bind_facts', 'validate_parameters', 'remove_facts', 'answer_question', 'ask_question', 'note'}
 DATA = {'define_dataset', 'update_dataset', 'remove_dataset', 'set_rules', 'prepare_data'}
-FORMULA = {'set_rules', 'compile_table', 'bind_facts', 'check_formula_task','patch_rule_component'}
+FORMULA = {'set_rules', 'compile_table', 'compile_coefficient_table', 'bind_facts', 'check_formula_task','patch_rule_component'}
 
 
 class Meter:
@@ -367,10 +367,10 @@ class TeamSession:
             raise ToolError('team.permission：分块路径超出任务目标')
         if name == 'check_formula_task' and args.get('task') != spec['id']:
             raise ToolError('team.permission：只能检查自己的任务')
-        if name in {'set_rules', 'compile_table'}:
+        if name in {'set_rules', 'compile_table', 'compile_coefficient_table'}:
             if args.get('scheme') != spec['scheme']:
                 raise ToolError('team.permission：方案必须显式等于任务方案')
-            if name == 'compile_table':
+            if name in {'compile_table','compile_coefficient_table'}:
                 if parts[0] != 'tables' or args.get('name') != parts[1]:
                     raise ToolError('team.permission：只能修改自己的参数表')
             else:

@@ -251,3 +251,24 @@ def test_missing_structure_stays_in_data_role_for_repair(tmp_path):
     assert report['status']=='FAIL' and any('structure.required' in x for x in report['issues'])
     team=TeamSession(ws,100_000)
     assert team.owners()[0][0]=='data' and 'set_rules' in ws._flow().hint()
+
+
+def test_main_coefficient_compiler_is_available_to_owning_table_agent(tmp_path):
+    from bonus_agent.tool_specs import TOOLS
+    ws=make_workspace(tmp_path);ws.prepare_data()
+    ws.plan_formula_tasks([{'id':'a','scheme':'S','target':'/tables/coefficient'}])
+    team=TeamSession(ws,100_000);spec=ws.workflow['construction']['tasks']['a']
+    assert 'compile_coefficient_table' in {t['name'] for t in team.tools(TOOLS,spec,'formula:a')}
+    c=call(team,'compile_coefficient_table',spec=spec)
+    team.authorize(c,{'scheme':'S','name':'coefficient'})
+    with pytest.raises(ToolError,match='permission'):
+        team.authorize(c,{'scheme':'S','name':'another'})
+
+
+def test_coordinator_can_return_after_real_plan_change_but_not_narration(tmp_path):
+    ws=make_workspace(tmp_path);TeamSession(ws,100_000)
+    rec=request_repair(ws,'coordinator','材料用途需要修正')['repair']
+    ws.workflow['plan']['summary']+=' 补充说明'
+    with pytest.raises(ToolError,match='no_change'):finish_repair(ws,rec['id'])
+    ws.workflow['plan']['files']['data.xlsx']='rule_and_data'
+    assert finish_repair(ws,rec['id'])['status']=='REPAIR_RETURNED'

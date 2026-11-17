@@ -322,6 +322,8 @@ class TaskBoard:
                     'active': {**spec, 'status': statuses[active]['status']},
                     'next': 'set_rules：先声明allocation的实体层级、key和parent_key；结构是公式作用域检查的前置条件，不需要先计算金额'}
         action = 'check_formula_task' if self.value(spec) is not None else ('compile_table' if spec['target'].startswith('/tables/') else 'set_rules')
+        if action == 'compile_table' and '系数' in spec.get('title', ''):
+            action = 'compile_coefficient_table'
         last = self.state['reports'].get(active,{})
         gaps = self.coverage_gaps()
         return {'total':len(tasks),'passed':sum(s['status']=='PASS' for s in statuses.values()),

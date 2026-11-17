@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Annotated, Literal, Union
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def to_decimal(v) -> Decimal:
@@ -103,10 +103,23 @@ class TierTable(RuleItem):
     mode: Literal["whole", "excess"]          # 全额累进 / 超额累进
     steps: list[tuple[Decimal, Decimal]]       # (下限, 比例)
     lower_inclusive: bool = True               # 达到下限即适用
+    step_inclusive: list[bool] = []             # 原文明示的逐档边界；空数组保持旧规则行为
+    purpose: Literal['amount', 'coefficient'] = 'amount'
     # 低于第一档下限的值怎么算：zero（默认，不计：比例 0、金额 0）；first（按第一档比例照算，如退货冲销的负数：
     # 比例取第一档；超额累进的金额 =（值 − 第一档下限）× 第一档比例，为负）。不要用“把第一档下限写成很小的负数”代替：
     # 超额累进会从那个负数起逐段累加，每个对象都凭空多出一大笔
     below_first: Literal["zero", "first"] = "zero"
+
+    def includes_lower(self, index: int) -> bool:
+        return self.step_inclusive[index] if self.step_inclusive else self.lower_inclusive
+
+    @model_validator(mode='after')
+    def _boundaries(self):
+        if self.step_inclusive and len(self.step_inclusive) != len(self.steps):
+            raise ValueError('step_inclusive须与steps逐档对应')
+        if self.purpose == 'coefficient' and self.mode != 'whole':
+            raise ValueError('区间系数表只取所在区间系数，不能使用超额累进')
+        return self
 
     @field_validator("steps", mode="before")
     @classmethod

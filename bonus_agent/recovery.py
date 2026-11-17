@@ -94,7 +94,7 @@ def local_advice(llm, reason, steps, facts, hint):
     packet['tool_contracts'] = [
         {'name': t['name'], 'required': t['parameters'].get('required', []),
          'parameters': list(t['parameters'].get('properties', {}))}
-        for t in TOOLS if t['name'] in failed_tools | {'set_rules', 'bind_facts', 'read_workspace', 'ask_question', 'validate_parameters'}
+         for t in TOOLS if t['name'] in failed_tools | {'set_rules', 'bind_facts', 'read_workspace', 'ask_question', 'validate_parameters', 'compile_coefficient_table'}
     ]
     packet['constraints'] = ('define_dataset.file必须是真实Excel文件名，不能引用其他数据集作为file；'
                              'combine引用原始Excel列名，fields.column也是原列名；'

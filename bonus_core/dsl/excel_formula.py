@@ -98,7 +98,11 @@ class Params:
                 items = list(t.mapping.items())
             else:
                 mode = "超额累进：各档分段累加" if t.mode == "excess" else "全额累进：整体按所在档"
+                if t.purpose == 'coefficient':
+                    mode = '区间取系数：只返回所在档系数'
                 bound = "达到下限即适用" if t.lower_inclusive else "超过下限才适用"
+                if t.step_inclusive:
+                    bound = '逐档下限等号：' + '、'.join('含' if x else '不含' for x in t.step_inclusive)
                 if getattr(t, "below_first", "zero") == "first":
                     bound += "，低于第一档下限按第一档比例"
                 self.rows.append([f"{name}（阶梯表，{mode}，{bound}）{desc}", "下限", "比例 / 系数"])
@@ -175,11 +179,12 @@ class Formula:
                 out = f"IF(({x}&\"\")={kc},{vc},{out})"
             return out
         steps = list(zip(t.steps, refs))
-        op = ">=" if t.lower_inclusive else ">"
+        op = ">=" if t.includes_lower(0) else ">"
         first = getattr(t, "below_first", "zero") == "first" and steps
         rate = steps[0][1][1] if first else "0"
-        for (lo, _), (lc, rc) in steps:
-            rate = f"IF({x}{op}{lc},{rc},{rate})"
+        for i, ((lo, _), (lc, rc)) in enumerate(steps):
+            edge = '>=' if t.includes_lower(i) else '>'
+            rate = f"IF({x}{edge}{lc},{rc},{rate})"
         if c.fn == "tier_rate":
             return rate
         if t.mode == "whole":

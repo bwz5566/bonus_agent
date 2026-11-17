@@ -6,6 +6,7 @@ from bonus_agent.recovery import fingerprint
 def repair_inputs(ws):
     from bonus_agent.construction import _semantic
     return fingerprint({'sources':ws._source_version,'said':ws.said,
+        'plan':{k:ws.workflow.get('plan',{}).get(k) for k in ('files','schemes','outputs')},
         'answers':[(q.id,q.answer,q.withdrawn) for q in ws.questions],
         'facts':[f.model_dump(mode='json') for f in ws.facts],
         'clauses':[(c.id,c.file,c.quote) for c in ws.clauses],

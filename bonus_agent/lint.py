@@ -577,7 +577,7 @@ def _coverage(rs: RuleSet, tiers: dict, coverage: list) -> tuple[list[tuple[str,
         if name not in {g for g, _ in gates}:
             t = rs.tables[name]
             gates.append((name, f"分档表 {name} 的第一档从 {_fmt(lo)} 起（比例 {_fmt(t.steps[0][1])}"
-                                f"{'，不含 ' + _fmt(lo) + ' 本身' if not t.lower_inclusive else ''}），实际有 {below} 个传入值"
+                                f"{'，不含 ' + _fmt(lo) + ' 本身' if not t.includes_lower(0) else ''}），实际有 {below} 个传入值"
                                 f"不在任何一档里（最小 {_fmt(low)}），这些对象按规则拿到的比例是 0。核对材料对这些值的规定："
                                 f"不发就在最前面加一档写明（下限写到比可能的最小值还小，比例 0）；按第一档比例照算（如负数照算）"
                                 "就在这张表上写 \"below_first\": \"first\"（不要把第一档下限改成很小的负数：超额累进会从那个负数起"
@@ -733,7 +733,7 @@ def _tier_amount_tables(rs: RuleSet, pct_strict: set[str] | None = None) -> dict
         for c in walk(ast):
             if isinstance(c, Call) and c.fn == "tier_rate" and c.args and isinstance(c.args[0], Name):
                 tb = rs.tables.get(c.args[0].id)
-                if not isinstance(tb, TierTable) or c.args[0].id in out:
+                if not isinstance(tb, TierTable) or tb.purpose == 'coefficient' or c.args[0].id in out:
                     continue
                 rates = [Decimal(str(r)) for _, r in tb.steps]
                 # 各档比例材料里都只写成 x%（漏了百分号、写成了 0.5 这类大数）的也算提成比例表
