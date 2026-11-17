@@ -182,10 +182,16 @@ def workspace_view(
                               if isinstance(entry, list) else [{'name': tool, 'field': field, 'value': entry}])
             else:
                 items += [{'name': tool, 'index': i, 'value': item} for i, item in enumerate(value)]
+    elif section == 'construction':
+        from bonus_agent.construction import TaskBoard
+        board = TaskBoard(ws)
+        statuses = board.statuses()
+        items = [{'name':n, **spec, **statuses[n], 'report':board.state['reports'].get(n)}
+                 for n,spec in board.state['tasks'].items()]
     else:
         from bonus_agent.workflow import fail
 
-        fail('section须为facts/clauses/rules/variables/tables/mapping/basis/checks/tool_results')
+        fail('section须为facts/clauses/rules/variables/tables/mapping/basis/checks/tool_results/construction')
     if name is not None and section not in ('variables', 'tables'):
         items = [
             item
@@ -320,5 +326,13 @@ def task_card(ws):
             'issue_count': len(report['report']['issues']),
             'first_issues': [x[:450] for x in report['report']['issues'][:3]],
             'lookup': 'read_workspace(section="checks")；current=false须先重新compile_formulas',
+        }
+    active = (data['workflow'].get('construction') or {}).get('active')
+    if active:
+        data['evidence']['uncovered'] = [x for x in data['evidence']['uncovered'] if x['id'] in active['clauses']]
+        data['current_task_evidence'] = {
+            'clauses':[{'id':c.id,'file':c.file,'quote':c.quote} for c in ws.clauses if c.id in active['clauses']][:6],
+            'facts':[{'name':f.name,'value':f.value,'unit':f.unit,'file':f.file,'page':f.page}
+                     for f in ws.facts if f.name in active['facts']][:6],
         }
     return json.dumps(data, ensure_ascii=False, default=str)

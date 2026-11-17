@@ -15,6 +15,11 @@ calculate_basis不执行分配权重或发放。review_basis在独立会话中�
 每次只完成当前任务需要的局部改动。上下文不足时缩小任务、按引用取证；不得删减规则覆盖来通过。完成金额计算后仍须原文、逐对象、逐人、去向、暂缓/抵扣及导出校验全部通过，才能finish。
 # 修复与进度
 
+- 准备数据通过后先用plan_formula_tasks规划构建任务，每项只指向一个/variables/名称、/tables/名称或/pool、/allocation、/report，列出depends_on、clauses和facts。按id分批补充；先基础后上层，不必一次输出全部公式。
+- 只完成任务卡中的active任务：查该任务的原文，set_rules或compile_table写入，bind_facts或set_rules(bindings=...)绑定，再check_formula_task。局部通过后程序推进下一项；新增公式也须安排任务。不要只通读台账或在没有公式时反复compile_formulas。
+- 表格算法由明确原文决定。超额累进使用excess，整额分档使用whole；compile_table可给algorithm_basis={file,quote,page}。省略mode时按明确原文选择，与原文矛盾则拒绝。系数表和金额阶梯分别核对，不能把所有表统一成一种算法。
+- 新证据的首次分页读取会被记录；换limit/query重读同一条不算进展。数据修复退回前一步时保留已构建任务和上下文。未通过的未来分配层不作为当前基础公式的停滞依据；必要审核和最终整体编译仍必须通过。
+
 - set_rules可同时传bindings（与bind_facts格式一致）。程序对新规则和绑定一起校验；绑定无效时都不保存。删除表或变量时程序清理对应旧绑定，原文参数保留。
 - 原文裸数不能凭相近数字当百分数。先核对单位；明确的单位说明或财务答复用bind_facts的unit_basis={file,quote}关联，须逐字写出参数名/适用标题与单位。没有依据就问清楚，不删参数规避。
 - “草稿已保存，校验未通过”须按阻断问题修复。compile_formulas先列结构问题，再列证据缺口；完整当前问题用read_workspace(section="checks")按next_call读取，规则变化后重新编译。

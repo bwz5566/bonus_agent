@@ -100,6 +100,7 @@ WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", 
                "record_clauses", "cover_clauses",
                "answer_question", "update_dataset"}
 WRITE_TOOLS |= {'plan_calculation','prepare_data','compile_formulas','calculate_basis','review_basis'}
+WRITE_TOOLS |= {'plan_formula_tasks', 'check_formula_task'}
 RULE_SUFFIXES = {".docx", ".pptx", ".pdf", ".png", ".jpg", ".jpeg", ".txt", ".md"}   # 规则文档：要登记参数
 CHAT_SOURCE = "财务对话"       # 财务在对话里贴的规则原文、口径说明：和材料一样可以引用核对
 ANSWER_NOTE = "回答财务"       # 财务的说明里带了提问：智能体把回答记在这条笔记里，网页放在本轮回复的开头（没算完也显示）
@@ -593,6 +594,14 @@ class Workspace:
 
     def compile_formulas(self):
         return self._flow().compile()
+
+    def plan_formula_tasks(self, tasks: list[dict], replace: bool = False):
+        from bonus_agent.construction import TaskBoard
+        return TaskBoard(self).plan(tasks, replace)
+
+    def check_formula_task(self, task: str):
+        from bonus_agent.construction import TaskBoard
+        return TaskBoard(self).check(task)
 
     def calculate_basis(self, scheme: str | None = None):
         try:
@@ -1096,8 +1105,8 @@ class Workspace:
             raise ToolError('source.scope：applies_to 须写明这些单元格适用的区分范围（如区域、事业部、产品线或页标题），'
                             '程序核对它在本页原文里；不能只写“提成比例”这类通用词。本次未登记')
         pages=self._page_texts(file)
-        if fx.norm(scope) not in pages.get(page,''):
-            elsewhere=[p for p,t in sorted(pages.items()) if fx.norm(scope) in t]
+        if fx.scope_norm(scope) not in fx.scope_norm(pages.get(page,'')):
+            elsewhere=[p for p,t in sorted(pages.items()) if fx.scope_norm(scope) in fx.scope_norm(t)]
             raise ToolError(f'source.scope：「{scope}」不在第 {page} 页的原文里'
                             + (f'，而在第 {"、".join(map(str,elsewhere[:6]))} 页' if elsewhere else '，整份文件里也没有')
                             + '。相似的表容易选错页：先 read_parameter_table(file) 按真实页标题核对，再读正确的 page。本次未登记')
@@ -1155,12 +1164,25 @@ class Workspace:
         hit = self._quote_pages(f.quote, pages)
         if not hit:
             return ""
-        if f.page in hit and f.context and fx.norm(f.context) in fx.norm(pages.get(f.page, '')):
+        if f.page in hit:
+            hit = [f.page]  # repeated values on another page cannot justify the selected page's scope
+        pages = {p:fx.scope_norm(text) for p,text in pages.items()}
+        if f.page in hit and f.context and fx.scope_norm(f.context) in fx.scope_norm(pages.get(f.page, '')):
             return ""  # explicit verified heading/page outrank name-word heuristics (including script variants)
         # 参数名里能在材料某几页找到、却不在引用所在页的词（取最长的）：参数名常写成一整串（如 海外美洲新项目阶梯），逐段找
-        name = fx.norm(f.name)
+        name = fx.scope_norm(f.name)
+        if f.source_cell and f.page:
+            from bonus_agent.source_cells import ppt_cell
+            try:
+                _, labels = ppt_cell(self._file(f.file), f.page, f.source_cell)
+                for label in labels:
+                    term = fx.scope_norm(label)
+                    if term and len(term) >= 2 and not fx.number(term):
+                        name = name.replace(term, '|')
+            except ValueError:
+                pass  # the authoritative coordinate check reports this separately
         for w in sorted(self._GENERIC_WORDS, key=len, reverse=True):     # 先按通用词切开，只在剩下的段里找（不会切出“成比”这种半个词）
-            name = name.replace(w, "|")
+            name = name.replace(fx.scope_norm(w), "|")
         name = re.sub(r"[\d.%-]+", "|", name)
         cands = []
         for seg in [x for x in name.split("|") if len(x) >= 2]:
@@ -1260,12 +1282,12 @@ class Workspace:
             if f.page is None:
                 hits = self._quote_pages(f.quote, self._page_texts(f.file))
                 if f.context:
-                    hits = [p for p in hits if fx.norm(f.context) in fx.norm(self._page_texts(f.file)[p])]
+                    hits = [p for p in hits if fx.scope_norm(f.context) in fx.scope_norm(self._page_texts(f.file)[p])]
                 if len(hits) == 1:
                     f.page = hits[0]
             if f.context:
                 body = self._page_texts(f.file).get(f.page, corpus.get(f.file,''))
-                if fx.norm(f.context) not in fx.norm(body):
+                if fx.scope_norm(f.context) not in fx.scope_norm(body):
                     lines.append(f'第 {i} 条未登记：context 不在指定原文页；核对适用标题与页码')
                     continue
             # 同名、同一单元格、同值、同原文版本的参数已经有了：引文写成单元格还是整行只是写法不同，不再登记第二条。
@@ -1341,7 +1363,7 @@ class Workspace:
                     raise ToolError(f"{f.name} 必须指定包含引用的 page，可选 {hits}")
                 context = str(spec.get("context", f.context))
                 body = pages.get(page, self._corpus().get(f.file, ""))
-                if context and fx.norm(context) not in fx.norm(body):
+                if context and fx.scope_norm(context) not in fx.scope_norm(body):
                     raise ToolError(f"{f.name} 的适用条件 context 不在指定原文位置")
                 candidate = fx.binding_candidate(f, list(spec["targets"]), spec.get("component"), spec.get("unit"), spec.get('unit_basis'))
                 candidate.page, candidate.context = page, context
@@ -1504,11 +1526,19 @@ class Workspace:
                 "如果原文就是文字口径，就不能放进阶梯或查找表")
 
     def compile_table(self, name: str, rows: list[dict], scheme: str | None = None,
-                      kind: str = "tier", mode: str = "whole", applies_when: str = "",
-                      lower_inclusive: bool = True, below_first: str = "zero", cells_from: dict | None = None) -> str:
+                      kind: str = "tier", mode: str | None = None, applies_when: str = "",
+                      lower_inclusive: bool = True, below_first: str = "zero", cells_from: dict | None = None,
+                      algorithm_basis: dict | None = None) -> str:
         """Compile table cells from registered facts instead of retyping business numbers."""
         if kind not in ("tier", "lookup") or not rows:
             raise ToolError("compile_table 需要非空 rows，kind 为 tier 或 lookup")
+        if algorithm_basis:
+            from bonus_agent.semantics import mode_basis
+            expected = mode_basis(self, algorithm_basis)
+            if mode is not None and mode != expected:
+                raise ToolError(f'algorithm.mode：所选{mode}与引用原文要求{expected}不一致；本次未保存。按原文重编')
+            mode = expected
+        mode = mode or 'whole'
         escape = lambda s: str(s).replace('~', '~0').replace('/', '~1')
         bindings, sources = [], []
         if cells_from is not None:
@@ -1583,6 +1613,8 @@ class Workspace:
                     raise ToolError(f"查找键重复：{key}")
                 table["mapping"][key] = take(row["value"], prefix+'/mapping/'+escape(key))
         table["sources"] = sources
+        if algorithm_basis:
+            table['sources'].append({'doc':algorithm_basis['file'], 'quote':algorithm_basis['quote'], 'page':algorithm_basis.get('page')})
         out = self.set_rules(scheme=scheme, tables={name: table})
         # 重编同一张表时，上一版自动建的绑定要先去掉：实测首档先写了 R1C2（“<25%”）后改成 0，
         # R1C2 仍绑在 steps/0/0 上，编译公式一直报“与原文 25% 不一致”
@@ -1733,6 +1765,9 @@ class Workspace:
         out: dict[str, list[str]] = {}
         many = len(self.drafts) > 1
         for sch, d in self.drafts.items():
+            for root in ('report', 'allocation', 'payout', 'offsets', 'checks'):
+                if d.get(root):
+                    out.setdefault(root, []).append(f'「{sch}」' + json.dumps(d[root], ensure_ascii=False, sort_keys=True))
             for ref, line in _rules_lines(d):
                 text = (f"「{sch}」" if many else "") + line.strip().split("  ", 1)[-1]
                 if text not in out.setdefault(ref, []):
@@ -3904,16 +3939,19 @@ class Workspace:
     def blocker_frontier(self) -> set[str]:
         """No model calls and no full recalculation; stable unresolved work survives history pruning."""
         if not self.results:
-            if self.staged and (self.workflow.get('formula_report') or
-                                self.workflow.get('data_report', {}).get('report', {}).get('status') == 'PASS'):
-                # Suggestions and wrong values can change after an unrelated write; the unresolved object has not changed.
-                out = {'parameter:' + x.split('：', 1)[0].split('=', 1)[0] for x in self._binding_gaps()}
-                out.update('clause:' + x.split('：', 1)[0] for x in self._clause_gaps(self._flow().skipped()))
-                for scheme in self.schemes:
-                    rs = self._ruleset(scheme)
-                    out.update(f'{scheme}:{i.code}:{i.where}' for i in self._validate(scheme, rs) if i.severity == 'blocking')
-                    out.update(f'{scheme}:static:{key}' for key, _ in lint.static_gates(rs))
-                return out
+            if self.staged:
+                from bonus_agent.construction import TaskBoard
+                stage, scheme = self._flow().stage()
+                if stage == 2:
+                    saved = self.workflow.get('data_report', {})
+                    if saved.get('version') != self._flow().version('data'):
+                        return set()  # first-time data construction is not a failed repair check
+                    return {'data:' + str(x).split('next',1)[0] for x in saved.get('report', {}).get('issues', [])}
+                if stage == 3:
+                    summary = TaskBoard(self).summary()
+                    active = summary['active']
+                    return {f'construction:{active["id"]}:{active["target"]}'} if active else {summary['next']}
+                return set()
             return set()
         bindings = self._binding_gaps()
         table_gaps = {m.group() for g in bindings if (m := re.search(r'/tables/\S+?(?==)', g))}
@@ -4553,9 +4591,11 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
     reached = ws.phase()               # 本轮到过的最远阶段：往前推进到新阶段时清空对话历史；改规则退回前面的阶段再回来不清
     reached_focus=ws._flow().stage() if ws.staged else None
     deep_why, deep_used = "", 0        # 下一步要深度思考的原因（空：普通模式）；本轮已用的深度思考步数
-    from bonus_agent.progress import ProgressWatch
+    from bonus_agent.progress import ProgressWatch, discover
     saved_progress = recovery.state.get('progress', {})
     progress_watch = ProgressWatch(set(saved_progress.get('previous', [])), saved_progress.get('stagnant', 0))
+    discovered_reads = set(saved_progress.get('reads', []))
+    highest_stage = reached_focus[0] if reached_focus else 0
     context_retries = 0
     def compact_local_context(msgs, body, tail, definitions):
         # Check the immutable floor first. Trimming history cannot fix an oversized floor.
@@ -4924,7 +4964,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                     result += (f"\n注意：「{what}」已经删了 {MAX_STUCK - 1} 次。先想清楚它该怎么定义再动手，"
                                f"再删一次就算卡住；拿不准就用 ask_question 问财务")
                     step.result = result
-            if (ok or saved_draft) and c["name"] == "set_rules":
+            if (ok or saved_draft) and c["name"] == "set_rules" and not (ws.staged and not ws.results):
                 # 每次都改掉了几个（阻断问题在减少）是在推进，只是一次没改完，不算卡住；
                 # 一个也没改掉才算原地打转。某一个问题一直挂着、别的在改，放宽到两倍次数再停
                 now = getattr(ws, "last_blocking", set())
@@ -5008,18 +5048,25 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             first = steps[turn_steps]
             first.model_secs, (first.tokens_in, first.tokens_out) = round(model_secs, 2), model_tokens
         deep_why = _deep_reason(steps[turn_steps:], skipped, ws, fails)
+        discovery = False
+        if ws.staged:
+            for st in steps[turn_steps:]:
+                discovery = discover(st, discovered_reads) or discovery
         if (ws.staged and ws.drafts) or any(
                 st.tool in {"bind_facts", "compile_table", "validate_parameters", "trial_run", "finish", "set_rules", "apply_repair"}
                 for st in steps[turn_steps:]):
             frontier = ws.blocker_frontier()
-            stagnant = progress_watch.observe(frontier)
-            recovery.state['progress'] = {'previous': sorted(progress_watch.previous), 'stagnant': stagnant}
+            stagnant = progress_watch.observe(frontier, discovery=discovery)
+            if discovery:
+                quiet = 0
+            recovery.state['progress'] = {'previous': sorted(progress_watch.previous), 'stagnant': stagnant, 'reads': sorted(discovered_reads)}
             recovery.save()
             if stagnant >= 2:
                 deep_why = f"连续 {stagnant + 1} 次检查没有消除既有问题；工具返回成功不代表有进展。" + "；".join(sorted(frontier)[:3])
-                ws.notes["纠错进度"] = (deep_why + "。先做局部参数预检；金额问题用 review_calculation 定位，"
+                ws.notes["纠错进度"] = (deep_why + ('。当前明确动作：' + ws._flow().hint() if ws.staged and not ws.results else
+                                      "。先做局部参数预检；金额问题用 review_calculation 定位，"
                                       "按原文修复，已有独立基线时使用 preview_repair / verify_repair / apply_repair。"
-                                      "禁止通过改答案、降低校验或把分配池归零消除问题。")
+                                      "禁止通过改答案、降低校验或把分配池归零消除问题。"))
             elif not stagnant:
                 ws.notes.pop("纠错进度", None)
             if stagnant >= (12 if ws.staged and not ws.results else 5):
@@ -5027,6 +5074,10 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                     repeats, stuck = MAX_STUCK, deep_why
                 else:
                     recovery.halt(deep_why)
+        elif discovery:
+            recovery.state['progress'] = {'previous':sorted(progress_watch.previous), 'stagnant':progress_watch.stagnant,
+                                          'reads':sorted(discovered_reads)}
+            recovery.save()
         if skipped and skipped == len(calls):
             # 整轮都是被拦下的重复调用：不把它留在历史里，否则小模型会照着历史接着重复；只留一句说明
             del history[turn_start:]
@@ -5054,6 +5105,16 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                     if on_step:
                         on_step(len(steps), steps[-1])
         if (ws.staged and focus!=reached_focus) or (not ws.staged and now>reached):
+            if ws.staged and focus[0] <= highest_stage:
+                reached_focus = focus
+                note = '阶段回退或恢复：保留已读证据、任务计划和历史，只处理当前前置缺口。下一步：' + ws._flow().hint()
+                history.append({'role':'user','content':note})
+                steps.append(Step('（恢复当前任务）', {}, note, True))
+                if on_step:
+                    on_step(len(steps), steps[-1])
+                continue
+            if ws.staged:
+                highest_stage = max(highest_stage, focus[0])
             # 进入新阶段：上一阶段的结论都已存进工作区（台账、条款、规则、试算、验算），对话历史里的读数、试错不再需要，
             # 清掉腾出上下文，让模型只看材料包和工作区状态专心做这一阶段（小上下文的模型尤其需要）
             reached = now
@@ -5615,7 +5676,7 @@ def _deep_reason(turn: list[Step], skipped: int, ws: Workspace, fails: dict[str,
         if _partial_facts(st.tool, st.ok, st.result):
             continue  # Rows were registered; each rejection already says what to fix. No paid deep step.
         head = st.result.removeprefix("错误：").split("\n", 1)[0][:300]
-        if not st.ok and st.tool in ('prepare_data','compile_formulas') and fails.get(st.tool,0)<2:
+        if not st.ok and st.tool in ('prepare_data','compile_formulas','check_formula_task') and fails.get(st.tool,0)<2:
             continue  # Program diagnostics already identify the first structural correction.
         if not st.ok and any(x in st.result for x in ('source.cell','source.page','plan.ignore_role','【原始数据诊断】')) and fails.get(st.tool,0)<2:
             continue  # Native table coordinates are a deterministic repair, not an advisory task.

@@ -47,7 +47,7 @@ def refs(where: str) -> list[str]:
     return [x.strip() for x in re.split(r"[、,，;；]\s*", w) if x.strip()]
 
 
-_ELEMENT = re.compile(r"^(pool$|(variables|tables|checks|datasets|payout|offsets|allocation|revisions)\.)")
+_ELEMENT = re.compile(r"^((pool|report|allocation|payout|offsets|checks)$|(variables|tables|checks|datasets|payout|offsets|allocation|revisions)\.)")
 
 
 def check_where(where: str, known: set[str], questions: set[str]) -> str | None:
@@ -91,6 +91,7 @@ def known_refs(drafts: dict, datasets: dict) -> set[str]:
             out |= {f"{k}.{n}" for n in (d.get(k) or {})}
         if d.get("pool"):
             out.add("pool")
+        out |= {k for k in ('report', 'allocation', 'payout', 'offsets', 'checks') if d.get(k)}
         for lv in d.get("allocation") or []:
             if isinstance(lv, dict) and lv.get("level"):
                 out.add(f"allocation.{lv['level']}")

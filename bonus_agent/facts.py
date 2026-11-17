@@ -223,6 +223,15 @@ def norm(s: str) -> str:
     return re.sub(r"[\s，,。：:；;、“”\"'（）()【】\[\]|]", "", s)
 
 
+# Scope/title comparisons only. Source quotations, customer identifiers and data keys stay literal.
+_SCOPE_SCRIPT = str.maketrans(dict(zip('業執負責務產獎區銷參與實際計總佔臺應營餘員發達標數額轉舊體國門層級設研項過逾稱簡',
+                                     '业执负责务产奖区销参与实际计总占台应营余员发达标数额转旧体国门层级设研项过逾称简')))
+
+
+def scope_norm(text: str) -> str:
+    return norm(text).translate(_SCOPE_SCRIPT)
+
+
 def number(value: str) -> Decimal | None:
     """原文写法换算成数：5% → 0.05，30万元 → 300000；不是“数 + 单位”的写法返回 None（按文字口径比较）。"""
     m = _NUM.match(unicodedata.normalize("NFKC", value).replace(",", "").replace(" ", ""))

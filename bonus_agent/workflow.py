@@ -29,7 +29,7 @@ _CORE = Path(__file__).resolve().parent.parent / 'bonus_core'
 _EXECUTION_PROFILE = hashlib.sha256(
     b''.join(p.read_bytes() for p in sorted(_CORE.rglob('*.py'))) + Path(__file__).read_bytes()
     + b''.join(Path(__file__).with_name(n).read_bytes() for n in
-               ('lint.py', 'facts.py', 'source_cells.py', 'agent.py', 'context.py', 'recovery.py'))
+               ('lint.py', 'facts.py', 'clauses.py', 'source_cells.py', 'agent.py', 'context.py', 'recovery.py', 'construction.py', 'semantics.py', 'progress.py'))
 ).hexdigest()
 
 
@@ -76,6 +76,7 @@ class Workflow:
                 answers=[(q.id, q.answer, q.withdrawn) for q in ws.questions],
                 said=ws.said,
                 transcripts=ws.transcripts,
+                construction_plan=self.state.get('construction', {}).get('tasks', {}),
             )
         return fingerprint(body)
 
@@ -277,11 +278,13 @@ class Workflow:
                  + (f'缺少 {missing}：用 set_rules(scheme=…) 写出这些方案的规则。' if missing else '')
                  + '确实要改方案，先依据原文用 plan_calculation 调整计划')
         repaired = self.ws.validate_parameters(repair=True)['repaired']
-        evidence = self.ws._binding_gaps() + self.ws._clause_gaps(self.skipped())
         issues = []
         graph = {}
         warnings = []
         from bonus_agent.lint import compile_warnings, reached
+        from bonus_agent.construction import TaskBoard
+        from bonus_agent.semantics import semantic_gates
+        construction_issues = TaskBoard(self.ws).gate() + semantic_gates(self.ws)
         all_reached = set().union(*(reached(self.ws._ruleset(s)) for s in self.ws.schemes))
         for s in self.ws.schemes:
             rs = self.ws._ruleset(s)
@@ -298,7 +301,7 @@ class Workflow:
             graph[s] = {'order': order, 'dependencies': {n: sorted(v) for n, v in deps.items()}}
         self.ws._order(self.ws.schemes)  # Inter-scheme cycles are also invalid.
         # Structural blockers must remain visible even with hundreds of evidence gaps.
-        issues = list(dict.fromkeys(issues + evidence))
+        issues = list(dict.fromkeys(issues + construction_issues + self.ws._binding_gaps() + self.ws._clause_gaps(self.skipped())))
         report = {'status': 'FAIL' if issues else 'PASS', 'issues': issues, 'warnings': warnings,
                   'graph': graph, 'repaired': repaired}
         self.state['formula_report'] = {'version': self.version(), 'report': copy.deepcopy(report)}
@@ -593,6 +596,9 @@ class Workflow:
 
     def hint(self):
         stage, scheme = self.stage()
+        if stage == 3:
+            from bonus_agent.construction import TaskBoard
+            return TaskBoard(self.ws).summary()['next']
         if stage == 1:
             missing = [item for item in self.rule_requirements() if item['missing']]
             if missing:
@@ -617,12 +623,14 @@ class Workflow:
         return STAGES[stage][1] + (f'（方案：{scheme}）' if scheme else '')
 
     def summary(self):
+        from bonus_agent.construction import TaskBoard
         index, scheme = self.stage()
         return {
             'stage': index,
             'name': STAGES[index][0],
             'scheme': scheme,
             'next': self.hint(),
+            'construction': TaskBoard(self.ws).summary() if index == 3 else None,
             'rule_requirements': self.rule_requirements() if index == 1 else [],
             'plan': self.state.get('plan'),
             'receipts': {n: {'current': self.current(n), 'at': r['at']} for n, r in self.state['receipts'].items()},
