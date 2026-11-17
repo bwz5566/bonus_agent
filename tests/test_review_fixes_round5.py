@@ -366,3 +366,36 @@ def test_band_header_with_an_upper_bound_first_cell_compiles_from_numbers_or_say
     assert [Decimal(str(s[0])) for s in steps] == [Decimal(x) for x in ("0", "0.25", "0.5", "0.75", "1")]
     band = next(f for f in ws.facts if f.name.endswith("R1.C3.L1"))
     assert any(t.endswith("/steps/1/0") for t in band.targets)          # 数仍来自原文那一格，并建了绑定
+
+
+def test_reading_a_table_under_rules_or_a_missing_scheme_redirects_instead_of_failing():
+    """实测第 6 轮：rules + 表名返回 0 条、改读「共用」方案报错，来回 3 次被判卡住。"""
+    from bonus_agent.context import workspace_view
+    ws = _ws_with_rules()
+    got = workspace_view(ws, "rules", name="阶梯_南方_新")
+    assert got["section"] == "tables" and got["total"] == 1 and "是表，不是方案" in got["notice"]
+    got = workspace_view(ws, "tables", scheme="共用", name="阶梯_南方_新")
+    assert got["total"] == 1 and "没有方案「共用」" in got["notice"]
+    got = workspace_view(ws, "rules", scheme="共用", name="阶梯_英国IVG_新")
+    assert got["total"] == 0 and "没有叫「阶梯_英国IVG_新」" in got["notice"] and "阶梯_南方_新" in got["notice"]
+
+
+def _ws_with_rules():
+    from bonus_agent.agent import Workspace
+    from bonus_agent.auto import Inventory
+    ws = Workspace(FakeLLM([]), Inventory(files=[], docs=[], sheets=[], sheet_text={}))
+    ws.set_rules(scheme="提成奖", tables={"阶梯_南方_新": {"kind": "tier", "mode": "excess", "steps": [["0", "0.01"]]}},
+                 variables={"x": {"expr": "1"}})
+    return ws
+
+
+def test_an_if_with_identical_branches_is_flagged_as_a_placeholder():
+    """实测：is_debt = if(…, 0, 0)，欠款暂扣（参考结果 12 万）整块没算，编译公式照样能过。"""
+    from bonus_agent.lint import static_gates
+    from bonus_core.dsl.models import RuleSet
+    rs = RuleSet.model_validate({"name": "t", "version": "1", "allocation": [], "datasets": {"项目": {"key": "pid", "fields": {"pid": {"type": "id"}, "v": {"type": "money"}}}},
+                                 "variables": {"is_debt": {"scope": "项目", "expr": "if(v > 0, 0, 0)"},
+                                               "ok": {"scope": "项目", "expr": "if(v > 0, 1, 0)"}},
+                                 "pool": {"expr": "0"}})
+    got = static_gates(rs)
+    assert len(got) == 1 and "variables.is_debt" in got[0][1] and "两个分支一样" in got[0][1]

@@ -28,6 +28,7 @@ STAGES = (
 _CORE = Path(__file__).resolve().parent.parent / 'bonus_core'
 _EXECUTION_PROFILE = hashlib.sha256(
     b''.join(p.read_bytes() for p in sorted(_CORE.rglob('*.py'))) + Path(__file__).read_bytes()
+    + Path(__file__).with_name('lint.py').read_bytes()
 ).hexdigest()
 
 
@@ -276,9 +277,15 @@ class Workflow:
                  + '确实要改方案，先依据原文用 plan_calculation 调整计划')
         issues = self.ws._binding_gaps() + self.ws._clause_gaps(self.skipped())
         graph = {}
+        warnings = []
+        from bonus_agent.lint import compile_warnings, reached
+        all_reached = set().union(*(reached(self.ws._ruleset(s)) for s in self.ws.schemes))
         for s in self.ws.schemes:
             rs = self.ws._ruleset(s)
+            warnings += [f'方案「{s}」：{message}' for message in compile_warnings(rs, all_reached)]
             issues += [str(i) for i in self.ws._validate(s, rs) if i.severity == 'blocking']
+            from bonus_agent.lint import static_gates
+            issues += [f'方案「{s}」：{message}' for _, message in static_gates(rs)]
             deps = {n: names(parse(v.expr)) & set(rs.variables) for n, v in rs.variables.items()}
             try:
                 order = list(TopologicalSorter(deps).static_order())
@@ -287,7 +294,7 @@ class Workflow:
                 order = []
             graph[s] = {'order': order, 'dependencies': {n: sorted(v) for n, v in deps.items()}}
         self.ws._order(self.ws.schemes)  # Inter-scheme cycles are also invalid.
-        report = {'status': 'FAIL' if issues else 'PASS', 'issues': issues, 'graph': graph}
+        report = {'status': 'FAIL' if issues else 'PASS', 'issues': issues, 'warnings': warnings, 'graph': graph}
         if not issues:
             self.receipt('formulas', report)
         return report

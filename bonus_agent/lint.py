@@ -119,6 +119,18 @@ def _exprs(rs: RuleSet):
         yield f"offsets.{o.id}", o.expr
     for c in rs.checks:
         yield f"checks.{c.id}", c.expr
+    if rs.report:
+        if rs.report.people:
+            yield 'report.people', rs.report.people
+        for kind in ('totals', 'details', 'pending'):
+            for i, item in enumerate(getattr(rs.report, kind)):
+                yield f'report.{kind}.{i}', item.expr
+        for i, item in enumerate(rs.report.balances):
+            yield f'report.balances.{i}.total', item.total
+            for j, expr in enumerate(item.parts):
+                yield f'report.balances.{i}.parts.{j}', expr
+        for i, item in enumerate(rs.report.distributions):
+            yield f'report.distributions.{i}.total', item.total
 
 
 def _parsed(rs: RuleSet):
@@ -220,12 +232,10 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
                          "已发抵扣、超发待核对都显示为 0。改法：pool 写扣减前的应得；已发金额写进 offsets（scope 最末层或人员表，"
                          "expr 写已发合计），引擎算本次实发 = MAX(应得 − 已发, 0)，超发待核对 = MAX(已发 − 应得, 0)")
         rep.keys.append("抵扣 pool")
-    # 0''. 字段和自己比较（id == id）：永远成立，多半是想按当前对象筛选却写错了
-    for where, ast in _parsed(rs):
-        same = self_compares(ast)
-        if same:
-            rep.gates.append(f"{where} 里的 {'、'.join(dict.fromkeys(same))} {SELF_COMPARE_HINT}")
-            rep.keys.append(f"同字段比较 {where}")
+    # 0''. 写法上就不起作用的条件（字段和自己比较、if 两个分支一样）
+    for key, message in static_gates(rs):
+        rep.gates.append(message)
+        rep.keys.append(key)
     # 1. 常数要有出处；材料里只写成百分数的，规则里不能漏了 %
     miss: dict[str, set[str]] = {}
     unit: dict[str, set[str]] = {}
@@ -899,3 +909,40 @@ def idle_parts(rs: RuleSet) -> tuple[list[str], list[str]]:
             continue
         idle_ds.append(ds)
     return idle_ds, [n for n in rs.variables if n not in seen]
+
+
+def compile_warnings(rs: RuleSet, reached_elsewhere: set[str] | None = None) -> list[str]:
+    """Early structural evidence, without guessing business meaning or blocking unused drafts."""
+    live = reached(rs) | (reached_elsewhere or set())
+    out = [f'参数表 {name} 尚未接入金额、明细或校验；核对是否漏用，或说明其仅供参考。'
+           for name in sorted(set(rs.tables) - live)]
+    for where, ast in _parsed(rs):
+        if where.startswith('variables.') and where.removeprefix('variables.') not in live:
+            continue
+        for node in walk(ast):
+            if not isinstance(node, Call) or node.fn != 'count_distinct' or not node.args:
+                continue
+            dataset = node.kw().get('of')
+            if not isinstance(dataset, Str) or not isinstance(node.args[0], Name):
+                continue
+            definition = rs.datasets.get(dataset.value)
+            if definition and definition.period == node.args[0].id and definition.window == 'period':
+                out.append(f'{where} 对当前期间表「{dataset.value}」统计期间值；若字段是月份编码且本次为单月，结果最多为1。'
+                           '材料要求累计平均时，应另定义累计窗口；本期平均则可保留。')
+    return list(dict.fromkeys(out))
+
+
+def static_gates(rs: RuleSet) -> list[tuple[str, str]]:
+    """不用数据就能看出不起作用的写法：[(去重键, 说明)]。编译公式阶段和试算后的检查共用。"""
+    out = []
+    for where, ast in _parsed(rs):
+        # 字段和自己比较（id == id）：永远成立，多半是想按当前对象筛选却写错了
+        same = self_compares(ast)
+        if same:
+            out.append((f"同字段比较 {where}", f"{where} 里的 {'、'.join(dict.fromkeys(same))} {SELF_COMPARE_HINT}"))
+        # if 的两个分支一样：条件不起作用，多半是占位（实测 is_debt = if(…, 0, 0)，欠款暂扣整块没算）
+        if any(isinstance(x, Call) and x.fn == "if" and len(x.args) == 3 and x.args[1] == x.args[2] for x in walk(ast)):
+            out.append((f"无效条件 {where}",
+                        f"{where} 里 if 的两个分支一样，条件成不成立结果都相同，等于没判断。这是占位写法：按材料写出成立时和"
+                        "不成立时各自的取值；判断依据在哪张表、哪一列，先把它定义进数据表"))
+    return out

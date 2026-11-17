@@ -643,6 +643,8 @@ class Evaluator:
 def _coerce(a: Val, other: Val, where: str) -> Val:
     """字符串和日期、是/否比较时，把字符串按对方的类型转换（如 recognition_date >= "2026-07-01"）。"""
     if isinstance(a.v, str) and isinstance(other.v, (date, bool)):
+        if not a.v.strip():
+            return Val(None, a.text, a.deps, a.rows)   # first_date == "" 是在问“是不是空”，不是一个日期
         try:
             v = to_bool(a.v) if isinstance(other.v, bool) else to_date(a.v)
         except ConvertError as e:

@@ -268,3 +268,12 @@ def test_comparing_a_field_with_itself_is_rejected():
     # 语法上合法（已冻结的模板照样能算），由智能体侧的检查（验算、evaluate、规则检查）拦下
     assert self_compares(parse('sum(v, of: "项目", where: project_id == project_id)')) == ["project_id == project_id"]
     assert self_compares(parse('sum(v, of: "项目", where: project_id == "P01")')) == []
+
+
+def test_comparing_a_date_with_an_empty_string_asks_whether_it_is_blank():
+    """实测：if(min(first_date, of: "项目首发日期") == "", 0, ...) 报“无法解析为日期: ''”，整个试算停下。"""
+    from datetime import date
+    from bonus_core.engine.evaluator import Val, _coerce
+    d = Val(date(2022, 1, 10), "first_date")
+    assert _coerce(Val("", '""'), d, "x").v is None
+    assert _coerce(Val("2022-01-10", '"2022-01-10"'), d, "x").v == date(2022, 1, 10)

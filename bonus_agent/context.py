@@ -1,5 +1,6 @@
 """Bounded task context; authoritative rules and raw rows stay in workspace tools."""
 
+import difflib
 import json
 import math
 import re
@@ -104,6 +105,17 @@ def workspace_view(
         fail('读取位置offset/detail_offset须为非负整数，limit须为整数')
     requested_limit = limit
     limit = max(1, min(limit, 50))  # Read-only sizing is safe to normalize, never a business correction.
+    notes = []
+    if scheme and scheme not in ws.schemes and section in ('rules', 'variables', 'tables', 'basis'):
+        # 只读：方案名写错（如共用部分已合并进各方案的「共用」）不报错，改读全部方案，免得反复撞同一个错被判卡住
+        notes.append(f'没有方案「{scheme}」（共用部分已合并进每个方案），已改为读全部方案 {ws.schemes}')
+        scheme = None
+    if section == 'rules' and name is not None and name not in ws.schemes:
+        # rules 的 name 只认方案名；写的是表或变量名时直接给那张表/变量
+        hit = next((sec for sec in ('tables', 'variables') for s in ws.schemes if name in (ws._merged(s).get(sec) or {})), None)
+        if hit:
+            notes.append(f'「{name}」是{"表" if hit == "tables" else "变量"}，不是方案；已按 section={hit} 给出')
+            section = hit
     if section == 'facts':
         items = [f.model_dump(mode='json') for f in ws.facts]
     elif section == 'clauses':
@@ -165,7 +177,17 @@ def workspace_view(
     if brief:
         result['view'] = 'brief：单条完整记录（原文、坐标）用 name 读取，或 detail=true'
     if requested_limit != limit:
-        result['notice'] = f'请求条数{requested_limit}已安全调整为{limit}；按next_call继续读取'
+        notes.append(f'请求条数{requested_limit}已安全调整为{limit}；按next_call继续读取')
+    if name is not None and not items:
+        # 名字对不上时说清楚有哪些，不让模型换着方案名、section 反复试
+        pool = sorted({n for s in ws.schemes for sec in ('tables', 'variables') for n in (ws._merged(s).get(sec) or {})}
+                      | set(ws.schemes) | set(ws.datasets))
+        near = difflib.get_close_matches(name, pool, n=6, cutoff=0.3)
+        notes.append(f'没有叫「{name}」的{section}' + (f'；名字相近的有 {near}' if near else '')
+                     + (f'；已有的表 {sorted({n for s in ws.schemes for n in (ws._merged(s).get("tables") or {})})[:40]}'
+                        if section in ('rules', 'tables') else '') + '。不要换方案名重试')
+    if notes:
+        result['notice'] = '；'.join(notes)
     # Stay below the runner's character cap while preserving whole records and real offsets.
     context = None
     for item in items[offset : offset + limit] if detail_offset is None else []:
