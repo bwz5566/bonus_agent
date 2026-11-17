@@ -116,7 +116,8 @@ def test_failed_partial_batch_is_not_committed(tmp_path,monkeypatch):
         self.notes['bad']='partial'
         return {'status':'PARTIAL'}
     monkeypatch.setattr(type(ws),'note',partial)
-    assert team.execute(call,{'topic':'x','text':'x'})['status']=='PARTIAL'
+    result=team.execute(call,{'topic':'x','text':'x'})
+    assert result['status']=='FAIL' and result['transaction']=='ROLLED_BACK'
     assert ws.notes==before
 
 
@@ -221,3 +222,72 @@ def test_program_stage_obeys_same_stop_boundary(tmp_path,monkeypatch):
     team.state['tasks']['basis'].update(status='BLOCKED',problem='same failure')
     with pytest.raises(LLMError,match='blocked'):
         team.propose('system','task',TOOLS)
+
+
+def test_empty_response_gets_one_scoped_correction_and_is_logged(tmp_path,monkeypatch):
+    ws,team=session(tmp_path)
+    monkeypatch.setattr(team,'owners',lambda:[('rules',None)])
+    calls=[]
+    def respond(self,messages,tools,**kwargs):
+        calls.append(copy.deepcopy(messages))
+        if len(calls)==1:return {'content':'规则登记完成了','tool_calls':[]}
+        return {'content':'','tool_calls':[{'name':'note','arguments':'{"topic":"下一步","text":"继续补其他原文"}'}]}
+    monkeypatch.setattr(FakeLLM,'chat_tools',respond)
+    reply=team.propose('system','task',TOOLS)
+    assert len(calls)==2 and reply['tool_calls'][0]['name']=='note'
+    record=team.state['tasks']['rules']
+    assert record['protocol_reports'][0]['problem'].startswith('no_calls')
+    assert '规则登记完成了' in record['protocol_reports'][0]['response_excerpt']
+    assert '程序拒绝上一响应' in calls[1][-1]['content']
+
+
+def test_valid_batch_rebases_only_its_own_commits(tmp_path,monkeypatch):
+    ws,team=session(tmp_path)
+    spec=ws.workflow['construction']['tasks']['a']
+    monkeypatch.setattr(team,'owners',lambda:[('formula:a',spec)])
+    def respond(self,messages,tools,**kwargs):
+        return {'content':'','tool_calls':[
+            {'name':'set_rules','arguments':json.dumps({'scheme':'S','variables':{'a':{'scope':'项目','expr':'amount'}}})},
+            {'name':'check_formula_task','arguments':'{"task":"a"}'}]}
+    monkeypatch.setattr(FakeLLM,'chat_tools',respond)
+    reply=team.propose('system','task',TOOLS)
+    assert len(reply['tool_calls'])==2
+    for c in reply['tool_calls']:
+        result=team.execute(c,json.loads(c['arguments']))
+        team.observe(c,str(result),True)
+    assert result['status']=='PASS'
+    assert ws.workflow['construction']['receipts']['a']
+
+
+@pytest.mark.parametrize('kind',['empty','forbidden','too_many','malformed'])
+def test_invalid_protocol_is_bounded_before_any_tool_executes(tmp_path,monkeypatch,kind):
+    ws,team=session(tmp_path)
+    monkeypatch.setattr(team,'owners',lambda:[('rules',None)])
+    invoked=[];before=copy.deepcopy(ws.drafts)
+    choices={'empty':[], 'forbidden':[{'name':'set_rules','arguments':'{}'}],
+             'too_many':[{'name':'note','arguments':'{}'}]*5,
+             'malformed':[{'name':'note','arguments':'[1,2]'}]}
+    def respond(self,*args,**kwargs):
+        invoked.append(1)
+        return {'content':'details','tool_calls':choices[kind]}
+    monkeypatch.setattr(FakeLLM,'chat_tools',respond)
+    with pytest.raises(LLMError,match='team.protocol'):
+        team.propose('system','task',TOOLS)
+    assert len(invoked)==2 and ws.drafts==before
+    with pytest.raises(LLMError,match='team.blocked'):
+        team.propose('system','task',TOOLS)
+    assert len(invoked)==2
+    assert len(team.state['tasks']['rules']['protocol_reports'])==2
+
+
+def test_corrective_call_still_checks_cumulative_budget(tmp_path,monkeypatch):
+    ws,team=session(tmp_path)
+    monkeypatch.setattr(team,'owners',lambda:[('rules',None)])
+    invoked=[]
+    def respond(self,*args,**kwargs):
+        invoked.append(1);self.usage += Usage(prompt_tokens=100_000,calls=1)
+        return {'content':'none','tool_calls':[]}
+    monkeypatch.setattr(FakeLLM,'chat_tools',respond)
+    with pytest.raises(LLMError,match='team.budget'):
+        team.propose('system','task',TOOLS)
+    assert len(invoked)==1

@@ -11,6 +11,7 @@ from bonus_agent.llm import LLMError, Usage, parse_json
 from bonus_agent.recovery import fingerprint
 
 _CALLS = threading.BoundedSemaphore(2)
+MAX_ACTIONS = 4
 READS = {'read_document', 'read_sheet', 'read_parameter_table', 'read_workspace',
          'list_files', 'query_dataset', 'diagnose_datasets', 'inspect_sheet', 'view_image'}
 EVIDENCE = {'record_facts', 'record_parameter_cells', 'record_clauses', 'cover_clauses',
@@ -116,6 +117,7 @@ class TeamSession:
         self.primary = ws.llm
         ws.llm = BudgetModel(ws.llm, self.meter)
         self.serial = 0
+        self.batch_versions = {}
         self.checkpoint = lambda: None
 
     def owners(self):
@@ -185,9 +187,14 @@ class TeamSession:
                 packet['state'].pop('current_task_evidence', None)
                 packet['state']['evidence'].pop('uncovered', None)
             messages = [{'role': 'system', 'content': system + '\n你是受限模块Agent。只处理owned_target；'
-                         '依赖不满足就反馈，不猜测规则，不直接口算金额。一次只调用一个工具。'
+                          '依赖不满足就反馈，不猜测规则，不直接口算金额。每次调用1至4个允许的工具；按依赖顺序提交。'
                          '任务局部通过不等于整案正确。需要变更公共口径时ask_question，不修改其他目标。'},
                         {'role': 'user', 'content': json.dumps(packet, ensure_ascii=False)}] + copy.deepcopy(history)
+            current_hint = (f'当前任务{spec["id"]}，只处理{spec["scheme"]}::{spec["target"]}，绑定证据后check_formula_task；不修改其他目标。'
+                            if spec else self.ws._flow().hint())
+            messages.append({'role':'user', 'content':'以当前程序状态为准继续，不要因上一工具成功就结束。当前下一步：'
+                             + current_hint + '\n优先补程序列出的缺失材料；已有登记先查索引，不从头遍历所有已读材料。'
+                             '\n只处理本角色允许范围；没有可执行动作时用note或ask_question说明具体阻塞，不以纯文本代替工具。'})
             packets.append((owner, spec, version, messages, self.tools(definitions, spec, owner)))
 
         if program_tool:
@@ -204,21 +211,54 @@ class TeamSession:
             record['status'] = 'RUNNING'
             if model.tool_mode == 'json':
                 messages[0]['content'] += '\n只输出JSON对象：{"tool":"工具名","args":{}}。工具定义：' + json.dumps(tools, ensure_ascii=False)
-                model.think_llm = None
-                act = BudgetModel(model, self.meter).chat_json(messages, max_tokens=8192,
-                    think=bool(spec and spec['target'] in ('/pool','/allocation','/payout','/offsets')))
-                calls = [{'name': act['tool'], 'arguments': json.dumps(act.get('args', {}), ensure_ascii=False)}]
-            else:
-                model.think_llm = None
-                reply = BudgetModel(model, self.meter).chat_tools(messages, openai_tools(tools), max_tokens=8192,
-                    think=bool(spec and spec['target'] in ('/pool','/allocation','/payout','/offsets')))
-                calls = reply['tool_calls']
-            if len(calls) != 1 or calls[0]['name'] not in {t['name'] for t in tools}:
-                raise LLMError('team.protocol：模块必须只提交一个允许的工具调用；' + owner)
-            action = calls[0]
-            record['status'] = 'VALIDATING'
-            return {**action, '_owner': owner, '_spec': spec, '_version': version,
-                    '_request':dict(getattr(model, 'last_call', {}))}
+            model.think_llm = None
+            attempts = record.setdefault('protocol_attempts', {})
+            allowed = {t['name'] for t in tools}
+            while attempts.get(version, 0) < 2:
+                reply = {}
+                problem = ''
+                try:
+                    if model.tool_mode == 'json':
+                        raw = BudgetModel(model, self.meter).chat(messages, json_out=True, max_tokens=8192,
+                            think=bool(spec and spec['target'] in ('/pool','/allocation','/payout','/offsets')))
+                        reply = {'content':raw}
+                        try:
+                            act = parse_json(raw)
+                        except LLMError as exc:
+                            raise ValueError(str(exc)) from exc
+                        calls = [{'name': act['tool'], 'arguments': json.dumps(act.get('args', {}), ensure_ascii=False)}]
+                        reply['tool_calls'] = calls
+                    else:
+                        reply = BudgetModel(model, self.meter).chat_tools(messages, openai_tools(tools), max_tokens=8192,
+                            think=bool(spec and spec['target'] in ('/pool','/allocation','/payout','/offsets')))
+                        calls = reply.get('tool_calls', [])
+                    if not isinstance(calls, list) or not calls:
+                        problem = 'no_calls：未返回工具调用'
+                    elif len(calls) > MAX_ACTIONS:
+                        problem = f'batch_too_large：返回{len(calls)}个调用，上限{MAX_ACTIONS}，整批未执行'
+                    elif any(not isinstance(c,dict) or c.get('name') not in allowed for c in calls):
+                        problem = 'disallowed_tools：包含当前角色或阶段不允许的工具，整批未执行'
+                    else:
+                        for c in calls:
+                            args = json.loads(c.get('arguments') or '{}')
+                            if not isinstance(args,dict):
+                                problem = 'arguments：工具参数必须是JSON对象，整批未执行'
+                except (ValueError, KeyError, TypeError) as exc:
+                    problem = f'malformed_response：{type(exc).__name__}，整批未执行'
+                if not problem:
+                    record['status'] = 'VALIDATING'
+                    return [{**c, '_owner':owner, '_spec':spec, '_version':version,
+                             '_request':dict(getattr(model,'last_call',{}))} for c in calls]
+                attempts[version] = attempts.get(version,0) + 1
+                reports = record.setdefault('protocol_reports', [])
+                reports.append({'version':version,'attempt':attempts[version], 'problem':problem,
+                    'response_excerpt':json.dumps(reply,ensure_ascii=False,default=str)[:12000],
+                    'excerpt_only':True, 'request':dict(getattr(model,'last_call',{}))})
+                del reports[:-4]
+                messages.append({'role':'user','content':'程序拒绝上一响应：'+problem+
+                    '。尚未执行其中任何动作。按当前任务继续，提交1至4个允许的工具调用。当前下一步：'+
+                    (f'{spec["id"]} {spec["target"]}' if spec else self.ws._flow().hint())})
+            raise LLMError('team.protocol：同版本协议纠正已达2次，保存响应诊断并停止；'+owner+'；'+record['protocol_reports'][-1]['problem'])
 
         # Preserve successful proposals if another worker fails. No workspace tools run in threads.
         results, errors = [], []
@@ -227,7 +267,10 @@ class TeamSession:
             futures = [pool.submit(call, p) for p in packets]
             for packet, future in zip(packets, futures):
                 try:
-                    results.append(future.result())
+                    batch = future.result()
+                    batch_id = f'{self.serial}:{packet[0]}'
+                    self.batch_versions[batch_id] = packet[2]
+                    results.extend({**c,'_batch':batch_id} for c in batch)
                 except Exception as exc:
                     owner = packet[0]
                     self.state['tasks'][owner].update(status='BLOCKED', problem=str(exc))
@@ -248,7 +291,8 @@ class TeamSession:
         permitted = self.tools([t for t in TOOLS if self.ws._flow().allowed(t['name'])], spec, call['_owner'])
         if call['name'] not in {t['name'] for t in permitted}:
             raise ToolError('team.permission：当前角色或阶段不允许此工具')
-        if call['_version'] != self.version(spec):
+        expected = self.batch_versions.get(call.get('_batch'), call['_version'])
+        if expected != self.version(spec):
             raise ToolError('team.stale：输入或依赖已变化，拒绝提交旧候选')
         if not spec:
             if call['_owner'] == 'data' and call['name'] == 'set_rules' and set(args) - {'scheme','allocation','patches','bindings'}:
@@ -293,7 +337,9 @@ class TeamSession:
         if (isinstance(value, dict) and value.get('status') == 'PARTIAL') or clone._fact_rejections:
             # Diagnostics are still returned, but the partial batch is not committed.
             self.ws._fact_rejections = copy.deepcopy(clone._fact_rejections)
-            return value
+            return {'status':'FAIL', 'transaction':'ROLLED_BACK',
+                    'issues':copy.deepcopy(clone._fact_rejections), 'candidate_result':value,
+                    'notice':'本批未提交任何修改；candidate_result仅为隔离草稿反馈，其登记数量不是实际已保存数量。修正拒绝项后重新提交整批。'}
         self.authorize(call, args)
         # Helper model calls updated the live ledger while this draft was private.
         # Never replace their usage with the pre-call copy in the draft.
@@ -301,6 +347,8 @@ class TeamSession:
         self.ws.__dict__.update(clone.__dict__)
         self.state = self.ws.workflow['team']
         self.meter.state = self.state['meter']
+        if call.get('_batch') in self.batch_versions:
+            self.batch_versions[call['_batch']] = self.version(spec=call.get('_spec'))
         return value
 
     def observe(self, call, result, ok):
