@@ -7,15 +7,32 @@ from bonus_agent import facts as fx
 from bonus_agent.construction import TaskBoard
 
 
-def submit(ws, task: str, value, bindings=None, facts=None):
+def submit(ws, task: str, value=None, bindings=None, facts=None, *, changes=None):
     from bonus_agent.agent import ToolError
 
     candidate = copy.deepcopy(ws, {id(ws.llm): ws.llm})
     board = TaskBoard(candidate)
     spec = board.task_spec(task)
     parts = fx.target_parts(spec['target'])
+    if value is not None and changes is not None:
+        raise ToolError('construction.package：value与changes互斥；完整替换用value，仅修改已有对象部分字段用changes')
+    if changes is not None:
+        if not isinstance(changes, dict) or not changes:
+            raise ToolError('construction.package：changes须为非空对象；只提供明确要替换的顶层字段')
+        try:
+            # Read the full stored target. TaskBoard.value may intentionally
+            # project report/checks during basis validation; merging that view
+            # would silently discard later distribution definitions.
+            current = fx.target_value(candidate._merged(spec['scheme']), spec['target'])
+        except (KeyError, IndexError, TypeError, ValueError):
+            current = None
+        if not isinstance(current, dict):
+            raise ToolError('construction.package：changes仅适用于已存在的对象目标；新目标或列表目标须用value完整提交')
+        # One explicit top-level replacement per supplied field. Nested maps
+        # and lists are not patched by guessed keys, positions or row identity.
+        value = {**copy.deepcopy(current), **copy.deepcopy(changes)}
     if value is None or not isinstance(value, (dict, list)):
-        raise ToolError('construction.package：value须为当前目标的完整对象或列表；删除组件使用set_rules')
+        raise ToolError('construction.package：须提供value完整对象/列表，或changes修改已有对象字段；删除组件使用set_rules')
     payload = {parts[0]: {parts[1]: value}} if len(parts) == 2 else {parts[0]: value}
     try:
         candidate._check_source_version()
@@ -46,4 +63,5 @@ def submit(ws, task: str, value, bindings=None, facts=None):
                 'next': '修正当前规则包后重新submit_formula_task；未保存部分公式或部分证据'}
     ws.__dict__.update(candidate.__dict__)
     return {**report, 'saved': True,
+            **({'updated_fields': sorted(changes)} if changes is not None else {}),
             'scope': '当前构件及其前置条件检查通过；金额仍须阶段编译、独立核算与最终验收'}

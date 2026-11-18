@@ -603,10 +603,10 @@ class Workspace:
         from bonus_agent.construction import TaskBoard
         return TaskBoard(self).check(task)
 
-    def submit_formula_task(self, task: str, value, bindings: list[dict] | None = None,
-                            facts: list[dict] | None = None):
+    def submit_formula_task(self, task: str, value=None, bindings: list[dict] | None = None,
+                            facts: list[dict] | None = None, changes: dict | None = None):
         from bonus_agent.rule_package import submit
-        return submit(self, task, value, bindings, facts)
+        return submit(self, task, value, bindings, facts, changes=changes)
 
     def calculate_basis(self, scheme: str | None = None):
         try:
@@ -3909,6 +3909,71 @@ class Workspace:
         invalidate_changed_reviews(self)
         return [q for q in self.questions if q.blocking and not q.answer and not q.withdrawn]
 
+    def _report_output_gaps(self) -> list[str]:
+        """A calculation basis can feed a recipient scheme without impersonating people."""
+        if not self.report_required:
+            return []
+        from bonus_core.dsl.validator import _weighted
+        referenced = {}
+        for name in self.schemes:
+            result = self.results.get(name, {}).get('R0')
+            if not result:
+                continue
+            rules = self._ruleset(name)
+            weighted = {level.level for level in _weighted(rules)}
+            roots = set()
+            for node in result.nodes.values():
+                if node.level == rules.pool.scope or rules.pool.scope == 'global' and node.parent is None:
+                    roots.add(f'{node.id}/奖金池')
+                if node.level in weighted:
+                    roots.add(f'{node.id}/权重')
+            for node in result.payouts:
+                for condition in rules.payout:
+                    roots.add(f'{node}/{"可发比例" if condition.pay_ratio.strip() else "挂起比例"}/{condition.id}')
+            for offset in rules.offsets:
+                nodes = {node.id for node in result.nodes.values() if node.level == offset.scope}
+                if offset.scope != rules.leaf.level:
+                    nodes.update(result.rollups)
+                roots.update(f'{node}/已发抵扣/{offset.id}' for node in nodes)
+            if rules.report:
+                claimed = {item for contract in rules.report.distributions for item in contract.pending}
+                for trace in result.traces.values():
+                    if trace.rule_item == 'report.pending' and any(
+                            item.name in claimed and trace.id == f'{trace.node_id}/待分配/{item.name}'
+                            for item in rules.report.pending):
+                        roots.add(trace.id)
+            inputs, todo = set(), list(roots)
+            while todo:
+                identity = todo.pop()
+                if identity in inputs:
+                    continue
+                inputs.add(identity)
+                if identity in result.traces:
+                    todo.extend(result.traces[identity].inputs)
+            for upstream, revision in self._deps(name):
+                source = self.results.get(upstream, {}).get(revision)
+                if source:
+                    used = {node for node in {*source.payouts, *source.rollups}
+                            if f'{upstream}/{revision}:{node}' in inputs}
+                    if used:
+                        referenced.setdefault(upstream, set()).update(used)
+        gaps = []
+        for name in self.schemes:
+            report = self._ruleset(name).report
+            result = self.results.get(name, {}).get('R0')
+            if not report or not report.totals:
+                gaps.append(f'方案「{name}」缺少 report.totals 汇总核算')
+            elif not result or {item.name for item in report.totals} - {label for label, _ in result.totals}:
+                gaps.append(f'方案「{name}」声明的 totals 尚无完整试算结果')
+            if not (report and report.people) and name not in referenced:
+                gaps.append(f'方案「{name}」缺少 report.people；只有被其他方案实际引用的核算基础可省略人员报告')
+            elif not (report and report.people):
+                details = {node for item in report.details if item.level != 'global'
+                           for node in result.details.get(item.name, {})} if report and result else set()
+                if not details or referenced[name] - details:
+                    gaps.append(f'方案「{name}」省略人员报告时须用 report.details 完整保留被引用对象的核算明细')
+        return gaps
+
     def finish(self, summary: str, ignored: list[dict] | None = None, review: bool = True) -> str:
         self._check_source_version()
         if self.staged and self._flow().has_plan():
@@ -3962,15 +4027,11 @@ class Workspace:
         if miss:
             raise ToolError(f"台账里这些参数的数值在规则里没有出现：{'、'.join(miss)}。请核对规则是否漏了或写错；"
                             "确实不参与计算的写进 ignored（ref 写参数名，说明原因）")
-        if self.report_required:
-            bare = [s for s in self.schemes if not (self._merged(s).get("report") or {}).get("totals")
-                    or not (self._merged(s).get("report") or {}).get("people")]
-            if bare:
-                raise ToolError(f"方案 {bare} 还没有写完 report。场景有输出要求（见任务说明的【输出要求】），用 set_rules 的 report 写明"
-                                "汇总核算的各类金额（totals）和按人汇总用的字段（people），然后再 trial_run。"
-                                "people 要写最末一层上表示人的字段：分配到人时，最末层用逐条的分配记录（如名单展开后每行一条，"
-                                "key 用行号，parent_key 写上一层的编号，权重写比例），people 写记录里的人名字段；"
-                                "不要为了写 people 另建一层“人员”，也不要改动已经试算成功的金额部分")
+        report_gaps = self._report_output_gaps()
+        if report_gaps:
+            raise ToolError('场景输出尚未完整：' + '；'.join(report_gaps)
+                            + '。各方案须保留汇总核算；最终人员方案按材料规定的分配与舍入口径生成人员汇总，'
+                              '项目基础方案保留对象明细，不要为通过检查把项目编号充当人名。')
         gates = [f"方案「{s}」：{g}" for s in self.schemes if s in self.lint for g in self._open_gates(self.lint[s])]
         if gates:
             raise ToolError("程序检查还有没处理的（逐条改规则；需要财务确认的用 ask_question；确实无关的写进 ignored，"

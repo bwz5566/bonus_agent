@@ -410,9 +410,51 @@ class _ScopeCheck:
         if ds not in self.lay.aux:
             return False
         k = self.rs.datasets[ds].key
-        mine = [n for n, lv in self.lay.table_level.items() if 0 <= lv <= ctx and n != ds and n not in self.lay.aux]
         lv_ds = [ed[0] for lv in self.rs.allocation[:ctx + 1] if (ed := self.rs.entity_dataset(lv.key))]
-        return bool(k) and any(k in self.rs.datasets[n].fields for n in set(mine) | set(lv_ds))
+        # Evaluator's direct auxiliary aggregation reads node/ancestor attrs,
+        # never the fields of their detail rows. A detail row's reference must
+        # be followed inside an explicit aggregation of that detail table.
+        return bool(k) and any(k in self.rs.datasets[n].fields for n in lv_ds)
+
+    def _aux_bridges(self, entity: str, ctx: int, ent: str | None) -> list[str]:
+        """Detail rows reachable here that actually carry this entity's key."""
+        key = self.rs.datasets[entity].key
+        out = []
+        for name, ds in self.rs.datasets.items():
+            if ds.key or not key or key not in ds.fields:
+                continue
+            if ent is None:
+                reachable = self.lay.table_level[name] >= ctx
+            else:
+                # Auxiliary rows see direct foreign-key rows and rows under
+                # their auxiliary children; unrelated transitive refs alone do
+                # not make those rows members of this entity's population.
+                owner, seen = name, set()
+                reachable = False
+                ent_key = self.rs.datasets[ent].key
+                while owner not in seen:
+                    seen.add(owner)
+                    if owner == ent or ent_key in self.rs.datasets[owner].fields:
+                        reachable = True
+                        break
+                    kind, parent, _ = self.lay.parent[owner]
+                    if kind != 'aux':
+                        break
+                    owner = parent
+            if reachable:
+                out.append(name)
+        return sorted(out)
+
+    def _aux_bridge_hint(self, value: str, entity: str, ctx: int, ent: str | None) -> str:
+        candidates = self._aux_bridges(entity, ctx, ent)
+        if not candidates:
+            return ''
+        shown = candidates[:4]
+        key = self.rs.datasets[entity].key
+        return (f"。当前作用域可读取、且行内含 {key} 引用「{entity}」的明细候选：{'、'.join(shown)}"
+                f"{'等' if len(candidates) > len(shown) else ''}。按材料选择关联路径；"
+                f"仅在原文明确当前对象应有唯一属性时，可用 single_value({value}, of: \"{shown[0]}\") 断言"
+                "（空值或多值仍阻断）；需合计时先核对业务粒度，不要把重复出现的系数求和")
 
     def _shared_ids(self, ds: str, ctx: int) -> list[tuple[str, str]]:
         """上层的表 ds 和 ctx 这一层的表共有的编号/文字字段（如客户编码），可以用来把 ds 变成关联实体。"""
@@ -495,6 +537,11 @@ class _ScopeCheck:
                                            f"本层就能直接引用它的字段和 scope=「{ds}」的变量（{f0} 取不到的对象没有值，按材料定怎么算）。"
                                            f"{f0} 在「{ds}」里有重复时先确认重复的行该合计还是取一条（拿不准就 ask_question），"
                                            f"不要在公司级表、上一层、本层之间来回换")
+                        if ds in self.lay.aux:
+                            value = node.args[0].id if node.args and isinstance(node.args[0], Name) else '待取值'
+                            bridge_hint = self._aux_bridge_hint(value, ds, ctx, ent)
+                            if bridge_hint:
+                                fix = bridge_hint.lstrip('。')
                         self._block("agg_above", f"{node.fn}(...) 聚合的数据表「{ds}」挂在「{lab(tl)}」层，在「{lab(ctx)}」层"
                                                  f"聚合不到任何行。{fix}")
                 inner = ds if ds in self.lay.aux else ent
@@ -540,8 +587,9 @@ class _ScopeCheck:
             e = sc or sorted(owners)[0]
             key = rs.datasets[e].key
             what = f"变量 {n} 属于关联实体「{e}」" if sc else f"{n} 是关联实体「{e}」的字段"
-            self._block("scope_aux", f"{what}，只能在「{e}」作用域的变量里、对「{e}」的聚合里（如 sum({n}, of: \"{e}\")），"
-                                     f"或带有 {key} 的表的聚合里使用")
+            hint = self._aux_bridge_hint(n, e, ctx, ent) if agg is None else ''
+            self._block("scope_aux", f"{what}，应在「{e}」作用域，或通过当前对象/明细行实际携带的 {key} 编号引用；"
+                                     f"不能仅因其他明细表有 {key} 就直接在当前对象上取值{hint}")
             return
         if n in rs.variables:
             vs = rs.variables[n].scope

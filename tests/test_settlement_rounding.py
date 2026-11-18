@@ -74,7 +74,7 @@ def test_after_sum_cannot_be_declared_on_a_record_tree_without_regrouping_people
     ws=case(tmp_path)
     ws.drafts['S']['report']['distributions']=[{'name':'funding','level':'global','rounding':'after_sum',
         'total':'sum(amount, of: "orders")','sources':[{'doc':'data.xlsx','quote':'amount'}]}]
-    with pytest.raises(ToolError,match='人员为奖金池'):
+    with pytest.raises(ToolError,match='recipient_rounding_scope'):
         ws.trial_run()
 
 
