@@ -1416,7 +1416,7 @@ class Workspace:
                 errors = fx.binding_errors([candidate], scopes)
                 if error or errors:
                     raise ToolError("parameter.binding：本批绑定未生效。" + str(error or '；'.join(errors))
-                                    + "。先修正类型、单位或绑定位置的取值；区间下界用 component: lower；不要重复试算。")
+                                    + "。按上述具体诊断修正类型、单位、component或绑定位置；不要重复试算。")
                 updates.append((f, candidate))
         changed = 0
         for f, candidate in updates:
@@ -4639,11 +4639,13 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                                {'files': prints, 'period': period_obj.label if period_obj else None,
                                 'answers': [(q.id, q.answer) for q in ws.questions if q.answer is not None],
                                 'code': rnd['code'], 'financial_context': ws.said})
-    from bonus_agent.progress import RepairReadBudget
+    from bonus_agent.progress import RepairReadBudget, repair_scope
     repair_reads = RepairReadBudget(recovery.state.setdefault('repair_reads', {}))
-    resumed_read_budget = repair_reads.observe([], recovery.state.get('native_repairs', {}), None, READ_ONLY)
+    recovery.set_repair_scope(repair_scope(ws))
+    resumed_read_budget = repair_reads.observe([], recovery.state.get('native_repairs', {}), None, READ_ONLY,
+                                             scope=recovery.state['repair_scope'])
     if resumed_read_budget['halt']:
-        recovery.halt(resumed_read_budget['message'])
+        recovery.halt(resumed_read_budget['message'], repair_read=resumed_read_budget)
     ws.notes.pop(ANSWER_NOTE, None)          # 上一轮的回答不带到这一轮
     handlers = {t["name"]: getattr(ws, t["name"]) for t in TOOLS}
     if not run_budget.check(llm) and not recovery.error:
@@ -4775,9 +4777,11 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             recovery.save()
             reached, reached_focus = ws.phase(), ws._flow().stage()
             highest_stage = max(highest_stage, reached_focus[0])
-    initial_read_budget = repair_reads.observe([], recovery.state.get('native_repairs', {}), current_compile_report(), READ_ONLY)
+    recovery.set_repair_scope(repair_scope(ws))
+    initial_read_budget = repair_reads.observe([], recovery.state.get('native_repairs', {}), current_compile_report(), READ_ONLY,
+                                             scope=recovery.state['repair_scope'])
     if initial_read_budget['halt']:
-        recovery.halt(initial_read_budget['message'])
+        recovery.halt(initial_read_budget['message'], repair_read=initial_read_budget)
         error = recovery.error  # enforce a persisted exhausted allowance before a new request
     recovery.save()
     for turn in range(max_steps if not error else 0):
@@ -4994,6 +4998,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                 except json.JSONDecodeError:
                     shown = {}
                 steps.append(Step(c["name"], shown if isinstance(shown, dict) else {}, result, False, thought))
+                steps[-1]._repair_scope = repair_scope(ws)
                 if on_step:
                     on_step(len(steps), steps[-1])
                 history.append(
@@ -5076,6 +5081,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             step = Step(c["name"], args if isinstance(args, dict) else {}, result, ok, thought,
                         at=time.strftime("%H:%M:%S", time.localtime(t_tool)), secs=round(time.time() - t_tool, 2),
                         request=dict(llm.last_call))
+            step._repair_scope = repair_scope(ws)
             if c['name'] == 'compile_formulas' and ws.staged:
                 # Retain the program's complete report at this exact point in a
                 # batch. A later tool can replace it; the displayed summary may
@@ -5248,23 +5254,26 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         native_changed = False
         read_budget_warned = False
         for step_index, st in enumerate(model_steps):
+            recovery.set_repair_scope(st._repair_scope if hasattr(st, '_repair_scope') else repair_scope(ws))
             native_changed = recovery.observe_native_feedback(st.tool, st.args, st.result, st.ok) or native_changed
             # Native feedback and reads are observed in execution order: reads
             # before the first failed attempt must not spend its new allowance.
             observed_budget = repair_reads.observe([st], recovery.state.get('native_repairs', {}),
                                                    getattr(st, '_repair_compile_report', None), READ_ONLY,
-                                                   attempts=model_steps[:step_index + 1])
+                                                    attempts=model_steps[:step_index + 1], scope=recovery.state['repair_scope'])
             read_budget_warned = read_budget_warned or observed_budget['warn']
         rechecked = automatic_recheck()
+        recovery.set_repair_scope(repair_scope(ws))
         read_budget = repair_reads.observe([], recovery.state.get('native_repairs', {}),
-                                           current_compile_report(), READ_ONLY, attempts=model_steps)
+                                           current_compile_report(), READ_ONLY, attempts=model_steps,
+                                           scope=recovery.state['repair_scope'])
         if read_budget['active'] and (read_budget_warned or read_budget['halt']):
             ws.notes['当前修复读取预算'] = read_budget['message']
             history.append({'role': 'user', 'content': '【当前修复读取预算】' + read_budget['message']})
         elif not read_budget['active']:
             ws.notes.pop('当前修复读取预算', None)
         if read_budget['halt']:
-            recovery.halt(read_budget['message'])
+            recovery.halt(read_budget['message'], repair_read=read_budget)
         if recovery.native_guidance:
             ws.notes['程序修复指引'] = recovery.native_guidance
             if native_changed:

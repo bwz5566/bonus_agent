@@ -107,6 +107,7 @@ class TaskBoard:
 
     def plan(self, tasks, replace=False):
         from bonus_agent.agent import ToolError
+        before = self.state['tasks']
         proposed = {} if replace else copy.deepcopy(self.state['tasks'])
         schemes = self.ws.workflow.get('plan', {}).get('schemes', self.ws.schemes)
         for item in tasks:
@@ -132,13 +133,14 @@ class TaskBoard:
             if set(spec['facts']) - {f.name for f in self.ws.facts}:
                 raise ToolError('construction.source：参数名不存在')
             proposed[spec['id']] = spec
-        targets = [(s['scheme'], s['target']) for s in proposed.values()]
+        targets = [(s['scheme'], tuple(fx.target_parts(s['target']))) for s in proposed.values()]
         if len(set(targets)) != len(targets):
             conflicts = []
-            for scheme, target in dict.fromkeys(targets):
-                ids = [n for n, item in proposed.items() if (item['scheme'], item['target']) == (scheme, target)]
+            for scheme, parts in dict.fromkeys(targets):
+                ids = [n for n, item in proposed.items() if (item['scheme'], tuple(fx.target_parts(item['target']))) == (scheme, parts)]
                 if len(ids) > 1:
                     existing = [n for n in ids if n in self.state['tasks']]
+                    target = '/' + '/'.join(p.replace('~', '~0').replace('/', '~1') for p in parts)
                     conflicts.append({'scheme': scheme, 'target': target, 'ids': ids, 'existing_ids': existing})
             raise ToolError('construction.plan：同一目标只允许一个任务，修改时复用id；本批未保存。冲突：'
                             + json.dumps(conflicts, ensure_ascii=False)
@@ -153,7 +155,19 @@ class TaskBoard:
         for scheme in {s['scheme'] for s in proposed.values()}:
             self.ws.drafts.setdefault(scheme, {})
         self.sync_targets()
-        return {'status': 'PLANNED', **self.summary()}
+        summary = self.summary()
+        # Receipt of this successful operation, not a claim that any formula or
+        # monetary result passed. Recovery can match an earlier duplicate target
+        # to the original ID only after the whole plan is unique and saved.
+        validated = []
+        for ident in dict.fromkeys(item['id'] for item in tasks):
+            spec = self.state['tasks'][ident]
+            prior = before.get(ident, {})
+            target = '/' + '/'.join(p.replace('~', '~0').replace('/', '~1') for p in fx.target_parts(spec['target']))
+            validated.append({'id': ident, 'scheme': spec['scheme'], 'target': target, 'unique': True,
+                              'reused': prior.get('scheme') == spec['scheme'] and
+                              fx.target_parts(prior.get('target', '')) == fx.target_parts(spec['target'])})
+        return {'status': 'PLANNED', **summary, 'validated_targets': validated}
 
     def sync_targets(self):
         """Enroll existing components without inventing formulas or clause ownership."""

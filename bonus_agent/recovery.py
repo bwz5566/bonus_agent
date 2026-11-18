@@ -26,6 +26,55 @@ def _repair_objects(args, result=''):
     return [str(args[key]) for key in ('name', 'task', 'dataset') if args.get(key)]
 
 
+def _plan_identity(value):
+    """Exact scheme and decoded JSON pointer; never match names inside prose."""
+    from bonus_agent.facts import target_parts
+    if not isinstance(value, dict):
+        return None
+    scheme, target = value.get('scheme'), value.get('target')
+    if not isinstance(scheme, str) or not scheme or not isinstance(target, str) or not target.startswith('/'):
+        return None
+    parts = target_parts(target)
+    return (scheme, tuple(parts)) if parts and all(parts) else None
+
+
+def _plan_conflicts(issue):
+    """Read the program's embedded conflict records, including saved legacy errors."""
+    if not issue.startswith('construction.plan：') or '冲突：' not in issue:
+        return []
+    try:
+        rows, _ = json.JSONDecoder().raw_decode(issue.split('冲突：', 1)[1])
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(rows, list):
+        return []
+    return [copy.deepcopy(row) for row in rows if _plan_identity(row)
+            and isinstance(row.get('ids'), list) and all(isinstance(x, str) and x for x in row['ids'])
+            and len(set(row['ids'])) > 1
+            and isinstance(row.get('existing_ids'), list) and row['existing_ids']
+            and all(isinstance(x, str) and x in row['ids'] for x in row['existing_ids'])]
+
+
+def _resolved_plan_conflicts(conflicts, args, report):
+    if report.get('status') != 'PLANNED' or not isinstance(report.get('validated_targets'), list):
+        return []
+    submitted = {(_plan_identity(row), row.get('id')) for row in args.get('tasks', [])
+                 if isinstance(row, dict) and _plan_identity(row) and isinstance(row.get('id'), str)}
+    validated = report['validated_targets']
+    resolved = []
+    for conflict in conflicts:
+        identity = _plan_identity(conflict)
+        matching = [row for row in validated if _plan_identity(row) == identity]
+        if len(matching) != 1:
+            continue
+        row = matching[0]
+        ident = row.get('id')
+        if (row.get('unique') is True and row.get('reused') is True
+                and ident in conflict['existing_ids'] and (identity, ident) in submitted):
+            resolved.append(conflict)
+    return resolved
+
+
 _NATIVE_CODE = r'(parameter\.(?:binding|type|unit|range|ref|order)|construction\.(?:plan|task)|source\.(?:cell|page|scope)|tool\.contract|unmatched_basis)\b'
 _NATIVE_PREFIX = re.compile(r'^(?:[^\n。；;！？!?“”"\'{}]+?[：:]\s*)?' + _NATIVE_CODE)
 _GUIDANCE = re.compile(r'(?:程序判断的下一步|下一步[（(:：]|\n\s*(?:注意|建议|历史(?:错误|诊断)?|引用(?:原文)?|原文)[：:]|\n\s*（提醒[：:])')
@@ -85,8 +134,12 @@ def native_repair_feedback(tool, args, result):
     else:
         guide = '按下列程序反例核对工具参数、已登记对象和原文坐标，使用已公布接口修复；重复读取或改描述不代表修复。'
     objects = [str(args['task'])] if code == 'construction.task' and args.get('task') else _repair_objects(args, issue)
-    return {'tool': tool, 'code': code, 'objects': objects,
+    item = {'tool': tool, 'code': code, 'objects': objects,
             'scheme': args.get('scheme'), 'issue': issue[:900], 'guide': guide}
+    if tool == 'plan_formula_tasks' and code == 'construction.plan':
+        if conflicts := _plan_conflicts(issue):
+            item['plan_conflicts'] = conflicts
+    return item
 
 
 def _feedback_phase(result):
@@ -254,6 +307,9 @@ class RunBudget:
         return ''
 
 
+_HALT_PREFIX = '纠错预算耗尽（智能体卡住），已保留工作区并停止自动接续：'
+
+
 class RecoveryJournal:
     def __init__(self, path: Path | None, context, limit=3):
         self.path, self.limit = path, limit
@@ -277,15 +333,67 @@ class RecoveryJournal:
 
     @property
     def error(self):
-        return self.state.get('halted', '')
+        halted = self.state.get('halted', '')
+        marker = self.state.get('read_budget_halt') or {}
+        if halted and marker.get('halt_fingerprint') == fingerprint(halted):
+            from bonus_agent.progress import RepairReadBudget, repair_deferred
+            row = self.state.get('repair_reads', {}).get('records', {}).get(marker.get('record_key'))
+            if (row and row.get('subject') == marker.get('subject') and row.get('reads', 0) >= RepairReadBudget.LIMIT
+                    and repair_deferred(self.state.get('repair_scope'), row['subject'], row.get('phase'))):
+                return ''  # the halt itself and its original allowance remain persisted
+        return halted
 
     @property
     def native_guidance(self):
-        pending = self.state.get('native_repairs', {})
+        from bonus_agent.progress import repair_deferred
+        scope = self.state.get('repair_scope')
+        pending = []
+        for item in self.state.get('native_repairs', {}).values():
+            issue = item['issue']
+            if item['tool'] == 'compile_formulas' and not item.get('objects'):
+                # Compiler facts have exact diagnostic-prefix identities even
+                # in legacy journals with objects=[]. Only those proved to be
+                # deferred may be hidden; unlocated/truncated errors stay live.
+                deferred = scope.get('deferred', ()) if scope and scope.get('phase') == 'basis' else ()
+                lines = [line for line in issue.splitlines() if not (_NATIVE_PREFIX.match(line) and any(
+                    line.startswith(name + '：') or line.startswith(name + ':') for name in deferred))]
+                if not lines:
+                    continue
+                issue = '\n'.join(lines)
+            objects = item.get('objects') or [item['tool']]
+            active = [obj for obj in objects if not repair_deferred(scope, obj, item.get('phase'))]
+            if not active:
+                continue
+            if len(active) != len(objects):
+                # Atomic failures may contain several objects, only some of
+                # which are deferred. Do not replay another phase's example as
+                # the current target; the original diagnostic stays persisted.
+                issue = f'{item["code"]}：当前阶段仍待验证对象：' + '、'.join(active)
+            pending.append(issue + '\n' + item['guide'])
         if not pending:
             return ''
         return ('程序已给出可执行修复，先处理下列问题；可选顾问不重复解释接口，原有失败/停滞预算仍生效。\n'
-                + '\n'.join(item['issue'] + '\n' + item['guide'] for item in list(pending.values())[-3:]))
+                + '\n'.join(pending[-3:]))
+
+    def set_repair_scope(self, scope):
+        """Suspend out-of-phase feedback without clearing any repair or allowance."""
+        self.state['repair_scope'] = copy.deepcopy(scope)
+        halted = self.state.get('halted', '')
+        if halted and not self.state.get('read_budget_halt'):
+            from bonus_agent.progress import RepairReadBudget
+            # Legacy recovery files have only prose. Accept only an exact match
+            # to a still-present exhausted record's full program-owned message.
+            matches = []
+            for key, row in self.state.get('repair_reads', {}).get('records', {}).items():
+                try:
+                    if row['reads'] >= RepairReadBudget.LIMIT and halted == _HALT_PREFIX + RepairReadBudget.message(row):
+                        matches.append((key, row['subject']))
+                except (KeyError, TypeError):
+                    continue
+            if len(matches) == 1:
+                key, subject = matches[0]
+                self.state['read_budget_halt'] = {'record_key': key, 'subject': subject,
+                                                  'halt_fingerprint': fingerprint(halted)}
 
     def observe_native_feedback(self, tool, args, result, ok):
         """Keep explicit failures pending across reads/resumes until program validation resolves them."""
@@ -302,6 +410,23 @@ class RecoveryJournal:
                                                                   tool == 'submit_formula_task' and report.get('saved') is True)
             parameter_checks = {'parameter.binding', 'parameter.type', 'parameter.unit', 'parameter.range'}
             for key, item in list(pending.items()):
+                if tool == 'plan_formula_tasks' and item['tool'] == tool and item['code'] == 'construction.plan':
+                    conflicts = item.get('plan_conflicts') or _plan_conflicts(item.get('issue', ''))
+                    if conflicts:
+                        resolved = _resolved_plan_conflicts(conflicts, args, report)
+                        if resolved:
+                            remaining_conflicts = [row for row in conflicts if row not in resolved]
+                            pending.pop(key)
+                            if remaining_conflicts:
+                                remaining_ids = {ident for row in remaining_conflicts for ident in row['ids']}
+                                remaining = set(item['objects']) & remaining_ids
+                                item = {**item, 'plan_conflicts': remaining_conflicts, 'objects': sorted(remaining),
+                                        'issue': 'construction.plan：目标仍有重复任务，复用existing_ids；冲突：'
+                                                 + json.dumps(remaining_conflicts, ensure_ascii=False)}
+                                pending[fingerprint([item['tool'], item['code'], item['objects']])] = item
+                        continue
+                    if '同一目标只允许一个任务' in item.get('issue', ''):
+                        continue  # Truncated legacy identity cannot be resolved by a same-ID success.
                 if item['code'] in parameter_checks and (tool == 'validate_parameters' or
                                                         tool == 'compile_formulas' and phase == 'all'):
                     pending.pop(key)
@@ -355,9 +480,14 @@ class RecoveryJournal:
         self.save()
         return item['attempts']
 
-    def halt(self, reason):
+    def halt(self, reason, *, repair_read=None):
         # 只写卡在哪；问什么、怎么答由 stuck_question 生成具体问题，不再笼统写“补充材料、明确答复”
-        self.state['halted'] = '纠错预算耗尽（智能体卡住），已保留工作区并停止自动接续：' + reason
+        self.state['halted'] = _HALT_PREFIX + reason
+        self.state.pop('read_budget_halt', None)
+        if repair_read and repair_read.get('halt') and repair_read.get('record_key'):
+            self.state['read_budget_halt'] = {'record_key': repair_read['record_key'],
+                                              'subject': repair_read['subject'],
+                                              'halt_fingerprint': fingerprint(self.state['halted'])}
         self.save()
 
     def claim_advice(self, issue):

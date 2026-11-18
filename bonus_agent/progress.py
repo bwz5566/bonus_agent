@@ -220,6 +220,49 @@ class ProgressWatch:
         return self.stagnant
 
 
+def repair_scope(ws):
+    """Identify only obligations explicitly omitted by the real basis projection.
+
+    Unknown ownership, broken projections and shared basis dependencies remain
+    active. This view schedules recovery; it never resolves an error or grants a
+    receipt. Callers snapshot it at each tool boundary to preserve batch order.
+    """
+    if not ws.staged:
+        return {'phase': 'all', 'deferred': []}
+    from bonus_agent.construction import TaskBoard
+    from bonus_agent.facts import target_parts
+    try:
+        board = TaskBoard(ws)
+        phase = board.phase()
+        if phase != 'basis':
+            return {'phase': phase, 'deferred': []}
+        view = ws._flow().basis_view()
+        required = board.required('basis')
+        active_facts = {fact.name for fact in view.facts}
+        active_facts.update(row['fact']['name'] for row in view._phase_binding_evidence)
+        deferred = {fact.name for fact in ws.facts} - active_facts
+        deferred.update({clause.id for clause in ws.clauses} - {clause.id for clause in view.clauses})
+        tasks = board.state['tasks']
+        deferred.update(set(tasks) - required)
+        # A target can be shared across schemes. Unqualified aliases are safe
+        # only when every owner is outside the current dependency closure.
+        owners = {}
+        for ident, task in tasks.items():
+            path = task['target']
+            for alias in (path, '.'.join(target_parts(path)), task['scheme'] + '::' + path):
+                owners.setdefault(alias, set()).add(ident)
+        deferred.update(alias for alias, ids in owners.items() if not ids & required)
+        return {'phase': phase, 'deferred': sorted(deferred)}
+    except (AttributeError, KeyError, IndexError, TypeError, ValueError):
+        # Missing context is not evidence that an unresolved object may wait.
+        return {'phase': 'basis', 'deferred': []}
+
+
+def repair_deferred(scope, subject, phase=None):
+    return bool(scope and scope.get('phase') == 'basis' and
+                subject in scope.get('deferred', ()))
+
+
 class RepairReadBudget:
     """Bound exploration of a concrete failed repair, not initial discovery.
 
@@ -240,7 +283,7 @@ class RepairReadBudget:
 
     @property
     def active(self):
-        return bool(self.state['records'])
+        return any(not row.get('deferred') for row in self.state['records'].values())
 
     @staticmethod
     def _subject(message):
@@ -274,7 +317,19 @@ class RepairReadBudget:
                 pass
         return objects
 
-    def observe(self, steps, native, report, read_tools, *, attempts=None):
+    @classmethod
+    def message(cls, row):
+        """Stable program-owned halt text, also used to identify legacy records."""
+        action = ('bind_facts；目标公式缺分支时set_rules(bindings=...)；绑定已经一致时validate_parameters核验剩余缺口' if row['tool'] == 'bind_facts' else
+                  'submit_formula_task（使用已有任务ID）/set_rules，然后程序局部检查')
+        return (f'当前未解决对象「{row["subject"]}」已读取 {row["reads"]}/{cls.LIMIT} 次，'
+                '换页面、换query、note、no-op或改描述不会增加额度。'
+                f'程序反例：{row["issue"][:600]}\n'
+                '已读位置：' + json.dumps(row['seen'], ensure_ascii=False) + '\n'
+                f'下一步：仅提交该对象的{action}，按已核对原文修复并验证。'
+                '需要补充证据时明确尚缺的原文位置；不能猜值、改无关公式或降低验证。')
+
+    def observe(self, steps, native, report, read_tools, *, attempts=None, scope=None):
         records = self.state['records']
         native_keys = set()
         for item in native.values():
@@ -286,7 +341,7 @@ class RepairReadBudget:
                 key = fingerprint(('native', item['tool'], item.get('scheme'), obj))
                 native_keys.add(key)
                 row = records.setdefault(key, {'kind': 'native', 'reads': 0, 'seen': [], 'warned': False})
-                row.update(subject=obj, issue=item['issue'], tool=item['tool'])
+                row.update(subject=obj, issue=item['issue'], tool=item['tool'], phase=item.get('phase'))
         for key in list(records):
             if records[key]['kind'] == 'native' and key not in native_keys:
                 del records[key]  # native feedback clears only validated successes
@@ -298,7 +353,12 @@ class RepairReadBudget:
                 report.get('static_checks_complete') is True
                 and report.get('issue_count', len(issues)) <= len(report.get('issues', [])))
             for key, row in list(records.items()):
-                if row['kind'] != 'compile' or row['phase'] != phase:
+                if row['kind'] != 'compile' or (row['phase'] != phase and not
+                                               (phase == 'all' and row['phase'] == 'basis')):
+                    continue
+                if repair_deferred(scope, row['subject'], row.get('phase')):
+                    # Absence from a projected report is deferral, not proof of
+                    # repair. Keep its earlier allowance for the full phase.
                     continue
                 runtime = re.match(r'^方案「([^」]+)」基础求值预检[：:]', row['issue'])
                 if runtime:
@@ -322,10 +382,16 @@ class RepairReadBudget:
             if phase not in self.state['seen_compile']:
                 self.state['seen_compile'].append(phase)
 
+        for row in records.values():
+            row['deferred'] = repair_deferred(scope, row['subject'], row.get('phase'))
+        active = {key: row for key, row in records.items() if not row['deferred']}
         focus = self.state.get('focus')
-        if focus not in records:
-            focus = next(iter(records), None)
-            self.state['focus'] = focus
+        exhausted = next((key for key, row in active.items() if row['reads'] >= self.LIMIT), None)
+        if exhausted is not None:
+            focus = exhausted
+        elif focus not in active:
+            focus = next(iter(active), None)
+        self.state['focus'] = focus
         if focus is None:
             return {'active': False, 'warn': False, 'halt': False, 'message': ''}
         row = records[focus]
@@ -339,13 +405,5 @@ class RepairReadBudget:
                 row['seen'] = [*row['seen'][-5:], location]
         warn = row['reads'] >= self.WARN and not row['warned']
         row['warned'] = row['warned'] or warn
-        action = ('bind_facts；目标公式缺分支时set_rules(bindings=...)；绑定已经一致时validate_parameters核验剩余缺口' if row['tool'] == 'bind_facts' else
-                  'submit_formula_task（使用已有任务ID）/set_rules，然后程序局部检查')
-        message = (f'当前未解决对象「{row["subject"]}」已读取 {row["reads"]}/{self.LIMIT} 次，'
-                   '换页面、换query、note、no-op或改描述不会增加额度。'
-                   f'程序反例：{row["issue"][:600]}\n'
-                   '已读位置：' + json.dumps(row['seen'], ensure_ascii=False) + '\n'
-                   f'下一步：仅提交该对象的{action}，按已核对原文修复并验证。'
-                   '需要补充证据时明确尚缺的原文位置；不能猜值、改无关公式或降低验证。')
-        return {'active': True, 'warn': warn, 'halt': row['reads'] >= self.LIMIT, 'message': message,
-                'subject': row['subject'], 'reads': row['reads'], 'limit': self.LIMIT}
+        return {'active': True, 'warn': warn, 'halt': row['reads'] >= self.LIMIT, 'message': self.message(row),
+                'subject': row['subject'], 'reads': row['reads'], 'limit': self.LIMIT, 'record_key': focus}
