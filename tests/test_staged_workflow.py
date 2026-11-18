@@ -200,6 +200,7 @@ def test_approved_resume_runs_allocation_but_never_skips_final_validation(tmp_pa
     llm=FakeLLM([{'tool':'trial_run','args':{'scheme':'S'}}]);llm.workflow_mode='staged'
     ar=run_agent(llm,ws.inv.files,out,max_steps=1)
     assert not ar.ok and not ar.results and not (out/'result.xlsx').exists()
+    assert 'S' in ar.ws.results, [(s.tool, s.result[:1200]) for s in ar.steps]
     assert ar.ws.results['S']['R0'].pool=='30.00'
     assert ar.status=='FAILED' and '最大步数' in ar.error
 

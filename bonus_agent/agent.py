@@ -100,7 +100,7 @@ WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", 
                "record_clauses", "cover_clauses",
                "answer_question", "update_dataset"}
 WRITE_TOOLS |= {'plan_calculation','prepare_data','compile_formulas','calculate_basis','review_basis'}
-WRITE_TOOLS |= {'plan_formula_tasks', 'check_formula_task', 'compile_coefficient_table'}
+WRITE_TOOLS |= {'plan_formula_tasks', 'check_formula_task', 'compile_coefficient_table', 'submit_formula_task'}
 RULE_SUFFIXES = {".docx", ".pptx", ".pdf", ".png", ".jpg", ".jpeg", ".txt", ".md"}   # 规则文档：要登记参数
 CHAT_SOURCE = "财务对话"       # 财务在对话里贴的规则原文、口径说明：和材料一样可以引用核对
 ANSWER_NOTE = "回答财务"       # 财务的说明里带了提问：智能体把回答记在这条笔记里，网页放在本轮回复的开头（没算完也显示）
@@ -602,6 +602,11 @@ class Workspace:
     def check_formula_task(self, task: str):
         from bonus_agent.construction import TaskBoard
         return TaskBoard(self).check(task)
+
+    def submit_formula_task(self, task: str, value, bindings: list[dict] | None = None,
+                            facts: list[dict] | None = None):
+        from bonus_agent.rule_package import submit
+        return submit(self, task, value, bindings, facts)
 
     def calculate_basis(self, scheme: str | None = None):
         try:
@@ -2808,12 +2813,16 @@ class Workspace:
         base = res["R0"]
         if self.staged:
             basis=self.workflow['basis'][name]
-            if Decimal(base.pool)!=Decimal(basis['pool']) or base.details!=basis['details'] or dict(base.totals)!=basis['totals']:
+            basis_details = {item.name for item in rs.report.details if item.stage == 'basis'} if rs.report else set()
+            basis_totals = {item.name for item in rs.report.totals if item.stage == 'basis'} if rs.report else set()
+            details = {key: value for key, value in base.details.items() if key in basis_details}
+            totals = {key: value for key, value in base.totals if key in basis_totals}
+            if Decimal(base.pool)!=Decimal(basis['pool']) or details!=basis['details'] or totals!=basis['totals']:
                 self.results.pop(name, None)
                 self.untested.add(name)
                 diff = [k for k, a, b in (('奖金池', Decimal(base.pool), Decimal(basis['pool'])),
-                                           ('对象明细', base.details, basis['details']),
-                                           ('合计', dict(base.totals), basis['totals'])) if a != b]
+                                           ('对象明细', details, basis['details']),
+                                           ('合计', totals, basis['totals'])) if a != b]
                 raise ToolError(f'workflow.gate：这次算出的{"、".join(diff)}和「核对计算基础」阶段确认的不一样'
                                 f'（确认时奖金池 {basis["pool"]}，这次 {base.pool}）。确认之后改过规则或数据：'
                                 '回到 calculate_basis 重新核对计算基础，再试算；不能直接发布')
@@ -3174,9 +3183,12 @@ class Workspace:
             raise ToolError(f"计算失败：{e}") from None
         return v, ev.traces["probe"].rendered
 
-    def _independent_env(self, name: str, spec: dict):
+    def _independent_env(self, name: str, spec: dict, *, basis: bool = False):
         """独立复读写的算式的计算环境：只用它自己的辅助变量和参数表（不带规则的变量和参数表）。写法不对抛 ToolError。"""
         rs = self._ruleset(name)
+        if basis:
+            from bonus_core.dsl.validator import basis_rules
+            rs = basis_rules(rs)
         data, _ = self._data(rs)
         data, patched = apply_patches(rs, data)
         try:
@@ -3254,11 +3266,14 @@ class Workspace:
             out[pending.name] = sum(self._independent_eval(ev, expr, nodes, '待分配').values(), Decimal(0))
         return out
 
-    def _independent_details(self, name: str, spec: dict) -> dict[str, Decimal]:
+    def _independent_details(self, name: str, spec: dict, *, basis: bool = False) -> dict[str, Decimal]:
         base=self._ruleset(name)
+        if basis:
+            from bonus_core.dsl.validator import basis_rules
+            base = basis_rules(base)
         if not base.report or not base.report.details:
             return {}
-        _,root,by_level,ev=self._independent_env(name,spec)
+        _,root,by_level,ev=self._independent_env(name,spec,basis=basis)
         out={}
         for item in base.report.details:
             expr=(spec.get('details') or {}).get(item.name)
@@ -5695,7 +5710,7 @@ def _deep_reason(turn: list[Step], skipped: int, ws: Workspace, fails: dict[str,
         if _partial_facts(st.tool, st.ok, st.result):
             continue  # Rows were registered; each rejection already says what to fix. No paid deep step.
         head = st.result.removeprefix("错误：").split("\n", 1)[0][:300]
-        if not st.ok and st.tool in ('prepare_data','compile_formulas','check_formula_task') and fails.get(st.tool,0)<2:
+        if not st.ok and st.tool in ('prepare_data','compile_formulas','check_formula_task','submit_formula_task') and fails.get(st.tool,0)<2:
             continue  # Program diagnostics already identify the first structural correction.
         if not st.ok and any(x in st.result for x in ('source.cell','source.page','plan.ignore_role','【原始数据诊断】')) and fails.get(st.tool,0)<2:
             continue  # Native table coordinates are a deterministic repair, not an advisory task.
@@ -5805,7 +5820,7 @@ def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None =
     out.mkdir(parents=True, exist_ok=True)
     from bonus_agent import review as rv
     for old in [*out.glob("result*.xlsx"), *out.glob("草稿结果*.xlsx"), *out.glob("rules*.yaml"), *out.glob("adjust_*.yaml"),
-                out / 'results.json', out / 'workflow.json', out / '总额预核算.xlsx',
+                out / 'results.json', out / 'engine_results.json', out / 'workflow.json', out / '总额预核算.xlsx',
                 out / "待确认问题.xlsx", out / "expected_check.txt", out / rv.FILE]:
         old.unlink(missing_ok=True)       # 上一轮的输出已存档在 history/，不能留在顶层被误用
     ws, paths = ar.ws, {}
@@ -5902,6 +5917,10 @@ def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None =
     paths["review"] = rv.write(ws, out, ar.results)  # 口径单：财务逐条确认后才能确认结果（确认记录按内容保留，见 review.py）
     paths["results"] = out / "results.json"      # 全部金额的明细（应得、暂缓、抵扣、超发、实发），便于程序逐分核对
     paths["results"].write_text(json.dumps(_results_json(ar.results), ensure_ascii=False, indent=1), encoding="utf-8")
+    paths["engine_results"] = out / "engine_results.json"
+    paths["engine_results"].write_text(json.dumps(
+        {name: {rev: result.to_dict() for rev, result in revisions.items()}
+         for name, revisions in ar.results.items()}, ensure_ascii=False, indent=1), encoding="utf-8")
     ar.recheck = "；".join(_recheck(ar, paths, name, rev) for name, revs in ar.results.items() for rev in revs)
     if ar.single:
         paths["excel"] = out / "result.xlsx"

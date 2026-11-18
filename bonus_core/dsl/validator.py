@@ -6,17 +6,19 @@ from graphlib import CycleError, TopologicalSorter
 from bonus_core.dsl.functions import FUNCTIONS
 from bonus_core.dsl.models import RuleSet, TierTable
 from bonus_core.dsl.parser import BinOp, BoolOp, Call, Cmp, ExprError, Name, Neg, Not, Str, names, parse, walk
+from bonus_core.dsl.phases import basis_rules
 from bonus_core.dsl.scope import Layout, is_aggregate
 from bonus_core.engine.issues import Issue
 
 
-def _exprs(rs: RuleSet):
+def _exprs(rs: RuleSet, *, include_distribution=True):
     """(位置, 表达式, 求值层级或关联实体表名) 列表。None 表示全局。"""
     for n, v in rs.variables.items():
         yield f"variables.{n}", v.expr, None if v.scope == "global" else v.scope
     yield "pool", rs.pool.expr, None if rs.pool.scope == "global" else rs.pool.scope
-    for lv in _weighted(rs):
-        yield f"allocation.{lv.level}.weight", lv.weight, lv.level
+    if include_distribution:
+        for lv in _weighted(rs):
+            yield f"allocation.{lv.level}.weight", lv.weight, lv.level
     for p in rs.payout:
         for k in ("hold_ratio", "pay_ratio"):
             if getattr(p, k).strip():
@@ -41,14 +43,18 @@ def _weighted(rs: RuleSet):
     return rs.allocation[start:]
 
 
-def validate(rs: RuleSet) -> list[Issue]:
+def validate_structure(rs: RuleSet, *, require_allocation=False) -> list[Issue]:
+    """Validate identities and relationships without requiring money formulas.
+
+    An allocation declaration, when present, must be structurally valid. An
+    empty declaration is allowed for entity-scoped basis calculations only;
+    final validation calls this with require_allocation=True.
+    """
     issues: list[Issue] = []
     levels = [lv.level for lv in rs.allocation]
-    all_fields = set(rs.field_owner())
-    kw_names = set()
 
     # ---- 数据集与分配层级 ----
-    if not rs.allocation:
+    if require_allocation and not rs.allocation:
         issues.append(Issue.block("no_levels", "至少需要一个分配层级"))
     for i, lv in enumerate(rs.allocation):
         ent = rs.entity_dataset(lv.key)
@@ -87,6 +93,40 @@ def validate(rs: RuleSet) -> list[Issue]:
             issues.append(Issue.block("key_shared", f"「{n}」和「{dup[0]}」的主键都是 {d.key}；一个编号只能有一张实体表，"
                                       f"其他表作为明细表用 link 关联", f"datasets.{n}"))
 
+    seen_levels, seen_keys = set(), set()
+    for lv in rs.allocation:
+        if lv.level in seen_levels:
+            issues.append(Issue.block('id_duplicate', f'分配层级编号「{lv.level}」重复，每条要用不同的编号', f'allocation.{lv.level}'))
+        if lv.key in seen_keys:
+            issues.append(Issue.block('level_key_shared', f'分配层级主键 {lv.key} 重复，不能把同一实体作为多个层级', f'allocation.{lv.level}'))
+        seen_levels.add(lv.level)
+        seen_keys.add(lv.key)
+    parents = {n: {target} if kind == 'aux' else set()
+               for n, (kind, target, _) in lay.parent.items()}
+    try:
+        tuple(TopologicalSorter(parents).static_order())
+    except CycleError as exc:
+        issues.append(Issue.block('dataset_cycle', f'数据实体关联存在循环：{" -> ".join(exc.args[1])}', 'datasets'))
+    return issues
+
+
+def validate(rs: RuleSet) -> list[Issue]:
+    """Full validation required for allocation, payouts and final export."""
+    return _validate(rs)
+
+
+def validate_basis(rs: RuleSet) -> list[Issue]:
+    """Validate all selected basis expressions and their transitive inputs."""
+    return _validate(basis_rules(rs), basis=True)
+
+
+def _validate(rs: RuleSet, *, basis=False) -> list[Issue]:
+    issues = validate_structure(rs, require_allocation=not basis)
+    levels = [lv.level for lv in rs.allocation]
+    all_fields = set(rs.field_owner())
+    kw_names = set()
+    lay = Layout(rs)
+
     # ---- 参数表 ----
     for n, t in rs.tables.items():
         if isinstance(t, TierTable):
@@ -104,9 +144,9 @@ def validate(rs: RuleSet) -> list[Issue]:
             issues.append(Issue.block("scope_bad", f"变量 {n} 的 scope「{v.scope}」不是 global、分配层级或关联实体表名", f"variables.{n}"))
         if n in all_fields:
             issues.append(Issue.block("name_clash", f"变量 {n} 与数据字段重名", f"variables.{n}"))
-    if rs.pool.scope != "global" and rs.pool.scope not in levels:
+    if rs.pool.scope != "global" and rs.pool.scope not in levels and not (basis and rs.pool.scope in lay.aux):
         issues.append(Issue.block("scope_bad", f"pool 的 scope「{rs.pool.scope}」不是 global 或分配层级", "pool"))
-    for lv in _weighted(rs):
+    for lv in ([] if basis else _weighted(rs)):
         if not lv.weight.strip():
             issues.append(Issue.block("weight_missing", f"层级「{lv.level}」需要权重表达式 weight", f"allocation.{lv.level}"))
     for p in rs.patches:                         # 数据修订：表和字段都要存在
@@ -147,8 +187,7 @@ def validate(rs: RuleSet) -> list[Issue]:
         if c.scope != "global" and c.scope not in levels and c.scope not in lay.aux:
             issues.append(Issue.block("scope_bad", f"校验 {c.id} 的 scope「{c.scope}」不是 global、分配层级或关联实体表名", f"checks.{c.id}"))
     # 编号重复：发放条件按编号记台账，重复会互相覆盖、漏记
-    for what, items in (("发放条件", rs.payout), ("抵扣", rs.offsets), ("校验", rs.checks),
-                        ("分配层级", [type("L", (), {"id": lv.level}) for lv in rs.allocation])):
+    for what, items in (("发放条件", rs.payout), ("抵扣", rs.offsets), ("校验", rs.checks)):
         seen: set[str] = set()
         for it in items:
             if it.id in seen:
@@ -177,7 +216,7 @@ def validate(rs: RuleSet) -> list[Issue]:
     # ---- 表达式 ----
     deps: dict[str, set[str]] = {}
     known = set(rs.variables) | set(rs.tables) | all_fields
-    for where, src, scope in _exprs(rs):
+    for where, src, scope in _exprs(rs, include_distribution=not basis):
         if scope is not None and scope not in levels and scope not in lay.aux:
             continue   # scope 不对已在上面报过
         try:
@@ -193,6 +232,10 @@ def validate(rs: RuleSet) -> list[Issue]:
                     continue
                 if not spec.min_args <= len(node.args) <= spec.max_args:
                     issues.append(Issue.block("fn_args", f"{node.fn} 需要 {spec.min_args}~{spec.max_args} 个参数，实际 {len(node.args)} 个", where))
+                if node.fn in ('sum', 'avg') and node.args:
+                    dataset = getattr(node.kw().get('of'), 'value', None)
+                    if _date_expr(rs, node.args[0], dataset=dataset):
+                        issues.append(Issue.block('fn_type', f'{node.fn} 不能对日期求和或平均；先按业务规则确定唯一日期，或有依据地取最早/最晚日期，再计算日期差', where))
                 for k, val in node.kwargs:
                     kw_names.add(k)
                     if k not in spec.kwargs:
@@ -213,7 +256,7 @@ def validate(rs: RuleSet) -> list[Issue]:
         for n in unknown:
             hint = f"：{n} 是数据表名，对它的字段聚合，表名写在 of 里，如 sum(字段, of: \"{n}\")" if n in rs.datasets else ""
             issues.append(Issue.block("name_unknown", f"无法识别的名字 {n}{hint}", where))
-        if not unknown and levels:
+        if not unknown:
             issues += _ScopeCheck(rs, where).run(ast, scope)
         if where.startswith("variables."):
             deps[where.split(".", 1)[1]] = names(ast) & set(rs.variables)
@@ -252,6 +295,29 @@ def validate(rs: RuleSet) -> list[Issue]:
             if balance.level != "global" and balance.level not in report_levels:
                 issues.append(Issue.block("report_level", "对账对象层级不存在", balance.level))
     return issues
+
+
+def _date_expr(rs: RuleSet, expr, *, dataset=None, busy=frozenset()) -> bool:
+    """Recognize declared date results; do not infer dates from names or values."""
+    if isinstance(expr, Name):
+        if expr.id in rs.variables and expr.id not in busy:
+            try:
+                child = parse(rs.variables[expr.id].expr)
+            except ExprError:
+                return False
+            return _date_expr(rs, child, busy=busy | {expr.id})
+        owners = ([rs.datasets[dataset]] if dataset in rs.datasets else rs.datasets.values())
+        types = {d.fields[expr.id].type for d in owners if expr.id in d.fields}
+        return types == {'date'}
+    if isinstance(expr, Call):
+        if expr.fn in ('date', 'period_start', 'period_end'):
+            return True
+        if expr.fn in ('min', 'max') and expr.args:
+            own = getattr(expr.kw().get('of'), 'value', dataset)
+            return all(_date_expr(rs, a, dataset=own, busy=busy) for a in expr.args)
+        if expr.fn == 'if' and len(expr.args) == 3:
+            return all(_date_expr(rs, a, dataset=dataset, busy=busy) for a in expr.args[1:])
+    return False
 
 
 class _ScopeCheck:

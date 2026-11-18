@@ -6,7 +6,7 @@
 
 PPT参数优先走原生路径：read_parameter_table(file)查看真实页码和同页文字，再指定page读取表格。页标题可能在表格下方，不能按相邻页猜适用区域。核对适用条件后用record_parameter_cells(file,page,table,applies_to,cells)按坐标登记，applies_to写本页表适用的区分范围，程序核对它在该页原文里，不在就是选错了页；数值、原文和参数名由程序生成。compile_table可写cells_from={file,page,table}，rows里用R行C列（多行加L行号）引用已登记的单元格，返回的name也可直接用于compile_table/bind_facts。不要再换业务名称重录同一单元格。已登记项可按read_workspace(section=facts,file,page,query)检索，只取当前这一步要用的几项，查到的名字立即用于compile_table/bind_facts或记入note，不要从头通读整个台账；重试先查既有结果。scope是原文定位提示，适用条件须结合全部page_context与行列标题核对；图片标题另用view_image核实。无法唯一提取的区间、公式和文字规则仍按record_facts登记并逐字核对。
 
-计算顺序：prepare_data → compile_formulas → calculate_basis → review_basis → 财务确认总额 → trial_run → review_calculation/verify → finish。数据或公式变化会使相应回执失效，须重新通过。prepare_data失败时用diagnose_datasets/query_dataset定位，不能通过evaluate反复建立同一棵失败的树。query_dataset只统计指定原表，不代表其他数据已通过。
+计算顺序：prepare_data → compile_formulas（基础）→ calculate_basis → review_basis → 财务确认总额 → 完成分配公式并compile_formulas（完整）→ trial_run → review_calculation/verify → finish。数据或公式变化会使相应回执失效，须重新通过。prepare_data失败时用diagnose_datasets/query_dataset定位，不能通过evaluate反复建立同一棵失败的树。query_dataset只统计指定原表，不代表其他数据已通过。
 
 set_rules按公式依赖逐个构建；每个变量明确scope、单位含义、适用条件、来源和舍入时点。编译检查全部参数绑定和条款覆盖。基础指标和逐对象金额由引擎计算，模型不心算、不填假设常数。材料要求按人员汇总舍入时，预核算需区分理论总额与最终人员舍入合计，差额按原文核验。
 
@@ -16,7 +16,7 @@ calculate_basis不执行分配权重或发放。review_basis在独立会话中�
 # 修复与进度
 
 - 准备数据通过后先用plan_formula_tasks规划构建任务，每项只指向一个/variables/名称、/tables/名称或/pool、/allocation、/report，列出depends_on、clauses和facts。按id分批补充；先基础后上层，不必一次输出全部公式。
-- 只完成任务卡中的active任务：查该任务的原文，set_rules或compile_table写入，bind_facts或set_rules(bindings=...)绑定，再check_formula_task。局部通过后程序推进下一项；新增公式也须安排任务。不要只通读台账或在没有公式时反复compile_formulas。
+- 只完成任务卡中的active任务：查该任务的原文，优先submit_formula_task(task,value,bindings,facts)一次提交目标及证据。程序负责登记、绑定、局部检查和原子保存；成功后直接处理下一任务，不重复check_formula_task。已有草稿可check_formula_task，原生参数表仍可compile_table/compile_coefficient_table。新增公式也须安排任务。不要只通读台账或在没有公式时反复compile_formulas。
 - 表格算法由明确原文决定。超额累进使用excess，整额分档使用whole；compile_table可给algorithm_basis={file,quote,page}。省略mode时按明确原文选择，与原文矛盾则拒绝。系数表和金额阶梯分别核对，不能把所有表统一成一种算法。
 - 指标区间取系数使用compile_coefficient_table(name,scheme,cells_from,applies_to,rows=[{range:"R1C2",value:"R2C2"},...])，水平表引用同列表头，竖直表引用同行区间。程序一次读取端点及系数并登记绑定，不必反复补区间格；原文不明或冲突时不保存。用tier_rate(表,指标)取系数，禁止用tier把达成率乘系数当奖金。不把普通标题当algorithm_basis，不编造负下界。错误有next_call时先核对原文用途再执行该修复路径，不原样重试。
 - 新证据的首次分页读取会被记录；换limit/query重读同一条不算进展。数据修复退回前一步时保留已构建任务和上下文。未通过的未来分配层不作为当前基础公式的停滞依据；必要审核和最终整体编译仍必须通过。
@@ -26,3 +26,4 @@ calculate_basis不执行分配权重或发放。review_basis在独立会话中�
 - “草稿已保存，校验未通过”须按阻断问题修复。compile_formulas先列结构问题，再列证据缺口；完整当前问题用read_workspace(section="checks")按next_call读取，规则变化后重新编译。
 - 每次只修复当前明确的问题并核对它是否消失。反复读取或改无关部分不会获得新的接续预算。分页只能照next_call，INVALID_OFFSET须用返回的恢复位置，不能把空内容当已经读完。
 - 按年月差的条件可用months_between(开始日期,截止日期)，忽略日；不能用固定天数替代月份。累计月均要使用正确历史窗口，count_distinct(month(日期))也受输入表window限制。
+- 数据实体与关联是基础公式的前置条件，分配权重可在金额公式完成后构建。遇实体/明细角色、主键或关联错误先按结构诊断修正；不能把需要唯一日期/唯一系数的取数随意改成sum来消除作用域错误。缺数据时的最终系数与比例分母为零的替代值是不同口径，须按原文建模，不能将最终默认系数再次查档。

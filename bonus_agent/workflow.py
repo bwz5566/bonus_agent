@@ -29,7 +29,7 @@ _CORE = Path(__file__).resolve().parent.parent / 'bonus_core'
 _EXECUTION_PROFILE = hashlib.sha256(
     b''.join(p.read_bytes() for p in sorted(_CORE.rglob('*.py'))) + Path(__file__).read_bytes()
     + b''.join(Path(__file__).with_name(n).read_bytes() for n in
-               ('lint.py', 'facts.py', 'clauses.py', 'source_cells.py', 'coefficient.py', 'agent.py', 'context.py', 'recovery.py', 'construction.py', 'semantics.py', 'progress.py'))
+               ('lint.py', 'facts.py', 'clauses.py', 'source_cells.py', 'coefficient.py', 'agent.py', 'context.py', 'recovery.py', 'construction.py', 'semantics.py', 'progress.py', 'rule_package.py', 'contracts.py'))
 ).hexdigest()
 
 
@@ -46,6 +46,72 @@ class Workflow:
         self.state.setdefault('receipts', {})
         self.state.setdefault('basis', {})
         self.state.setdefault('attempts', {})
+
+    def basis_view(self):
+        """A read-only validation view; deferred allocation evidence stays in the real workspace."""
+        from bonus_core.dsl.validator import basis_rules
+        from bonus_agent import facts as fx
+        from bonus_agent.construction import TaskBoard
+        from bonus_agent.extract_rules import Extraction
+
+        view = copy.copy(self.ws)
+        view.drafts = {s: basis_rules(self.ws._ruleset(s)).model_dump(mode='json', include=set(Extraction.model_fields))
+                       for s in self.ws.schemes}
+        for scheme, draft in view.drafts.items():
+            for level in draft.get('allocation', []):
+                level.pop('weight', None)
+            original_variables = self.ws._merged(scheme).get('variables') or {}
+            for name, variable in draft.get('variables', {}).items():
+                if 'scope' not in (original_variables.get(name) or {}):
+                    # An implicit global default is not an explicit instruction to repeat a
+                    # whole-company aggregate at each object. Preserve this validation fact.
+                    variable.pop('scope', None)
+        tasks = self.state.get('construction', {}).get('tasks', {})
+        required = TaskBoard(self.ws).required('basis')
+        deferred_facts = {f for n, spec in tasks.items() if n not in required for f in spec['facts']}
+        required_facts = {f for n, spec in tasks.items() if n in required for f in spec['facts']}
+
+        def projected_targets(target):
+            scheme, path = fx.split_target(target)
+            parts = fx.target_parts(path)
+            if not parts or parts[0] in ('allocation', 'payout', 'offsets'):
+                return []
+            if parts[0] == 'report' and len(parts) > 1 and parts[1] not in ('totals', 'details'):
+                return []
+            candidates = view.drafts if scheme in (None, '共用') else {scheme: view.drafts.get(scheme, {})}
+            out = []
+            for name, draft in candidates.items():
+                if parts[0] in ('variables', 'tables') and len(parts) > 1 and parts[1] not in draft.get(parts[0], {}):
+                    continue
+                mapped = list(parts)
+                array_path = parts[:2] if parts[0] == 'report' and len(parts) > 2 else (parts[:1] if parts[0] == 'checks' and len(parts) > 1 else None)
+                if array_path:
+                    index_at = len(array_path)
+                    try:
+                        original = fx.target_value(self.ws._merged(name), '/' + '/'.join(array_path))
+                        item = original[int(parts[index_at])]
+                        if item.get('stage', 'basis') != 'basis':
+                            continue
+                        selected = fx.target_value(draft, '/' + '/'.join(array_path))
+                        identity = 'name' if parts[0] == 'report' else 'id'
+                        mapped[index_at] = str(next(i for i, value in enumerate(selected) if value[identity] == item[identity]))
+                    except (KeyError, IndexError, ValueError, TypeError, StopIteration):
+                        pass  # Keep an invalid original target visible to binding validation.
+                out.append(name + '::/' + '/'.join(str(p).replace('~', '~0').replace('/', '~1') for p in mapped))
+            return out
+
+        view.facts = []
+        for fact in self.ws.facts:
+            targets = list(dict.fromkeys(t for original in fact.targets for t in projected_targets(original)))
+            if fact.targets and not targets:
+                continue
+            if not fact.targets and fact.name in deferred_facts - required_facts:
+                continue
+            view.facts.append(fact.model_copy(update={'targets': targets}))
+        deferred_clauses = {c for n, spec in tasks.items() if n not in required for c in spec['clauses']}
+        required_clauses = {c for n, spec in tasks.items() if n in required for c in spec['clauses']}
+        view.clauses = [c for c in self.ws.clauses if c.id not in deferred_clauses - required_clauses]
+        return view
 
     def version(self, kind='formula'):
         ws = self.ws
@@ -68,15 +134,20 @@ class Workflow:
                 for s in ws.schemes
             }
         else:
+            if kind == 'basis':
+                ws = self.basis_view()
+                from bonus_agent.construction import TaskBoard
+                required = TaskBoard(self.ws).required('basis')
             body.update(
                 rules=ws._rules_print(),
                 plan=self.state.get('plan'),
                 facts=[f.model_dump(mode='json') for f in ws.facts],
-                clauses=[c.model_dump(mode='json') for c in ws.clauses],
+                clauses=[c.model_dump(mode='json', exclude={'checked'} if kind == 'basis' else set()) for c in ws.clauses],
                 answers=[(q.id, q.answer, q.withdrawn) for q in ws.questions],
                 said=ws.said,
                 transcripts=ws.transcripts,
-                construction_plan=self.state.get('construction', {}).get('tasks', {}),
+                construction_plan={n:s for n,s in self.state.get('construction', {}).get('tasks', {}).items()
+                                   if kind != 'basis' or n in required},
             )
         return fingerprint(body)
 
@@ -172,6 +243,8 @@ class Workflow:
     def prepare_data(self):
         from bonus_core.data.population import prepare, gaps
         from bonus_core.engine.tree import build_tree
+        from bonus_core.dsl.validator import validate_structure
+        from bonus_agent.agent import ToolError
 
         if not self.has_plan():
             fail('材料清单或版本已变化，先完成plan_calculation')
@@ -182,6 +255,7 @@ class Workflow:
         names = self.ws.schemes or [None]
         for name in names:
             rs = self.ws._ruleset(name) if name else self._data_rules()
+            issues += [str(i) for i in validate_structure(rs) if i.severity == 'blocking']
             keys = {d.key for d in rs.datasets.values() if d.key}
             level_keys = {lv.key for lv in rs.allocation}
             for n, d in rs.datasets.items():
@@ -194,7 +268,11 @@ class Workflow:
                                   '不要把已有实体的 key 改成不唯一的字段')
                 if d.key in level_keys and d.link:
                     issues.append(f'{n} 是分配实体，不能同时声明link')
-            data, _ = self.ws._data(rs)
+            try:
+                data, _ = self.ws._data(rs)
+            except ToolError as exc:
+                issues.append(f'方案「{name}」数据读入未通过：{exc}')
+                continue
             data, patched = prepare(rs, data)
             issues += [str(i) for i in patched if i.severity == 'blocking']
             issues += [message for _, message in gaps(rs, data, self.ws.mapping)]
@@ -207,7 +285,10 @@ class Workflow:
                         if None in keys or len(set(keys)) != len(keys):
                             issues.append(f'{n} 主键为空或重复')
             counts.update({n: len(t.rows) for n, t in data.items()})
-        diagnostic = self.ws.diagnose_datasets()
+        try:
+            diagnostic = self.ws.diagnose_datasets()
+        except ToolError as exc:
+            diagnostic = {'issues': [{'code': 'dataset.diagnostic', 'message': str(exc)}]}
         issues += [
             json.dumps(i, ensure_ascii=False)
             for i in diagnostic['issues']
@@ -258,10 +339,13 @@ class Workflow:
             'scope': '仅按该表映射、筛选与期间统计，不证明其他关联或金额通过验收',
         }
 
-    def compile(self):
+    def compile(self, phase=None):
         from bonus_core.dsl.parser import names, parse
+        from bonus_core.dsl.validator import validate_basis
+        from bonus_agent.construction import TaskBoard
 
         self.require('data')
+        phase = phase or TaskBoard(self.ws).phase()
         missing = self.rules_ready()
         if missing:
             fail('规则证据未齐：' + str(missing[:8]))
@@ -282,17 +366,26 @@ class Workflow:
         graph = {}
         warnings = []
         from bonus_agent.lint import compile_warnings, reached
-        from bonus_agent.construction import TaskBoard
         from bonus_agent.semantics import semantic_gates
-        construction_issues = TaskBoard(self.ws).gate() + semantic_gates(self.ws)
-        all_reached = set().union(*(reached(self.ws._ruleset(s)) for s in self.ws.schemes))
+        construction_issues = TaskBoard(self.ws).gate(phase)
+        view = self.basis_view() if phase == 'basis' else self.ws
+        construction_issues += semantic_gates(view)
+        all_reached = set().union(*(reached(view._ruleset(s)) for s in view.schemes))
         for s in self.ws.schemes:
-            rs = self.ws._ruleset(s)
+            rs = view._ruleset(s)
             warnings += [f'方案「{s}」：{message}' for message in compile_warnings(rs, all_reached)]
-            issues += [str(i) for i in self.ws._validate(s, rs) if i.severity == 'blocking']
+            validation = validate_basis(rs) if phase == 'basis' else self.ws._validate(s, rs)
+            issues += [str(i) for i in validation if i.severity == 'blocking']
+            if phase == 'basis':
+                issues += [str(i) for i in self.ws._validate(s, rs)
+                           if i.severity == 'blocking' and i.code == 'global_in_level']
             from bonus_agent.lint import static_gates
             issues += [f'方案「{s}」：{message}' for _, message in static_gates(rs)]
-            deps = {n: names(parse(v.expr)) & set(rs.variables) for n, v in rs.variables.items()}
+            from bonus_core.dsl.parser import ExprError
+            try:
+                deps = {n: names(parse(v.expr)) & set(rs.variables) for n, v in rs.variables.items()}
+            except ExprError:
+                deps = {}  # The validator above reports the exact malformed expression.
             try:
                 order = list(TopologicalSorter(deps).static_order())
             except ValueError as exc:
@@ -301,12 +394,13 @@ class Workflow:
             graph[s] = {'order': order, 'dependencies': {n: sorted(v) for n, v in deps.items()}}
         self.ws._order(self.ws.schemes)  # Inter-scheme cycles are also invalid.
         # Structural blockers must remain visible even with hundreds of evidence gaps.
-        issues = list(dict.fromkeys(issues + construction_issues + self.ws._binding_gaps() + self.ws._clause_gaps(self.skipped())))
+        issues = list(dict.fromkeys(issues + construction_issues + view._binding_gaps() + view._clause_gaps(self.skipped())))
         report = {'status': 'FAIL' if issues else 'PASS', 'issues': issues, 'warnings': warnings,
-                  'graph': graph, 'repaired': repaired}
+                  'graph': graph, 'repaired': repaired, 'phase': phase}
         self.state['formula_report'] = {'version': self.version(), 'report': copy.deepcopy(report)}
         if not issues:
-            self.receipt('formulas', report)
+            self.receipt('allocation_formulas' if phase == 'all' else 'formulas', report,
+                         kind='formula' if phase == 'all' else 'basis')
         return self.compile_summary(report)
 
     def compile_summary(self, report):
@@ -325,7 +419,8 @@ class Workflow:
             'next_call': {'tool': 'read_workspace', 'args': {'section': 'checks', 'offset': len(preview), 'limit': 6}}
                          if len(preview) < len(report['issues']) or len(report['warnings']) > 3 else None,
             'next': '按issues逐项修复；完整检查见read_workspace(section="checks")。草稿保存不等于校验通过。'
-                    if report['issues'] else 'calculate_basis',
+                    if report['issues'] else ('trial_run' if report.get('phase') == 'all' else 'calculate_basis'),
+            'phase': report.get('phase', 'all'),
         }
 
     def references(self, name):
@@ -347,9 +442,9 @@ class Workflow:
         name = self.ws._scheme(scheme)
         rs = self.ws._ruleset(name)
         data, _ = self.ws._data(rs)
-        basis = Engine.prepare(rs, data, self.references(name), self.ws.period).calculate_basis()
+        basis = Engine.prepare_basis(rs, data, self.references(name), self.ws.period).calculate_basis()
         self.state['basis'][name] = basis
-        self.receipt('basis:' + name, {'digest': fingerprint(basis)})
+        self.receipt('basis:' + name, {'digest': fingerprint(basis)}, kind='basis')
         return {
             'status': 'PASS',
             'scheme': name,
@@ -365,12 +460,13 @@ class Workflow:
 
         name = self.ws._scheme(scheme)
         self.require('basis:' + name)
-        version = self.version()
+        version = self.version('basis')
         basis = self.state['basis'][name]
         digest = fingerprint(basis)
         if self.current('review:' + name):
             return {'status': 'PASS', 'scheme': name, 'next': '等待财务确认总额'}
-        rs = self.ws._ruleset(name)
+        from bonus_core.dsl.validator import basis_rules
+        rs = basis_rules(self.ws._ruleset(name))
         from bonus_agent.extract_rules import data_dictionary
 
         structure = {
@@ -433,8 +529,11 @@ class Workflow:
                 '独立复核没有完整公式或存在未明确口径，保持阻断：'
                 + str(spec.get('unclear') if isinstance(spec, dict) else type(spec).__name__)
             )
-        _, root, by_level, ev = self.ws._independent_env(name, spec)
-        targets = [root] if rs.pool.scope == 'global' else by_level[rs.pool.scope]
+        _, root, by_level, ev = self.ws._independent_env(name, spec, basis=True)
+        targets = ([root] if rs.pool.scope == 'global' else
+                   by_level.get(rs.pool.scope) or list((root.index or {}).get(rs.pool.scope, {}).values()))
+        if not targets:
+            fail('独立奖金池没有核算对象：' + rs.pool.scope)
         pools = self.ws._independent_eval(ev, spec['pool'], targets, '预核算奖金池')
         actual = {k: Decimal(v['amount']) for k, v in basis['objects'].items()}
         issues = []
@@ -461,7 +560,7 @@ class Workflow:
         )
         if expected_total != Decimal(basis['pool']):
             issues.append('奖金池汇总不一致')
-        details = self.ws._independent_details(name, spec)
+        details = self.ws._independent_details(name, spec, basis=True)
         wanted = {
             json.dumps([report, nid], ensure_ascii=False): Decimal(v['amount'])
             for report, rows in basis['details'].items()
@@ -507,7 +606,7 @@ class Workflow:
             'report': copy.deepcopy(report),
         }
         if not issues:
-            self.receipt('review:' + name, report)
+            self.receipt('review:' + name, report, kind='basis')
             self.state['waiting'] = name
             self.ws.done = True
         else:
@@ -534,7 +633,7 @@ class Workflow:
         self.calculate_basis(name)  # Recompute from immutable source inputs, not a browser payload.
         if self.state['basis'][name] != prior:
             fail('重新计算的金额或对象范围与待确认版本不一致')
-        self.receipt('approved:' + name, {'by': by, 'basis_digest': digest})
+        self.receipt('approved:' + name, {'by': by, 'basis_digest': digest}, kind='basis')
         self.state.pop('waiting', None)
         return {'status': 'PASS', 'scheme': name, 'by': by, 'digest': digest}
 
@@ -544,6 +643,10 @@ class Workflow:
         self.require('basis:' + name)
         self.require('review:' + name)
         self.require('approved:' + name)
+        if not self.current('allocation_formulas'):
+            report = self.compile('all')
+            if report['status'] != 'PASS':
+                fail('人员分配公式尚未通过完整检查：' + '；'.join(report['issues']))
         digest = fingerprint(self.state['basis'][name])
         if any(
             self.state['receipts'][k + name]['payload'].get('basis_digest') != digest for k in ('review:', 'approved:')
@@ -559,7 +662,7 @@ class Workflow:
             stage, _scheme = self.stage()
             if stage == 2 and 'data' in self.state['receipts']:
                 name, run = 'prepare_data', self.prepare_data
-            elif stage == 3 and 'formulas' in self.state['receipts']:
+            elif stage == 3 and ('formulas' in self.state['receipts'] or 'allocation_formulas' in self.state['receipts']):
                 name, run = 'compile_formulas', self.compile
             else:
                 break
@@ -590,6 +693,8 @@ class Workflow:
                 return 5, s
             if not self.current('approved:' + s):
                 return 6, s
+            if not self.current('allocation_formulas'):
+                return 3, s
             if s not in self.ws.results or s in self.ws.untested:
                 return 7, s
         return 8, None
@@ -655,4 +760,8 @@ class Workflow:
         }
         if tool == 'finish':
             return stage == 8 or bool(self.ws.pending)
+        if tool == 'trial_run' and stage == 3 and self.current('formulas'):
+            # The normal entry point may compile already-built distribution rules on resume.
+            # guard_allocation still checks the requested scheme's exact approval and full rules.
+            return any(self.current('approved:' + s) for s in self.ws.schemes)
         return stage >= minima.get(tool, 0)

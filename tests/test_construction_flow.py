@@ -30,7 +30,7 @@ def test_construct_validate_and_invalidate_dependent_tasks(tmp_path):
     ws.prepare_data()
     board=TaskBoard(ws)
     ws.plan_formula_tasks(tasks())
-    assert 'base' in ws._flow().hint() and 'set_rules' in ws._flow().hint()
+    assert 'base' in ws._flow().hint() and 'submit_formula_task' in ws._flow().hint()
     assert ws.check_formula_task('pool')['status']=='FAIL'
     assert ws.compile_formulas()['status']=='FAIL'
     f=ws.facts[0]

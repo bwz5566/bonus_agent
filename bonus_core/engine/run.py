@@ -13,7 +13,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from bonus_core.data.population import prepare as apply_patches
 from bonus_core.data.table import Datasets
 from bonus_core.dsl.models import RuleSet
-from bonus_core.dsl.validator import _weighted, validate
+from bonus_core.dsl.validator import _weighted, basis_rules, validate, validate_basis
 from bonus_core.engine.allocation import CENT, AdjustConflict, allocate, max_allowed, round_pool
 from bonus_core.dsl import excel_formula as xf
 from bonus_core.engine.evaluator import Ctx, EvalError, Evaluator, Trace
@@ -181,11 +181,24 @@ class Engine:
         eng._prepare(rs, data, refs, period)
         return eng
 
-    def _prepare(self, rs, data, refs, period):
-        issues = [i for i in validate(rs) if i.severity == "blocking"]
+    @classmethod
+    def prepare_basis(cls, rs: RuleSet, data: Datasets, refs: dict | None = None, period=None):
+        """Prepare only the basis dependency closure; never invent allocation weights.
+
+        Structural identities and relationships are still validated. This
+        context cannot be used to issue final allocated amounts.
+        """
+        eng = cls.__new__(cls)
+        eng._prepare(basis_rules(rs), data, refs, period, validator=validate_basis)
+        eng._basis_only = True
+        return eng
+
+    def _prepare(self, rs, data, refs, period, *, validator=validate):
+        issues = [i for i in validator(rs) if i.severity == "blocking"]
         if issues:
             raise EngineError(issues)
         self.rs = rs
+        self._basis_only = False
         try:
             data, patched = apply_patches(rs, data)
         except ValueError as e:
@@ -225,7 +238,7 @@ class Engine:
         self.pool_exact = self._pool()
         if self.pool_exact < 0 and self.rs.pool.negative != 'allow':
             raise EngineError([Issue.block('pool_negative', f'奖金池为负：{self.pool_exact}')])
-        targets = [self.root] if self.rs.pool.scope == 'global' else self.by_level[self.rs.pool.scope]
+        targets = self._report_nodes(self.rs.pool.scope)
         objects = {
             n.id: {
                 'raw': self.ev.traces[f'{n.id}/奖金池'].value,
@@ -269,6 +282,16 @@ class Engine:
         rs = self.rs
         if rs.pool.scope == "global":
             return self.ev.evaluate(rs.pool.expr, self.root, f"{ROOT_LEVEL}/奖金池", "pool")
+        if rs.pool.scope not in self.by_level:
+            # Before allocation is declared, keyed datasets are real entity
+            # scopes. Their amounts are rounded per object, just as a level pool.
+            values = []
+            for n in self._report_nodes(rs.pool.scope):
+                v = self.ev.evaluate(rs.pool.expr, n, f"{n.id}/奖金池", "pool")
+                if v < 0 and rs.pool.negative != "allow":
+                    raise EngineError([Issue.block("pool_negative", f"{n.id} 的奖金池为负：{v}", n.id)])
+                values.append(round_pool(v))
+            return sum(values, Decimal(0))
         levels = [lv.level for lv in rs.allocation]
         at = levels.index(rs.pool.scope)
         for n in self.by_level[rs.pool.scope]:
@@ -310,6 +333,8 @@ class Engine:
 
     # ---- 分配 ----
     def _apply(self, adjustments: list[Adjustment], actor_scopes: dict[str, set[str]] | None) -> list[Adjustment]:
+        if self._basis_only:
+            raise EngineError([Issue.block('basis_only', '基础核算上下文不能执行人员分配；须完整验证并重新建立正式计算上下文')])
         active = [a for a in sorted(adjustments, key=lambda a: a.created_at) if not a.revoked]
         for n in self.nodes.values():
             n.lock = n.fixed

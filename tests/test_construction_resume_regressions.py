@@ -66,8 +66,10 @@ def test_missing_structure_cannot_approve_a_formula_and_component_reads_are_targ
     ws = make_workspace(tmp_path)
     allocation = copy.deepcopy(ws.drafts['S'].pop('allocation'))
     ws.plan_formula_tasks([{'id': 'pool', 'scheme': 'S', 'target': '/pool'}])
-    assert '先声明allocation' in TaskBoard(ws).summary()['next']
-    assert ws.check_formula_task('pool')['status'] == 'FAIL'
+    assert 'pool' in TaskBoard(ws).summary()['next']
+    failed = ws.check_formula_task('pool')
+    assert failed['status'] == 'FAIL'
+    assert any('scope_bad' in issue for issue in failed['issues'])
     ws.drafts['S']['allocation'] = allocation
     assert ws.check_formula_task('pool')['status'] == 'PASS'
     got = ws.read_workspace('rules', scheme='S', query='allocation')

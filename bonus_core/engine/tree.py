@@ -168,7 +168,7 @@ def build_tree(rs: RuleSet, data: Datasets) -> tuple[Node, dict[str, list[Node]]
                     f"「{up.level}」的编号如 {have}。先查两边编号的拼法是否一致（合成编号的列、同名列用的是哪一列）、"
                     "期间是否一致（这张表要不要也写 period 只取本期）；确实是材料或数据里就对不上的，把这几行列出来 ask_question 问财务，"
                     "财务答复不参与后在这张实体表写 unmatched: ignore", where=unknown[0][2]))
-    for n in nodes[levels[0].level].values():
+    for n in nodes[levels[0].level].values() if levels else ():
         n.parent = root
         root.children.append(n)
 

@@ -167,6 +167,7 @@ class Check(RuleItem):
     expr: str                  # 条件表达式，如 abs(sum(share) - 1) < 0.000001
     message: str = ""
     severity: Literal["blocking", "warning"] = "blocking"
+    stage: Literal["basis", "distribution"] = "basis"
 
 
 class AllocationLevel(RuleItem):
@@ -235,6 +236,7 @@ class ReportTotal(RuleItem):
     name: str
     level: str
     expr: str
+    stage: Literal["basis", "distribution"] = "basis"
 
 
 class ReportBalance(RuleItem):

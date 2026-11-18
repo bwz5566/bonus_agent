@@ -45,14 +45,36 @@ def ratio_default_gaps(rs):
                 if hasattr(ast, attr):
                     yield from calls(getattr(ast, attr), guards)
 
+    def missing_default(ast, seen=()):
+        """Find a scalar fallback for absent rows before the coefficient lookup."""
+        if isinstance(ast, Name) and ast.id in rs.variables:
+            if ast.id in seen:
+                return False
+            return missing_default(parse(rs.variables[ast.id].expr), (*seen, ast.id))
+        if isinstance(ast, Call) and ast.fn == 'if' and len(ast.args) == 3:
+            condition, yes, no = ast.args
+            nodes = list(walk(expand(condition)))
+            absent_rows = (any(isinstance(n, Call) and n.fn == 'count' for n in nodes)
+                           and any(isinstance(n, Num) and n.value == 0 for n in nodes))
+            if absent_rows and any(isinstance(expand(branch), Num) for branch in (yes, no)):
+                return True
+            return missing_default(yes, seen) or missing_default(no, seen)
+        return False
+
     for name, variable in rs.variables.items():
         for call, guards in calls(parse(variable.expr)):
             if not isinstance(call, Call) or call.fn != 'tier_rate' or len(call.args) < 2:
                 continue
             ratio = expand(call.args[1])
+            if variable.ratio_default == 'rate' and variable.sources:
+                continue  # An explicit rate fallback is a distinct source-bound policy.
+            if missing_default(ratio):
+                gaps.append((f'variables.{name}',
+                    f'变量 {name} 把缺少记录时的常数再次送入tier_rate查档；默认最终系数可能被换成另一档。'
+                    '按原文将缺失判断放在查表外，或用tier_ratio(..., missing: 缺失条件)。'
+                    '若原文明示默认的是达成率而非最终系数，须提供sources并声明ratio_default: rate。'))
+                continue
             if isinstance(ratio, Call) and ratio.fn == 'ratio' and 'zero' in ratio.kw():
-                if variable.ratio_default == 'rate' and variable.sources:
-                    continue  # explicit source-bound business intent, rechecked independently
                 if len(ratio.args) > 1 and any(nonzero(cond, ratio.args[1], truth) for cond, truth in guards):
                     continue
                 if len(ratio.args) > 1 and zero_factor(parse(variable.expr), ratio.args[1]):
