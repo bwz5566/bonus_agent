@@ -58,7 +58,10 @@ def test_shared_job_budget_does_not_reset_at_next_round():
     assert '总上限 100' in budget.check(llm)
 
 
-def test_pro_diagnoses_without_taking_over_primary_tools(tmp_path):
+def test_pro_diagnoses_without_taking_over_primary_tools(tmp_path, monkeypatch):
+    def semantic_failure(self, *args, **kwargs):
+        raise ToolError('formula.semantic：已按工具合同修复，但两个业务口径仍冲突')
+    monkeypatch.setattr(Workspace, 'compile_table', semantic_failure)
     class Primary(FakeLLM):
         def chat_tools(self, messages, tools, **kw):
             assert not kw.get('think')

@@ -12,9 +12,7 @@ def submit(ws, task: str, value, bindings=None, facts=None):
 
     candidate = copy.deepcopy(ws, {id(ws.llm): ws.llm})
     board = TaskBoard(candidate)
-    spec = board.state['tasks'].get(task)
-    if spec is None:
-        raise ToolError('construction.task：任务不存在，先用plan_formula_tasks声明目标、依赖和来源')
+    spec = board.task_spec(task)
     parts = fx.target_parts(spec['target'])
     if value is None or not isinstance(value, (dict, list)):
         raise ToolError('construction.package：value须为当前目标的完整对象或列表；删除组件使用set_rules')

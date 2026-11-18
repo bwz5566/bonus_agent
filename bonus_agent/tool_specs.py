@@ -91,9 +91,9 @@ TOOLS: list[dict] = [
          "override": {"type": "boolean", "description": "原文明确写了修改旧规定（修改为 / 以本通知为准）时为 true，"
                                                          "quote 要包含这句话"}}, ["name", "value", "file", "quote"])}},
          ["facts"])},
-    {"name": "bind_facts", "description": "把已登记的参数绑定到精确规则位置；多页文档须给page和原文适用标题context。不能以另一处相同数字代替。",
+    {"name": "bind_facts", "description": "把已登记的参数绑定到精确规则或数据筛选位置；多页文档须给page和原文适用标题context。expr字符串本身可绑定其中明确使用的数值，无需虚构threshold/default_value子节点。筛选参数先read_workspace(section='mapping',name=数据表名)核对实际列和条件。不能以另一处相同数字代替。",
      "parameters": _obj({"bindings": {"type": "array", "items": _obj({"name": _S,
-         "targets": {"type": "array", "items": _S, "description": "如 tables.eu.steps.0.1 或 variables.bonus.expr"},
+          "targets": {"type": "array", "items": _S, "description": "如 tables.eu.steps.0.1、方案::/variables/bonus/expr；真实筛选值用 方案::/mapping/数据表/filter/销售金额/not/0（排除列表首项），包含列表为/filter/列名/0，单值为/filter/列名。路径中~和/分别转义为~0和~1。仅支持真实执行的filter，不支持任意映射备注。"},
          "page": _I, "context": _S, "component": {"type": "string", "enum": ["literal", "lower", "upper"]},
           "unit": _S, "unit_basis": _obj({'file': _S, 'quote': {**_S, 'description': '原文或财务确认，必须明确提及此参数名/适用标题和单位；不能借用其他数字的百分号'}}, ['file', 'quote'])}, ["name", "targets"])}}, ["bindings"])},
     {"name": "validate_parameters", "description": "局部参数预检：自动修正已声明阶梯下界绑定的共享单位区间投影，返回剩余缺口与具体动作；不重跑金额、不改规则数值。",

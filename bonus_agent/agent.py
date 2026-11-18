@@ -1337,13 +1337,36 @@ class Workspace:
             out += [f"- {q.id} {q.text}" for q in new]
         return "\n".join(out)
 
+    def _binding_scopes(self) -> dict:
+        """Read-only evidence view of rules and the filters actually used by mapping.
+
+        Mapping remains workspace-owned, never persisted in a rule draft. Only
+        executable filter values are exposed; notes and arbitrary metadata cannot
+        satisfy a parameter. Missing/deleted datasets deliberately leave dangling
+        targets visible to validation instead of erasing their evidence.
+        """
+        import copy
+
+        filters = {}
+        for name, mapping in self.mapping.items():
+            if name not in self.datasets:
+                continue
+            valid = {}
+            for column, value in mapping.filter.items():
+                if isinstance(value, dict) and set(value) != {'not'}:
+                    continue
+                valid[column] = copy.deepcopy(value)
+            filters[name] = {'filter': valid}
+        scopes = {s: self._merged(s) for s in self.schemes}
+        if SHARED in self.drafts:
+            scopes[SHARED] = self.drafts[SHARED]
+        return {s: {**draft, 'mapping': copy.deepcopy(filters)} for s, draft in scopes.items()}
+
     def bind_facts(self, bindings: list[dict]) -> str:
         """Bind a material parameter to exact DSL positions without changing its value."""
         self._check_source_version()
         updates = []
-        scopes = {s: self._merged(s) for s in self.schemes}
-        if SHARED in self.drafts:
-            scopes[SHARED] = self.drafts[SHARED]
+        scopes = self._binding_scopes()
         for spec in bindings:
             found = [f for f in self.facts if f.name == spec.get("name")]
             if not found or not spec.get("targets"):
@@ -1417,7 +1440,7 @@ class Workspace:
         self._check_source_version()
         repaired, errors = [], []
         if repair:
-            scopes = {s: self._merged(s) for s in self.schemes}
+            scopes = self._binding_scopes()
             repaired += fx.prune_orphan_targets(self.facts, scopes)
             for f in self.facts:
                 if f.targets and fx.numeric(f) is None and fx.interval(f.value) is not None:
@@ -1689,9 +1712,7 @@ class Workspace:
             if has and chosen != format(v.normalize(), 'f'):
                 continue
             active.append(f)
-        scopes = {s: self._merged(s) for s in self.schemes}
-        if SHARED in self.drafts:
-            scopes[SHARED] = self.drafts[SHARED]
+        scopes = self._binding_scopes()
         gaps += fx.binding_errors(active, scopes)
         for scheme in self.schemes:
             draft = self._merged(scheme)
@@ -2639,9 +2660,25 @@ class Workspace:
         if detached:
             out.append(f'已同步清理指向本次删除对象的{detached}条绑定；原文参数仍保留，继续绑定到正确位置。')
         self.last_blocking = set()
+        from bonus_agent.construction import TaskBoard
+        from bonus_core.dsl.validator import basis_rules, validate_basis
+        basis_phase = self.staged and TaskBoard(self).phase() == 'basis'
         for t, rs in rss.items():
             full = self._merged(t)
             issues = self._validate(t, rs)
+            deferred = []
+            if basis_phase:
+                full_issues, full_static = issues, lint.static_gates(rs)
+                selected = basis_rules(rs)
+                issues = validate_basis(rs)
+                issues += [i for i in self._validate(t, selected)
+                           if i.severity == 'blocking' and i.code == 'global_in_level']
+                current = {(i.code, i.where, i.message) for i in issues if i.severity == 'blocking'}
+                deferred = [str(i) for i in full_issues if i.severity == 'blocking'
+                            and (i.code, i.where, i.message) not in current]
+                current_static = set(lint.static_gates(selected))
+                deferred += [message for key, message in full_static if (key, message) not in current_static]
+                rs = selected
             if "pool" not in full:
                 issues = [i for i in issues if i.where != "pool"]
             later = ""
@@ -2669,9 +2706,13 @@ class Workspace:
                 out.append(head + "静态校验发现问题，需要修正：\n" + "\n".join(f"- {e}" for e in blocking)
                            + fixes.hints([i for i in issues if i.severity == "blocking"]))
             else:
-                out.append(head + "静态校验通过。" + ("\n提示：\n" + "\n".join(f"- {w}" for w in warns) if warns else ""))
+                out.append(head + ("基础阶段静态校验通过。" if basis_phase else "静态校验通过。")
+                           + ("\n提示：\n" + "\n".join(f"- {w}" for w in warns) if warns else ""))
             if later:
                 out.append(later)
+            if deferred:
+                out.append('后续分配阶段检查延期，当前基础公式保存不以这些问题判失败；人员分配前仍须全部通过：\n'
+                           + '\n'.join(f'- {message}' for message in dict.fromkeys(deferred)))
             warnings = lint.compile_warnings(rs)
             if warnings:
                 out.append('结构提示：\n' + '\n'.join(warnings[:3]))
@@ -4672,6 +4713,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                        'message': f"{name} {'通过' if ok else '未通过'}",
                        'next': flow.hint()}
             text = json.dumps(payload, ensure_ascii=False, default=str)
+            recovery.observe_native_feedback(name, {}, text, ok)
             steps.append(Step('（自动复核）', {'tool': name, 'automatic': True, 'phase': report.get('phase')}, text, ok))
             history.append({'role': 'user', 'content': '【程序自动检查，未调用模型】' + text})
             if on_step:
@@ -4707,8 +4749,20 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         if _shrink(history, max_history_chars):
             seen.clear()       # 较早的结果已省略，重新读取是合理的
         think = bool(deep_why) and deep_used < deep
+        if recovery.native_guidance:
+            ws.notes['程序修复指引'] = recovery.native_guidance
+            think, deep_why = False, ''
+        else:
+            ws.notes.pop('程序修复指引', None)
         if think and llm.recovery_mode == 'advisor' and llm.think_llm is not None:
-            if recovery.claim_advice(deep_why):
+            # Counter changes and reworded stagnation notices are not new problems.
+            blockers = sorted(ws.blocker_frontier())
+            advice_issue = {'blockers': blockers} if blockers else deep_why
+            if blockers and ws.staged:
+                phase = (ws.workflow.get('formula_report', {}).get('report') or {}).get('phase')
+                current_report = ws._flow().compile_feedback(phase) if phase in ('basis', 'all') else None
+                advice_issue['issues'] = (current_report or {}).get('issues', [])
+            if recovery.claim_advice(advice_issue):
                 deep_used += 1
                 started_advice = time.time()
                 before_advice = (llm.usage.prompt_tokens, llm.usage.completion_tokens)
@@ -5137,7 +5191,16 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             first = steps[turn_steps]
             first.model_secs, (first.tokens_in, first.tokens_out) = round(model_secs, 2), model_tokens
         model_steps = steps[turn_steps:]
+        native_changed = False
+        for st in model_steps:
+            native_changed = recovery.observe_native_feedback(st.tool, st.args, st.result, st.ok) or native_changed
         rechecked = automatic_recheck()
+        if recovery.native_guidance:
+            ws.notes['程序修复指引'] = recovery.native_guidance
+            if native_changed:
+                history.append({'role': 'user', 'content': '【程序修复指引，未调用顾问】' + recovery.native_guidance})
+        else:
+            ws.notes.pop('程序修复指引', None)
         deep_why = _deep_reason(model_steps, skipped, ws, fails)
         if any(not ok for _, ok, _ in rechecked):
             # A fresh deterministic counterexample goes back to the primary model first.
@@ -5157,8 +5220,9 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             recovery.state['progress'] = {'previous': sorted(progress_watch.previous), 'stagnant': stagnant, 'reads': sorted(discovered_reads)}
             recovery.save()
             if stagnant >= 2:
-                deep_why = f"连续 {stagnant + 1} 次检查没有消除既有问题；工具返回成功不代表有进展。" + "；".join(sorted(frontier)[:3])
-                ws.notes["纠错进度"] = (deep_why + ('。当前明确动作：' + ws._flow().hint() if ws.staged and not ws.results else
+                progress_reason = f"连续 {stagnant + 1} 次检查没有消除既有问题；工具返回成功不代表有进展。" + "；".join(sorted(frontier)[:3])
+                deep_why = '' if recovery.native_guidance else progress_reason
+                ws.notes["纠错进度"] = (progress_reason + ('。当前明确动作：' + ws._flow().hint() if ws.staged and not ws.results else
                                       "。先做局部参数预检；金额问题用 review_calculation 定位，"
                                       "按原文修复，已有独立基线时使用 preview_repair / verify_repair / apply_repair。"
                                       "禁止通过改答案、降低校验或把分配池归零消除问题。"))
@@ -5166,9 +5230,9 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                 ws.notes.pop("纠错进度", None)
             if stagnant >= (12 if ws.staged and not ws.results else 5):
                 if ws.pending:
-                    repeats, stuck = MAX_STUCK, deep_why
+                    repeats, stuck = MAX_STUCK, progress_reason
                 else:
-                    recovery.halt(deep_why)
+                    recovery.halt(progress_reason)
         elif discovery:
             recovery.state['progress'] = {'previous':sorted(progress_watch.previous), 'stagnant':progress_watch.stagnant,
                                           'reads':sorted(discovered_reads)}
@@ -5748,6 +5812,9 @@ def _deep_reason(turn: list[Step], skipped: int, ws: Workspace, fails: dict[str,
             continue
         if st.tool in ('read_workspace','read_parameter_table','read_document','read_sheet'):
             continue  # Read-interface errors have native feedback; Pro cannot repair pagination or a wrong file type.
+        from bonus_agent.recovery import native_repair_feedback
+        if not st.ok and fails.get(st.tool, 0) < 2 and native_repair_feedback(st.tool, st.args, st.result):
+            continue  # Concrete type/binding/tool-contract repairs precede optional advice.
         if not st.ok and st.tool == 'compile_table' and 'next_call=' in st.result:
             continue  # A source-coordinate coefficient repair is already available; no paid guess is needed.
         if not st.ok and st.tool == 'compile_coefficient_table':

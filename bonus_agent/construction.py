@@ -43,6 +43,29 @@ class TaskBoard:
         flow = self.ws._flow()
         return 'all' if any(flow.current('approved:' + s) for s in self.ws.schemes) else 'basis'
 
+    def task_spec(self, task):
+        """Reject a component name used as a task ID with exact existing-task hints."""
+        from bonus_agent.agent import ToolError
+        if task in self.state['tasks']:
+            return self.state['tasks'][task]
+        scheme, path = fx.split_target(task)
+        candidates = []
+        for ident, spec in self.state['tasks'].items():
+            if scheme is not None and scheme != spec['scheme']:
+                continue
+            if path == spec['target'] or path == fx.target_parts(spec['target'])[-1]:
+                candidates.append({'id': ident, 'scheme': spec['scheme'], 'target': spec['target'],
+                                   'next_call': {'tool': 'read_workspace',
+                                                 'args': {'section': 'construction', 'name': ident}}})
+        if candidates:
+            detail = ('已有目标对应任务（不可重新建同目标任务，也未自动选择）：'
+                      + json.dumps(candidates[:5], ensure_ascii=False)
+                      + (f'；共 {len(candidates)} 个，须按方案核对' if len(candidates) > 1 else ''))
+        else:
+            detail = ('先read_workspace(section="construction", query=所需公式名)查已有任务；'
+                      '确无该目标时才用plan_formula_tasks声明目标、依赖和来源')
+        raise ToolError(f'construction.task：任务ID「{task}」不存在；task须用计划中的id，不能用变量名替代。' + detail)
+
     def required(self, phase=None):
         phase = phase or self.phase()
         if phase == 'all':
@@ -310,15 +333,13 @@ class TaskBoard:
 
     def check(self, task, *, include_next=True):
         from bonus_agent.agent import ToolError
-        if task not in self.state['tasks']:
-            raise ToolError('construction.task：任务不存在，先plan_formula_tasks')
+        spec = self.task_spec(task)
         self.ws._check_source_version()
         statuses = self.statuses()
-        spec = self.state['tasks'][task]
         pending = [n for n in statuses[task]['depends_on'] if statuses[n]['status'] != 'PASS']
         issues = ([f'construction.cycle：当前公式依赖成环，先用set_rules修正{spec["target"]}'] if statuses[task].get('cycle') else
                   ([f'construction.dependency：先检查依赖任务{pending}'] if pending else self.issues(spec)))
-        report = {'status':'FAIL' if issues else 'PASS','task':task,'target':spec['target'],'issues':issues,
+        report = {'status':'FAIL' if issues else 'PASS','task':task,'scheme':spec['scheme'],'target':spec['target'],'issues':issues,
                   'version':statuses[task]['version']}
         self.state['reports'][task] = copy.deepcopy(report)
         if not issues:

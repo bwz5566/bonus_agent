@@ -4,6 +4,7 @@ import copy
 import json
 import time
 import math
+import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,6 +12,55 @@ from pathlib import Path
 
 def fingerprint(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _repair_objects(args, result=''):
+    names = []
+    for group in ('bindings', 'facts', 'tasks'):
+        for item in args.get(group, []) or []:
+            if isinstance(item, dict) and (name := item.get('name') or item.get('id')):
+                names.append(str(name))
+    if names:
+        mentioned = [name for name in names if name in result]
+        return sorted(set(mentioned or names))
+    return [str(args[key]) for key in ('name', 'task', 'dataset') if args.get(key)]
+
+
+def native_repair_feedback(tool, args, result):
+    """Classify an explicit program contract error, not every unsuccessful model action."""
+    match = re.search(r'\b(parameter\.(?:binding|type|unit|range|ref|order)|construction\.(?:plan|task)|'
+                      r'source\.(?:cell|page|scope)|tool\.contract|unmatched_basis)\b', result)
+    code = match.group() if match else ('tool.arguments' if result.startswith(('错误：参数', '错误：没有工具')) else None)
+    if code is None:
+        return None
+    if code == 'parameter.binding':
+        guide = ('先读取失败参数和精确目标定义。literal可以绑定含该数值的expr AST；目标不存在须纠正路径，'
+                 '目标存在但缺所需数值/分支时，按原文修复公式后再绑定，不能借用无关同值。'
+                 'bind_facts不修改公式，整批失败不保存绑定；已有缺失不能推断为本次绑定新引入。')
+    elif code in ('parameter.type', 'parameter.unit', 'parameter.range'):
+        guide = ('按原文及已有财务确认核对数值、单位和区间component，补齐unit_basis或lower/upper；'
+                 '不能猜单位、删参数或改金额绕过验证。证据不足按具体原文缺口处理。')
+    else:
+        guide = '按下列程序反例核对工具参数、已登记对象和原文坐标，使用已公布接口修复；重复读取或改描述不代表修复。'
+    objects = [str(args['task'])] if code == 'construction.task' and args.get('task') else _repair_objects(args, result)
+    return {'tool': tool, 'code': code, 'objects': objects,
+            'scheme': args.get('scheme'), 'issue': result.removeprefix('错误：')[:900], 'guide': guide}
+
+
+def _feedback_phase(result):
+    try:
+        value, _ = json.JSONDecoder().raw_decode(result.lstrip())
+        return value.get('phase') if isinstance(value, dict) else None
+    except (ValueError, AttributeError):
+        return None
+
+
+def _feedback_report(result):
+    try:
+        value, _ = json.JSONDecoder().raw_decode(result.lstrip())
+        return value if isinstance(value, dict) else {}
+    except (ValueError, AttributeError):
+        return {}
 
 
 @dataclass
@@ -176,6 +226,60 @@ class RecoveryJournal:
     def error(self):
         return self.state.get('halted', '')
 
+    @property
+    def native_guidance(self):
+        pending = self.state.get('native_repairs', {})
+        if not pending:
+            return ''
+        return ('程序已给出可执行修复，先处理下列问题；可选顾问不重复解释接口，原有失败/停滞预算仍生效。\n'
+                + '\n'.join(item['issue'] + '\n' + item['guide'] for item in list(pending.values())[-3:]))
+
+    def observe_native_feedback(self, tool, args, result, ok):
+        """Keep explicit failures pending across reads/resumes until program validation resolves them."""
+        pending = self.state.setdefault('native_repairs', {})
+        previous = set(pending)
+        if ok:
+            completed = set(_repair_objects(args))
+            phase = _feedback_phase(result)
+            report = _feedback_report(result)
+            equivalent_binding = bool(args.get('bindings')) and (tool == 'set_rules' or
+                                                                  tool == 'submit_formula_task' and report.get('saved') is True)
+            parameter_checks = {'parameter.binding', 'parameter.type', 'parameter.unit', 'parameter.range'}
+            for key, item in list(pending.items()):
+                if item['code'] in parameter_checks and (tool == 'validate_parameters' or
+                                                        tool == 'compile_formulas' and phase == 'all'):
+                    pending.pop(key)
+                elif item['tool'] == tool or (item['tool'] == 'bind_facts' and equivalent_binding and item['objects']):
+                    if tool == 'compile_formulas':
+                        if phase and item.get('phase') == phase:
+                            pending.pop(key)
+                        continue
+                    verified = set(completed)
+                    if item['code'] == 'construction.task' and tool in ('check_formula_task', 'submit_formula_task'):
+                        if (tool == 'submit_formula_task' and report.get('saved') is not True or
+                                item.get('scheme') and item['scheme'] != (args.get('scheme') or report.get('scheme'))):
+                            continue
+                        verified = {str(args['task'])} if args.get('task') else set()
+                        target = report.get('target')
+                        if isinstance(target, str):
+                            from bonus_agent.facts import target_parts
+                            parts = target_parts(target)
+                            verified.update([target, '.'.join(parts), parts[-1]])
+                    remaining = set(item['objects']) - verified
+                    if not remaining:
+                        pending.pop(key)
+                    elif remaining != set(item['objects']):
+                        pending.pop(key)
+                        item = {**item, 'objects': sorted(remaining)}
+                        pending[fingerprint([item['tool'], item['code'], item['objects']])] = item
+        elif item := native_repair_feedback(tool, args, result):
+            item['phase'] = _feedback_phase(result)
+            key = fingerprint([item['tool'], item['code'], item['objects']])
+            pending[key] = item
+        if pending or previous:
+            self.save()
+        return set(pending) != previous
+
     def save(self):
         if self.path:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -201,7 +305,7 @@ class RecoveryJournal:
         self.save()
 
     def claim_advice(self, issue):
-        if self.state.get('advisor_disabled'):
+        if self.state.get('advisor_disabled') or self.native_guidance:
             return False
         key = fingerprint(issue)
         if key in self.state['advised'] or len(self.state['advised']) >= 6:
@@ -226,13 +330,43 @@ def local_advice(llm, reason, steps, facts, hint):
     from bonus_agent.tool_specs import TOOLS
     failed_tools = {s.tool for s in steps[-4:] if not s.ok}
     packet['tool_contracts'] = [
-        {'name': t['name'], 'required': t['parameters'].get('required', []),
-         'parameters': list(t['parameters'].get('properties', {}))}
-         for t in TOOLS if t['name'] in failed_tools | {'set_rules', 'bind_facts', 'read_workspace', 'ask_question', 'validate_parameters', 'compile_coefficient_table'}
-    ]
+        {'name': t['name'], 'description': t['description'], 'required': t['parameters'].get('required', []),
+         'parameters': list(t['parameters'].get('properties', {})),
+         **({'schema': t['parameters']} if t['name'] in failed_tools else {})}
+        for t in TOOLS if t['name'] in failed_tools | {'set_rules', 'bind_facts', 'read_workspace', 'ask_question', 'validate_parameters', 'compile_coefficient_table'}]
     packet['constraints'] = ('define_dataset.file必须是真实Excel文件名，不能引用其他数据集作为file；'
                              'combine引用原始Excel列名，fields.column也是原列名；'
-                             '只使用tool_contracts列出的工具参数，不发明数据集派生接口。')
+                             '只使用tool_contracts列出的工具参数，不发明数据集派生接口。'
+                             'bind_facts的literal可以绑定expr中的AST数值；已含常量不等于来源已经绑定。'
+                             'bind_facts不修改公式，失败整批不保存绑定；既有公式缺失不能推断为此次绑定新引入。'
+                             '精确目标路径使用read_workspace(section="rules",name="方案::/variables/变量/expr")；'
+                             'section="variables"或"tables"用于按组件名称/query检索，不把完整路径当变量名。')
+    from bonus_agent.facts import split_target, target_parts
+    targets = [target for step in steps[-4:] if not step.ok for item in step.args.get('bindings', [])
+               if isinstance(item, dict) for target in item.get('targets', []) if isinstance(target, str)]
+    targets = sorted(dict.fromkeys(targets), key=lambda target: ('.'.join(target_parts(split_target(target)[1])) not in reason,
+                                                                target))[:12]
+    priority = {target: index for index, target in enumerate(targets)}
+    packet['related_nodes'] = []
+    seen_targets = set()
+    for step in reversed(steps):
+        if step.tool != 'read_workspace' or not step.ok or not isinstance(step.args.get('name'), str):
+            continue
+        section, name = step.args.get('section'), step.args['name']
+        scheme, path = split_target(name)
+        if section in ('variables', 'tables'):
+            scheme = step.args.get('scheme')
+        parts = target_parts(path) if section == 'rules' else [section, name] if section in ('variables', 'tables') else []
+        matches = [target for target in targets if target not in seen_targets and parts and
+                   (split_target(target)[0] in (None, scheme) or scheme is None) and
+                   target_parts(split_target(target)[1])[:len(parts)] == parts]
+        if matches:
+            packet['related_nodes'].append({'targets': matches, 'read_args': step.args,
+                                            'result_excerpt': step.result[:2400], 'is_excerpt': len(step.result) > 2400})
+            seen_targets.update(matches)
+        if len(seen_targets) == len(targets):
+            break
+    packet['related_nodes'] = sorted(packet['related_nodes'], key=lambda item: min(priority[t] for t in item['targets']))[:4]
     # Bound *all* fields, including model-produced arguments and source quotations.
     packet['recent_is_excerpt'] = True
     for item in packet['recent']:
@@ -240,11 +374,13 @@ def local_advice(llm, reason, steps, facts, hint):
         if len(args) > 2400:
             item['args'] = {'excerpt': args[:2400], 'notice': '参数摘录，非可执行JSON，不代表完整调用'}
     payload = json.dumps(packet, ensure_ascii=False, default=str)
-    while len(payload) > 18000 and (packet['facts'] or len(packet['recent']) > 1):
+    while len(payload) > 18000 and (packet['facts'] or len(packet['recent']) > 1 or len(packet['related_nodes']) > 1):
         if packet['facts']:
             packet['facts'].pop()
-        else:
+        elif len(packet['recent']) > 1:
             packet['recent'].pop(0)
+        else:
+            packet['related_nodes'].pop()
         payload = json.dumps(packet, ensure_ascii=False, default=str)
     if len(payload) > 18000:
         packet['problem'] = packet['problem'][:1000]
@@ -253,7 +389,11 @@ def local_advice(llm, reason, steps, facts, hint):
             item['tool'] = item['tool'][:80]
             item['args'] = {'excerpt': str(item['args'])[:800]}
             item['result'] = item['result'][:800]
+        for item in packet['related_nodes']:
+            item['result_excerpt'], item['is_excerpt'] = item['result_excerpt'][:800], True
         payload = json.dumps(packet, ensure_ascii=False, default=str)
+    if len(payload) > 18000:
+        raise ValueError('局部顾问诊断包超过18000字符，完整工具合同仍无法容纳；未调用模型，先按程序反馈修复')
     advisor = copy.copy(llm)
     advisor.think_max_tokens = 4096
     advisor.think_timeout = min(llm.think_timeout, 180)

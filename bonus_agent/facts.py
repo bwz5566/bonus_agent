@@ -126,7 +126,7 @@ def binding_errors(facts: list[Fact], drafts: dict) -> list[str]:
             errors.append(f"{f.name}：缺少精确规则位置，用 bind_facts 绑定参数" + hint)
             continue
         for target in f.targets:
-            matches = []
+            resolved, failures, missing = [], [], []
             scheme, path = split_target(target)
             for name, draft in drafts.items():
                 if scheme is not None and name != scheme:
@@ -134,37 +134,98 @@ def binding_errors(facts: list[Fact], drafts: dict) -> list[str]:
                 try:
                     v = target_value(draft, path)
                 except (KeyError, IndexError, TypeError, ValueError):
+                    missing.append((name, _binding_path_context(draft, path)))
                     continue
-                if value is None:
-                    from bonus_core.dsl.parser import parse, walk, Str, ExprError
-                    values = [v] if isinstance(v, str) and target_parts(path)[-1] != 'expr' else []
-                    if isinstance(v, str):
-                        try:
-                            values += [n.value for n in walk(parse(v)) if isinstance(n, Str)]
-                        except ExprError:
-                            pass
-                    same = lambda s: date_key(str(s)) or norm(s)
-                    matches.append({None} if any(same(x) == same(f.value) for x in values) else set())
-                    continue
-                target_number = number(str(v))
-                if target_number is None:
-                    try:
-                        target_number = Decimal(str(v))
-                    except InvalidOperation:
-                        pass
-                if target_number is not None:
-                    matches.append({target_number})
-                elif isinstance(v, str):
-                    from bonus_core.dsl.parser import parse, walk, Num, ExprError
-                    try:
-                        matches.append({n.value for n in walk(parse(v)) if isinstance(n, Num)})
-                    except ExprError:
-                        matches.append(set())
+                resolved.append(name)
+                problem = _binding_target_problem(f, value, v, path)
+                if problem:
+                    failures.append(f'方案「{name}」：{problem}')
+            if not resolved:
+                if not missing:
+                    detail = f'方案「{scheme}」不存在；现有方案：{list(drafts)}'
                 else:
-                    matches.append(set())
-            if not matches or any(value not in values for values in matches):
-                errors.append(f"{f.name}：{target} 的取值与原文 {f.value} 不一致或位置不存在")
+                    detail = '；'.join(f'方案「{name}」：{context}' for name, context in missing)
+                errors.append(f'{f.name}：parameter.binding.path_missing，{target} 位置不存在。{detail}。'
+                              '按已存在的字段读取并绑定精确位置；expr中的数值常量可直接绑定，不需要新增不存在的threshold或value字段。')
+            elif failures:
+                # Unqualified paths retain their existing meaning: every
+                # scheme where this path exists must match; absent paths in
+                # other schemes do not invalidate a matching existing target.
+                errors.append(f'{f.name}：{target} ' + '；'.join(failures))
     return errors
+
+
+def _binding_path_context(draft: dict, path: str) -> str:
+    """Show the deepest real parent, without inventing a replacement path."""
+    current, visited = draft, []
+    for part in target_parts(path):
+        try:
+            current = current[int(part)] if isinstance(current, (list, tuple)) else current[part]
+        except (KeyError, IndexError, TypeError, ValueError):
+            break
+        visited.append(part)
+    parent = '/' + '/'.join(str(p).replace('~', '~0').replace('/', '~1') for p in visited)
+    if isinstance(current, dict):
+        available = f'已有字段={list(current)[:12]}'
+    elif isinstance(current, (list, tuple)):
+        available = f'已有索引=0..{len(current) - 1}' if current else '当前列表为空'
+    else:
+        available = f'该节点为{type(current).__name__}标量，没有子字段'
+    return f'最深已存在节点 {parent}，{available}'
+
+
+def _binding_target_problem(f: Fact, expected, target, path: str) -> str:
+    """Explain the same strict binding predicate; never alter a rule or a fact."""
+    from bonus_core.dsl.parser import parse, walk, Num, Str, ExprError
+
+    if not isinstance(target, (str, int, float, Decimal)) or isinstance(target, bool):
+        detail = f'；已有字段={list(target)[:12]}' if isinstance(target, dict) else ''
+        if isinstance(target, dict) and 'expr' in target:
+            detail += '；该对象有expr字段，可读取它并绑定其中真实存在的常量'
+        return (f'parameter.binding.target_type，目标类型不支持：{type(target).__name__}{detail}。'
+                '须绑定精确标量字段、表格数值单元格或字符串表达式，不能绑定整个对象/数组。')
+    if expected is None:
+        values = [target] if isinstance(target, str) and target_parts(path)[-1] != 'expr' else []
+        if isinstance(target, str):
+            try:
+                values += [node.value for node in walk(parse(target)) if isinstance(node, Str)]
+            except ExprError:
+                pass
+        same = lambda s: date_key(str(s)) or norm(s)
+        if any(same(x) == same(f.value) for x in values):
+            return ''
+        return (f'parameter.binding.value_mismatch，值不一致：原文文字={f.value!r}，'
+                f'当前目标中的文字={values[:12]!r}。按原文核对精确字段或表达式字符串。')
+
+    expected_text = f'期望数值={expected}（原文={f.value!r}' + (f'，单位={f.unit}' if f.unit else '') + '）'
+    actual = number(str(target))
+    if actual is None:
+        try:
+            actual = Decimal(str(target))
+        except InvalidOperation:
+            pass
+    if actual is not None:
+        if actual == expected:
+            return ''
+        return (f'parameter.binding.value_mismatch，值不一致：{expected_text}，当前标量={actual}。'
+                '保留已确认单位，按原文核对该位置；不能改绑无关同值节点。')
+    if isinstance(target, str):
+        expression = target if len(target) <= 1600 else target[:1600] + '…（表达式摘录，完整内容须读取目标节点）'
+        try:
+            values = {node.value for node in walk(parse(target)) if isinstance(node, Num)}
+        except ExprError as exc:
+            return (f'parameter.binding.expr_invalid，目标表达式语法无效：{exc}；当前expr={expression!r}。'
+                    '先修复表达式语法，再绑定其中的数值常量。')
+        if expected in values:
+            return ''
+        shown = [str(value) for value in sorted(values)[:20]]
+        return (f'parameter.binding.expr_literal_missing，值不一致：目标表达式有效，{expected_text}，'
+                f'当前expr={expression!r}，实际AST数值常量={shown}（共{len(values)}个）。'
+                'expr支持直接绑定AST数值常量；此次是缺少期望常量，不是expr不支持绑定。'
+                '先按原文检查公式是否缺少默认值/阈值等分支，确需补公式时先set_rules修改再bind_facts；'
+                '若参数由其他变量提供，读取并绑定该变量的真实定义。'
+                '不要寻找不存在的threshold节点，不得为通过检查随意插入常量或改绑无关同值节点。')
+    return f'parameter.binding.value_mismatch，值不一致：{expected_text}，当前目标={target!r}'
 
 
 def detach_targets(facts: list[Fact], scheme: str, deleted: set[tuple[str, str]], drafts: dict | None = None) -> int:
