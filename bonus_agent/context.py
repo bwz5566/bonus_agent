@@ -186,7 +186,10 @@ def workspace_view(
         if not saved:
             return {'section': 'checks', 'status': 'NOT_RUN', 'items': [],
                     'next_call': {'tool': 'compile_formulas', 'args': {}}, 'notice': '尚无公式检查，先compile_formulas'}
-        if saved.get('version') != Workflow(ws).version():
+        flow = Workflow(ws)
+        current = (flow.compile_feedback(saved['report'].get('phase', 'all')) is not None
+                   if saved.get('phase_version') else saved.get('version') == flow.version())
+        if not current:
             return {'section': 'checks', 'status': 'STALE', 'items': [],
                     'next_call': {'tool': 'compile_formulas', 'args': {}}, 'notice': '规则或证据已变化，重新compile_formulas；不能把旧检查当当前结论'}
         items = [{'kind': 'issue', 'index': i, 'message': message} for i, message in enumerate(saved['report']['issues'])]
@@ -345,7 +348,8 @@ def task_card(ws):
     report = ws.workflow.get('formula_report', {})
     if report:
         data['last_formula_check'] = {
-            'current': report.get('version') == flow.version(),
+            'current': ((flow.compile_feedback(report['report'].get('phase', 'all')) is not None)
+                        if report.get('phase_version') else report.get('version') == flow.version()),
             'issue_count': len(report['report']['issues']),
             'first_issues': [x[:450] for x in report['report']['issues'][:3]],
             'lookup': 'read_workspace(section="checks")；current=false须先重新compile_formulas',

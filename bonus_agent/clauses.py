@@ -43,11 +43,16 @@ def check_quote(file: str, quote: str, corpus: dict[str, str]) -> str | None:
 
 def refs(where: str) -> list[str]:
     """位置列表；每项后面括号里的说明（如 pool（仅求和））不算位置的一部分。"""
-    w = re.sub(r"\s*[（(][^（）()]*[）)]", "", where or "")
+    w = where or ""
+    while True:
+        cleaned = re.sub(r"\s*[（(][^（）()]*[）)]", "", w)
+        if cleaned == w:
+            break
+        w = cleaned
     return [x.strip() for x in re.split(r"[、,，;；]\s*", w) if x.strip()]
 
 
-_ELEMENT = re.compile(r"^((pool|report|allocation|payout|offsets|checks)$|(variables|tables|checks|datasets|payout|offsets|allocation|revisions)\.)")
+_ELEMENT = re.compile(r"^((pool|report|allocation|payout|offsets|checks)$|(variables|tables|checks|datasets|payout|offsets|allocation|revisions|report)\.)")
 
 
 def check_where(where: str, known: set[str], questions: set[str]) -> str | None:
@@ -77,11 +82,53 @@ def check_where(where: str, known: set[str], questions: set[str]) -> str | None:
             return None if ids and all(i in questions for i in ids) else f"「{rest}」里的问题编号不存在"
     bad = late or bad
     if bad:
-        return (f"{'、'.join(bad)} 不存在。写规则元素的位置，如 variables.net_receipt、checks.grade_known、pool、"
+        report_hint = ''
+        if any(r.startswith('report.') for r in bad):
+            choices = sorted((r for r in known if r.startswith('report.')), key=lambda r: (r.count('.'), r))[:12]
+            report_hint = ('。已存在的报告位置：' + '、'.join(choices) if choices else '。当前没有已定义的报告子项')
+            report_hint += '；列表须指定实际名称或索引，如 report.distributions.0.pending；待分配金额定义在 report.pending'
+        return (f"{'、'.join(bad)} 不存在{report_hint}。写规则元素的位置，如 variables.net_receipt、checks.grade_known、pool、"
                 "allocation.参与分配、payout.warranty、offsets.prepaid、tables.margin_tier、datasets.成本费用；"
                 f"不落在规则里的写「{BUILTIN}：说明」（程序本身就会做的检查或处理）、「{NOT_APPLY}：原因」"
                 f"或「{ASKED} q1」，可以和规则位置写在一起，如 checks.share_sum、{BUILTIN}：编号重复由程序检查")
     return None
+
+
+def report_elements(draft: dict) -> dict[str, object]:
+    """Actual report paths and their content, shared by validation and evidence signatures.
+
+    A section only exists when it contains an item. Lists support exact indices
+    and unique, unambiguous names; no wildcard path can stand in for a missing
+    pending item or an absent distribution contract.
+    """
+    report = draft.get('report') or {}
+    if not isinstance(report, dict):
+        return {}
+    out = {}
+
+    def visit(path, value):
+        if value is None or value == '' or value == [] or value == {}:
+            return
+        out[path] = value
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key not in ('sources', 'desc', 'confidence', 'confirmed_by'):
+                    visit(path + '.' + str(key), child)
+        elif isinstance(value, list):
+            named = {}
+            for item in value:
+                if isinstance(item, dict) and isinstance(item.get('name'), str):
+                    named[item['name']] = named.get(item['name'], 0) + 1
+            for index, child in enumerate(value):
+                visit(path + '.' + str(index), child)
+                name = child.get('name') if isinstance(child, dict) else None
+                if (name and named.get(name) == 1 and not name.isdigit()
+                        and not re.search(r'[.、,，;；（）()]', name)):
+                    visit(path + '.' + name, child)
+
+    for section in ('totals', 'details', 'balances', 'pending', 'distributions', 'people'):
+        visit('report.' + section, report.get(section))
+    return out
 
 
 def known_refs(drafts: dict, datasets: dict) -> set[str]:
@@ -92,6 +139,7 @@ def known_refs(drafts: dict, datasets: dict) -> set[str]:
         if d.get("pool"):
             out.add("pool")
         out |= {k for k in ('report', 'allocation', 'payout', 'offsets', 'checks') if d.get(k)}
+        out.update(report_elements(d))
         for lv in d.get("allocation") or []:
             if isinstance(lv, dict) and lv.get("level"):
                 out.add(f"allocation.{lv['level']}")

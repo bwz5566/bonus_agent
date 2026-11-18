@@ -1756,29 +1756,37 @@ class Workspace:
         return (f"已登记 {len(added)} 条：{added[0]}～{added[-1]}（清单共 {len(self.clauses)} 条，每一步都附在工作区状态里）。"
                 + ("\n" + "\n".join(lines) if lines else "") + "\n写好规则后用 cover_clauses 标注每条落在哪里")
 
-    def cover_clauses(self, items: dict) -> str:
+    def cover_clauses(self, items: dict) -> dict:
         if not isinstance(items, dict) or not items:
             raise ToolError('items 写成 {"C1": "variables.net_receipt", ...}')
         byid = {c.id: c for c in self.clauses}
         known, qids = cl.known_refs(self.drafts, self.datasets), {q.id for q in self.questions}
-        ok, bad = [], []
+        ok, bad, rejected = [], [], []
         for cid, where in items.items():
             c = byid.get(str(cid).strip())
             if c is None:
                 bad.append(f"{cid}：清单里没有这条")
+                rejected.append({'id': str(cid), 'where': str(where), 'message': '清单里没有这条'})
                 continue
             err = cl.check_where(str(where), known, qids)
             if err:
                 bad.append(f"{cid}：{err}")
+                rejected.append({'id': c.id, 'where': str(where), 'message': err})
                 continue
             c.where = str(where).strip()
             ok.append(c.id)
         left = [c.id for c in self.clauses if not c.where]
         if not ok:
             raise ToolError("没有标注任何条款：\n" + "\n".join(bad))
-        return (f"已标注 {len(ok)} 条。" + ("\n未标注成功：\n" + "\n".join(bad) if bad else "")
-                + (f"\n还没落实的条款：{'、'.join(left[:30])}" if left else "\n条款清单已全部落实")
-                + "\n\n" + self._side_by_side([byid[i] for i in ok]))
+        return {
+            'status': 'FAIL' if bad else 'PASS', 'applied': ok, 'rejected': rejected, 'issues': bad,
+            'remaining_clauses': left,
+            'message': f'已标注 {len(ok)} 条；失败 {len(bad)} 条。已成功部分保留。',
+            'scope': '仅核对条款引用位置；不代表业务口径、公式或计算结果已通过。',
+            'next': '只修复rejected中的位置，按错误给出的实际报告路径重新标注。' if bad
+                    else ('继续落实remaining_clauses。' if left else '引用位置已标注，继续程序校验与独立复核。'),
+            'review': self._side_by_side([byid[i] for i in ok]),
+        }
 
     def _element_texts(self) -> dict[str, list[str]]:
         """规则元素位置 -> 各方案里的内容（各方案相同的只列一次）。"""
@@ -1788,6 +1796,8 @@ class Workspace:
             for root in ('report', 'allocation', 'payout', 'offsets', 'checks'):
                 if d.get(root):
                     out.setdefault(root, []).append(f'「{sch}」' + json.dumps(d[root], ensure_ascii=False, sort_keys=True))
+            for ref, value in cl.report_elements(d).items():
+                out.setdefault(ref, []).append(f'「{sch}」{ref} ' + json.dumps(value, ensure_ascii=False, sort_keys=True))
             for ref, line in _rules_lines(d):
                 text = (f"「{sch}」" if many else "") + line.strip().split("  ", 1)[-1]
                 if text not in out.setdefault(ref, []):
@@ -4644,6 +4654,42 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         if _size(history) >= before:
             history.clear()
         return _size(history)<before
+
+    def automatic_recheck():
+        """Run ready deterministic checks before paying a model to choose the next action."""
+        if not ws.staged or ws.done:
+            return []
+        flow = ws._flow()
+        focus = flow.stage()
+        regressed = bool(reached_focus and focus[0] < reached_focus[0])
+        checked = flow.recheck(initial_compile=not regressed)
+        for name, ok, issues in checked:
+            if name == 'compile_formulas':
+                report = flow.compile_summary(flow.state['formula_report']['report'])
+            else:
+                report = flow.state.get('auto_checks', {}).get(name + ':data', {}).get('report', {})
+            payload = {**report, 'status': 'PASS' if ok else 'FAIL', 'issues': issues[:6],
+                       'message': f"{name} {'通过' if ok else '未通过'}",
+                       'next': flow.hint()}
+            text = json.dumps(payload, ensure_ascii=False, default=str)
+            steps.append(Step('（自动复核）', {'tool': name, 'automatic': True, 'phase': report.get('phase')}, text, ok))
+            history.append({'role': 'user', 'content': '【程序自动检查，未调用模型】' + text})
+            if on_step:
+                on_step(len(steps), steps[-1])
+        return checked
+
+    if not error and not ws.done and not (should_stop and should_stop()):
+        initial_checks = automatic_recheck()
+        if initial_checks:
+            discovery = False
+            for st in steps:
+                discovery = discover(st, discovered_reads) or discovery
+            progress_watch.observe(ws.blocker_frontier(), discovery=discovery)
+            recovery.state['progress'] = {'previous': sorted(progress_watch.previous), 'stagnant': progress_watch.stagnant,
+                                          'reads': sorted(discovered_reads)}
+            recovery.save()
+            reached, reached_focus = ws.phase(), ws._flow().stage()
+            highest_stage = max(highest_stage, reached_focus[0])
     for turn in range(max_steps if not error else 0):
         if ws.done:
             break
@@ -5090,7 +5136,13 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         if len(steps) > turn_steps:       # 模型这次回复的用时和 tokens 记在本次第一个调用上
             first = steps[turn_steps]
             first.model_secs, (first.tokens_in, first.tokens_out) = round(model_secs, 2), model_tokens
-        deep_why = _deep_reason(steps[turn_steps:], skipped, ws, fails)
+        model_steps = steps[turn_steps:]
+        rechecked = automatic_recheck()
+        deep_why = _deep_reason(model_steps, skipped, ws, fails)
+        if any(not ok for _, ok, _ in rechecked):
+            # A fresh deterministic counterexample goes back to the primary model first.
+            # Required independent monetary review still uses its configured reviewer.
+            deep_why = ''
         discovery = False
         if ws.staged:
             for st in steps[turn_steps:]:
@@ -5121,7 +5173,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             recovery.state['progress'] = {'previous':sorted(progress_watch.previous), 'stagnant':progress_watch.stagnant,
                                           'reads':sorted(discovered_reads)}
             recovery.save()
-        if skipped and skipped == len(calls):
+        if skipped and skipped == len(calls) and not rechecked:
             # 整轮都是被拦下的重复调用：不把它留在历史里，否则小模型会照着历史接着重复；只留一句说明
             del history[turn_start:]
             history.append({"role": "user", "content": f"（你刚才又原样调用了 {calls[0]['name']}，和之前完全相同，没有任何变化。"
@@ -5134,19 +5186,6 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             break
         now = ws.phase() if not message or ws.staged else reached
         focus=ws._flow().stage() if ws.staged else None
-        rechecked = []
-        if ws.staged and focus and reached_focus and focus[0] < reached_focus[0]:
-            # 改动让前面已通过的检查失效：程序自己重跑确定性检查，过了就原地接着做，不退阶段、不清对话
-            rechecked = ws._flow().recheck()
-            if rechecked:
-                focus = ws._flow().stage()
-                text = "；".join(f"{n} {'通过' if ok else '未通过'}" for n, ok, _ in rechecked)
-                if focus == reached_focus:
-                    history.append({"role": "user", "content": f"（刚才的修改让前面已通过的检查失效，程序已自动重新核对：{text}。"
-                                                               "阶段不变，接着做当前这一步，不用再调用这些检查）"})
-                    steps.append(Step("（自动复核）", {}, text, True))
-                    if on_step:
-                        on_step(len(steps), steps[-1])
         if (ws.staged and focus!=reached_focus) or (not ws.staged and now>reached):
             if ws.staged and focus[0] <= highest_stage:
                 reached_focus = focus

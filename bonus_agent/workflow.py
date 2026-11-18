@@ -341,15 +341,55 @@ class Workflow:
 
     def compile(self, phase=None):
         from bonus_agent.construction import TaskBoard
+        from bonus_agent.agent import ToolError
         try:
             phase = phase or TaskBoard(self.ws).phase()
+            self.ws._check_source_version()
+            prior = self.compile_feedback(phase)
+            if prior and prior['status'] == 'FAIL':
+                # A failed deterministic check is useful feedback, not a reason to run the
+                # identical preflight again. A changed rule/evidence version invalidates it.
+                self._invalidate_compilation(phase)
+                return {**self.compile_summary(prior), 'cached': True}
             report = self._compile(phase)
-        except Exception:
+        except Exception as exc:
             self._invalidate_compilation(phase or 'basis')
+            if isinstance(exc, ToolError):
+                self._save_compile_report({'status': 'FAIL', 'issues': [str(exc)], 'warnings': [],
+                                           'graph': {}, 'repaired': [], 'phase': phase or 'basis', 'preflight': {}})
             raise
         if report['status'] != 'PASS':
             self._invalidate_compilation(phase)
         return report
+
+    def _save_compile_report(self, report):
+        from bonus_agent.construction import TaskBoard
+        kind = 'basis' if report.get('phase') == 'basis' else 'formula'
+        version = self.version()
+        board = TaskBoard(self.ws)
+        self.state['formula_report'] = {
+            'version': version, 'kind': kind,
+            'phase_version': self.version(kind) if kind == 'basis' else version,
+            'task_receipts': {name: board.state['receipts'].get(name)
+                              for name in board.required(report.get('phase'))},
+            'report': copy.deepcopy(report),
+        }
+
+    def compile_feedback(self, phase='basis', *, version=None):
+        """Only current, phase-specific diagnostics may guide the next repair."""
+        saved = self.state.get('formula_report', {})
+        report = saved.get('report') or {}
+        if report.get('phase') != phase:
+            return None
+        receipts = self.state.get('construction', {}).get('receipts', {})
+        if any(receipts.get(name) != token for name, token in saved.get('task_receipts', {}).items()):
+            return None
+        if saved.get('phase_version'):
+            kind = 'basis' if phase == 'basis' else 'formula'
+            return report if saved['phase_version'] == (version or self.version(kind)) else None
+        # Existing cases did not record a projected version. Do not guess whether a
+        # failure still applies after any rules/evidence change.
+        return report if saved.get('version') == self.version() else None
 
     def _invalidate_compilation(self, phase):
         receipts = self.state['receipts']
@@ -451,7 +491,7 @@ class Workflow:
                     issues.append(f'方案「{name}」基础求值预检：' + json.dumps(brief, ensure_ascii=False)[:2400])
         report = {'status': 'FAIL' if issues else 'PASS', 'issues': issues, 'warnings': warnings,
                   'graph': graph, 'repaired': repaired, 'phase': phase, 'preflight': preflight}
-        self.state['formula_report'] = {'version': self.version(), 'report': copy.deepcopy(report)}
+        self._save_compile_report(report)
         if not issues:
             self.receipt('allocation_formulas' if phase == 'all' else 'formulas', report,
                          kind='formula' if phase == 'all' else 'basis')
@@ -801,18 +841,38 @@ class Workflow:
         ):
             fail('金额基线与复核或确认回执不一致')
 
-    def recheck(self):
+    def recheck(self, *, initial_compile=False):
         """改动让已通过的“准备数据 / 编译公式”回执失效时，程序自己重跑这两项确定性检查。
         实测模型补一条分配层级或改一处规则就退回前一阶段、清空对话，再把整套检查和读取重做一遍，白耗步数和 tokens。
-        只重跑之前通过过的检查；返回 [(检查名, 是否通过, 未通过的问题)]。"""
+        initial_compile还允许基础任务首次全部通过后自动编译；不执行付费复核或金额确认。
+        每个输入版本只自动执行一次；返回 [(检查名, 是否通过, 未通过的问题)]。"""
         done = []
         for _ in range(2):
             stage, _scheme = self.stage()
             if stage == 2 and 'data' in self.state['receipts']:
-                name, run = 'prepare_data', self.prepare_data
-            elif stage == 3 and ('formulas' in self.state['receipts'] or 'allocation_formulas' in self.state['receipts']):
-                name, run = 'compile_formulas', self.compile
+                name, kind, phase, run = 'prepare_data', 'data', None, self.prepare_data
+            elif stage == 3:
+                from bonus_agent.construction import TaskBoard
+                phase = 'basis' if not self.current('formulas') else 'all'
+                passed_before = 'formulas' in self.state['receipts'] or 'allocation_formulas' in self.state['receipts']
+                if (phase == 'all' and initial_compile) or (not passed_before and not initial_compile):
+                    break
+                # Do not manufacture local PASS receipts for unfinished work. Existing
+                # stale receipts may be refreshed by the board's normal deterministic gate.
+                if TaskBoard(self.ws).gate(phase):
+                    break
+                name, kind = 'compile_formulas', 'basis' if phase == 'basis' else 'formula'
+                run = lambda: self.compile(phase)
             else:
+                break
+            version = self.version(kind)
+            if name == 'compile_formulas':
+                feedback = self.compile_feedback(phase, version=version)
+                if feedback and feedback['status'] == 'FAIL':
+                    break
+            key = name + ':' + (phase or kind)
+            prior = self.state.get('auto_checks', {}).get(key, {})
+            if name != 'compile_formulas' and prior.get('version') == version:
                 break
             from bonus_agent.agent import ToolError
             try:
@@ -820,6 +880,13 @@ class Workflow:
                 ok, issues = report.get('status') == 'PASS', report.get('issues') or []
             except ToolError as exc:
                 ok, issues = False, [str(exc)]
+                report = {'status': 'FAIL', 'issues': issues, 'phase': phase}
+            # Parameter binding repair can change inputs during compilation. Record the
+            # resulting version so that the repair itself cannot create an automatic loop.
+            self.state.setdefault('auto_checks', {})[key] = {
+                'version': self.version(kind), 'kind': kind, 'phase': phase,
+                'report': copy.deepcopy(report),
+            }
             done.append((name, ok, issues))
             if not ok:
                 break
@@ -850,6 +917,13 @@ class Workflow:
     def hint(self):
         stage, scheme = self.stage()
         if stage == 3:
+            phase = 'basis' if not self.current('formulas') else 'all'
+            report = self.compile_feedback(phase)
+            if report and report['status'] == 'FAIL':
+                summary = self.compile_summary(report)
+                return ('当前版本已编译未通过，先修复反例，不要原样重编译：'
+                        + '；'.join(str(i)[:450] for i in summary['issues'][:3])
+                        + '；完整检查：read_workspace(section="checks")')
             from bonus_agent.construction import TaskBoard
             return TaskBoard(self.ws).summary()['next']
         if stage == 1:
@@ -878,12 +952,20 @@ class Workflow:
     def summary(self):
         from bonus_agent.construction import TaskBoard
         index, scheme = self.stage()
+        construction = TaskBoard(self.ws).summary() if index == 3 else None
+        next_action = self.hint()
+        if construction is not None:
+            phase = 'basis' if not self.current('formulas') else 'all'
+            report = self.compile_feedback(phase)
+            if report and report['status'] == 'FAIL':
+                # Keep the nested task card and the workflow next action consistent.
+                construction = {**construction, 'next': next_action, 'compile_failure': self.compile_summary(report)}
         return {
             'stage': index,
             'name': STAGES[index][0],
             'scheme': scheme,
-            'next': self.hint(),
-            'construction': TaskBoard(self.ws).summary() if index == 3 else None,
+            'next': next_action,
+            'construction': construction,
             'rule_requirements': self.rule_requirements() if index == 1 else [],
             'plan': self.state.get('plan'),
             'receipts': {n: {'current': self.current(n), 'at': r['at']} for n, r in self.state['receipts'].items()},

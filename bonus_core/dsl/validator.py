@@ -294,6 +294,39 @@ def _validate(rs: RuleSet, *, basis=False) -> list[Issue]:
         for balance in rs.report.balances:
             if balance.level != "global" and balance.level not in report_levels:
                 issues.append(Issue.block("report_level", "对账对象层级不存在", balance.level))
+        issues += validate_distribution_contracts(rs)
+    return issues
+
+
+def validate_distribution_contracts(rs: RuleSet) -> list[Issue]:
+    """Catch executable settlement-shape errors before allocating any money."""
+    if rs.report is None:
+        return []
+    issues, claimed = [], set()
+    pending = {item.name: item for item in rs.report.pending}
+    levels = {level.level for level in rs.allocation}
+    for contract in rs.report.distributions:
+        where = 'report.distributions.' + contract.name
+        if contract.rounding == 'after_sum':
+            if (contract.level != 'global' or not rs.allocation
+                    or rs.pool.scope != rs.allocation[-1].level or not rs.report.people or not contract.sources):
+                issues.append(Issue.block('recipient_rounding_scope',
+                    '汇总后舍入须先按人员聚合，以人员作为奖金池及最末层，在 global 对账并提供原文依据；'
+                    '不能仅给项目分配池改 rounding 标签来获得人员汇总后舍入', where))
+        elif contract.level != rs.pool.scope or contract.level not in levels or not contract.sources:
+            issues.append(Issue.block('distribution_scope', '金额去向对账须在奖金池分配层并提供原文依据', where))
+        if len(set(contract.pending)) != len(contract.pending) or claimed & set(contract.pending):
+            issues.append(Issue.block('distribution_pending_duplicate', '待分配项被重复计入去向对账', where))
+        claimed.update(contract.pending)
+        for name in contract.pending:
+            item = pending.get(name)
+            if item is None:
+                issues.append(Issue.block('distribution_pending_missing',
+                    f'待分配项「{name}」必须在 report.pending 中定义；同名 totals 汇总不能替代待分配金额', where))
+            elif contract.rounding != 'after_sum' and item.level != contract.level:
+                issues.append(Issue.block('distribution_pending_missing', f'待分配项「{name}」与对账层级不同', where))
+            elif not item.sources:
+                issues.append(Issue.block('distribution_pending_source', f'待分配项「{name}」缺少原文依据', where))
     return issues
 
 
