@@ -97,7 +97,8 @@ def test_legacy_failure_returns_executable_source_based_repair(tmp_path):
 def test_task_routes_explicit_coefficient_intent_and_keeps_amount_algorithm_gate(tmp_path):
     ws,args=workspace(tmp_path)
     ws.plan_calculation('核对原文区间系数',['系数表'],{'rules.pptx':'rule'},['S'])
-    ws.plan_formula_tasks([{'id':'coef','scheme':'S','target':'/tables/coefficient','title':'指标区间系数表'}])
+    ws.plan_formula_tasks([{'id':'coef','scheme':'S','target':'/tables/coefficient','title':'指标区间系数表'},
+                           {'id':'pool','scheme':'S','target':'/pool','depends_on':['coef']}])
     from bonus_agent.construction import TaskBoard
     assert 'compile_coefficient_table' in TaskBoard(ws).summary()['next']
     ws.compile_coefficient_table(**args)

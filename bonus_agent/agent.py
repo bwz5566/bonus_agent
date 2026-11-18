@@ -1573,12 +1573,17 @@ class Workspace:
             raise ToolError(str(exc)) from None
 
     def compile_table(self, name: str, rows: list[dict], scheme: str | None = None,
-                      kind: str = "tier", mode: str | None = None, applies_when: str = "",
-                      lower_inclusive: bool = True, below_first: str = "zero", cells_from: dict | None = None,
+                      kind: str | None = None, mode: str | None = None, applies_when: str | None = None,
+                      lower_inclusive: bool | None = None, below_first: str | None = None, cells_from: dict | None = None,
                       algorithm_basis: dict | None = None) -> str:
         """Compile table cells from registered facts instead of retyping business numbers."""
+        import copy
+        owner = self._scheme(scheme, for_write=True)
+        existing = self._merged(owner).get('tables', {}).get(name, {})
+        kind = kind if kind is not None else existing.get('kind', 'tier')
         if kind not in ("tier", "lookup") or not rows:
             raise ToolError("compile_table 需要非空 rows，kind 为 tier 或 lookup")
+        prior = existing if existing.get('kind') == kind else {}
         if algorithm_basis:
             from bonus_agent.semantics import mode_basis
             try:
@@ -1592,9 +1597,9 @@ class Workspace:
             if mode is not None and mode != expected:
                 raise ToolError(f'algorithm.mode：所选{mode}与引用原文要求{expected}不一致；本次未保存。按原文重编')
             mode = expected
-        mode = mode or 'whole'
+        mode = mode if mode is not None else prior.get('mode', 'whole')
         escape = lambda s: str(s).replace('~', '~0').replace('/', '~1')
-        bindings, sources = [], []
+        bindings, sources = [], copy.deepcopy(prior.get('sources', []))
         if cells_from is not None:
             if not isinstance(cells_from, dict) or {"file", "page", "table"} - set(cells_from):
                 raise ToolError("parameter.ref：cells_from 要写 {file, page, table}")
@@ -1618,10 +1623,15 @@ class Workspace:
                 sources.append(source)
             return str(fx.numeric(f))
 
-        table = {"kind": kind, "applies_when": applies_when}
+        # Rebuilding row values must not reset an existing table's independently
+        # confirmed policy. Explicit False/empty arguments still override it.
+        table = {k: copy.deepcopy(v) for k, v in prior.items() if k not in ('steps', 'mapping', 'sources')}
+        table.update(kind=kind, applies_when=applies_when if applies_when is not None else prior.get('applies_when', ''))
         prefix = '/tables/' + escape(name)
         if kind == "tier":
-            table.update(mode=mode, lower_inclusive=lower_inclusive, below_first=below_first, steps=[])
+            table.update(mode=mode,
+                         lower_inclusive=lower_inclusive if lower_inclusive is not None else prior.get('lower_inclusive', True),
+                         below_first=below_first if below_first is not None else prior.get('below_first', 'zero'), steps=[])
             for i, row in enumerate(rows):
                 ref = row.get("lower")
                 if (cells_from and ref and not any(f.name == ref for f in self.facts)
@@ -1659,6 +1669,14 @@ class Workspace:
             if any(Decimal(a[0]) >= Decimal(b[0]) for a, b in zip(table['steps'], table['steps'][1:])):
                 raise ToolError('parameter.order：档位下界必须严格递增，本次未保存表或绑定；核对档位列与比例列，'
                                 '不要把新项目比例当下界、老项目比例当取值。按原文档位从小到大列出rows')
+            if prior.get('step_inclusive'):
+                old_lowers = [Decimal(str(row[0])) for row in prior.get('steps', [])]
+                new_lowers = [Decimal(str(row[0])) for row in table['steps']]
+                if (old_lowers != new_lowers or lower_inclusive is not None and
+                        any(value != lower_inclusive for value in prior['step_inclusive'])):
+                    raise ToolError('algorithm.boundary：既有step_inclusive逐档边界不能套用到变更后的档位或全局边界；'
+                                    '本次未保存。按原文重建逐档边界；指标系数表使用compile_coefficient_table，'
+                                    '金额表用set_rules同时明确steps和step_inclusive，不能静默清空边界政策')
         else:
             table["mapping"] = {}
             for row in rows:
@@ -1668,14 +1686,15 @@ class Workspace:
                 table["mapping"][key] = take(row["value"], prefix+'/mapping/'+escape(key))
         table["sources"] = sources
         if algorithm_basis:
-            table['sources'].append({'doc':algorithm_basis['file'], 'quote':algorithm_basis['quote'], 'page':algorithm_basis.get('page')})
+            basis_source = {'doc':algorithm_basis['file'], 'quote':algorithm_basis['quote'], 'page':algorithm_basis.get('page')}
+            if basis_source not in table['sources']:
+                table['sources'].append(basis_source)
         out = self.set_rules(scheme=scheme, tables={name: table})
         # 重编同一张表时，上一版自动建的绑定要先去掉：实测首档先写了 R1C2（“<25%”）后改成 0，
         # R1C2 仍绑在 steps/0/0 上，编译公式一直报“与原文 25% 不一致”
         mine = self._scheme(scheme, for_write=True) + '::' + prefix + '/'
         for f in self.facts:
-            if any(t.startswith(mine) for t in f.targets):
-                f.targets = [t for t in f.targets if not t.startswith(mine)]
+            f.targets = [t for t in f.targets if not t.startswith((mine + 'steps/', mine + 'mapping/'))]
         for f, candidate, path in bindings:
             f.component, f.unit = candidate.component, candidate.unit
             if path not in f.targets:
@@ -1756,13 +1775,17 @@ class Workspace:
                 if (self.report_required and report.people and report.totals and
                         self._ruleset(scheme).pool.scope != "global" and not report.distributions):
                     gaps.append(f"方案「{scheme}」缺少 report.distributions：在奖金池层用原文应分配总额，对账分配池与已列示 pending；不能只对账总额=正常+暂扣")
-                for item in [*report.balances, *report.pending, *report.distributions, *report.details]:
-                    if not item.sources:
-                        gaps.append(f"{item.name} 缺少原文依据")
-                    for source in item.sources:
-                        bad = cl.check_quote(source.doc, source.quote, self._corpus())
-                        if bad:
-                            gaps.append(f"{item.name}：{bad}")
+                from bonus_agent.source_diagnostics import report_source_issue
+                for section in ('balances', 'pending', 'distributions', 'details'):
+                    for index, item in enumerate(getattr(report, section)):
+                        if not item.sources:
+                            gaps.append(report_source_issue(self, scheme, section, index, item,
+                                                            'source.required', '缺少原文依据'))
+                        for source_index, source in enumerate(item.sources):
+                            bad = cl.check_quote(source.doc, source.quote, self._corpus())
+                            if bad:
+                                gaps.append(report_source_issue(self, scheme, section, index, item,
+                                                                'source.quote', bad, source_index=source_index))
         return gaps
 
     # ---- 条款清单 ----

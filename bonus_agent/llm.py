@@ -118,6 +118,15 @@ class _PresendProbe:
     malformed trace disables the proof. No request data enters diagnostics.
     """
     STAGES = {'connection.connect_tcp', 'connection.start_tls'}
+    # Diagnostic-only names: accepting an event here grants no retry authority.
+    TRACE_EVENTS = frozenset(f'{stage}.{transition}' for stage in (
+        'connection.connect_tcp', 'connection.connect_unix_socket', 'connection.start_tls',
+        'proxy.start_tls', 'http11.send_request_headers', 'http11.send_request_body',
+        'http11.receive_response_headers', 'http11.receive_response_body', 'http11.response_closed',
+        'http2.send_connection_init', 'http2.send_request_headers', 'http2.send_request_body',
+        'http2.receive_response_headers', 'http2.receive_response_body',
+        'http2.receive_remote_settings', 'http2.response_closed',
+    ) for transition in ('started', 'complete', 'failed'))
 
     def __init__(self):
         self.installed = False
@@ -130,6 +139,8 @@ class _PresendProbe:
         self.failed_exception = None
         self.failure_causes = ()
         self.failure_count = 0
+        self.trace_events = []
+        self.trace_events_truncated = False
 
     def install(self, client):
         try:
@@ -161,6 +172,12 @@ class _PresendProbe:
 
     def on_trace(self, event, info):
         try:
+            # Record before fail-closed branches so CONNECT -> proxy TLS errors
+            # stay diagnosable. Never copy info or stringify unknown event data.
+            self.trace_events.append(event if isinstance(event, str) and event in self.TRACE_EVENTS else 'unknown')
+            if len(self.trace_events) > 32:
+                del self.trace_events[16]  # first 16 + latest 16, bounded throughout the request
+                self.trace_events_truncated = True
             stage, transition = event.rsplit('.', 1)
             if '.send_' in event:
                 # started is before the write; even a failed/partial header write is unknown.
@@ -217,7 +234,8 @@ class _PresendProbe:
                 'trace_valid': self.valid, 'single_request': self.requests == 1,
                 'application_write_started': self.write_started, 'failed_stage': self.failed_stage,
                 'failure_paired': self.failure_count == 1 and self.active is None,
-                'not_sent': self.not_sent(exc) if exc is not None else False}
+                'not_sent': self.not_sent(exc) if exc is not None else False,
+                'trace_events': list(self.trace_events), 'trace_events_truncated': self.trace_events_truncated}
 
 
 THINK_BUDGET = 8192               # 百炼千问思考时每步思考 tokens 的上限

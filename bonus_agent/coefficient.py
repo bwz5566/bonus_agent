@@ -147,11 +147,13 @@ def compile_coefficients(ws, name, rows, cells_from, applies_to, scheme=None):
                     and f.source_cell and all(f.source_cell.get(k, 1) == v for k,v in {'table':cells_from['table'],**locator}.items()))
 
     scheme = clone._scheme(scheme, for_write=True)
+    prior = clone._merged(scheme).get('tables', {}).get(name, {})
+    prior = prior if prior.get('kind') == 'tier' else {}
     escape = lambda x: str(x).replace('~','~0').replace('/','~1')
     prefix = scheme + '::/tables/' + escape(name) + '/'
     for fact in clone.facts:
-        fact.targets = [t for t in fact.targets if not t.startswith(prefix)]
-    steps, inclusivity, bindings, sources = [], [], {}, []
+        fact.targets = [t for t in fact.targets if not t.startswith((prefix + 'steps/', prefix + 'mapping/'))]
+    steps, inclusivity, bindings, sources = [], [], {}, copy.deepcopy(prior.get('sources', []))
     def bind(fact, target):
         bindings.setdefault(fact.name, set(fact.targets)).add(target)
         source = {'doc':fact.file, 'page':fact.page, 'quote':fact.quote}
@@ -195,6 +197,9 @@ def compile_coefficients(ws, name, rows, cells_from, applies_to, scheme=None):
         _fail('origin：原文含非正分界点，不能用隐式0起点表示；请按原文明确定义表及未命中政策')
     table = {'kind':'tier','purpose':'coefficient','mode':'whole','steps':steps,
              'below_first':'first','step_inclusive':inclusivity,'sources':sources}
+    # Interval boundaries are regenerated from source cells, while a separate
+    # applicability condition must not disappear just because rows were rebuilt.
+    table.update({k: copy.deepcopy(prior[k]) for k in ('applies_when', 'desc') if k in prior})
     clone.set_rules(scheme=scheme, tables={name:table}, bindings=[{'name':n,'targets':sorted(ts)} for n,ts in bindings.items()])
     ws.__dict__.update(clone.__dict__)
     return {'status':'PASS','table':name,'scheme':scheme,'scope':'仅区间系数表编译；整案仍须完整编译和独立核算',

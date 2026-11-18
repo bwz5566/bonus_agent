@@ -1,5 +1,6 @@
 """Measure resolution of validation problems, rather than successful tool responses."""
 from dataclasses import dataclass, field
+import copy
 import json
 import re
 
@@ -286,6 +287,28 @@ class RepairReadBudget:
         return any(not row.get('deferred') for row in self.state['records'].values())
 
     @staticmethod
+    def native_keys(native):
+        return {fingerprint(('native', item['tool'], item.get('scheme'), obj))
+                for item in native.values() if item['tool'] != 'compile_formulas'
+                for obj in item.get('objects') or [item['tool']]}
+
+    def validated_close(self, key, verification):
+        """Archive a halted obligation only at an explicit successful check.
+
+        Disappearing native entries still remove ordinary records in observe(),
+        but absence alone never creates this proof or releases an old halt.
+        """
+        row = self.state['records'].get(key)
+        if row is None or verification.get('status') != 'PASS':
+            return
+        marker = row.get('halt_marker') or {}
+        if marker.get('id') and marker.get('record_key') == key and marker.get('subject') == row['subject']:
+            self.state.setdefault('resolved_halts', {})[marker['id']] = {
+                'halt': copy.deepcopy(marker), 'record': copy.deepcopy(row),
+                'verification': copy.deepcopy(verification)}
+        del self.state['records'][key]
+
+    @staticmethod
     def _subject(message):
         # Keep source-cell IDs (which contain ::) intact. Do not key allowances
         # by query, description, generated remedy text or workspace version.
@@ -366,9 +389,12 @@ class RepairReadBudget:
                     # even overall PASS can contain DEFERRED upstream-dependent
                     # preflights. Only this scheme's executed PASS resolves it.
                     if report.get('preflight', {}).get(runtime.group(1), {}).get('status') == 'PASS':
-                        del records[key]
+                        self.validated_close(key, {'status': 'PASS', 'kind': 'runtime', 'tool': 'compile_formulas',
+                                                   'scheme': runtime.group(1), 'phase': phase,
+                                                   'report_fingerprint': fingerprint(report)})
                 elif static_complete and row['subject'] not in issues:
-                    del records[key]
+                    self.validated_close(key, {'status': 'PASS', 'kind': 'static', 'tool': 'compile_formulas',
+                                               'phase': phase, 'report_fingerprint': fingerprint(report)})
             attempted_steps = steps if attempts is None else attempts
             attempted = set().union(*(self._write_objects(step) for step in attempted_steps)) if attempted_steps else set()
             if phase in self.state['seen_compile'] and report['status'] == 'FAIL' and attempted:

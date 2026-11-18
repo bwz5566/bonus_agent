@@ -337,7 +337,20 @@ class RecoveryJournal:
         marker = self.state.get('read_budget_halt') or {}
         if halted and marker.get('halt_fingerprint') == fingerprint(halted):
             from bonus_agent.progress import RepairReadBudget, repair_deferred
-            row = self.state.get('repair_reads', {}).get('records', {}).get(marker.get('record_key'))
+            reads = self.state.get('repair_reads', {})
+            resolved = reads.get('resolved_halts', {}).get(marker.get('id')) or {}
+            resolved = resolved if isinstance(resolved, dict) else {}
+            evidence = resolved.get('record') or {}
+            evidence = evidence if isinstance(evidence, dict) else {}
+            verification = resolved.get('verification') or {}
+            verification = verification if isinstance(verification, dict) else {}
+            if (marker.get('id') and resolved.get('halt') == marker and evidence.get('halt_marker') == marker
+                    and evidence.get('subject') == marker.get('subject')
+                    and isinstance(evidence.get('reads'), int) and evidence['reads'] >= RepairReadBudget.LIMIT
+                    and verification.get('status') == 'PASS' and verification.get('kind') in ('native', 'static', 'runtime')
+                    and verification.get('tool') and verification.get('report_fingerprint')):
+                return ''  # a verified closure archives this exact stop, not a future recurrence
+            row = reads.get('records', {}).get(marker.get('record_key'))
             if (row and row.get('subject') == marker.get('subject') and row.get('reads', 0) >= RepairReadBudget.LIMIT
                     and repair_deferred(self.state.get('repair_scope'), row['subject'], row.get('phase'))):
                 return ''  # the halt itself and its original allowance remain persisted
@@ -394,6 +407,20 @@ class RecoveryJournal:
                 key, subject = matches[0]
                 self.state['read_budget_halt'] = {'record_key': key, 'subject': subject,
                                                   'halt_fingerprint': fingerprint(halted)}
+        self._tag_read_halt()
+
+    def _tag_read_halt(self):
+        """Attach the current stop identity to its still-present budget record."""
+        marker = self.state.get('read_budget_halt') or {}
+        row = self.state.get('repair_reads', {}).get('records', {}).get(marker.get('record_key'))
+        if (not row or marker.get('halt_fingerprint') != fingerprint(self.state.get('halted', ''))
+                or row.get('subject') != marker.get('subject')):
+            return
+        if not marker.get('id'):
+            serial = self.state.get('read_halt_sequence', 0) + 1
+            self.state['read_halt_sequence'] = serial
+            marker['id'] = str(serial)
+        row['halt_marker'] = copy.deepcopy(marker)
 
     def observe_native_feedback(self, tool, args, result, ok):
         """Keep explicit failures pending across reads/resumes until program validation resolves them."""
@@ -402,6 +429,8 @@ class RecoveryJournal:
             return False  # only the binding endpoint's complete revalidation is evidence of resolution
         pending = self.state.setdefault('native_repairs', {})
         previous = set(pending)
+        from bonus_agent.progress import RepairReadBudget
+        previous_records = RepairReadBudget.native_keys(pending)
         if ok:
             completed = set(_repair_objects(args))
             phase = _feedback_phase(result)
@@ -457,6 +486,14 @@ class RecoveryJournal:
             item['phase'] = _feedback_phase(result)
             key = fingerprint([item['tool'], item['code'], item['objects']])
             pending[key] = item
+        if ok:
+            verified = previous_records - RepairReadBudget.native_keys(pending)
+            if verified:
+                budget = RepairReadBudget(self.state.setdefault('repair_reads', {}))
+                for key in verified:
+                    budget.validated_close(key, {'status': 'PASS', 'kind': 'native', 'tool': tool,
+                                                 'args_fingerprint': fingerprint(args),
+                                                 'report_fingerprint': fingerprint(result)})
         if pending or previous:
             self.save()
         return set(pending) != previous
@@ -488,6 +525,7 @@ class RecoveryJournal:
             self.state['read_budget_halt'] = {'record_key': repair_read['record_key'],
                                               'subject': repair_read['subject'],
                                               'halt_fingerprint': fingerprint(self.state['halted'])}
+            self._tag_read_halt()
         self.save()
 
     def claim_advice(self, issue):
