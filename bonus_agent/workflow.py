@@ -170,6 +170,10 @@ class Workflow:
                 ws = self.basis_view()
                 from bonus_agent.construction import TaskBoard
                 required = TaskBoard(self.ws).required('basis')
+                if self.state.get('plan', {}).get('output_targets'):
+                    # Distribution expressions are otherwise projected out. Removing a
+                    # promised output must invalidate an earlier structure check.
+                    body['missing_outputs'] = TaskBoard(self.ws).output_obligations('basis')
                 # Evidence omitted from executable rules still invalidates old PASS receipts.
                 # Hash source/target identities, never presentation text from diagnostics.
                 body['phase_binding_evidence'] = ws._phase_binding_evidence
@@ -215,7 +219,7 @@ class Workflow:
     def skipped(self):
         return {x['ref'] for x in self.state.get('plan', {}).get('ignored', [])} if self.has_plan() else set()
 
-    def plan(self, summary, outputs, files, schemes, ignored=None):
+    def plan(self, summary, outputs, files, schemes, ignored=None, output_targets=None):
         known = {p.name for p in self.ws.inv.files}
         if not summary.strip() or not outputs or not schemes or len(set(schemes)) != len(schemes):
             fail('计划须包含任务说明、非空输出清单和不重复的方案名')
@@ -238,6 +242,11 @@ class Workflow:
                 f'plan.ignore_role：ignored中用途不为ignore的文件及实际用途={extra}；缺少忽略依据={missing}。'
                 'reference保留作参考时从ignored删除；真正不参与时才分类为ignore并写依据。两处必须一致'
             )
+        if output_targets is None:
+            output_targets = self.state.get('plan', {}).get('output_targets')
+        if output_targets is not None:
+            from bonus_agent.construction import validate_output_targets
+            output_targets = validate_output_targets(outputs, schemes, output_targets)
         self.state['plan'] = {
             'summary': summary,
             'outputs': outputs,
@@ -246,6 +255,8 @@ class Workflow:
             'ignored': ignored,
             'files_version': fingerprint(self.ws._source_version),
         }
+        if output_targets is not None:
+            self.state['plan']['output_targets'] = output_targets
         return {'status': 'PASS', 'plan': self.state['plan'], 'next': self.hint()}
 
     def rule_requirements(self):

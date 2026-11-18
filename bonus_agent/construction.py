@@ -8,6 +8,51 @@ from bonus_agent.recovery import fingerprint
 from bonus_core.dsl.parser import parse, walk, Name, ExprError, Num
 
 ROOTS = {'tables', 'variables', 'pool', 'allocation', 'report', 'payout', 'offsets', 'checks'}
+REPORT_ROWS = {'totals', 'details', 'pending', 'balances', 'distributions'}
+
+
+def validate_output_targets(outputs, schemes, targets):
+    """Optional promises of report fields, separate from calculation task declarations."""
+    from bonus_agent.agent import ToolError
+    if not isinstance(targets, dict) or set(targets) != set(outputs):
+        raise ToolError('plan.output_targets：请为每项输出提供至少一个实际报表位置，键名须与outputs一致')
+    for name, pointers in targets.items():
+        if not isinstance(pointers, list) or not pointers or not all(isinstance(p, str) for p in pointers):
+            raise ToolError(f'plan.output_targets：{name}须提供非空的报表位置列表')
+        for pointer in pointers:
+            scheme, path = fx.split_target(pointer)
+            parts = fx.target_parts(path)
+            if (scheme not in schemes or not path.startswith('/report/') or len(parts) not in (2, 3)
+                    or not all(p.strip() for p in parts)
+                    or not (parts[1] in REPORT_ROWS or parts[1:] == ['people'])):
+                raise ToolError(f'plan.output_targets：无法识别{pointer}；使用计划中的方案::/report/people、'
+                                '方案::/report/totals 或 方案::/report/details/明细名称 等报表位置')
+    return {k: list(dict.fromkeys(v)) for k, v in targets.items()}
+
+
+def _has_output(report, target):
+    _, field, *named = fx.target_parts(target)
+    if not isinstance(report, dict):
+        return False
+    value = report.get(field)
+    if field == 'people':
+        return isinstance(value, str) and bool(value.strip())
+    if not isinstance(value, list) or not value:
+        return False
+    if any(not isinstance(row, dict) for row in value):
+        return False
+    rows = [row for row in value if not named or row.get('name') == named[0]]
+    if not rows or (named and len(rows) != 1):
+        return False
+    fields = ('name', 'level', 'total' if field in ('balances', 'distributions') else 'expr')
+    for row in rows:
+        if not all(isinstance(row.get(k), str) and row[k].strip() for k in fields):
+            return False
+        if field == 'balances':
+            parts = row.get('parts')
+            if not isinstance(parts, list) or not parts or not all(isinstance(p, str) and p.strip() for p in parts):
+                return False
+    return True
 
 
 def _semantic(value):
@@ -380,13 +425,44 @@ class TaskBoard:
                     and not (previous.get('version') == status['version'] and previous.get('status') == 'FAIL')):
                 self.check(name, include_next=False)
 
+    def output_obligations(self, phase='basis'):
+        """Executable plan structure still missing, including reports deferred from basis evaluation."""
+        plan = self.ws.workflow.get('plan', {})
+        owned = {(s['scheme'], s['target']) for s in self.state['tasks'].values()}
+        obligations = []
+        roots = ['/allocation', '/pool'] if phase == 'all' else ['/pool']
+        if self.ws.report_required:
+            roots.append('/report')
+        for scheme in plan.get('schemes', []):
+            for target in roots:
+                if (scheme, target) not in owned:
+                    obligations.append({'output': '', 'scheme': scheme, 'target': target,
+                                        'task_target': target, 'kind': 'missing_task'})
+        for output, pointers in plan.get('output_targets', {}).items():
+            for pointer in pointers:
+                scheme, target = fx.split_target(pointer)
+                if (scheme, '/report') not in owned:
+                    kind = 'missing_task'
+                elif not _has_output(self.ws._merged(scheme).get('report'), target):
+                    kind = 'missing_component'
+                else:
+                    continue
+                obligations.append({'output': output, 'scheme': scheme, 'target': target,
+                                    'task_target': '/report', 'kind': kind})
+        return obligations
+
     def coverage_gaps(self, phase=None):
         tasks = self.state['tasks']
         gaps = []
+        for row in self.output_obligations(phase or self.phase()):
+            if row['output']:
+                action = ('plan_formula_tasks登记/report任务' if row['kind'] == 'missing_task'
+                          else '完善/report任务中的实际输出定义')
+                gaps.append(f'construction.plan：交付项「{row["output"]}」缺少{row["scheme"]}::{row["target"]}；{action}')
+            else:
+                gaps.append(f'construction.plan：{row["scheme"]}缺少构建任务{row["target"]}')
         for scheme in self.ws.workflow.get('plan', {}).get('schemes', []):
             roots = {s['target'] for s in tasks.values() if s['scheme'] == scheme}
-            required = {'/pool'} | ({'/allocation'} if (phase or self.phase()) == 'all' else set()) | ({'/report'} if self.ws.report_required else set())
-            gaps += [f'construction.plan：{scheme}缺少构建任务{target}' for target in sorted(required-roots)]
             for root, value in self.ws._merged(scheme).items():
                 if root not in ROOTS or not value:
                     continue

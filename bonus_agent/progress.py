@@ -264,6 +264,47 @@ def repair_deferred(scope, subject, phase=None):
                 subject in scope.get('deferred', ()))
 
 
+class ConstructionReadBudget:
+    """Track one unbuilt plan obligation across evidence reads and agent restarts."""
+
+    WARN = 4
+    LIMIT = 8
+
+    def __init__(self, state):
+        self.state = state
+
+    @staticmethod
+    def _id(row):
+        # One missing task may own multiple outputs. Rewording their labels or
+        # adding another output with the same owner cannot buy more attempts.
+        target = row['task_target'] if row['kind'] == 'missing_task' else row['target']
+        return fingerprint((row['scheme'], target, row['kind']))
+
+    def observe(self, obligations, *, previous=None, reads=0):
+        # None means rules/data or a runtime repair take priority. Preserve the
+        # allowance until construction resumes against the actual plan.
+        if obligations is None:
+            return None
+        if not obligations:
+            self.state.clear()
+            return None
+        indexed = {self._id(row): row for row in reversed(obligations)}
+        key = self.state.get('id')
+        if key not in indexed:
+            key = self._id(obligations[0])
+            self.state.update(id=key, reads=0)
+        if key == previous:
+            self.state['reads'] += reads
+        row = indexed[key]
+        target = row['task_target'] if row['kind'] == 'missing_task' else row['target']
+        action = (f"用 plan_formula_tasks 登记 {row['scheme']}::{target} 的任务"
+                  if row['kind'] == 'missing_task' else
+                  f"用 submit_formula_task 向 {row['scheme']}::{row['task_target']} 的现有任务提交包含 {target} 的构件")
+        count = self.state['reads']
+        return {'id': key, 'halt': count >= self.LIMIT, 'warn': count >= self.WARN,
+                'message': f"当前方案交付缺口 {row['scheme']}::{target}。请{action}。该缺口已累计读取 {count}/{self.LIMIT} 次。"}
+
+
 class RepairReadBudget:
     """Bound exploration of a concrete failed repair, not initial discovery.
 

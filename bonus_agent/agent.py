@@ -574,8 +574,9 @@ class Workspace:
         from bonus_agent.workflow import Workflow
         return Workflow(self)
 
-    def plan_calculation(self, summary: str, outputs: list[str], files: dict, schemes: list[str], ignored: list[dict] | None = None):
-        return self._flow().plan(summary,outputs,files,schemes,ignored)
+    def plan_calculation(self, summary: str, outputs: list[str], files: dict, schemes: list[str],
+                         ignored: list[dict] | None = None, output_targets: dict | None = None):
+        return self._flow().plan(summary, outputs, files, schemes, ignored, output_targets)
 
     def read_workspace(self, section: str, scheme: str | None = None, offset: int = 0, limit: int = 20, name: str | None = None,
                        query: str | None = None, file: str | None = None, page: int | None = None,
@@ -4733,16 +4734,35 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                                {'files': prints, 'period': period_obj.label if period_obj else None,
                                 'answers': [(q.id, q.answer) for q in ws.questions if q.answer is not None],
                                 'code': rnd['code'], 'financial_context': ws.said})
-    from bonus_agent.progress import RepairReadBudget, repair_scope
+    from bonus_agent.progress import ConstructionReadBudget, RepairReadBudget, repair_scope
     repair_reads = RepairReadBudget(recovery.state.setdefault('repair_reads', {}))
+    construction_reads = ConstructionReadBudget(recovery.state.setdefault('construction_reads', {}))
+
+    def construction_focus(**observation):
+        from bonus_agent.construction import TaskBoard
+        if not ws.staged or ws.pending or repair_reads.active:
+            return None
+        stage, scheme = ws._flow().stage()
+        if stage != 3:
+            return None
+        obligations = TaskBoard(ws).output_obligations('all' if scheme else 'basis')
+        return construction_reads.observe(obligations, **observation)
+
+    def construction_stop(focus):
+        if focus and focus['halt']:
+            return '公式构建停滞，已停止自动接续。' + focus['message']
+        return ''
+
     recovery.set_repair_scope(repair_scope(ws))
     resumed_read_budget = repair_reads.observe([], recovery.state.get('native_repairs', {}), None, READ_ONLY,
                                              scope=recovery.state['repair_scope'])
     if resumed_read_budget['halt']:
         recovery.halt(resumed_read_budget['message'], repair_read=resumed_read_budget)
+    previous_construction_stop = (construction_stop(construction_focus())
+                                  if construction_reads.state.get('reads', 0) >= construction_reads.LIMIT else '')
     ws.notes.pop(ANSWER_NOTE, None)          # 上一轮的回答不带到这一轮
     handlers = {t["name"]: getattr(ws, t["name"]) for t in TOOLS}
-    if not run_budget.check(llm) and not recovery.error:
+    if not run_budget.check(llm) and not recovery.error and not previous_construction_stop:
         ws.transcribe_all()
         ws.triage_all()
     pack = '' if ws.staged else ("\n\n【材料包】以下是本批次材料的内容（程序读取，图片已转写），每轮都附在这里、不会被裁剪。"
@@ -4786,7 +4806,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
     carry_chars = max(CARRY_CHARS, max_history_chars // 4)
     history: list[dict] = []
     steps: list[Step] = []
-    error = run_budget.check(llm) or recovery.error
+    error = run_budget.check(llm) or recovery.error or previous_construction_stop
     nudges = 0
     seen: dict[str, int] = {}          # 只读工具的调用 -> 第几步，用来发现原地打转
     recent_reads: dict[str, tuple] = {}  # 上次清空对话以来读过的工作区内容，清空时仍没变的附在说明里
@@ -4891,11 +4911,16 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         if max_tokens and used >= max_tokens:
             error = f"tokens 用量 {used} 达到上限 {max_tokens}，已停止"
             break
+        construction = construction_focus()
+        if error := construction_stop(construction):
+            break
         ws.progress = (len(steps), max_steps)
         ws.budget = f"已用 {len(steps)} 步，上限 {max_steps} 步" + (f"；tokens 已用 {used}，上限 {max_tokens}" if max_tokens else "")
         if _shrink(history, max_history_chars):
             seen.clear()       # 较早的结果已省略，重新读取是合理的
         think = bool(deep_why) and deep_used < deep
+        if construction and construction['warn']:
+            think, deep_why = False, ''
         if recovery.native_guidance:
             ws.notes['程序修复指引'] = recovery.native_guidance
             think, deep_why = False, ''
@@ -4946,6 +4971,8 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         request_think = think or bool(getattr(llm, 'tools_thinking', False))
         request_output = max(8192, llm.think_max_tokens) if request_think else 8192
         tail = [{"role": "user", "content": ws.state() + (_deep_note(deep_why, steps) if think else "")}]
+        if construction and construction['warn']:
+            tail[0]['content'] += '\n【当前缺失的构建任务】' + construction['message']
         focus_report = current_compile_report()
         if focus_report or runtime_focus_text:
             try:
@@ -5398,6 +5425,9 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             ws.notes.pop('当前修复读取预算', None)
         if read_budget['halt']:
             recovery.halt(read_budget['message'], repair_read=read_budget)
+        if construction:
+            construction = construction_focus(previous=construction['id'],
+                                              reads=sum(st.tool in READ_ONLY for st in model_steps))
         if recovery.native_guidance:
             ws.notes['程序修复指引'] = recovery.native_guidance
             if native_changed:
@@ -5454,6 +5484,8 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         if recovery.error:
             error = recovery.error
             ws.done = False
+            break
+        if error := construction_stop(construction):
             break
         if ws.done:
             break
