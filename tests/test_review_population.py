@@ -126,6 +126,7 @@ def test_proven_identifier_spelling_keeps_alias_evidence(tmp_path):
         sheet = wb.create_sheet('sales')
         sheet.append(['pid'])
         sheet.append(['a'])
+        sheet.append(['a'])
         sheet.append(['B'])
     ws = make_workspace(tmp_path, alter)
     ws.define_dataset('sales', 'data.xlsx', 'sales', {'pid': {'column': 'pid', 'type': 'id'}}, link='pid')
@@ -135,6 +136,7 @@ def test_proven_identifier_spelling_keeps_alias_evidence(tmp_path):
     assert result['status'] == 'PASS', result
     objects = next(c for c in result['checks'] if c['scope'] == '项目')
     assert objects['verified_spelling_aliases'] == {'a': 'A'}
+    assert (objects['reference_rows'], objects['expected_count'], objects['repeated_key_rows']) == (3, 2, 1)
 
 
 def test_source_page_is_checked_when_declared(tmp_path):

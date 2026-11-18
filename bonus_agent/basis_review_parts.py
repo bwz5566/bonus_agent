@@ -160,8 +160,16 @@ class BasisReviewParts:
             part = self._part('populations', labels,
                 '输出 {"populations":{"范围名":{"dataset":"来源表","key":"对象标识字段",'
                 '"filter":{},"period":null,"window":"period","sources":[{"doc":"文件","quote":"逐字引文"}]}},"unclear":[]}。'
-                '按原始行/去重对象分别重建范围。filter 用原列名，period 为日期字段或 null，'
-                'window 可选 period/year_to_date/to_date；rows: 范围无需 key。',
+                'kind=objects 时范围名是核算层级。按原文选择能直接识别合格对象的来源数据集；'
+                '可以是业务明细或实体清单，不要求来源与层级同名或自身按该 key 唯一。'
+                '例如原文要求“当期有合格交易的门店”时，可选包含门店标识、交易日期和资格列的交易明细；'
+                'key 填该明细中的门店标识标准字段，period 填交易日期标准字段，按原文填写 filter/window。'
+                '程序从原表取行，按筛选和期间窗口取出合格行，再按 key 去重比对对象集合。'
+                'population_from 是待核生产映射，实现上述声明无需复制该字段，也不应仅因输出没有该字段就报 unclear。'
+                'kind=rows 时 dataset 必须为要求核对的来源表，按物理行比对、不去重，无需 key。'
+                'filter 用原表列名；period 填标准日期字段或明确 null，window 为 period/year_to_date/to_date。'
+                'sources 引用支持本次对象、资格或期间口径的原文。材料确有歧义、原表缺少关键字段，'
+                '或无法用以上方式表示时，说明具体缺口并保留 unclear；示例条件不能替代本批依据。',
                 {'population_requirements': {k: required[k] for k in labels}},
                 lambda value: self._validate_populations(value, labels))
             if part.get('unclear'):
