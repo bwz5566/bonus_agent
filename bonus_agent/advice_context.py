@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 MAX_CONTEXT_CHARS = 9500
+MAX_RUNTIME_NODES = 8
 
 
 def _json(value):
@@ -20,6 +21,246 @@ def _hash(value):
 
 def _dump(value):
     return value.model_dump(mode='json', exclude_defaults=True) if hasattr(value, 'model_dump') else value
+
+
+def build_runtime_focus_context(ws, report=None):
+    """Current deterministic failure, dependencies and cited physical material.
+
+    This is a primary-model input, not an adviser call or a reading/approval
+    receipt. Every excerpt comes from an already loaded authorized material;
+    references that cannot be verified remain explicit missing evidence.
+    """
+    ws._check_source_version()
+    saved = ws.workflow.get('formula_report', {})
+    phase = (report or saved.get('report', {})).get('phase', 'basis')
+    current = ws._flow().compile_feedback(phase) if ws.staged else None
+    if current is None or (report is not None and current != report):
+        return None
+    focus = next(((scheme, issue) for scheme, result in current.get('preflight', {}).items()
+                  if result.get('status') == 'FAIL' for issue in result.get('issues', [])
+                  if isinstance(issue, dict) and issue.get('node_id')
+                  and (issue.get('target') or issue.get('rule_item'))), None)
+    if focus is None:
+        return None
+    scheme, issue = focus
+    draft = ws._merged(scheme)
+    from bonus_agent.facts import norm, target_parts, target_value
+    from bonus_core.dsl.parser import ExprError, names, parse
+
+    def pointer(part):
+        return str(part).replace('~', '~0').replace('/', '~1')
+
+    def component(item):
+        """Resolve program identities without guessing names from error prose."""
+        if not isinstance(item, str):
+            return None
+        if item.startswith('/'):
+            try:
+                parts = target_parts(item)
+            except ValueError:
+                return None
+            if not parts:
+                return None
+            if parts[0] in ('variables', 'tables'):
+                parts = parts[:2]
+            elif parts[0] == 'report':
+                parts = parts[:2]
+            elif parts[0] in ('pool', 'checks'):
+                parts = parts[:1]
+            else:
+                return None
+            path = '/' + '/'.join(pointer(p) for p in parts)
+        elif item in draft.get('variables', {}):
+            path = '/variables/' + pointer(item)
+        elif item in draft.get('tables', {}):
+            path = '/tables/' + pointer(item)
+        elif item == 'pool':
+            path = '/pool'
+        elif item.startswith('checks.'):
+            path = '/checks'
+        elif item.startswith('report.'):
+            path = '/report/' + pointer(item.split('.')[1])
+        elif item == 'basis':
+            path = '/report/totals'
+        else:
+            return None
+        try:
+            value = target_value(draft, path)
+        except (KeyError, IndexError, TypeError, ValueError):
+            return None
+        if path == '/checks' and issue.get('rule_item', '').startswith('checks.'):
+            ident = issue['rule_item'][7:]
+            value = [v for v in value if isinstance(v, dict) and v.get('id') == ident]
+        return path, value
+
+    root = component(issue.get('target')) or component(issue.get('rule_item'))
+    if root is None:
+        return None
+    packet = {
+        'kind': 'runtime_repair_focus', 'phase': phase, 'scheme': scheme,
+        'version': saved.get('phase_version') or saved.get('version'),
+        'failure': {k: issue[k] for k in ('code', 'message', 'node_id', 'node_scope', 'rule_item',
+                    'target', 'source', 'formula', 'evidence_kind') if k in issue},
+        'current_nodes': [], 'source_references': [], 'source_excerpts': [], 'omitted': [],
+        'limits': {'max_chars': MAX_CONTEXT_CHARS, 'max_nodes': MAX_RUNTIME_NODES, 'truncated': False},
+        'meaning': ('程序附上的当前失败及相关定义、既有任务和来源摘录；不是新工具读取、读取回执、业务批准或修复结论。'
+                    'source_references只是当前规则声明的引用；仅source_excerpts中verified原文表示本包已核对。'
+                    '结合所有来源判断旧规则与本案细化是否一致；摘录不是完整文档，省略不代表缺失。'
+                    '任务卡active为空或任务以前通过，不代表不能修复已有构件；按当前工具权限优先使用已有任务ID，勿重复建任务。'
+                    '保存后仍须真实执行及独立金额核验。'),
+    }
+    omitted = []
+
+    def add(section, value, reserve=0):
+        packet[section].append(value)
+        if len(_json(packet)) + reserve <= MAX_CONTEXT_CHARS - 800:
+            return True
+        packet[section].pop()
+        omitted.append({'section': section, 'target': value.get('target'), 'file': value.get('file'),
+                        'reason': '完整内容超过剩余空间，未截断公式或条件'})
+        return False
+
+    # Keep the exact failure as a whole, or its structured identity and address.
+    if len(_json(packet)) > 2400:
+        packet['failure'] = {k: issue[k] for k in ('code', 'node_id', 'rule_item', 'target') if k in issue}
+        omitted.append({'section': 'failure', 'read_call': {
+            'tool': 'read_workspace', 'args': {'section': 'checks', 'name': 'preflight:' + scheme}}})
+
+    def expressions(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in ('expr', 'applies_when', 'total', 'weight', 'hold_ratio', 'pay_ratio', 'people') and isinstance(child, str):
+                    yield child
+                elif key in ('parts', 'pending') and isinstance(child, list):
+                    yield from (expr for expr in child if isinstance(expr, str))
+                elif key not in ('sources', 'desc', 'notes', 'algorithm_basis'):
+                    yield from expressions(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from expressions(child)
+
+    def citations(value):
+        if isinstance(value, dict):
+            for source in value.get('sources', []):
+                if isinstance(source, dict) and source.get('doc') and source.get('quote'):
+                    yield source
+            for key, child in value.items():
+                if key != 'sources':
+                    yield from citations(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from citations(child)
+
+    def semantic(value):
+        if isinstance(value, dict):
+            return {k: semantic(v) for k, v in value.items()
+                    if k not in ('sources', 'desc', 'notes', 'algorithm_basis')}
+        return [semantic(v) for v in value] if isinstance(value, list) else value
+
+    tasks = ws.workflow.get('construction', {}).get('tasks', {})
+    pending, visited, sources = [root], set(), []
+    while pending and len(visited) < MAX_RUNTIME_NODES:
+        path, value = pending.pop(0)
+        if path in visited:
+            continue
+        visited.add(path)
+        task_ids = [ident for ident, task in tasks.items() if isinstance(task, dict)
+                    and task.get('scheme') == scheme
+                    and (task.get('target') == path or str(task.get('target', '')).startswith(path + '/')
+                         or (isinstance(task.get('target'), str) and task['target'].startswith('/')
+                             and path.startswith(task['target'] + '/')))]
+        node = {'target': scheme + '::' + path, 'task_ids': task_ids,
+                'definition': semantic(value), 'source_refs': []}
+        for source in citations(value):
+            reference = {k: source[k] for k in ('doc', 'page', 'quote') if k in source}
+            if reference not in sources:
+                sources.append(reference)
+            node['source_refs'].append(sources.index(reference) + 1)
+        if not add('current_nodes', node, reserve=3500):
+            continue
+        refs = set()
+        for expr in expressions(value):
+            try:
+                refs.update(names(parse(expr)))
+            except ExprError:
+                omitted.append({'section': 'dependencies', 'target': scheme + '::' + path,
+                                'reason': '表达式尚不能解析，未猜测依赖'})
+        for ref in sorted(refs):
+            found = component(ref)
+            if found and found[0] not in visited and all(found[0] != p[0] for p in pending):
+                pending.append(found)
+    if pending:
+        omitted.append({'section': 'dependencies', 'remaining': len(pending), 'reason': '有界依赖，其他项未宣称已核查'})
+
+    # Group all cited files before selecting excerpts: an old rule and a later
+    # refinement each receive a chance, rather than one file consuming space.
+    files = {}
+    for index, source in enumerate(sources, 1):
+        add('source_references', {'id': index, **source, 'declared_reference_only': True}, reserve=2200)
+        files.setdefault((source['doc'], source.get('page')), []).append((index, source))
+    physical = {f.name for f in ws.inv.files}
+    excerpts = {}
+    for (file, page), refs in files.items():
+        if file not in physical:
+            omitted.append({'section': 'sources', 'file': file, 'reason': '不是已加载的实体材料，未当作已核对原文'})
+            continue
+        # _lines reads original material without read_document/read_sheet, so
+        # no tool history, doc_reads, budget counter or approval is fabricated.
+        if page is not None:
+            raw = ws._page_raw(file).get(page)
+            if raw is None:
+                omitted.append({'section': 'sources', 'file': file, 'page': page,
+                                'reason': '指定页不存在或没有可核对文字，未用其他页冒充'})
+                continue
+            lines = raw.splitlines()
+        else:
+            lines = ws._lines(file)
+        normalized = [norm(line) for line in lines]
+        text, ends = '', []
+        for line in normalized:
+            text += line
+            ends.append(len(text))
+        spans = []
+        import bisect
+        for index, source in refs:
+            quote = norm(source['quote'])
+            start = text.find(quote) if quote else -1
+            if start < 0:
+                omitted.append({'section': 'sources', 'file': file, 'source_ref': index,
+                                'reason': '引用未在当前原文核对上，不能当作证据'})
+                continue
+            a = bisect.bisect_right(ends, start)
+            b = bisect.bisect_left(ends, start + len(quote))
+            lo, hi = max(0, a - 1), min(len(lines), b + 2)
+            spans.append((lo, hi, index))
+        merged = []
+        for lo, hi, index in sorted(spans):
+            if merged and lo <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], hi)
+                merged[-1][2].append(index)
+            else:
+                merged.append([lo, hi, [index]])
+        excerpts[(file, page)] = [{'file': file, 'page': page, 'source_refs': ids, 'line_start': lo + 1,
+                           'line_end': hi, 'text': '\n'.join(lines[lo:hi]),
+                           'verified_in_current_material': True,
+                           'match': '逐字内容按现有引用规则忽略空白、全半角及标点核对；展示的是原文',
+                           'is_excerpt': True, 'not_a_read_receipt': True}
+                          for lo, hi, ids in merged]
+    # Round-robin by file preserves competing/refining sources. Whole lines
+    # and adjacent context stay together; oversized spans are explicit omissions.
+    while any(excerpts.values()):
+        for file, values in excerpts.items():
+            if values:
+                add('source_excerpts', values.pop(0))
+    packet['limits']['truncated'] = bool(omitted)
+    packet['limits']['omitted_count'] = len(omitted)
+    packet['omitted'] = omitted[:4]
+    # Reads, counters and unrelated version changes are not a new failure.
+    packet['fingerprint'] = _hash({k: packet[k] for k in
+        ('phase', 'scheme', 'failure', 'current_nodes', 'source_references', 'source_excerpts')})
+    if len(_json(packet)) > MAX_CONTEXT_CHARS:
+        raise ValueError('运行失败聚焦包超过上限；未调用模型，不能静默截断公式或来源条件')
+    return packet
 
 
 def build_advice_context(ws, steps, report=None):

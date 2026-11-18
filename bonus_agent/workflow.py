@@ -683,9 +683,15 @@ class Workflow:
                 return None
             return {
                 'name': getattr(model, 'name', ''), 'model': getattr(model, 'model', ''),
-                # Store a configuration digest, never credentials or endpoint secrets.
+                # Include request limits: increasing a truncated review's output
+                # allowance must not reuse its old response or retry allowance.
+                # Only stable configuration belongs here, not discovered provider
+                # limits or usage. Store a digest, never credentials or endpoint secrets.
                 'configuration': fingerprint({k: getattr(model, k, None) for k in
-                                              ('base_url', 'think_body', 'extra_body', 'json_mode')}),
+                                              ('base_url', 'think_body', 'extra_body', 'json_mode',
+                                               'think_max_tokens', 'think_timeout', 'timeout',
+                                               'think_echo', 'cache', 'max_input_tokens',
+                                               'min_request_seconds')}),
                 'think_route': model_identity(getattr(model, 'think_llm', None), (*seen, id(model))),
             }
 

@@ -4810,11 +4810,12 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
     reached = ws.phase()               # 本轮到过的最远阶段：往前推进到新阶段时清空对话历史；改规则退回前面的阶段再回来不清
     reached_focus=ws._flow().stage() if ws.staged else None
     deep_why, deep_used = "", 0        # 下一步要深度思考的原因（空：普通模式）；本轮已用的深度思考步数
-    from bonus_agent.progress import ProgressWatch, discover
+    from bonus_agent.progress import ProgressWatch, discover, fingerprint
     saved_progress = recovery.state.get('progress', {})
     progress_watch = ProgressWatch(set(saved_progress.get('previous', [])), saved_progress.get('stagnant', 0),
                                    saved_progress.get('compile', {}))
     discovered_reads = set(saved_progress.get('reads', []))
+    runtime_focus_version, runtime_focus_text = None, ''
 
     def current_compile_report():
         if not ws.staged:
@@ -4945,6 +4946,30 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         request_think = think or bool(getattr(llm, 'tools_thinking', False))
         request_output = max(8192, llm.think_max_tokens) if request_think else 8192
         tail = [{"role": "user", "content": ws.state() + (_deep_note(deep_why, steps) if think else "")}]
+        focus_report = current_compile_report()
+        if focus_report or runtime_focus_text:
+            try:
+                ws._check_source_version()
+            except ToolError as exc:
+                error = f'当前运行失败证据已失效：{exc}；未发送本次模型请求。'
+                break
+        focus_version = fingerprint((focus_report, ws.workflow.get('formula_report', {}).get('phase_version'),
+                                     ws.workflow.get('formula_report', {}).get('version')))
+        if focus_version != runtime_focus_version:
+            from bonus_agent.advice_context import build_runtime_focus_context
+            try:
+                focus_packet = build_runtime_focus_context(ws, focus_report) if focus_report else None
+            except (ToolError, ValueError) as exc:
+                error = f'当前运行失败证据包无法安全构建：{exc}；未发送本次模型请求。'
+                break
+            runtime_focus_text = ('【当前运行失败聚焦包；程序附加，不计工具读取】'
+                                  + json.dumps(focus_packet, ensure_ascii=False, default=str)) if focus_packet else ''
+            runtime_focus_version = focus_version
+        if runtime_focus_text:
+            # One current packet per request, outside growing history. Reads do
+            # not append duplicates, and compaction cannot discard the only
+            # copy of the failed component and its existing repair task IDs.
+            tail.append({'role': 'user', 'content': runtime_focus_text})
         # 缓存标记：系统提示 + 任务固定不变；历史在两次整理之间只追加，标在历史最后一条上
         body = [{"role": "user", "content": task, "_cache": True}] + history[:-1] \
             + ([{**history[-1], "_cache": True}] if history else [])

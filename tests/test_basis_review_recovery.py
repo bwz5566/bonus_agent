@@ -126,6 +126,43 @@ def test_same_checker_thinking_change_invalidates_reference_cache(tmp_path):
     assert len(checker.calls) == 2
 
 
+def test_larger_review_output_retries_truncation_without_erasing_old_attempts(tmp_path):
+    ws, good = setup_review(tmp_path)
+    checker = FakeLLM(['{"pool":', '{"pool":', json.dumps(good)], name='checker')
+    checker.think_body = {'thinking': {'type': 'enabled'}}
+    checker.think_max_tokens = 8192
+    ws.llm.checker_llm = checker
+    for _ in range(2):
+        with pytest.raises(ToolError, match='无法解析'):
+            ws.review_basis('S')
+    old_signature = ws.workflow['references']['S']['input_signature']
+    with pytest.raises(ToolError, match='已达预算'):
+        ws.review_basis('S')
+    checker.think_max_tokens = 16384
+    assert ws.review_basis('S')['status'] == 'PASS'
+    assert old_signature != ws.workflow['references']['S']['input_signature']
+    assert sorted(ws.workflow['attempts'].values()) == [1, 2]
+    assert len(checker.calls) == 3
+    assert len(checker.calls[2]) == len(checker.calls[0])
+    assert ws.review_basis('S')['cached'] and len(checker.calls) == 3
+
+
+def test_discovered_provider_metadata_does_not_resample_a_valid_disagreement(tmp_path):
+    ws, good = setup_review(tmp_path)
+    different = copy.deepcopy(good)
+    different['pool'] = 'amount * 0.2'
+    checker = FakeLLM([json.dumps(different), json.dumps(good)], name='checker')
+    ws.llm.checker_llm = checker
+    assert ws.review_basis('S')['status'] == 'FAIL'
+    old_signature = ws.workflow['references']['S']['input_signature']
+    checker._ctx, checker._max_output_tokens = 128000, 32000
+    checker._context_token_ratio = 1.1
+    again = ws.review_basis('S')
+    assert again['status'] == 'FAIL' and again['cached']
+    assert ws.workflow['references']['S']['input_signature'] == old_signature
+    assert len(checker.calls) == 1
+
+
 def test_new_checker_cannot_use_an_old_pass_fast_path(tmp_path):
     ws, good = setup_review(tmp_path)
     assert ws.review_basis('S')['status'] == 'PASS'

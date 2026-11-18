@@ -140,6 +140,18 @@ def _ask(ws, msgs: list[dict]) -> str:
         except LLMError as e:
             ws.checker_down = (f"交叉验证模型 {other.name} 调用失败（{str(e)[:120]}）" +
                                ('，关键复核阻断' if getattr(ws.llm, 'checker_required', False) else f'，改用主模型 {ws.llm.name} 验证'))
+            if not getattr(ws.llm, 'checker_required', False):
+                try:
+                    # The fallback may have a different context/output allowance
+                    # and minimum request window from the failed reviewer.
+                    guard_request(ws, msgs)
+                except RunBudgetError as stop:
+                    # This marker can describe the unsent fallback only; the
+                    # checker was already attempted in this review invocation.
+                    # Do not refund the whole review attempt in workflow.
+                    if getattr(stop, 'request_not_sent', False):
+                        stop.request_not_sent = False
+                    raise
     if getattr(ws.llm, 'checker_required', False):
         if other is None:
             raise LLMError('关键复核模型未配置；独立复核不能标记通过')
