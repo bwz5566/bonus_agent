@@ -25,6 +25,13 @@ def test_tier_and_lookup_text():
     assert rv.lookup_text({"mapping": {"东区": 1.1}}) == "东区 → 1.1；表里没有的取值会报错停下"
 
 
+def test_single_value_reading_preserves_dataset_filter_and_failure_contract():
+    assert rv.plain('single_value(region, of: "明细", where: status == "已审批")', NM) == \
+        '「明细」中满足〔「状态」 为 “已审批”〕的行的「区域」 唯一非空值（空或多值报错）'
+    assert rv.plain('single_value(region, of: "参考")', NM) == \
+        '「参考」「区域」 唯一非空值（空或多值报错）'
+
+
 def _ws(profit="sum(amount - cost)"):
     field = lambda t: NS(type=t)                                                          # noqa: E731
     return NS(

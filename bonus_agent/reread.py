@@ -59,7 +59,7 @@ def _is_data(st, data: set) -> bool:
     return (st.file, st.sheet) in data or (None, st.sheet) in data
 
 
-def material(ws) -> str:
+def material(ws, *, full_documents=False) -> str:
     """交给复读的材料：规则文档、财务答复、参数表整表、数据表只给表头和列类型。"""
     from bonus_agent.agent import CHAT_SOURCE, _json_data_summary
     parts = []
@@ -68,7 +68,7 @@ def material(ws) -> str:
         if len(text) > DATA_JSON_CHARS and _json_data_summary(ws._file(d.name)):    # 大的结构化数据文件（数据行），不给
             continue
         if text.strip():
-            parts.append(f"## 文件 {d.name}\n{text[:DOC_CHARS]}")
+            parts.append(f"## 文件 {d.name}\n{text if full_documents else text[:DOC_CHARS]}")
     answered = [q for q in ws.questions if q.answer not in (None, "") and not getattr(q, "withdrawn", "")]
     if answered:
         parts.append("## 财务答复\n" + "\n".join(f"问：{q.text}\n答：{q.answer}" for q in answered))

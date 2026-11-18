@@ -29,7 +29,7 @@ _CORE = Path(__file__).resolve().parent.parent / 'bonus_core'
 _EXECUTION_PROFILE = hashlib.sha256(
     b''.join(p.read_bytes() for p in sorted(_CORE.rglob('*.py'))) + Path(__file__).read_bytes()
     + b''.join(Path(__file__).with_name(n).read_bytes() for n in
-               ('lint.py', 'facts.py', 'clauses.py', 'source_cells.py', 'source_diagnostics.py', 'coefficient.py', 'agent.py', 'context.py', 'recovery.py', 'construction.py', 'semantics.py', 'progress.py', 'rule_package.py', 'contracts.py', 'data_profile.py', 'review_population.py'))
+               ('lint.py', 'facts.py', 'clauses.py', 'source_cells.py', 'source_diagnostics.py', 'scope_diagnostics.py', 'question_review.py', 'reread.py', 'coefficient.py', 'agent.py', 'context.py', 'recovery.py', 'construction.py', 'semantics.py', 'progress.py', 'rule_package.py', 'contracts.py', 'data_profile.py', 'review_population.py'))
 ).hexdigest()
 
 
@@ -517,6 +517,17 @@ class Workflow:
                     rs = view._ruleset(name)
                     data, _ = view._data(rs)
                     result = preflight_basis(rs, data, refs, self.ws.period)
+                    if result['status'] == 'FAIL':
+                        from bonus_agent.scope_diagnostics import scope_diagnostics
+                        empty = next((c['dataset'] for issue in result.get('issues', [])
+                                      for c in issue.get('coverage', [])
+                                      if c.get('visible_rows') == 0 and c.get('dataset')), None)
+                        scope = scope_diagnostics(self.ws, scheme=name, data=data, focus=empty, limit=1)
+                        result['scope_context'] = scope
+                        if result.get('issues'):
+                            # The existing checks/preflight read entry exposes this
+                            # focused observation alongside the original failure.
+                            result['issues'][0]['scope_context'] = scope
                 except ToolError as exc:
                     result = {'status': 'FAIL', 'issues': [{'message': str(exc)}]}
                 preflight[name] = result
@@ -556,6 +567,7 @@ class Workflow:
             'phase': report.get('phase', 'all'),
             'static_checks_complete': report.get('static_checks_complete') is True,
             'preflight': {s: {'status': r['status'], 'summary': r.get('summary'),
+                              **({'scope_context': r['scope_context']} if r.get('scope_context') else {}),
                               'dependencies': r.get('dependencies', []),
                               'details_call': {'tool': 'read_workspace', 'args': {'section': 'checks', 'name': 'preflight:' + s}} if r.get('issues') else None}
                           for s, r in report.get('preflight', {}).items()},
@@ -649,6 +661,7 @@ class Workflow:
                 '每个报告项都须给独立公式；材料不清楚写unclear，不猜测。金额由程序计算。'
                 '数据概况中的期间、筛选、实体范围和关联是待核对的映射事实，不是已获业务批准的核算范围。'
                 '必须按原材料独立核对本期核算对象集合、历史累计窗口、真实分类值和空值口径。'
+                '属性提取失败不表示正常分类应为空串或默认类别；独立重建每个正常分类分支，不能把技术修复后的可执行公式当作业务依据。'
                 '父实体与当期明细覆盖不同，须区分本期奖金对象和历史累计数据；不能直接裁掉历史实体或默认所有父对象都应核算。'
                 '仅在同一映射上算出相同金额不足以证明范围正确；无法证明对象范围符合原文时，'
                 '在unclear中列出具体表、字段、期间或覆盖数量及需核对的来源，不能签发同意。'

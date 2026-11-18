@@ -20,6 +20,10 @@ FUNCTIONS: dict[str, FnSpec] = {
     "avg": FnSpec(1, 1, AGG_KW, True, "明细行平均值"),
     "count": FnSpec(0, 0, AGG_KW, True, "明细行计数"),
     "count_distinct": FnSpec(1, 1, AGG_KW, True, "明细行中不同取值的个数，如项目数"),
+    "single_value": FnSpec(1, 1, AGG_KW, True,
+        'single_value(字段或表达式, of: "表名", where: 条件)：仅在业务已明确当前对象应有唯一属性时使用。'
+        '选中行至少一行且每行均为非空、同类型、完全相同的标量才返回原值（文本/编号/枚举、数字、日期、布尔）；'
+        '重复同值允许。零行、任一空值或不同值均报错；不归一化文本、不忽略空值、不取第一条、不提供default'),
     "min": FnSpec(1, 9, AGG_KW, True, "一个参数时为明细行最小值，多个参数时为取最小"),
     "max": FnSpec(1, 9, AGG_KW, True, "一个参数时为明细行最大值，多个参数时为取最大"),
     "tier": FnSpec(2, 2, doc="tier(阶梯表, x) 直接返回奖金金额：whole=x×所在档比例；excess=各档分段累加"),

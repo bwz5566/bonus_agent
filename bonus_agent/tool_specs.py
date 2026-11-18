@@ -247,6 +247,13 @@ TOOLS: list[dict] = [
                                        "写了 suggested 时所有引用必须核对通过。Excel可改传sheet、row（原Excel行号）、columns（精确列名），程序生成真实引用；禁止省略号拼接。",
                                        "items": _obj({"file": _S, "quote": _S, "sheet": _S, "row": _I,
                                                       "columns": {"type": "array", "items": _S}}, ["file"])}}, ["text", "options"])},
+    {"name": "review_question",
+     "description": "已提出的待答问题可能源于错误映射/范围，或原文已明确解决时，提交理由和逐字依据给独立模型复核。"
+                    "独立复核可撤回有充分原文依据的错误问题；不代答财务、不批准金额，不改规则。真正缺失的信息继续等待。"
+                    "同一证据状态的复核不会因改写理由而重复调用。",
+     "parameters": _obj({"id": _S, "reason": _S,
+                         "evidence": {"type": "array", "items": _obj({"file": _S, "quote": _S}, ["file", "quote"])}},
+                        ["id", "reason", "evidence"])},
     {"name": "reply",
      "description": "对话时用：回复财务这条消息并结束本次对话。改过规则、数据表或台账时，程序会先自动试算全部方案并做完成前检查，"
                     "不通过会把原因返回给你修正。回复里的金额要来自 evaluate / explain / 试算结果，不要自己算。",

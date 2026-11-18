@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import operator
+from math import isfinite
 from dataclasses import asdict, dataclass, field
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal, localcontext
@@ -531,6 +532,8 @@ class Evaluator:
                     item[key + '_sources'] = [str(r.src) for r in rows[:3] if r.src] if rows is not None else []
                 active = coverage.get('active_row')
                 item['active_row_source'] = str(active.src) if active is not None and active.src else ''
+                if 'conflicting_sources' in coverage:
+                    item['conflicting_sources'] = coverage['conflicting_sources']
                 exc.aggregates.append(item)
             raise
 
@@ -609,6 +612,26 @@ class Evaluator:
             coverage.pop('active_row', None)
             if c.fn == "count_distinct":
                 r = Decimal(len(set(vals)))
+            elif c.fn == 'single_value':
+                if not vals:
+                    raise EvalError(f'single_value.empty：当前对象在「{ds}」的关联、期间及筛选范围内没有明细行，无法证明唯一值。'
+                                    '核对对象范围、关系和筛选；不得取第一条、补默认值或删对象来通过检查', ctx.where)
+                for row, value in zip(rows, vals):
+                    coverage['active_row'] = row
+                    if value is None or isinstance(value, str) and not value.strip():
+                        raise EvalError(f'single_value.missing：「{ds}」选中行存在空值，不能忽略该行或用其他行的值补齐；'
+                                        '按原文核对缺失值和适用范围', ctx.where)
+                    if (type(value) not in (str, Decimal, int, float, date, bool)
+                            or isinstance(value, Decimal) and not value.is_finite()
+                            or isinstance(value, float) and not isfinite(value)):
+                        raise EvalError(f'single_value.type：「{ds}」的值不是受支持的有限标量（类型{type(value).__name__}）', ctx.where)
+                    if type(value) is not type(vals[0]) or value != vals[0]:
+                        coverage['conflicting_sources'] = [str(item.src) for item in (rows[0], row) if item.src]
+                        raise EvalError(f'single_value.multiple：「{ds}」在当前对象范围内存在不同值或类型：'
+                                        f'{fmt(vals[0])}（{type(vals[0]).__name__}）与{fmt(value)}（{type(value).__name__}）。'
+                                        '唯一属性尚未成立；核对来源行、关联键和业务粒度，不得取第一条或补默认值', ctx.where)
+                coverage.pop('active_row', None)
+                r = vals[0]  # every selected value was checked before returning a representative
             else:
                 from datetime import date as _date
                 if c.fn in ("min", "max") and vals and all(isinstance(v, _date) for v in vals):
@@ -618,7 +641,8 @@ class Evaluator:
                 if text is not None:
                     coverage['active_row'] = rows[vals.index(text)]
                     raise EvalError(f"{c.fn} 要对数字求值，这里取到的是 {fmt(text)}（{ds} 的行）。数行数用 count(of: \"{ds}\", where: 条件)，"
-                                    f"数不同取值的个数用 count_distinct(字段, of: \"{ds}\")", ctx.where)
+                                    f"数不同取值的个数用 count_distinct(字段, of: \"{ds}\")；"
+                                    '只有业务已明确对象属性唯一时才用single_value断言，空值或多值仍阻断', ctx.where)
                 nums = []
                 for row, v in zip(rows, vals):
                     coverage['active_row'] = row

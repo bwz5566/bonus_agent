@@ -13,7 +13,7 @@ from __future__ import annotations
 from bonus_core.dsl.models import RuleSet
 from bonus_core.dsl.parser import Call, Name, names, walk
 
-AGGREGATES = {"sum", "avg", "count", "count_distinct", "min", "max"}
+AGGREGATES = {"sum", "avg", "count", "count_distinct", "single_value", "min", "max"}
 
 
 def is_aggregate(c: Call) -> bool:

@@ -241,7 +241,8 @@ def _validate(rs: RuleSet, *, basis=False) -> list[Issue]:
                     accepted = '数值或日期' if node.fn in ('min', 'max') else '数值'
                     issues.append(Issue.block('fn_type',
                         f'{node.fn} 的直接字段「{dataset}.{node.args[0].id}」声明为 {field_type}，该聚合只支持{accepted}；'
-                        '核对原文字段含义及所属对象，不能用数值默认值、更换字段类型或任取一条记录来绕过', where))
+                        '核对原文字段含义及所属对象，不能用数值默认值、更换字段类型或任取一条记录来绕过。'
+                        '只有业务已明确对象属性唯一时，才使用single_value(字段, of: "表名")断言；有空值或多值仍报错', where))
                 elif node.fn in ('sum', 'avg') and node.args:
                     dataset = getattr(node.kw().get('of'), 'value', None)
                     if _date_expr(rs, node.args[0], dataset=dataset):
@@ -367,7 +368,7 @@ def _date_expr(rs: RuleSet, expr, *, dataset=None, busy=frozenset()) -> bool:
     if isinstance(expr, Call):
         if expr.fn in ('date', 'period_start', 'period_end'):
             return True
-        if expr.fn in ('min', 'max') and expr.args:
+        if expr.fn in ('min', 'max', 'single_value') and expr.args:
             own = getattr(expr.kw().get('of'), 'value', dataset)
             return all(_date_expr(rs, a, dataset=own, busy=busy) for a in expr.args)
         if expr.fn == 'if' and len(expr.args) == 3:

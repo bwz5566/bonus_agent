@@ -119,13 +119,14 @@ def _call(c: Call, nm: Names) -> str:
     r = [t for t, _ in raw]
     kw = c.kw()
     fn = c.fn
-    if fn in ("sum", "avg", "count", "count_distinct") or (fn in ("min", "max") and len(c.args) == 1):
+    if fn in ("sum", "avg", "count", "count_distinct", "single_value") or (fn in ("min", "max") and len(c.args) == 1):
         src = kw.get("of")
         table = f"「{src.value}」" if isinstance(src, Str) else "明细"
         cond = f"中满足〔{_render(kw['where'], nm)[0]}〕的行" if "where" in kw else "各行"
         what = {"sum": f"{a[0] if a else ''} 合计", "avg": f"{a[0] if a else ''} 平均值", "count": "行数",
                 "count_distinct": f"不同 {a[0] if a else ''} 的个数", "min": f"{a[0] if a else ''} 最小值",
-                "max": f"{a[0] if a else ''} 最大值"}[fn]
+                "max": f"{a[0] if a else ''} 最大值",
+                "single_value": f"{a[0] if a else ''} 唯一非空值（空或多值报错）"}[fn]
         return f"{table}{cond}的{what}" if "where" in kw else f"{table}{what}"
     if fn in ("min", "max"):
         return f"取{'较小' if fn == 'min' else '较大'}（{'；'.join(r)}）"

@@ -98,7 +98,7 @@ def _GATE_ORDER(key: str) -> int:
 VERIFY_TOL = Decimal("0.005")   # 按份额分配时，独立算式和引擎未舍入的份额之差不超过半分，才算尾差
 WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", "record_parameter_cells", "bind_facts", "compile_table", "validate_parameters", "review_calculation", "preview_repair", "verify_repair", "apply_repair", "remove_facts", "ask_question",
                "record_clauses", "cover_clauses",
-               "answer_question", "update_dataset"}
+               "answer_question", "review_question", "update_dataset"}
 WRITE_TOOLS |= {'plan_calculation','prepare_data','compile_formulas','calculate_basis','review_basis'}
 WRITE_TOOLS |= {'plan_formula_tasks', 'check_formula_task', 'compile_coefficient_table', 'submit_formula_task'}
 RULE_SUFFIXES = {".docx", ".pptx", ".pdf", ".png", ".jpg", ".jpeg", ".txt", ".md"}   # 规则文档：要登记参数
@@ -3762,6 +3762,10 @@ class Workspace:
                     "继续做不受影响的部分，全部问完后调用 finish 结束本轮")
         return f"已记录提示 {q.id}（不影响金额，不必等答复）{note}"
 
+    def review_question(self, id: str, reason: str, evidence: list[dict]) -> dict:
+        from bonus_agent.question_review import review_question
+        return review_question(self, id, reason, evidence)
+
     def _dup_choice_check(self, st, fields, combine, unpivot, filter) -> None:
         """表里有几列同名（如两列都叫“客户简称”）时，用的那一列的取值要和其他表里同名的列对得上：另一列对得上得更多就不保存。
         两列都明确写了列号也会选错（项目和参考表用的是另一列，对不上的客户整批被当成“参考表里多出来的”悄悄丢掉）。"""
@@ -3901,6 +3905,8 @@ class Workspace:
     @property
     def pending(self) -> list[Question]:
         """还在等财务答复的问题。"""
+        from bonus_agent.question_review import invalidate_changed_reviews
+        invalidate_changed_reviews(self)
         return [q for q in self.questions if q.blocking and not q.answer and not q.withdrawn]
 
     def finish(self, summary: str, ignored: list[dict] | None = None, review: bool = True) -> str:
@@ -5578,6 +5584,8 @@ def _resume_task(ws: Workspace, last: dict | None, changes: dict | None, fresh: 
                   "  " + str(last["error"])[:600]] + [f"  · {t}" for t in _lessons(str(last["error"]))]
     if ws.pending:
         lines.append("- 仍在等待答复：" + "；".join(f"{q.id} {q.text}" for q in ws.pending))
+        lines.append("- 若问题由错误映射或核算范围引起，先查原文与程序范围诊断；可用 review_question 提交原文给独立模型复核撤回。"
+                     "不能自己选择答案；真正缺失的口径继续等待，撤回也不能替代后续计算验证。")
     lines += ["", "请：",
               "1. 按新答复修改规则（答复只影响它相关的部分，其余保持不变）；",
               "2. 阅读新增、修改的文件，用 record_facts 登记其中的参数（与已有台账同一参数用相同的名字）、record_clauses 摘出条款"
