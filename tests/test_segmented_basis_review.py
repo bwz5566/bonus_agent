@@ -69,6 +69,27 @@ def test_restore_retries_only_incomplete_report_without_production_values(tmp_pa
         assert total not in text
 
 
+def test_partially_invalid_populations_resume_only_remaining_label(tmp_path):
+    ws = review_workspace(tmp_path)
+    population, pool, reports = responses()
+    rows = population['populations']['rows:projects']
+    bad = {**population, 'populations': {**population['populations'], 'rows:projects': {**rows, 'period': 'PRIVATE_BAD_VALUE'}}}
+    first = attach_checker(ws, [bad])
+    with pytest.raises(ToolError, match='period_field'):
+        ws.review_basis('S')
+    assert len(first.calls) == 1 and not ws._flow().current('review:S')
+    clone = Workspace(FakeLLM([]), ws.inv)
+    case.restore(clone, json.loads(json.dumps(case.snapshot(ws), ensure_ascii=False)))
+    clone.llm.checker_required = True
+    resumed = attach_checker(clone, [{'populations': {'rows:projects': rows}, 'unclear': []}, pool, reports])
+    assert clone.review_basis('S')['status'] == 'PASS'
+    request = resumed.calls[0]
+    contract = json.loads(request[1]['content'].split('\n本段输入：')[-1])
+    assert set(contract['output_template']) == set(contract['population_requirements']) == {'rows:projects'}
+    assert 'period_field' in request[-1]['content'] and 'PRIVATE_BAD_VALUE' not in str(request)
+    assert '项目' in clone.workflow['references']['S']['spec']['populations']
+
+
 def test_report_cannot_override_independent_pool_or_exceed_retry_limit(tmp_path):
     ws = review_workspace(tmp_path)
     population, pool, reports = responses()
@@ -120,10 +141,13 @@ def test_switching_from_monolithic_to_split_cannot_discard_independent_disagreem
     assert len(checker.calls) == 1 and not ws._flow().current('review:S')
 
 
-def test_population_counterexample_stops_before_paid_formula_slices(tmp_path):
+@pytest.mark.parametrize('other_invalid', [False, True])
+def test_population_counterexample_stops_before_paid_formula_slices(tmp_path, other_invalid):
     ws = review_workspace(tmp_path)
     population, _, _ = responses()
     population['populations']['项目']['filter'] = {'pid': ['A']}
+    if other_invalid:
+        population['populations']['rows:projects']['window'] = 'invalid'
     checker = attach_checker(ws, [population])
     for _ in range(2):
         result = ws.review_basis('S')

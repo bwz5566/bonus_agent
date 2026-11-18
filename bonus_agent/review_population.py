@@ -46,11 +46,12 @@ def check_populations(ws, rs, spec, root, by_level, *, scope_names=None):
     if scope_names is not None:
         wanted = {label: wanted[label] for label in scope_names}
     supplied = spec.get('populations')
-    issues, checks, valid = [], [], True
+    issues, checks, contract_errors = [], [], []
     if not isinstance(supplied, dict):
         return {'status': 'FAIL', 'contract_valid': False, 'issues': ['独立复核缺少 populations 核算范围声明'], 'checks': []}
     for label, requirement in wanted.items():
         cfg = supplied.get(label)
+        code = 'contract_shape'
         try:
             if not isinstance(cfg, dict):
                 raise ValueError(f'缺少 {label} 的独立核算范围')
@@ -58,8 +59,10 @@ def check_populations(ws, rs, spec, root, by_level, *, scope_names=None):
             if set(cfg) - allowed or not {'dataset', 'filter', 'period', 'window', 'sources'} <= set(cfg):
                 raise ValueError('须显式填写 dataset/filter/period/window/sources；对象范围另填 key，不继承生产筛选')
             source_name = cfg['dataset']
+            code = 'unknown_source_dataset'
             if source_name not in ws.datasets or source_name not in ws.mapping:
                 raise ValueError(f'未知来源数据表 {source_name}')
+            code = 'missing_or_invalid_source_quote'
             sources = cfg['sources']
             if not isinstance(sources, list) or not sources:
                 raise ValueError('核算范围缺少原文依据 sources')
@@ -75,17 +78,21 @@ def check_populations(ws, rs, spec, root, by_level, *, scope_names=None):
                         raise ValueError(f'核算范围引文不在声明的第 {source.page} 页')
             original = ws.datasets[source_name]
             key = cfg.get('key')
+            code = 'object_key_field'
             if requirement['kind'] == 'objects' and (not isinstance(key, str) or key not in original.fields):
                 raise ValueError(f'对象 key 必须是 {source_name} 的实际标准字段')
+            code = 'wrong_physical_row_source'
             if requirement['kind'] == 'rows' and source_name != requirement['dataset']:
                 raise ValueError('金额取数范围必须核对对应来源表，不能换表')
             period = cfg['period']
+            code = 'period_field'
             if period is not None and (period not in original.fields or ws.period is None):
                 raise ValueError('独立期间字段不存在，或本轮未指定核算期间')
             selected = set(original.fields) if requirement['kind'] == 'rows' else {key}
             if period:
                 selected.add(period)
             fields = {n: original.fields[n].model_copy(update={'if_empty': None}) for n in selected}
+            code = 'window'
             independent_ds = DatasetDef(fields=fields, period=period, window=cfg['window'])
             # Raw source mapping operations (e.g. combined IDs) remain visible to
             # the reviewer. No production row filter or population patch is used.
@@ -93,15 +100,20 @@ def check_populations(ws, rs, spec, root, by_level, *, scope_names=None):
                 'columns': {n: c for n, c in ws.mapping[source_name].columns.items() if n in selected},
                 'filter': cfg['filter'],
             })
+            code = 'filter_shape'
             mapping = DatasetMapping.model_validate(mapping.model_dump())
             independent = RuleSet(name='independent_population', version='1',
                                   datasets={source_name: independent_ds}, pool={'expr': '0'}, allocation=[])
+            code = 'source_mapping_or_read'
             raw, errors = apply_mapping(independent, ws.data_files, {source_name: mapping}, ws.period)
             blocking = [str(e) for e in errors if e.severity == 'blocking']
             if blocking:
+                if any(e.code == 'filter_column' for e in errors if e.severity == 'blocking'):
+                    code = 'filter_column'
                 raise ValueError('独立来源读取失败：' + '；'.join(blocking[:3]))
             rows = raw[source_name].rows
             if requirement['kind'] == 'objects':
+                code = 'object_key_empty'
                 empty = [r for r in rows if r.values.get(key) in (None, '')]
                 if empty:
                     raise ValueError(f'独立对象标识为空：{empty[0].src}')
@@ -127,6 +139,7 @@ def check_populations(ws, rs, spec, root, by_level, *, scope_names=None):
                 expected = {aliases.get(key, key) for key in expected}
                 missing, extra = sorted(expected - actual), sorted(actual - expected)
             else:
+                code = 'production_source_read'
                 # Compare participating physical rows before entity distinct,
                 # otherwise valid grouping would look like missing source rows.
                 production_ds = original.model_copy(update={'key': None, 'link': None, 'distinct': False,
@@ -154,6 +167,8 @@ def check_populations(ws, rs, spec, root, by_level, *, scope_names=None):
                 issues.append(f'{label} 核算范围与独立原文取数不符：缺少 {len(missing)}，多出 {len(extra)}；'
                               '核对本期对象与历史统计数据的各自范围，不能通过修改金额或盲目裁历史明细消除此差异')
         except (ValueError, TypeError, KeyError) as exc:
-            valid = False
+            # These allowlisted tags are safe to send in a blind review retry. Local issues may include data values.
+            contract_errors.append({'scope': label, 'code': code})
             issues.append(f'{label}：{exc}')
-    return {'status': 'FAIL' if issues else 'PASS', 'contract_valid': valid, 'issues': issues, 'checks': checks}
+    return {'status': 'FAIL' if issues else 'PASS', 'contract_valid': not contract_errors, 'issues': issues,
+            'checks': checks, 'contract_errors': contract_errors}

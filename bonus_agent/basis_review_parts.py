@@ -26,6 +26,12 @@ class PopulationDifference(Exception):
         self.selection = selection
 
 
+class InvalidPopulations(ValueError):
+    def __init__(self, accepted, errors):
+        self.accepted, self.errors = accepted, errors
+        super().__init__('范围声明未通过合同校验：' + _json(errors))
+
+
 class BasisReviewParts:
     def __init__(self, flow, name, rs, evidence, structure, signature):
         self.ws, self.flow, self.name, self.rs = flow.ws, flow, name, rs
@@ -52,8 +58,8 @@ class BasisReviewParts:
                '已列出的映射、范围、期间和分类是待核事实。核对当期对象、历史累计窗口、空值和真实分类。'
                'unknown、values_truncated 或 fields_complete=false 均不证明未展示的值不存在。'
                '业务口径无法从原文或财务答复确定时用 unclear 字符串数组具体指出问题；程序计算金额。' + instruction)
-        messages = [{'role': 'system', 'content': sys}, {'role': 'user', 'content': self.evidence +
-                    '\n独立复核结构：' + _json(self.base) + '\n本段输入：' + _json(contract)}]
+        prefix = self.evidence + '\n独立复核结构：' + _json(self.base) + '\n本段输入：'
+        messages = [{'role': 'system', 'content': sys}, {'role': 'user', 'content': prefix + _json(contract)}]
         checker = self.ws.llm.checker_llm
         sig = fingerprint((self.signature, section, messages, getattr(checker, 'basis_review_reasoning_effort', None)))
         row = self.records.setdefault(sig, {'section': section, 'targets': targets})
@@ -67,6 +73,13 @@ class BasisReviewParts:
         key = f'{self.name}:part:{sig}'
         attempts = self.flow.state['attempts']
         before = attempts.get(key, 0)
+        accepted = row.get('accepted', {})
+        if accepted:
+            self._validate_populations({'populations': accepted}, list(accepted))
+            if self.population_report['status'] != 'PASS':
+                raise PopulationDifference(self.population_report, accepted)
+            pending = [label for label in targets if label not in accepted]
+            messages[1]['content'] = prefix + _json({k: {n: values[n] for n in pending} for k, values in contract.items()})
         if before >= 2:
             raise ToolError(f'独立复核分段 {section} {targets} 已达两次尝试，诊断：{row.get("diagnostic", "请求未完成")}')
         if row.get('diagnostic'):
@@ -101,12 +114,22 @@ class BasisReviewParts:
             if value.get('unclear'):
                 row.update(state='unresolved', value={'unclear': value['unclear']})
                 return copy.deepcopy(row['value'])
+            if accepted:
+                returned = value.get('populations')
+                if not isinstance(returned, dict) or set(returned) - set(pending):
+                    raise ValueError('补充声明只能包含本次剩余的范围名，禁止重写已保存的独立范围')
+                value['populations'] = {**accepted, **returned}
             validate(value)
+        except InvalidPopulations as exc:
+            row.update(state='invalid', accepted=copy.deepcopy(exc.accepted), contract_errors=exc.errors, diagnostic=str(exc))
+            raise ToolError(f'独立复核分段 {section} {targets} 未通过：{exc}') from None
         except ValueError as exc:
             row.update(state='invalid', diagnostic=str(exc))
             raise ToolError(f'独立复核分段 {section} {targets} 未通过：{exc}') from None
         row.update(state='valid', value=copy.deepcopy(value))
         row.pop('diagnostic', None)
+        row.pop('accepted', None)
+        row.pop('contract_errors', None)
         return value
 
     @staticmethod
@@ -119,14 +142,16 @@ class BasisReviewParts:
 
     def _validate_populations(self, value, labels):
         self._shape(value, ['populations'])
-        if set(value['populations']) != set(labels):
+        if set(value['populations']) - set(labels):
             raise ValueError('populations 须且仅须覆盖：' + '、'.join(labels))
         _, root, levels, _ = self.ws._independent_env(self.name, {}, basis=True)
         report = check_populations(self.ws, self.rs, value, root, levels, scope_names=labels)
         if not report['contract_valid']:
-            valid = {r['scope'] for r in report['checks']}
-            raise ValueError('范围声明无法验证：' + '、'.join(s for s in labels if s not in valid) +
-                             '。请核对来源表、实际字段、期间窗口和可逐字核对的原文引文')
+            valid = {r['scope']: value['populations'][r['scope']] for r in report['checks']}
+            if any(r['status'] == 'FAIL' for r in report['checks']):
+                checked = check_populations(self.ws, self.rs, {'populations': valid}, root, levels, scope_names=valid)
+                raise PopulationDifference(checked, valid)
+            raise InvalidPopulations(valid, report['contract_errors'])
         self.population_report = report
 
     def _validate_formulas(self, value, pool=None, items=()):
@@ -157,6 +182,11 @@ class BasisReviewParts:
         result = {'details': {}, 'totals': {}, 'populations': {}, 'unclear': []}
         required = self.structure['population_requirements']
         for labels in groups(list(required), 4):
+            template = {k: {'dataset': required[k].get('dataset', '<能据原文识别合格对象的标准数据集>'),
+                            **({'key': '<该来源的标准对象标识>'} if required[k]['kind'] == 'objects' else {}),
+                            'filter': '<原始列名构成的JSON筛选对象>', 'period': '<标准行日期字段或JSON null>',
+                            'window': '<根据原文选择 period/year_to_date/to_date>',
+                            'sources': [{'doc': '<材料名>', 'quote': '<支持该范围的逐字引文>'}]} for k in labels}
             part = self._part('populations', labels,
                 '输出 {"populations":{"范围名":{"dataset":"来源表","key":"对象标识字段",'
                 '"filter":{},"period":null,"window":"period","sources":[{"doc":"文件","quote":"逐字引文"}]}},"unclear":[]}。'
@@ -168,9 +198,13 @@ class BasisReviewParts:
                 'population_from 是待核生产映射，实现上述声明无需复制该字段，也不应仅因输出没有该字段就报 unclear。'
                 'kind=rows 时 dataset 必须为要求核对的来源表，按物理行比对、不去重，无需 key。'
                 'filter 用原表列名；period 填标准日期字段或明确 null，window 为 period/year_to_date/to_date。'
+                '月度横表若原材料以月份列选择当期、没有行日期，则 period 可填 JSON null；'
+                '选当月金额列与筛选业务行分别判定，金额列不能充当行日期字段。'
+                '占位或小计行是否参与须有独立材料依据；原列排除可写 {"列名":{"not":["占位标签"]}}。'
+                'output_template 按本次请求逐个给出 JSON 键；所有尖括号占位符都要据原文换成正确类型的声明。'
                 'sources 引用支持本次对象、资格或期间口径的原文。材料确有歧义、原表缺少关键字段，'
                 '或无法用以上方式表示时，说明具体缺口并保留 unclear；示例条件不能替代本批依据。',
-                {'population_requirements': {k: required[k] for k in labels}},
+                {'population_requirements': {k: required[k] for k in labels}, 'output_template': template},
                 lambda value: self._validate_populations(value, labels))
             if part.get('unclear'):
                 return part
