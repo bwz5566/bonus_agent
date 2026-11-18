@@ -40,9 +40,11 @@ def requirements(rs):
     return result
 
 
-def check_populations(ws, rs, spec, root, by_level):
+def check_populations(ws, rs, spec, root, by_level, *, scope_names=None):
     """Compare sets (or physical row multiplicities), without changing production data."""
     wanted = requirements(rs)
+    if scope_names is not None:
+        wanted = {label: wanted[label] for label in scope_names}
     supplied = spec.get('populations')
     issues, checks, valid = [], [], True
     if not isinstance(supplied, dict):

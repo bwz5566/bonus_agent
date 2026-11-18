@@ -21,11 +21,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from contextlib import contextmanager
 from datetime import date
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from bonus_agent.extract_rules import prompt
-from bonus_agent.llm import LLMError, RunBudgetError, parse_json
+from bonus_agent.llm import BASIS_PART_REASONING, LLMError, RunBudgetError, parse_json
 
 MARK = "【独立复读】"            # 系统提示的开头；测试用的 FakeLLM 靠它认出复读调用
 CALC_MARK = "【独立算式】"
@@ -103,13 +104,33 @@ def review_signature(ws, text):
     return signature(text)
 
 
-def guard_request(ws, msgs: list[dict]):
+@contextmanager
+def basis_part_request_policy(ws):
+    """Scope configured thinking to the independent model for this basis part."""
+    checker = getattr(ws.llm, 'checker_llm', None)
+    effort = getattr(checker, 'basis_review_reasoning_effort', None)
+    if effort is None:
+        yield
+        return
+    route = checker
+    seen = set()
+    while getattr(route, 'think_llm', None) is not None and id(route) not in seen:
+        seen.add(id(route))
+        route = route.think_llm
+    token = BASIS_PART_REASONING.set((route, effort))
+    try:
+        yield
+    finally:
+        BASIS_PART_REASONING.reset(token)
+
+
+def guard_request(ws, msgs: list[dict], *, checker_only=False):
     """Reserve context for the actual reviewer route before spending a review attempt."""
     from bonus_agent.context import guard_messages
 
     other = getattr(ws.llm, 'checker_llm', None)
-    available = other is not None and not getattr(ws, 'checker_down', '')
-    if getattr(ws.llm, 'checker_required', False) and not available:
+    available = other is not None and other is not ws.llm and not getattr(ws, 'checker_down', '')
+    if (checker_only or getattr(ws.llm, 'checker_required', False)) and not available:
         raise LLMError('关键复核模型不可用；独立复核不能降级为主模型自验')
     model = other if available else ws.llm
     think = available or not bool(getattr(ws, 'checker_down', '') and getattr(ws.llm, 'think_llm', None))
@@ -127,10 +148,13 @@ def guard_request(ws, msgs: list[dict]):
     return model
 
 
-def _ask(ws, msgs: list[dict]) -> str:
+def _ask(ws, msgs: list[dict], *, checker_only=False) -> str:
     """交叉验证：配置了另一个模型就让它来复读、写独立算式（和主流程的模型错法不同，验得更真）；
     它调用失败时退回主模型，并记下来，不让整轮失败。"""
-    guard_request(ws, msgs)
+    if checker_only:
+        guard_request(ws, msgs, checker_only=True)
+    else:
+        guard_request(ws, msgs)
     other = getattr(ws.llm, "checker_llm", None)
     if other is not None and not getattr(ws, "checker_down", ""):
         try:
@@ -138,9 +162,12 @@ def _ask(ws, msgs: list[dict]) -> str:
         except RunBudgetError:
             raise  # A job allowance is not evidence that the reviewer is unavailable.
         except LLMError as e:
+            required = checker_only or getattr(ws.llm, 'checker_required', False)
             ws.checker_down = (f"交叉验证模型 {other.name} 调用失败（{str(e)[:120]}）" +
-                               ('，关键复核阻断' if getattr(ws.llm, 'checker_required', False) else f'，改用主模型 {ws.llm.name} 验证'))
-            if not getattr(ws.llm, 'checker_required', False):
+                               ('，关键复核阻断' if required else f'，改用主模型 {ws.llm.name} 验证'))
+            if checker_only:
+                raise
+            if not required:
                 try:
                     # The fallback may have a different context/output allowance
                     # and minimum request window from the failed reviewer.

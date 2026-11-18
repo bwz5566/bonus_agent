@@ -55,6 +55,32 @@ def test_recipient_settlement_matches_group_then_round_and_exports_auxiliary_tra
     assert {'舍入对账','orders核算底稿','orders核算结果'}<=set(book.sheetnames)
 
 
+def test_independent_pending_amount_uses_auxiliary_projects_and_its_own_formula(tmp_path):
+    ws = recipient_model(tmp_path)
+    draft = ws.drafts['S']
+    draft['variables']['recipient_total']['expr'] = 'sum(amount / 2 / order_count, of: "shares")'
+    report = draft['report']
+    report['pending'] = [{'name': 'Waiting', 'level': 'orders', 'expr': 'amount / 2',
+                          'sources': [{'doc': 'data.xlsx', 'quote': 'amount'}]}]
+    report['distributions'][0]['pending'] = ['Waiting']
+    ws.trial_run()
+    per_person = 'sum(amount / independent_count / 2, of: "shares")'
+    spec = {'pool': per_person, 'helpers': {'independent_count': {'scope': 'orders', 'expr': 'count(of: "shares")'}},
+            'people': {'mode': 'after_sum', 'key': 'person', 'expr': per_person},
+            'details': {'orders': 'amount'}, 'pending': {'Waiting': 'amount * 0.5'}}
+    assert ws._independent_people('S', spec)['Waiting'] == D('.005')
+    assert not _disagree(ws, 'S', spec)
+    spec['pending']['Waiting'] = 'amount * 2'
+    assert any(row[1] == 'Waiting' for row in _disagree(ws, 'S', spec))
+    del spec['pending']['Waiting']
+    with pytest.raises(ToolError, match='缺少待分配项'):
+        ws._independent_people('S', spec)
+    report['pending'][0]['level'] = 'missing_projects'
+    spec['pending']['Waiting'] = 'amount'
+    with pytest.raises(ToolError, match='missing_projects.*没有对象'):
+        ws._independent_people('S', spec)
+
+
 def test_rounding_delta_is_visible_and_cannot_be_used_to_hide_lost_entitlements(tmp_path):
     ws=recipient_model(tmp_path)
     # Two recipients each accrue half a cent; rounding by recipient pays a cent each.

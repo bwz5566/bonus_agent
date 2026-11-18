@@ -5,9 +5,29 @@ import pytest
 
 from bonus_agent import reread
 from bonus_agent.context import ContextBudgetError
-from bonus_agent.llm import FakeLLM, LLMError, RunBudgetError
+from bonus_agent.llm import FakeLLM, LLM, LLMError, RunBudgetError
 from bonus_agent.recovery import RunBudget
 from tests.test_staged_workflow import make_workspace, prepared
+
+
+def test_segmented_reasoning_override_is_scoped_to_checker_request():
+    def reviewer(name):
+        return LLM(name, 'pro', 'https://test.invalid', '',
+                   think_body={'thinking': {'type': 'enabled'}, 'reasoning_effort': 'high'},
+                   basis_review_split=True, basis_review_reasoning_effort='low')
+
+    checker, other = reviewer('independent'), reviewer('other')
+    ws = SimpleNamespace(llm=SimpleNamespace(checker_llm=checker))
+
+    def effort(model):
+        return model._think(True, {}, 8192)[1]['reasoning_effort']
+
+    assert effort(checker) == 'high'
+    with pytest.raises(LLMError), reread.basis_part_request_policy(ws):
+        assert effort(checker) == 'low'
+        assert effort(other) == 'high'
+        raise LLMError('simulated request failure')
+    assert effort(checker) == 'high'
 
 pytestmark = pytest.mark.evidence
 

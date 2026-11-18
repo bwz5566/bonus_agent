@@ -143,6 +143,8 @@ models:
     think_max_tokens: 16384
     think_timeout: 300
     min_request_seconds: 300      # 关键独立复核须保留完整请求窗口
+    basis_review_split: true      # 独立范围、基础金额与报表表达式分段重建并逐项核对
+    basis_review_reasoning_effort: low  # 分段复核限制推理长度，其他复核保留 high
     vision: deepseek-flash
 
   deepseek-pro-repair:          # 明确选择的修复执行配置；不改变默认模型或Flash执行配置

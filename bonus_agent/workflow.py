@@ -29,7 +29,7 @@ _CORE = Path(__file__).resolve().parent.parent / 'bonus_core'
 _EXECUTION_PROFILE = hashlib.sha256(
     b''.join(p.read_bytes() for p in sorted(_CORE.rglob('*.py'))) + Path(__file__).read_bytes()
     + b''.join(Path(__file__).with_name(n).read_bytes() for n in
-               ('lint.py', 'facts.py', 'clauses.py', 'source_cells.py', 'source_diagnostics.py', 'scope_diagnostics.py', 'question_review.py', 'reread.py', 'coefficient.py', 'agent.py', 'context.py', 'advice_context.py', 'recovery.py', 'construction.py', 'semantics.py', 'progress.py', 'rule_package.py', 'contracts.py', 'data_profile.py', 'review_population.py'))
+               ('lint.py', 'facts.py', 'clauses.py', 'source_cells.py', 'source_diagnostics.py', 'scope_diagnostics.py', 'question_review.py', 'reread.py', 'coefficient.py', 'agent.py', 'context.py', 'advice_context.py', 'recovery.py', 'construction.py', 'semantics.py', 'progress.py', 'rule_package.py', 'contracts.py', 'data_profile.py', 'review_population.py', 'basis_review_parts.py'))
 ).hexdigest()
 
 
@@ -657,6 +657,7 @@ class Workflow:
         }
         from bonus_agent.context import guard_messages
 
+        evidence = rr.material(self.ws) + '\n' + data_dictionary(self.ws.datasets)
         msgs = [
             {
                 'role': 'system',
@@ -680,9 +681,7 @@ class Workflow:
             },
             {
                 'role': 'user',
-                'content': rr.material(self.ws)
-                + '\n'
-                + data_dictionary(self.ws.datasets)
+                'content': evidence
                 + '\n结构（不含生产公式）：'
                 + json.dumps(structure, ensure_ascii=False)
                 + '\n表达式语法：'
@@ -709,9 +708,28 @@ class Workflow:
         checker = getattr(self.ws.llm, 'checker_llm', None)
         policy = {'checker': model_identity(checker), 'primary': model_identity(self.ws.llm),
                   'checker_required': bool(getattr(self.ws.llm, 'checker_required', False))}
-        signature = fingerprint({'messages': msgs, 'execution_profile': _EXECUTION_PROFILE, 'reviewer_policy': policy})
+        legacy_signature = fingerprint({'messages': msgs, 'execution_profile': _EXECUTION_PROFILE, 'reviewer_policy': policy})
+        split = bool(getattr(checker, 'basis_review_split', False))
         prior = self.state.get('references', {}).get(name)
+        prior_split = bool(prior and (prior.get('reviewer') or {}).get('basis_review_split'))
+        split_signature, split_structure = None, None
+        if split or prior_split:
+            from bonus_agent.basis_review_parts import BasisReviewParts
+            split_structure = BasisReviewParts.visible_structure(self, name, structure)
+            split_signature = fingerprint({'evidence': evidence, 'structure': split_structure, 'dsl': self._dsl(),
+                                           'execution_profile': _EXECUTION_PROFILE, 'reviewer_policy': policy})
+        source_signature = split_signature if split else legacy_signature
+        signature = (fingerprint((source_signature, 'basis_review_parts:1', getattr(checker, 'basis_review_reasoning_effort', None)))
+                     if split else source_signature)
         same_input = bool(prior and prior.get('input_signature') == signature)
+        same_prior_evidence = bool(prior and prior.get('source_signature', prior.get('input_signature')) ==
+                                   (split_signature if prior_split else legacy_signature))
+        if (same_prior_evidence and prior.get('spec_state') in ('valid', 'unresolved', 'population_difference') and
+                prior.get('report', {}).get('status') == 'FAIL'):
+            # Preserve a frozen opinion's original protocol and evidence identity across request-mode changes.
+            same_input = True
+            signature = prior['input_signature']
+            source_signature = prior.get('source_signature', signature)
         cached = bool(same_input and prior.get('spec_state') in ('valid', 'unresolved'))
         if self.current('review:' + name) and cached and prior['report']['status'] == 'PASS':
             return {'status': 'PASS', 'scheme': name, 'cached': True, 'by': prior['reviewer']['name'],
@@ -724,7 +742,7 @@ class Workflow:
 
         def remember(report, spec_state='valid', diagnostic=None):
             self.state.setdefault('references', {})[name] = {
-                'version': version, 'basis_digest': digest, 'input_signature': signature,
+                'version': version, 'basis_digest': digest, 'input_signature': signature, 'source_signature': source_signature,
                 'spec': copy.deepcopy(spec), 'spec_state': spec_state, 'report': copy.deepcopy(report),
                 'reviewer': copy.deepcopy(reviewer), 'diagnostic': diagnostic, 'raw_response': raw_response,
             }
@@ -745,6 +763,38 @@ class Workflow:
 
         if cached:
             spec = copy.deepcopy(prior['spec'])
+        elif split or (same_prior_evidence and prior.get('spec_state') == 'population_difference'):
+            from bonus_agent.basis_review_parts import BasisReviewParts, PopulationDifference
+            actual, seen = checker, set()
+            while getattr(actual, 'think_llm', None) is not None and id(actual) not in seen:
+                seen.add(id(actual))
+                actual = actual.think_llm
+            reviewer = model_identity(actual)
+            reviewer.update(fallback_reason='', basis_review_split=True,
+                            basis_review_reasoning_effort=getattr(checker, 'basis_review_reasoning_effort', None))
+            if same_prior_evidence and prior.get('spec_state') == 'population_difference':
+                # Keep an already observed source-grounded scope disagreement frozen, including across request-mode changes.
+                spec = prior['spec']
+                _, root, levels, _ = checked(self.ws._independent_env, name, {}, basis=True)
+                observed = check_populations(self.ws, rs, spec, root, levels, scope_names=spec['populations'])
+                if not observed['contract_valid']:
+                    invalid('此前已记录的范围声明已无法通过程序核验')
+                if observed['status'] != 'PASS':
+                    report = {**prior['report'], 'cached': True, 'issues': observed['issues'],
+                              'population': observed, 'basis_digest': digest}
+                    remember(report, 'population_difference')
+                    self.state['last_review'] = report
+                    return report
+            try:
+                spec = BasisReviewParts(self, name, rs, evidence, split_structure, signature).generate()
+            except PopulationDifference as exc:
+                spec = {'populations': exc.selection}
+                report = {'status': 'FAIL', 'issues': exc.report['issues'], 'population': exc.report,
+                          'basis_digest': digest, 'cached': False, 'checked_objects': 0, 'by': reviewer['name'],
+                          'reviewer': copy.deepcopy(reviewer)}
+                remember(report, 'population_difference')
+                self.state['last_review'] = report
+                return report
         else:
             key = f'{name}:{signature}'
             attempts = self.state['attempts'].get(key, 0)
@@ -784,10 +834,10 @@ class Workflow:
                 spec = parse_json(raw_response)
             except (LLMError, ValueError) as exc:
                 invalid('独立复核输出无法解析为JSON：' + str(exc))
+        if isinstance(spec, dict) and spec.get('unclear'):
+            invalid('独立复核存在未明确口径，补充原文依据前保持阻断：' + str(spec['unclear']), unresolved=True)
         if not isinstance(spec, dict) or not isinstance(spec.get('pool'), str) or not spec['pool'].strip():
             invalid('独立复核须输出包含非空pool表达式的JSON对象')
-        if spec.get('unclear'):
-            invalid('独立复核存在未明确口径，补充原文依据前保持阻断：' + str(spec['unclear']), unresolved=True)
         for field in ('helpers', 'tables', 'details', 'totals'):
             if field in spec and not isinstance(spec[field], dict):
                 invalid(f'独立复核的{field}须为JSON对象')

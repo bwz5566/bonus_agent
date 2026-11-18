@@ -11,6 +11,7 @@ import os
 import re
 import ssl
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -19,6 +20,7 @@ import yaml
 
 DEFAULT_CONFIG = Path(__file__).parent / "config" / "models.yaml"      # 随安装包发布的默认配置
 REPO_CONFIG = Path(__file__).parent.parent / "config"                   # 源码目录下的 config/（放 secrets.yaml）
+BASIS_PART_REASONING = ContextVar('basis_part_reasoning', default=None)
 
 
 def _first(paths) -> Path | None:
@@ -544,6 +546,8 @@ class LLM:
     run_budget: object | None = field(default=None, repr=False, compare=False)
     tools_thinking: bool = False     # agent tool turns request thinking without consuming recovery/advisor attempts
     min_request_seconds: float = 0   # minimum job time remaining before a potentially billable request
+    basis_review_split: bool = False  # independently generate bounded basis review sections
+    basis_review_reasoning_effort: str | None = None
 
     @classmethod
     def from_config(cls, name: str | None = None, config: dict | None = None, checker: str | None = None,
@@ -575,6 +579,15 @@ class LLM:
         if not isinstance(tools_thinking, bool):
             raise LLMError(f'模型 {name} 的 tools_thinking 须为 true 或 false')
         llm.tools_thinking = tools_thinking
+        basis_review_split = m.get('basis_review_split', False)
+        if not isinstance(basis_review_split, bool):
+            raise LLMError(f'模型 {name} 的 basis_review_split 须为 true 或 false')
+        llm.basis_review_split = basis_review_split
+        effort = m.get('basis_review_reasoning_effort')
+        if effort is not None and (not basis_review_split or effort not in ('low', 'high')
+                                   or 'reasoning_effort' not in (llm.think_body or {})):
+            raise LLMError(f'模型 {name} 的分段思考配置须启用分段，且模型已配置 reasoning_effort；可选 low 或 high')
+        llm.basis_review_reasoning_effort = effort
         minimum = m.get('min_request_seconds', 0)
         try:
             minimum = float(minimum) if isinstance(minimum, (int, float)) and not isinstance(minimum, bool) else math.nan
@@ -793,7 +806,11 @@ class LLM:
         """这一步是否真的思考、请求参数、输出上限。模型不能切换思考时照常调用。"""
         if not (think and self.can_think):
             return False, body, max_tokens
-        return True, _merge(body, self.think_body), max(max_tokens, self.think_max_tokens)
+        thinking_body = self.think_body
+        scoped = BASIS_PART_REASONING.get()
+        if scoped is not None and scoped[0] is self:
+            thinking_body = {**(thinking_body or {}), 'reasoning_effort': scoped[1]}
+        return True, _merge(body, thinking_body), max(max_tokens, self.think_max_tokens)
 
     def context_window(self) -> int | None:
         """模型服务的上下文长度（vLLM 在 /models 里返回 max_model_len）；查不到返回 None，不影响调用。"""

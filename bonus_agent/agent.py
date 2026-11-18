@@ -3360,11 +3360,17 @@ class Workspace:
             expr = (spec.get('pending') or {}).get(pending.name)
             if not expr:
                 raise ToolError(f'缺少待分配项「{pending.name}」的独立表达式 pending')
-            nodes = [root] if pending.level == 'global' else by_level.get(pending.level) or []
+            nodes = self._independent_report_nodes(root, by_level, pending.level)
             if not nodes or pending.name in out:
-                raise ToolError(f'待分配项「{pending.name}」' + ('和某个人员同名，换一个名字' if pending.name in out else f'所在层级「{pending.level}」没有对象，核对 level 写的是分配层级名'))
+                raise ToolError(f'待分配项「{pending.name}」' + ('和某个人员同名，换一个名字' if pending.name in out else f'所在层级「{pending.level}」没有对象，请核对分配层级、辅助实体和数据范围'))
             out[pending.name] = sum(self._independent_eval(ev, expr, nodes, '待分配').values(), Decimal(0))
         return out
+
+    @staticmethod
+    def _independent_report_nodes(root, by_level, level):
+        if level == 'global':
+            return [root]
+        return by_level.get(level) or list((root.index or {}).get(level, {}).values())
 
     def _independent_details(self, name: str, spec: dict, *, basis: bool = False) -> dict[str, Decimal]:
         base=self._ruleset(name)
@@ -3379,10 +3385,9 @@ class Workspace:
             expr=(spec.get('details') or {}).get(item.name)
             if not expr:
                 raise ToolError(f'缺少对象金额报告「{item.name}」的独立表达式 details')
-            nodes=([root] if item.level=='global' else by_level.get(item.level) or
-                   list((root.index or {}).get(item.level,{}).values()))
+            nodes=self._independent_report_nodes(root, by_level, item.level)
             if not nodes:
-                raise ToolError(f'对象金额报告「{item.name}」所在层级「{item.level}」没有对象：核对 level 写的是分配层级名（{[lv.level for lv in base.allocation]}）')
+                raise ToolError(f'对象金额报告「{item.name}」所在层级「{item.level}」没有对象，请核对分配层级、辅助实体和数据范围')
             values=self._independent_eval(ev,expr,nodes,'对象金额')
             out.update({json.dumps([item.name,nid],ensure_ascii=False):value.quantize(Decimal('.01'),ROUND_HALF_UP)
                         for nid,value in values.items()})
