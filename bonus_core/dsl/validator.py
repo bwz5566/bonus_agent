@@ -13,6 +13,10 @@ from bonus_core.engine.issues import Issue
 
 def _exprs(rs: RuleSet, *, include_distribution=True):
     """(位置, 表达式, 求值层级或关联实体表名) 列表。None 表示全局。"""
+    for n, table in rs.tables.items():
+        if table.applies_when:
+            # Guard scope is the actual call site's scope, checked in _ScopeCheck.
+            yield f'tables.{n}.applies_when', table.applies_when, None
     for n, v in rs.variables.items():
         yield f"variables.{n}", v.expr, None if v.scope == "global" else v.scope
     yield "pool", rs.pool.expr, None if rs.pool.scope == "global" else rs.pool.scope
@@ -255,7 +259,7 @@ def _validate(rs: RuleSet, *, basis=False) -> list[Issue]:
                         issues.append(Issue.block("fn_of", f"{node.fn} 的 of 必须是数据表名字符串", where))
                 if node.fn == "scheme_paid" and not all(isinstance(a, Str) for a in node.args):
                     issues.append(Issue.block("fn_args", 'scheme_paid 的参数是方案名和修订名字符串，如 scheme_paid("方案名", "修订名")', where))
-                if node.fn in ("tier", "tier_rate", "lookup") and node.args:
+                if node.fn in ("tier", "tier_rate", "tier_ratio", "lookup") and node.args:
                     a0 = node.args[0]
                     want = "tier" if node.fn != "lookup" else "lookup"
                     t = rs.tables.get(a0.id) if isinstance(a0, Name) else None
@@ -267,15 +271,17 @@ def _validate(rs: RuleSet, *, basis=False) -> list[Issue]:
         for n in unknown:
             hint = f"：{n} 是数据表名，对它的字段聚合，表名写在 of 里，如 sum(字段, of: \"{n}\")" if n in rs.datasets else ""
             issues.append(Issue.block("name_unknown", f"无法识别的名字 {n}{hint}", where))
-        if not unknown:
+        if not unknown and not where.startswith('tables.'):
             issues += _ScopeCheck(rs, where).run(ast, scope)
         if where.startswith("variables."):
-            deps[where.split(".", 1)[1]] = names(ast) & set(rs.variables)
+            deps[where.split(".", 1)[1]] = names(ast) & (set(rs.variables) | set(rs.tables))
+        elif where.startswith('tables.'):
+            deps[where.removeprefix('tables.').removesuffix('.applies_when')] = names(ast) & (set(rs.variables) | set(rs.tables))
 
     try:
         tuple(TopologicalSorter(deps).static_order())
     except CycleError as e:
-        issues.append(Issue.block("cycle", f"变量循环引用：{' -> '.join(e.args[1])}"))
+        issues.append(Issue.block("cycle", f"变量或参数表适用条件循环引用：{' -> '.join(e.args[1])}"))
 
     # ---- 出处 ----
     unconfirmed = [
@@ -390,6 +396,7 @@ class _ScopeCheck:
         self.lay = Layout(rs)
         self.issues: list[Issue] = []
         self.seen: set[str] = set()
+        self.guard_stack: set[str] = set()
 
     def run(self, ast, scope: str | None) -> list[Issue]:
         if scope in self.lay.aux:
@@ -494,6 +501,20 @@ class _ScopeCheck:
                 for a in list(args) + [v for k, v in kws if k == "where"]:
                     self._visit(a, ctx, inner, ds)
             case Call(args=args, kwargs=kws):
+                if node.fn in ('tier', 'tier_rate', 'tier_ratio', 'lookup') and args and isinstance(args[0], Name):
+                    name = args[0].id
+                    table = self.rs.tables.get(name)
+                    if table is not None and table.applies_when and name not in self.guard_stack:
+                        old_where = self.where
+                        self.guard_stack.add(name)
+                        self.where = f'tables.{name}.applies_when'
+                        try:
+                            self._visit(parse(table.applies_when), ctx, ent, agg)
+                        except ExprError:
+                            pass  # The standalone guard check reports syntax at its exact path.
+                        finally:
+                            self.where = old_where
+                            self.guard_stack.remove(name)
                 for a in list(args) + [v for k, v in kws]:
                     self._visit(a, ctx, ent, agg)
             case BinOp(left=l, right=r) | Cmp(left=l, right=r) | BoolOp(left=l, right=r):

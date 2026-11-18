@@ -544,27 +544,38 @@ class RecoveryJournal:
         self.save()
 
 
-def local_advice(llm, reason, steps, facts, hint):
+def local_advice(llm, reason, steps, facts, hint, *, context=None):
     """A fresh, tool-free conversation with a small source/evidence packet."""
     recent = [{'tool': s.tool, 'args': s.args, 'ok': s.ok, 'result': s.result[:1600]} for s in steps[-4:]]
-    text = reason + json.dumps(recent, ensure_ascii=False)
+    text = reason + json.dumps(recent, ensure_ascii=False) + json.dumps(context or {}, ensure_ascii=False, default=str)
     relevant = [f for f in facts if f.name in text or any(t in text for t in f.targets)]
     packet = {'problem': reason[:2000], 'recent': recent, 'next_action': hint[:1600],
               'facts': [f.model_dump() for f in relevant[:12]]}
+    if context is not None:
+        if not isinstance(context, dict):
+            raise ValueError('顾问证据包须为结构化对象；未调用模型')
+        packet['evidence_context'] = context
     from bonus_agent.tool_specs import TOOLS
     failed_tools = {s.tool for s in steps[-4:] if not s.ok}
+    context_tools = ({'update_dataset', 'prepare_data', 'compile_formulas'}
+                     if context and (context.get('scope_observations') or any(
+                         'mapping' in node for node in context.get('current_nodes', []))) else set())
     packet['tool_contracts'] = [
         {'name': t['name'], 'description': t['description'], 'required': t['parameters'].get('required', []),
          'parameters': list(t['parameters'].get('properties', {})),
-         **({'schema': t['parameters']} if t['name'] in failed_tools else {})}
-        for t in TOOLS if t['name'] in failed_tools | {'set_rules', 'bind_facts', 'read_workspace', 'ask_question', 'validate_parameters', 'compile_coefficient_table'}]
+         **({'schema': t['parameters']} if t['name'] in failed_tools or t['name'] == 'update_dataset' and context_tools else {})}
+        for t in TOOLS if t['name'] in failed_tools | context_tools | {'set_rules', 'bind_facts', 'read_workspace', 'ask_question', 'validate_parameters', 'compile_coefficient_table'}]
     packet['constraints'] = ('define_dataset.file必须是真实Excel文件名，不能引用其他数据集作为file；'
                              'combine引用原始Excel列名，fields.column也是原列名；'
                              '只使用tool_contracts列出的工具参数，不发明数据集派生接口。'
                              'bind_facts的literal可以绑定expr中的AST数值；已含常量不等于来源已经绑定。'
                              'bind_facts不修改公式，失败整批不保存绑定；既有公式缺失不能推断为此次绑定新引入。'
                              '精确目标路径使用read_workspace(section="rules",name="方案::/variables/变量/expr")；'
-                             'section="variables"或"tables"用于按组件名称/query检索，不把完整路径当变量名。')
+                             'section="variables"或"tables"用于按组件名称/query检索，不把完整路径当变量名。'
+                             'evidence_context中的当前反例、范围观察、定义和已核对原文优先于recent摘要。'
+                             '已读回执不等于业务批准；不要重复索取已提供的同版本证据。'
+                             '先核对对象是否属本期；有原文依据的population/期间/关系修正不等于删除反例，须验证历史依赖仍可达。'
+                             '不得从截断对象名称猜测键拼接错误；须用完整键、实际映射和程序匹配证据证明。')
     from bonus_agent.facts import split_target, target_parts
     targets = [target for step in steps[-4:] if not step.ok for item in step.args.get('bindings', [])
                if isinstance(item, dict) for target in item.get('targets', []) if isinstance(target, str)]
@@ -585,8 +596,16 @@ def local_advice(llm, reason, steps, facts, hint):
                    (split_target(target)[0] in (None, scheme) or scheme is None) and
                    target_parts(split_target(target)[1])[:len(parts)] == parts]
         if matches:
+            excerpt = step.result[:2400]
+            try:
+                structured = json.loads(step.result)
+            except (TypeError, ValueError):
+                structured = None
+            if isinstance(structured, (dict, list)):
+                excerpt = structured if len(step.result) <= 2400 else {
+                    'omitted': True, 'notice': '完整结构化节点过长，未截断JSON；请按read_args读取'}
             packet['related_nodes'].append({'targets': matches, 'read_args': step.args,
-                                            'result_excerpt': step.result[:2400], 'is_excerpt': len(step.result) > 2400})
+                                            'result_excerpt': excerpt, 'is_excerpt': len(step.result) > 2400})
             seen_targets.update(matches)
         if len(seen_targets) == len(targets):
             break
@@ -596,7 +615,19 @@ def local_advice(llm, reason, steps, facts, hint):
     for item in packet['recent']:
         args = json.dumps(item['args'], ensure_ascii=False, default=str)
         if len(args) > 2400:
-            item['args'] = {'excerpt': args[:2400], 'notice': '参数摘录，非可执行JSON，不代表完整调用'}
+            item['args'] = {'omitted': True, 'keys': list(item['args'])[:12],
+                            'notice': '参数过长，未截断JSON；不是可执行调用'}
+    # Structured tool reports must not turn into misleading half-JSON snippets.
+    for item, step in zip(packet['recent'], steps[-4:]):
+        try:
+            structured = json.loads(step.result)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(structured, (dict, list)):
+            item['result'] = structured if len(step.result) <= 1600 else {
+                'omitted': True, 'reason': '结构化报告过长，未截断JSON；看当前证据包或精确读取入口',
+                'top_level_keys': list(structured)[:12] if isinstance(structured, dict) else [],
+            }
     payload = json.dumps(packet, ensure_ascii=False, default=str)
     while len(payload) > 18000 and (packet['facts'] or len(packet['recent']) > 1 or len(packet['related_nodes']) > 1):
         if packet['facts']:
@@ -611,10 +642,13 @@ def local_advice(llm, reason, steps, facts, hint):
         packet['next_action'] = packet['next_action'][:800]
         for item in packet['recent']:
             item['tool'] = item['tool'][:80]
-            item['args'] = {'excerpt': str(item['args'])[:800]}
-            item['result'] = item['result'][:800]
+            item['args'] = {'omitted': True, 'notice': '详细调用参数已省略'}
+            item['result'] = (item['result'][:800] if isinstance(item['result'], str)
+                              else {'omitted': True, 'notice': '结构化结果已省略，未截断JSON'})
         for item in packet['related_nodes']:
-            item['result_excerpt'], item['is_excerpt'] = item['result_excerpt'][:800], True
+            item['result_excerpt'] = (item['result_excerpt'][:800] if isinstance(item['result_excerpt'], str)
+                                      else {'omitted': True, 'notice': '结构化节点省略，未截断JSON；请按read_args读取'})
+            item['is_excerpt'] = True
         payload = json.dumps(packet, ensure_ascii=False, default=str)
     if len(payload) > 18000:
         raise ValueError('局部顾问诊断包超过18000字符，完整工具合同仍无法容纳；未调用模型，先按程序反馈修复')
@@ -630,6 +664,9 @@ def local_advice(llm, reason, steps, facts, hint):
              '输入是局部诊断包，不是完整案卷；recent或facts里没列出的内容不代表原文件缺失。'
              '只有显式文件清单或读取失败能支持缺文件结论，不得据局部上下文要求重新上传整批材料。'
              '缺证据就指出缺口，不猜测业务政策，不改验算迎合引擎，不降低校验。'
+              '先区分本期对象范围与历史统计范围；没有原文证明对象应在本期时，不得把永久保留该反例写成验收要求。'
+              '有来源的范围修正必须保留历史依赖并重新验证；不准无依据删对象，也不准把任何范围修正都说成删反例。'
+              '不从对象显示文本或截断内容推断拼接键错误。证据不足时给一个准确缺口，验收条件应为条件性核验，不编业务口径。'
              '下一步必须遵守tool_contracts和constraints，不得建议工具不支持的操作。'
              '只返回JSON：diagnosis(原因)、next_action(一个可执行修复步骤)、evidence_needed(缺少的原文)、'
              'acceptance(修复后必须验证什么)。'},

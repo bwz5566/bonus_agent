@@ -4848,7 +4848,9 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                 started_advice = time.time()
                 before_advice = (llm.usage.prompt_tokens, llm.usage.completion_tokens)
                 try:
-                    advice = local_advice(llm.think_llm, deep_why, steps, ws.facts, ws.next_hint())
+                    from bonus_agent.advice_context import build_advice_context
+                    context = build_advice_context(ws, steps, current_compile_report())
+                    advice = local_advice(llm.think_llm, deep_why, steps, ws.facts, ws.next_hint(), context=context)
                     content = json.dumps(advice, ensure_ascii=False)
                     history.append({'role': 'user', 'content': '【只读纠错建议，必须经原文和程序验证后应用】' + content})
                     advice_ok = True

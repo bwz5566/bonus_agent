@@ -281,6 +281,7 @@ class RepairReadBudget:
         self.state = state
         state.setdefault('records', {})
         state.setdefault('seen_compile', [])
+        state.setdefault('seen_runtime_targets', {})
 
     @property
     def active(self):
@@ -340,10 +341,80 @@ class RepairReadBudget:
                 pass
         return objects
 
+    @staticmethod
+    def _runtime_failures(report):
+        """Use executed structured frames, never a generated error paraphrase."""
+        for scheme, result in report.get('preflight', {}).items():
+            if not isinstance(result, dict) or result.get('status') != 'FAIL':
+                continue
+            for issue in result.get('issues', []):
+                if (not isinstance(issue, dict) or issue.get('code') != 'basis_preflight_eval'
+                        or not isinstance(issue.get('node_id'), str) or not issue['node_id']
+                        or not isinstance(issue.get('rule_item'), str) or not issue['rule_item']):
+                    continue
+                item = issue['rule_item']
+                if item == 'pool':
+                    target = '/pool'
+                elif item.startswith('report.'):
+                    target = '/' + item.replace('.', '/')
+                elif item == 'basis':
+                    target = 'rule_item:basis'  # report identity is not a variable name
+                else:
+                    target = '/variables/' + item.replace('~', '~0').replace('/', '~1')
+                yield scheme, target, issue
+                break  # preflight stops at its first executed failure
+
+    @staticmethod
+    def _runtime_write(step):
+        """A successful execution-affecting write; prose/evidence alone cannot qualify."""
+        saved_draft = (step.tool in ('set_rules', 'compile_table')
+                       and step.result.startswith('草稿已保存，校验未通过'))
+        if ((not step.ok and not saved_draft) or step.result.lstrip().startswith('no-op')
+                or step.tool not in {'set_rules', 'submit_formula_task', 'update_dataset',
+                                     'define_dataset', 'compile_table', 'compile_coefficient_table'}):
+            return False
+        if step.tool == 'submit_formula_task':
+            try:
+                saved, _ = json.JSONDecoder().raw_decode(step.result.lstrip())
+                if not isinstance(saved, dict) or saved.get('saved') is not True:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        semantic = {'expr', 'scope', 'key', 'link', 'period', 'window', 'filter', 'population_from',
+                    'column', 'combine', 'unpivot', 'unmatched', 'distinct', 'type', 'nullable',
+                    'steps', 'mapping', 'mode', 'lower_inclusive', 'below_first', 'default',
+                    'applies_when', 'level', 'parent_key', 'weight', 'people', 'total',
+                    'rounding', 'allocation', 'checks', 'payout', 'offsets'}
+        def meaningful(value):
+            if isinstance(value, dict):
+                return any(key in semantic or meaningful(child) for key, child in value.items()
+                           if key not in {'desc', 'sources', 'notes', 'algorithm_basis', 'bindings', 'facts'})
+            return isinstance(value, list) and any(meaningful(child) for child in value)
+        return meaningful(step.args)
+
+    @staticmethod
+    def _runtime_verified(row, result):
+        """Positive execution evidence, or a complete population after a real write."""
+        runtime = row.get('runtime')
+        if (not runtime or not row.get('runtime_written') or not isinstance(result, dict)
+                or result.get('status') not in ('PASS', 'FAIL')):
+            return False
+        evidence = result.get('execution_evidence')
+        if not isinstance(evidence, dict):
+            return False
+        if any(isinstance(item, dict) and item.get('node_id') == runtime['node_id']
+               and item.get('rule_item') == runtime['rule_item'] for item in evidence.get('successful', [])):
+            return True
+        scope, ids = evidence.get('object_scope'), evidence.get('object_ids')
+        return bool(evidence.get('objects_complete') is True and isinstance(scope, str) and scope
+                    and isinstance(ids, list) and all(isinstance(item, str) for item in ids)
+                    and runtime.get('object_scope') == scope and runtime['node_id'] not in ids)
+
     @classmethod
     def message(cls, row):
         """Stable program-owned halt text, also used to identify legacy records."""
-        action = ('bind_facts；目标公式缺分支时set_rules(bindings=...)；绑定已经一致时validate_parameters核验剩余缺口' if row['tool'] == 'bind_facts' else
+        action = ('update_dataset核对对象范围/关联，或submit_formula_task/set_rules修正公式；随后compile_formulas验证' if row.get('runtime') else
+                  'bind_facts；目标公式缺分支时set_rules(bindings=...)；绑定已经一致时validate_parameters核验剩余缺口' if row['tool'] == 'bind_facts' else
                   'submit_formula_task（使用已有任务ID）/set_rules，然后程序局部检查')
         return (f'当前未解决对象「{row["subject"]}」已读取 {row["reads"]}/{cls.LIMIT} 次，'
                 '换页面、换query、note、no-op或改描述不会增加额度。'
@@ -370,6 +441,11 @@ class RepairReadBudget:
                 del records[key]  # native feedback clears only validated successes
 
         phase = report.get('phase') if report else None
+        attempted_steps = steps if attempts is None else attempts
+        for row in records.values():
+            if row.get('runtime') and any(self._runtime_write(step)
+                    and step.args.get('scheme') in (None, row['runtime']['scheme']) for step in attempted_steps):
+                row['runtime_written'] = True
         if phase in ('basis', 'all') and report.get('status') in ('PASS', 'FAIL'):
             issues = {self._subject(message): str(message) for message in report.get('issues', [])}
             static_complete = report['status'] == 'PASS' or (
@@ -388,17 +464,59 @@ class RepairReadBudget:
                     # Static errors can prevent the runtime check from running;
                     # even overall PASS can contain DEFERRED upstream-dependent
                     # preflights. Only this scheme's executed PASS resolves it.
-                    if report.get('preflight', {}).get(runtime.group(1), {}).get('status') == 'PASS':
+                    result = report.get('preflight', {}).get(runtime.group(1), {})
+                    if result.get('status') == 'PASS' or self._runtime_verified(row, result):
+                        if row.get('runtime'):
+                            remembered = copy.deepcopy(row)
+                            remembered.pop('halt_marker', None)
+                            remembered.pop('runtime_written', None)
+                            self.state['seen_runtime_targets'][key] = remembered
                         self.validated_close(key, {'status': 'PASS', 'kind': 'runtime', 'tool': 'compile_formulas',
                                                    'scheme': runtime.group(1), 'phase': phase,
                                                    'report_fingerprint': fingerprint(report)})
                 elif static_complete and row['subject'] not in issues:
                     self.validated_close(key, {'status': 'PASS', 'kind': 'static', 'tool': 'compile_formulas',
                                                'phase': phase, 'report_fingerprint': fingerprint(report)})
-            attempted_steps = steps if attempts is None else attempts
+            runtime_subjects = set()
+            for scheme, target, issue in self._runtime_failures(report):
+                prefix = f'方案「{scheme}」基础求值预检'
+                runtime_subjects.add(prefix)
+                subject = prefix + ' / ' + target
+                key = fingerprint(('compile', phase, subject))
+                # A masked earlier failure still owns the allowance. A new
+                # target is not proof that the previous target was fixed.
+                older = [row for row in records.values() if row['kind'] == 'compile'
+                         and re.match(r'^方案「([^」]+)」基础求值预检[：:]', row['issue'])
+                         and re.match(r'^方案「([^」]+)」基础求值预检[：:]', row['issue']).group(1) == scheme]
+                if key not in records and older:
+                    continue
+                identity = {'scheme': scheme, 'target': target,
+                            'node_id': issue['node_id'], 'rule_item': issue['rule_item']}
+                evidence = report['preflight'][scheme].get('execution_evidence', {})
+                object_scope, object_ids = evidence.get('object_scope'), evidence.get('object_ids')
+                if (isinstance(object_scope, str) and object_scope and isinstance(object_ids, list)
+                        and issue['node_id'] in object_ids):
+                    # Only a positive membership observation establishes the
+                    # old object's scope. IDs alone cannot disambiguate a colon
+                    # in a legitimate scope name from one in an object key.
+                    identity['object_scope'] = object_scope
+                if key not in records:
+                    remembered = copy.deepcopy(self.state['seen_runtime_targets'].get(key, {}))
+                    records[key] = remembered or {'kind': 'compile', 'phase': phase, 'reads': 0,
+                                                  'seen': [], 'warned': False}
+                    records[key]['runtime'] = identity
+                row = records[key]
+                # A repeated target shares its quota even on a different node.
+                # Retain the first unresolved node until its execution is proven.
+                row.setdefault('runtime', identity)
+                brief = {k: issue[k] for k in ('code', 'message', 'where', 'node_id', 'rule_item') if k in issue}
+                row.update(subject=subject, issue=prefix + '：' + json.dumps(brief, ensure_ascii=False)[:1000],
+                           tool='compile_formulas')
             attempted = set().union(*(self._write_objects(step) for step in attempted_steps)) if attempted_steps else set()
             if phase in self.state['seen_compile'] and report['status'] == 'FAIL' and attempted:
                 for subject, message in issues.items():
+                    if subject in runtime_subjects:
+                        continue
                     if not any(obj == subject or obj in message for obj in attempted):
                         continue
                     key = fingerprint(('compile', phase, subject))

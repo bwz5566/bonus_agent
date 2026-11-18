@@ -56,11 +56,30 @@ def _report(status, phase, engine, issues, *, issue_count=None):
         'note': '仅检查当前基础公式能否在真实数据上执行；不代表金额确认、业务规则审核或人员分配通过。',
     }
     if engine is not None:
+        objects = engine._report_nodes(engine.rs.pool.scope)
         report['summary'] = {
             'dataset_rows': {name: len(table.rows) for name, table in engine.data.items()},
             'pool_scope': engine.rs.pool.scope,
-            'candidate_objects': len(engine._report_nodes(engine.rs.pool.scope)),
+            'candidate_objects': len(objects),
             'completed_expression_traces': len(engine.ev.traces),
+        }
+        # Progress evidence contains identities only, never computed money.
+        # A truncated list may prove an included success, never an absence.
+        # evaluate() may append a scalar trace before rejecting its numeric
+        # result contract. Explicit failure frames must not become a success.
+        failed = {(frame.get('node_id'), frame.get('rule_item')) for issue in issues
+                  for frame in [issue, *issue.get('dependency_chain', [])]
+                  if frame.get('node_id') and frame.get('rule_item')}
+        failed_places = {issue.get('where') for issue in issues if issue.get('where')}
+        identities = list(dict.fromkeys((t.node_id, t.rule_item) for t in engine.ev.traces.values()
+                                       if (t.node_id, t.rule_item) not in failed
+                                       and t.id not in failed_places and t.rule_item not in failed_places))
+        report['execution_evidence'] = {
+            'successful': [{'node_id': node, 'rule_item': item} for node, item in identities[:128]],
+            'successful_complete': len(identities) <= 128,
+            'object_ids': [node.id for node in objects[:128]],
+            'objects_complete': len(objects) <= 128,
+            'object_scope': engine.rs.pool.scope,
         }
     return report
 

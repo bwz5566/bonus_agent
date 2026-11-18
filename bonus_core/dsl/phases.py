@@ -35,7 +35,10 @@ def basis_rules(rs: RuleSet) -> RuleSet:
             refs = names(parse(expr))
         except ExprError:
             continue
-        tables.update(refs & set(result.tables))
+        for name in refs & set(result.tables) - tables:
+            tables.add(name)
+            if result.tables[name].applies_when:
+                pending.append(result.tables[name].applies_when)
         for name in refs & set(result.variables) - variables:
             variables.add(name)
             pending.append(result.variables[name].expr)
