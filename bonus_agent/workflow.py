@@ -922,14 +922,14 @@ class Workflow:
             fail('金额基线与复核或确认回执不一致')
 
     def recheck(self, *, initial_compile=False):
-        """改动让已通过的“准备数据 / 编译公式”回执失效时，程序自己重跑这两项确定性检查。
+        """数据输入在检查后变化，或公式回执失效时，重新执行相应的确定性检查。
         实测模型补一条分配层级或改一处规则就退回前一阶段、清空对话，再把整套检查和读取重做一遍，白耗步数和 tokens。
         initial_compile还允许基础任务首次全部通过后自动编译；不执行付费复核或金额确认。
         每个输入版本只自动执行一次；返回 [(检查名, 是否通过, 未通过的问题)]。"""
         done = []
         for _ in range(2):
             stage, _scheme = self.stage()
-            if stage == 2 and 'data' in self.state['receipts']:
+            if stage == 2 and not self.ws.pending:
                 name, kind, phase, run = 'prepare_data', 'data', None, self.prepare_data
             elif stage == 3:
                 from bonus_agent.construction import TaskBoard
@@ -946,7 +946,12 @@ class Workflow:
             else:
                 break
             version = self.version(kind)
-            if name == 'compile_formulas':
+            if name == 'prepare_data':
+                previous = self.state.get('data_report', {})
+                failed_version = previous.get('version') if previous.get('report', {}).get('status') == 'FAIL' else None
+                if failed_version == version or (not failed_version and 'data' not in self.state['receipts']):
+                    break
+            else:
                 feedback = self.compile_feedback(phase, version=version)
                 if feedback and feedback['status'] == 'FAIL':
                     break

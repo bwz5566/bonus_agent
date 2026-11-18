@@ -9,6 +9,7 @@ from bonus_agent.agent import Workspace, ToolError, run_agent
 from bonus_agent.auto import build_inventory
 from bonus_agent.construction import TaskBoard
 from bonus_agent.context import task_card
+from bonus_agent.extract_rules import Question
 from bonus_agent.llm import FakeLLM
 from bonus_agent.workflow import Workflow
 from tests.test_staged_workflow import make_workspace, save_staged_case, _staged_llm
@@ -36,6 +37,27 @@ def count_compilations(monkeypatch):
         return original(self, phase)
     monkeypatch.setattr(Workflow, '_compile', counted)
     return calls
+
+
+def test_data_recheck_after_first_failed_mapping_and_resume(tmp_path):
+    ws = make_workspace(tmp_path)
+    assert ws._flow().recheck() == []
+    ws.define_dataset('附表', ws.mapping['projects'].file, 'projects',
+                      {'pid': {'column': 'pid', 'type': 'id'}}, key='pid')
+    failed = ws.prepare_data()
+    assert failed['status'] == 'FAIL' and any('key_shared' in msg for msg in failed['issues'])
+    assert ws._flow().recheck() == []  # same failed version
+    ws.update_dataset('附表', {'key': None, 'link': 'pid'})
+    resumed = Workspace(FakeLLM([]), ws.inv)
+    case.restore(resumed, case.snapshot(ws))
+    assert 'data' not in resumed.workflow['receipts']
+    q = Question(id='q1', text='期间是否已确认？', blocking=True)
+    resumed.questions.append(q)
+    assert resumed._flow().recheck() == []
+    q.answer = '已确认'
+    assert resumed._flow().recheck() == [('prepare_data', True, [])]
+    assert resumed._flow().recheck() == []
+    assert resumed._flow().current('data') and not resumed.llm.calls
 
 
 def test_first_ready_basis_compiles_once_without_downstream_weight_or_model(tmp_path, monkeypatch):
