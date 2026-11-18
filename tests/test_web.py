@@ -256,7 +256,8 @@ def test_failure_explained_with_retry(env):
     x = explain("智能体卡住了，已停止以免继续消耗 tokens：trial_run 连续 3 次失败，最后一次：错误：方案「Q」试算失败："
                 "- [阻断] eval_error: min 没有可计算的明细行（回款明细）")
     assert "「试算」" in x["title"] and "没有对应的明细行" in x["title"] and "重试" in x["advice"]
-    assert "按 0 处理" in x["ask"] and "min 没有可计算的明细行" in x["where"]
+    assert x["ask"] == "" and "min 没有可计算的明细行" in x["where"]
+    assert "核对核算范围" in x["title"] and "已有材料" in x["advice"]
     assert "欠费" in explain("Error code: 400 - Arrearage")["title"]
     x = explain("智能体卡住了，已停止以免继续消耗 tokens：verify 连续 3 次失败，最后一次：错误：验算式算不出来：计算失败："
                 "变量 v_ew 属于「员工」层级，不能在「个人」层直接引用（需要聚合）（位置：个人:E007）")

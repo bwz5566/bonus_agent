@@ -4,7 +4,7 @@ from copy import deepcopy
 import pytest
 
 from bonus_core.data.table import from_records
-from bonus_core.dsl.models import Check, RuleSet, Variable
+from bonus_core.dsl.models import Check, FieldDef, RuleSet, Variable
 from bonus_core.engine.preflight import preflight_basis
 from bonus_core.engine.run import Engine
 
@@ -63,6 +63,31 @@ def test_filter_empty_is_distinguished_from_missing_relationship_rows():
     assert coverage['selected_sources'] == []
     assert coverage['where'] == 'amount > 1000'
     assert 'where' in issue['repair'][0]
+
+
+@pytest.mark.parametrize('field', ['amount', 'region'])
+def test_empty_aggregate_keeps_failure_and_never_invents_a_numeric_branch(field):
+    rs, records = example(f'min({field}, of: "sales")')
+    rs.datasets['sales'].fields['region'] = FieldDef(type='text')
+    records['sales'][0]['region'] = 'West'
+    before = deepcopy(records)
+    report = preflight_basis(rs, from_records(rs, records))
+    assert report['status'] == 'FAIL'
+    issue = report['issues'][0]
+    if field == 'region':
+        # A declared text operand is rejected before evaluating any object;
+        # do not require runtime coverage from a check that never ran.
+        assert report['phase'] == 'prepare'
+        assert issue['code'] == 'fn_type' and issue['where'] == 'variables.base'
+        assert '不能用数值默认值' in issue['message']
+        assert 'coverage' not in issue
+    else:
+        assert issue['coverage'][0]['selected_rows'] == 0
+        assert '原文规定' in issue['message'] and '字段类型一致' in issue['message']
+        assert '历史' in issue['message'] and '关联键' in issue['message']
+    assert '>= 0' not in issue['message'] and ', 0)' not in issue['message']
+    assert '合计用 sum' not in issue['message']
+    assert records == before
 
 
 def test_if_guarded_empty_set_is_not_rejected():

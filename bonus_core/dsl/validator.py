@@ -232,7 +232,17 @@ def _validate(rs: RuleSet, *, basis=False) -> list[Issue]:
                     continue
                 if not spec.min_args <= len(node.args) <= spec.max_args:
                     issues.append(Issue.block("fn_args", f"{node.fn} 需要 {spec.min_args}~{spec.max_args} 个参数，实际 {len(node.args)} 个", where))
-                if node.fn in ('sum', 'avg') and node.args:
+                field_type = _aggregate_field_type(rs, node)
+                supported = {'money', 'number', 'int', 'ratio'}
+                if node.fn in ('min', 'max'):
+                    supported.add('date')
+                if field_type is not None and field_type not in supported:
+                    dataset = node.kw()['of'].value
+                    accepted = '数值或日期' if node.fn in ('min', 'max') else '数值'
+                    issues.append(Issue.block('fn_type',
+                        f'{node.fn} 的直接字段「{dataset}.{node.args[0].id}」声明为 {field_type}，该聚合只支持{accepted}；'
+                        '核对原文字段含义及所属对象，不能用数值默认值、更换字段类型或任取一条记录来绕过', where))
+                elif node.fn in ('sum', 'avg') and node.args:
                     dataset = getattr(node.kw().get('of'), 'value', None)
                     if _date_expr(rs, node.args[0], dataset=dataset):
                         issues.append(Issue.block('fn_type', f'{node.fn} 不能对日期求和或平均；先按业务规则确定唯一日期，或有依据地取最早/最晚日期，再计算日期差', where))
@@ -328,6 +338,18 @@ def validate_distribution_contracts(rs: RuleSet) -> list[Issue]:
             elif not item.sources:
                 issues.append(Issue.block('distribution_pending_source', f'待分配项「{name}」缺少原文依据', where))
     return issues
+
+
+def _aggregate_field_type(rs: RuleSet, node: Call):
+    """Only a direct row field with an explicit dataset has a proven type here."""
+    if node.fn not in ('sum', 'avg', 'min', 'max') or len(node.args) != 1:
+        return None
+    owner = node.kw().get('of')
+    arg = node.args[0]
+    if not isinstance(owner, Str) or owner.value not in rs.datasets or not isinstance(arg, Name):
+        return None
+    field = rs.datasets[owner.value].fields.get(arg.id)
+    return field.type if field is not None else None
 
 
 def _date_expr(rs: RuleSet, expr, *, dataset=None, busy=frozenset()) -> bool:

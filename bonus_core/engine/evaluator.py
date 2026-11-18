@@ -627,9 +627,10 @@ class Evaluator:
                 if c.fn == "sum":
                     r = sum(nums, Decimal(0))
                 elif not nums:
-                    raise EvalError(f"{c.fn} 没有可计算的明细行（{ds}）：这个对象在「{ds}」里没有行，{c.fn} 求不出值。"
-                                    f"没有行时应当怎样，按材料写明，如 count(of: \"{ds}\") == 0 or {c.fn}(...) >= 0，"
-                                    f"或 if(count(of: \"{ds}\") > 0, {c.fn}(...), 0)；合计用 sum（没有行时为 0）", ctx.where)
+                    raise EvalError(f"{c.fn} 没有可计算的明细行（{ds}）：当前对象在关联、期间及筛选后的聚合范围内没有行，{c.fn} 求不出值。"
+                                    "先核对本次核算对象范围、关联键、期间和筛选；本期对象与历史统计应分别表达，保留公式所需历史行。"
+                                    "只有原文明确允许缺行时才添加条件分支，使用原文规定且与字段类型一致的返回值；"
+                                    "不得任意补默认值、删对象或更换聚合函数来消除报错", ctx.where)
                 elif c.fn == "avg":
                     r = sum(nums, Decimal(0)) / len(nums)
                 else:

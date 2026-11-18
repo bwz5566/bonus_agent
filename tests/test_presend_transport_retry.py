@@ -29,7 +29,7 @@ class Stream:
         self.plan, self.writes, self.closed = plan, [], False
         self.reads = list(plan.get('responses', [payload()]))
 
-    def start_tls(self, **kwargs):
+    def start_tls(self, ssl_context=None, server_hostname=None, timeout=None):
         if error := self.plan.get('tls_error'):
             self.close()  # real SyncStream closes a failed TLS upgrade
             raise httpcore2.ConnectError('TLS failed') from error
@@ -220,9 +220,9 @@ def test_redirect_connection_failure_cannot_erase_the_initial_send(monkeypatch):
     assert len(created) == 1 and budget.snapshot()['unconfirmed_reserved_tokens'] > 0
 
 
-def test_proxy_connect_write_prevents_retry_of_subsequent_tls_failure(monkeypatch):
+def test_proxy_certificate_failure_remains_unknown_and_never_retries(monkeypatch):
     connect = b'HTTP/1.1 200 Connection Established\r\n\r\n'
-    created = install(monkeypatch, [[{'responses': [connect], 'tls_error': ssl.SSLEOFError(8, 'target TLS EOF')}]],
+    created = install(monkeypatch, [[{'responses': [connect], 'tls_error': ssl.SSLCertVerificationError(1, 'certificate verification failed')}]],
                       proxy='http://proxy.invalid:8080')
     llm, budget = bound()
     with pytest.raises(LLMError):

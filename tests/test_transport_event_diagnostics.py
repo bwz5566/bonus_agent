@@ -8,9 +8,9 @@ from bonus_agent.llm import LLMError, _PresendProbe
 from tests.test_presend_transport_retry import bound, install
 
 
-def test_real_installed_proxy_connect_then_tls_failure_is_visible_but_still_unknown(monkeypatch):
+def test_real_installed_proxy_certificate_failure_is_visible_but_still_unknown(monkeypatch):
     connect = b'HTTP/1.1 200 Connection Established\r\n\r\n'
-    created = install(monkeypatch, [[{'responses': [connect], 'tls_error': ssl.SSLEOFError(8, 'handshake EOF')}]],
+    created = install(monkeypatch, [[{'responses': [connect], 'tls_error': ssl.SSLCertVerificationError(1, 'certificate verification failed')}]],
                       proxy='http://private-proxy.invalid:8080')
     llm, budget = bound()
     with pytest.raises(LLMError):

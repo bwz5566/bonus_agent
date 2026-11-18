@@ -110,12 +110,90 @@ def _exception_chain(exc):
     return chain
 
 
+class _ProxyTunnelProof:
+    """Proof for one empty CONNECT followed by a failed target TLS handshake.
+
+    Restricted to the installed HTTP proxy implementation. Every extra event
+    invalidates the proof; no request headers, address or body are exported.
+    """
+    EVENTS = (
+        'connection.connect_tcp.started', 'connection.connect_tcp.complete',
+        'http11.send_request_headers.started', 'http11.send_request_headers.complete',
+        'http11.send_request_body.started', 'http11.send_request_body.complete',
+        'http11.receive_response_headers.started', 'http11.receive_response_headers.complete',
+        'proxy.start_tls.started', 'proxy.start_tls.failed',
+    )
+
+    def __init__(self, request, pool, callback):
+        import httpcore2
+        self.valid = (type(pool) is httpcore2.HTTPProxy and pool._retries == 0
+                      and pool._proxy_url.scheme == b'http' and request.url.raw_scheme == b'https'
+                      and request.method == 'POST' and not {'sni_hostname', 'target'} & request.extensions.keys())
+        self.index = 0
+        self.failed_exception = None
+        self.failure_causes = ()
+        self._proxy_origin = pool._proxy_url.origin
+        self._host = request.url.raw_host
+        self._authority = self._host + b':' + str(request.url.port or 443).encode('ascii')
+        self._callback = callback
+        self._connect = None
+
+    def _empty_connect(self, request):
+        import httpcore2
+        from httpcore2._models import ByteStream
+        return (type(request) is httpcore2.Request and request.method == b'CONNECT'
+                and request.url.origin == self._proxy_origin and request.url.target == self._authority
+                and request.extensions.get('trace') == self._callback
+                and type(request.stream) is ByteStream and request.stream._content == b'')
+
+    def observe(self, event, info):
+        if not self.valid:
+            return
+        try:
+            if self.index >= len(self.EVENTS) or event != self.EVENTS[self.index]:
+                self.valid = False
+                return
+            if self.index == 0:
+                self.valid = (info.get('host') == self._proxy_origin.host.decode('ascii')
+                              and info.get('port') == self._proxy_origin.port)
+            elif self.index == 2:
+                self._connect = info.get('request')
+                self.valid = self._empty_connect(self._connect)
+            elif self.index in (4, 6):
+                self.valid = info.get('request') is self._connect and self._empty_connect(self._connect)
+            elif self.index == 7:
+                response = info.get('return_value')
+                self.valid = (type(response) is tuple and len(response) == 4
+                              and response[0] in (b'HTTP/1.0', b'HTTP/1.1')
+                              and type(response[1]) is int and 200 <= response[1] < 300)
+            elif self.index == 8:
+                context = info.get('ssl_context')
+                self.valid = (info.get('server_hostname') == self._host.decode('ascii')
+                              and isinstance(context, ssl.SSLContext) and context.check_hostname
+                              and context.verify_mode == ssl.CERT_REQUIRED)
+            elif self.index == 9:
+                self.failed_exception = info.get('exception')
+                self.valid = isinstance(self.failed_exception, BaseException)
+                if self.valid:
+                    self.failure_causes = tuple(_exception_chain(self.failed_exception))
+            self.index += 1
+        except Exception:
+            self.valid = False
+
+    def not_sent(self, exc):
+        causes = [*_exception_chain(exc), *self.failure_causes]
+        return bool(self.valid and self.index == len(self.EVENTS)
+                    and any(cause is self.failed_exception for cause in _exception_chain(exc))
+                    and not any(isinstance(cause, (ssl.SSLCertVerificationError, ssl.CertificateError)) for cause in causes))
+
+
 class _PresendProbe:
     """Conservative proof for this attempt, never an inference from an error class.
 
     Only the installed httpx2/httpcore2 transport is covered. Any application
-    write (including CONNECT and HTTP/2 initialization), redirect, missing or
-    malformed trace disables the proof. No request data enters diagnostics.
+    write disables the direct-connection proof. A separate strict proof covers
+    only empty CONNECT -> failed target TLS; HTTP/2 initialization, redirects,
+    missing or malformed traces stay unknown. No request data enters diagnostics.
     """
     STAGES = {'connection.connect_tcp', 'connection.start_tls'}
     # Diagnostic-only names: accepting an event here grants no retry authority.
@@ -141,6 +219,8 @@ class _PresendProbe:
         self.failure_count = 0
         self.trace_events = []
         self.trace_events_truncated = False
+        self._http = None
+        self._tunnel = None
 
     def install(self, client):
         try:
@@ -156,6 +236,7 @@ class _PresendProbe:
                 and getattr(t._pool, '_retries', None) == 0
             ) for t in transports)
             http.event_hooks['request'].append(self.on_request)
+            self._http = http
             self.installed = True
         except Exception:
             self.valid = False
@@ -165,13 +246,25 @@ class _PresendProbe:
             self.requests += 1
             if self.requests != 1 or request.extensions.get('trace') is not None:
                 self.valid = False  # redirects/auth replay must not reset earlier send evidence
+                if self._tunnel is not None:
+                    self._tunnel.valid = False
                 return
             request.extensions['trace'] = self.on_trace
+            if self.supported and self._http is not None:
+                import httpx2
+                import httpcore2
+                transport = self._http._transport_for_url(request.url)
+                if type(transport) is httpx2.HTTPTransport and type(transport._pool) is httpcore2.HTTPProxy:
+                    self._tunnel = _ProxyTunnelProof(request, transport._pool, request.extensions['trace'])
         except Exception:
             self.valid = False
+            if self._tunnel is not None:
+                self._tunnel.valid = False
 
     def on_trace(self, event, info):
         try:
+            if self._tunnel is not None:
+                self._tunnel.observe(event, info)
             # Record before fail-closed branches so CONNECT -> proxy TLS errors
             # stay diagnosable. Never copy info or stringify unknown event data.
             self.trace_events.append(event if isinstance(event, str) and event in self.TRACE_EVENTS else 'unknown')
@@ -205,21 +298,28 @@ class _PresendProbe:
                         self.failure_causes = tuple(_exception_chain(self.failed_exception))
         except Exception:
             self.valid = False  # instrumentation must never replace the original outcome
+            if self._tunnel is not None:
+                self._tunnel.valid = False
 
     def not_sent(self, exc):
-        return bool(self.installed and self.supported and self.valid and self.requests == 1
-                    and not self.write_started and self.active is None and self.failure_count == 1
-                    and any(cause is self.failed_exception for cause in _exception_chain(exc)))
+        direct = bool(self.valid and not self.write_started and self.active is None and self.failure_count == 1
+                      and any(cause is self.failed_exception for cause in _exception_chain(exc)))
+        tunnel = self._tunnel is not None and self._tunnel.not_sent(exc)
+        return bool(self.installed and self.supported and self.requests == 1 and (direct or tunnel))
 
     def causes_for(self, exc):
         # A broken trace cannot authorize a retry, but its captured cause can
         # still explain the very same exception later stripped by the pool.
-        return self.failure_causes if any(cause is self.failed_exception for cause in _exception_chain(exc)) else ()
+        if any(cause is self.failed_exception for cause in _exception_chain(exc)):
+            return self.failure_causes
+        if self._tunnel is not None and any(cause is self._tunnel.failed_exception for cause in _exception_chain(exc)):
+            return self._tunnel.failure_causes
+        return ()
 
     def retryable(self, exc):
         if not self.not_sent(exc):
             return False
-        causes = [*_exception_chain(exc), *self.failure_causes]
+        causes = [*_exception_chain(exc), *self.causes_for(exc)]
         if any(isinstance(cause, (ssl.SSLCertVerificationError, ssl.CertificateError)) for cause in causes):
             return False
         # A generic ConnectError/SSLError says nothing about whether the cause is transient.
@@ -235,6 +335,8 @@ class _PresendProbe:
                 'application_write_started': self.write_started, 'failed_stage': self.failed_stage,
                 'failure_paired': self.failure_count == 1 and self.active is None,
                 'not_sent': self.not_sent(exc) if exc is not None else False,
+                'proxy_tunnel_not_sent': bool(exc is not None and self._tunnel is not None and self.requests == 1
+                                              and self._tunnel.not_sent(exc)),
                 'trace_events': list(self.trace_events), 'trace_events_truncated': self.trace_events_truncated}
 
 
