@@ -42,6 +42,10 @@ class LLMError(RuntimeError):
     pass
 
 
+class RunBudgetError(LLMError):
+    """A shared job allowance stopped the request, not a provider/protocol failure."""
+
+
 THINK_BUDGET = 8192               # 百炼千问思考时每步思考 tokens 的上限
 THINK_KEYS = ("enable_thinking", "thinking")      # 各家“思考开关”的参数名：千问 / vLLM 模板用 enable_thinking，DeepSeek 用 thinking
 
@@ -235,6 +239,7 @@ class LLM:
     workflow_mode: str = 'staged'
     max_input_tokens: int = 96000
     max_history_chars: int | None = None   # 对话历史上限（字符），见 models.yaml
+    run_budget: object | None = field(default=None, repr=False, compare=False)
 
     @classmethod
     def from_config(cls, name: str | None = None, config: dict | None = None, checker: str | None = None,
@@ -300,15 +305,24 @@ class LLM:
 
     def _usage(self, resp, t0: float):
         u = Usage(calls=1, latency_s=time.monotonic() - t0)
-        if resp.usage:
-            u.prompt_tokens, u.completion_tokens = resp.usage.prompt_tokens, resp.usage.completion_tokens
-            estimate=self.__dict__.pop('_pending_context_estimate',None)
+        usage = getattr(resp, 'usage', None)
+        counts = [getattr(usage, key, None) for key in ('prompt_tokens', 'completion_tokens')]
+        reported = all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in counts)
+        estimate=self.__dict__.pop('_pending_context_estimate',None)
+        if reported:
+            u.prompt_tokens, u.completion_tokens = counts
             if estimate and u.prompt_tokens:
                 self._context_token_ratio=max(getattr(self,'_context_token_ratio',0),u.prompt_tokens/estimate)
                 self.last_call.update(estimated_input_tokens=estimate,actual_input_tokens=u.prompt_tokens)
-            details = getattr(resp.usage, "prompt_tokens_details", None)
-            u.cached_tokens = (getattr(details, "cached_tokens", None) or 0) if details else 0
-        self.usage += u
+            details = getattr(usage, "prompt_tokens_details", None)
+            cached = getattr(details, 'cached_tokens', None)
+            u.cached_tokens = min(cached, u.prompt_tokens) if isinstance(cached, int) and 0 <= cached else 0
+        self.last_call['usage_reported'] = reported
+        if self.run_budget is not None:
+            self.run_budget.record_usage(self, u)
+        else:
+            self.usage += u
+        return reported
 
     @property
     def can_think(self) -> bool:
@@ -331,7 +345,58 @@ class LLM:
         return out
 
     def _client(self, think: bool = False):
-        return openai_client(self.base_url, self.api_key, self.think_timeout if think else self.timeout)
+        timeout = self.think_timeout if think else self.timeout
+        if self.run_budget is not None:
+            timeout = self.run_budget.request_timeout(timeout)
+        client = openai_client(self.base_url, self.api_key, timeout)
+        if self.run_budget is not None:
+            # A retry is another potentially billable request. SDK retries cannot reserve
+            # tokens or re-evaluate the job deadline, so budgeted jobs disable them.
+            client = client.with_options(max_retries=0, timeout=self.run_budget.request_timeout(timeout))
+        return client
+
+    def _send(self, kwargs, think):
+        budget, reservation = self.run_budget, None
+        if budget is not None:
+            from bonus_agent.context import estimate_tokens
+            packet = {k: kwargs[k] for k in ('messages', 'tools', 'response_format', 'extra_body') if k in kwargs}
+            baseline = estimate_tokens(packet)
+            estimate = budget.estimate_input(self, baseline)
+            output = max(int(kwargs.get('max_tokens', 0)),
+                         int((kwargs.get('extra_body') or {}).get('max_tokens', 0)),
+                         int((kwargs.get('extra_body') or {}).get('max_completion_tokens', 0)))
+            try:
+                reservation = budget.reserve(self, estimate, output)
+            except RunBudgetError:
+                self.last_call.update(status='budget_blocked', budget=budget.snapshot(),
+                                      reserved_input_estimate=estimate, requested_output_tokens=output)
+                raise
+            self.last_call.update(budget=budget.snapshot(), reserved_input_estimate=estimate,
+                                  requested_output_tokens=output, transport_retries_limit=0)
+        t0, sent, reported = time.monotonic(), False, False
+        try:
+            client = self._client(think)
+            sent = True
+            resp = client.chat.completions.create(**kwargs)
+            reported = self._usage(resp, t0)
+            if budget is not None and reported:
+                budget.observe_input(self, baseline, resp.usage.prompt_tokens)
+        except Exception as exc:
+            self.last_call.update(status='budget_blocked' if isinstance(exc, RunBudgetError) else 'failed', error_type=type(exc).__name__)
+            if isinstance(exc, RunBudgetError):
+                raise
+            raise LLMError(f'{self.name} 调用失败：{exc}') from exc
+        finally:
+            if budget is not None and reservation is not None:
+                budget.settle(reservation, reported=reported, sent=sent)
+                self.last_call['budget'] = budget.snapshot()
+        if budget is not None:
+            try:
+                budget.after_response()
+            except RunBudgetError:
+                self.last_call.update(status='budget_blocked', budget=budget.snapshot())
+                raise
+        return resp
 
     def _think(self, think: bool, body: dict, max_tokens: int) -> tuple[bool, dict, int]:
         """这一步是否真的思考、请求参数、输出上限。模型不能切换思考时照常调用。"""
@@ -344,12 +409,20 @@ class LLM:
         if not hasattr(self, "_ctx"):
             self._ctx = None
             try:
-                for m in openai_client(self.base_url, self.api_key, 20).models.list():
+                timeout = self.run_budget.request_timeout(20) if self.run_budget is not None else 20
+                client = openai_client(self.base_url, self.api_key, timeout)
+                if self.run_budget is not None:
+                    client = client.with_options(max_retries=0, timeout=self.run_budget.request_timeout(timeout))
+                for m in client.models.list():
                     if m.id == self.model:
                         extra=getattr(m,'model_extra',None) or {}
                         n = getattr(m,'context_window',None) or extra.get('context_window') or getattr(m, "max_model_len", None) or extra.get("max_model_len")
                         self._max_output_tokens=getattr(m,'max_output_tokens',None) or extra.get('max_output_tokens')
                         self._ctx = int(n) if n else None
+                if self.run_budget is not None:
+                    self.run_budget.after_response()
+            except RunBudgetError:
+                raise
             except Exception:
                 pass
         return self._ctx
@@ -359,6 +432,8 @@ class LLM:
         """think：这一次打开思考（JSON 协议的智能体出错后用）。思考时不加 response_format：
         部分服务思考模式下不支持 JSON 输出，结果仍按容错方式解析。思考内容放在 last_reasoning。"""
         if think and self.think_llm is not None:
+            if self.run_budget is not None:
+                self.run_budget.bind(self)
             out = self.think_llm.chat(messages, schema=schema, json_out=json_out, temperature=temperature,
                                       max_tokens=max_tokens, think=True)
             self.last_reasoning = self.think_llm.last_reasoning
@@ -376,13 +451,7 @@ class LLM:
                 kwargs["response_format"] = {"type": "json_object"}
         self.last_call = {'model': self.model, 'thinking': think, 'status': 'requesting',
                           'reasoning_effort': (body or {}).get('reasoning_effort'), 'transport_retries_limit': MAX_RETRIES}
-        t0 = time.monotonic()
-        try:
-            resp = self._client(think).chat.completions.create(**kwargs)
-        except Exception as e:  # 网络、鉴权、限流等
-            self.last_call.update(status='failed', error_type=type(e).__name__)
-            raise LLMError(f"{self.name} 调用失败：{e}") from e
-        self._usage(resp, t0)
+        resp = self._send(kwargs, think)
         self._record_call(resp, think)
         self.last_reasoning = _reasoning(resp.choices[0].message) if think else ""
         return resp.choices[0].message.content or ""
@@ -403,6 +472,8 @@ class LLM:
         """工具调用。返回 {"content": 文本, "tool_calls": [{"id", "name", "arguments"(JSON 字符串)}], "reasoning": 思考内容}。
         think：这一步打开思考（模型不能切换时照常调用，reasoning 为空）；配了 think_model 时这一步交给那个模型。"""
         if think and self.think_llm is not None:
+            if self.run_budget is not None:
+                self.run_budget.bind(self)
             out = self.think_llm.chat_tools(messages, tools, temperature=temperature, max_tokens=max_tokens, think=True)
             self.last_call = self.think_llm.last_call
             return out
@@ -414,13 +485,7 @@ class LLM:
             kwargs["extra_body"] = body
         self.last_call = {'model': self.model, 'thinking': think, 'status': 'requesting',
                           'reasoning_effort': (body or {}).get('reasoning_effort'), 'transport_retries_limit': MAX_RETRIES}
-        t0 = time.monotonic()
-        try:
-            resp = self._client(think).chat.completions.create(**kwargs)
-        except Exception as e:
-            self.last_call.update(status='failed', error_type=type(e).__name__)
-            raise LLMError(f"{self.name} 调用失败：{e}") from e
-        self._usage(resp, t0)
+        resp = self._send(kwargs, think)
         self._record_call(resp, think)
         msg = resp.choices[0].message
         calls = [{"id": c.id, "name": c.function.name, "arguments": c.function.arguments or "{}"}

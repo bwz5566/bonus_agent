@@ -53,7 +53,9 @@ PAGE_CHARS = 5400
 FRAGMENT_CHARS = 3800  # raw JSON text; escaping inside the result makes it longer
 # Listing views of the ledger: enough to pick a name and see what it means. Full records (quote, source
 # coordinates, hashes) are ~4x larger and made a 135-fact ledger unreadable within the history budget.
-_BRIEF = {'facts': ('name', 'value', 'unit', 'page', 'context', 'meaning'), 'clauses': ('id', 'file', 'point', 'where')}
+_BRIEF = {'facts': ('name', 'value', 'unit', 'page', 'context', 'meaning'),
+          'clauses': ('id', 'file', 'point', 'where'),
+          'construction': ('id', 'scheme', 'target', 'title', 'status', 'depends_on')}
 
 
 def _brief(section, item):
@@ -69,6 +71,12 @@ def _brief(section, item):
             out['meaning'] = meaning[: -len(value) - 3]  # the value is already shown
         if item.get('targets'):
             out['bound'] = len(item['targets'])
+    elif section == 'construction':
+        out['fact_count'] = len(item.get('facts') or [])
+        out['clause_count'] = len(item.get('clauses') or [])
+        issues = (item.get('report') or {}).get('issues') or []
+        if issues:
+            out['issue_count'] = len(issues)
     return out
 
 
@@ -183,6 +191,9 @@ def workspace_view(
                     'next_call': {'tool': 'compile_formulas', 'args': {}}, 'notice': '规则或证据已变化，重新compile_formulas；不能把旧检查当当前结论'}
         items = [{'kind': 'issue', 'index': i, 'message': message} for i, message in enumerate(saved['report']['issues'])]
         items += [{'kind': 'warning', 'index': i, 'message': message} for i, message in enumerate(saved['report']['warnings'])]
+        items += [{'kind': 'preflight', 'name': 'preflight:' + scheme, 'index': i, **issue}
+                  for scheme, report in saved['report'].get('preflight', {}).items()
+                  for i, issue in enumerate(report.get('issues', []))]
     elif section == 'tool_results':
         reports = ws.workflow.get('tool_reports', {})
         chosen = {name: reports[name]} if name in reports else (reports if name is None else {})
@@ -239,7 +250,7 @@ def workspace_view(
         'next_call': None,
     }
     if brief:
-        result['view'] = 'brief：单条完整记录（原文、坐标）用 name 读取，或 detail=true'
+        result['view'] = 'brief：单条完整记录用 name 读取，或 detail=true；任务完整记录含条款、参数及检查报告'
     if requested_limit != limit:
         notes.append(f'请求条数{requested_limit}已安全调整为{limit}；按next_call继续读取')
     if name is not None and not items:

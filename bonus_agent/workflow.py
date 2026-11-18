@@ -29,7 +29,7 @@ _CORE = Path(__file__).resolve().parent.parent / 'bonus_core'
 _EXECUTION_PROFILE = hashlib.sha256(
     b''.join(p.read_bytes() for p in sorted(_CORE.rglob('*.py'))) + Path(__file__).read_bytes()
     + b''.join(Path(__file__).with_name(n).read_bytes() for n in
-               ('lint.py', 'facts.py', 'clauses.py', 'source_cells.py', 'coefficient.py', 'agent.py', 'context.py', 'recovery.py', 'construction.py', 'semantics.py', 'progress.py', 'rule_package.py', 'contracts.py'))
+               ('lint.py', 'facts.py', 'clauses.py', 'source_cells.py', 'coefficient.py', 'agent.py', 'context.py', 'recovery.py', 'construction.py', 'semantics.py', 'progress.py', 'rule_package.py', 'contracts.py', 'data_profile.py', 'review_population.py'))
 ).hexdigest()
 
 
@@ -76,7 +76,7 @@ class Workflow:
             parts = fx.target_parts(path)
             if not parts or parts[0] in ('allocation', 'payout', 'offsets'):
                 return []
-            if parts[0] == 'report' and len(parts) > 1 and parts[1] not in ('totals', 'details'):
+            if parts[0] == 'report' and len(parts) > 1 and parts[1] not in ('totals', 'details', 'balances'):
                 return []
             candidates = view.drafts if scheme in (None, '共用') else {scheme: view.drafts.get(scheme, {})}
             out = []
@@ -340,6 +340,31 @@ class Workflow:
         }
 
     def compile(self, phase=None):
+        from bonus_agent.construction import TaskBoard
+        try:
+            phase = phase or TaskBoard(self.ws).phase()
+            report = self._compile(phase)
+        except Exception:
+            self._invalidate_compilation(phase or 'basis')
+            raise
+        if report['status'] != 'PASS':
+            self._invalidate_compilation(phase)
+        return report
+
+    def _invalidate_compilation(self, phase):
+        receipts = self.state['receipts']
+        names = [name for name in receipts if name == 'allocation_formulas' or
+                 (phase == 'basis' and (name == 'formulas' or name.startswith(('basis:', 'review:', 'approved:'))))]
+        if names:
+            self.state['invalidated_receipts'] = {
+                'reason': '当前编译未通过，旧回执不得继续放行', 'phase': phase,
+                'receipts': {name: receipts.pop(name) for name in names},
+            }
+        if phase == 'basis':
+            self.state.pop('waiting', None)
+            self.ws.done = False
+
+    def _compile(self, phase):
         from bonus_core.dsl.parser import names, parse
         from bonus_core.dsl.validator import validate_basis
         from bonus_agent.construction import TaskBoard
@@ -395,8 +420,37 @@ class Workflow:
         self.ws._order(self.ws.schemes)  # Inter-scheme cycles are also invalid.
         # Structural blockers must remain visible even with hundreds of evidence gaps.
         issues = list(dict.fromkeys(issues + construction_issues + view._binding_gaps() + view._clause_gaps(self.skipped())))
+        preflight = {}
+        if not issues and phase == 'basis':
+            from bonus_agent.agent import ToolError
+            from bonus_core.engine.preflight import preflight_basis
+            for name in self.ws._order(self.ws.schemes):
+                refs, missing_refs = {}, []
+                for dependency, revision in self.ws._deps(name):
+                    if (not self.current('approved:' + dependency) or dependency in self.ws.untested
+                            or revision not in self.ws.results.get(dependency, {})):
+                        missing_refs.append(f'{dependency}/{revision}')
+                    else:
+                        refs[f'{dependency}/{revision}'] = self.ws.results[dependency][revision]
+                if missing_refs:
+                    # Compilation cannot approve a dependency or calculate recipients.
+                    preflight[name] = {'status': 'DEFERRED', 'dependencies': missing_refs,
+                                       'reason': '等待上游已确认且有效的结果；尚未完成本方案求值预检'}
+                    continue
+                try:
+                    rs = view._ruleset(name)
+                    data, _ = view._data(rs)
+                    result = preflight_basis(rs, data, refs, self.ws.period)
+                except ToolError as exc:
+                    result = {'status': 'FAIL', 'issues': [{'message': str(exc)}]}
+                preflight[name] = result
+                for issue in result.get('issues', []) if result['status'] == 'FAIL' else []:
+                    brief = {k: issue[k] for k in ('code', 'message', 'where', 'node_id', 'source', 'formula', 'repair') if k in issue}
+                    brief['coverage'] = [{k: c[k] for k in ('dataset', 'visible_rows', 'selected_rows', 'dataset_rows', 'active_row_source') if k in c}
+                                         for c in issue.get('coverage', [])[:2]]
+                    issues.append(f'方案「{name}」基础求值预检：' + json.dumps(brief, ensure_ascii=False)[:2400])
         report = {'status': 'FAIL' if issues else 'PASS', 'issues': issues, 'warnings': warnings,
-                  'graph': graph, 'repaired': repaired, 'phase': phase}
+                  'graph': graph, 'repaired': repaired, 'phase': phase, 'preflight': preflight}
         self.state['formula_report'] = {'version': self.version(), 'report': copy.deepcopy(report)}
         if not issues:
             self.receipt('allocation_formulas' if phase == 'all' else 'formulas', report,
@@ -421,6 +475,10 @@ class Workflow:
             'next': '按issues逐项修复；完整检查见read_workspace(section="checks")。草稿保存不等于校验通过。'
                     if report['issues'] else ('trial_run' if report.get('phase') == 'all' else 'calculate_basis'),
             'phase': report.get('phase', 'all'),
+            'preflight': {s: {'status': r['status'], 'summary': r.get('summary'),
+                              'dependencies': r.get('dependencies', []),
+                              'details_call': {'tool': 'read_workspace', 'args': {'section': 'checks', 'name': 'preflight:' + s}} if r.get('issues') else None}
+                          for s, r in report.get('preflight', {}).items()},
         }
 
     def references(self, name):
@@ -457,17 +515,20 @@ class Workflow:
 
     def review_basis(self, scheme=None):
         from bonus_agent import reread as rr
+        from bonus_agent.agent import ToolError
+        from bonus_agent.llm import LLMError, parse_json
+        from bonus_core.engine.evaluator import EvalError
+        from bonus_core.engine.issues import EngineError
 
         name = self.ws._scheme(scheme)
         self.require('basis:' + name)
         version = self.version('basis')
         basis = self.state['basis'][name]
         digest = fingerprint(basis)
-        if self.current('review:' + name):
-            return {'status': 'PASS', 'scheme': name, 'next': '等待财务确认总额'}
         from bonus_core.dsl.validator import basis_rules
         rs = basis_rules(self.ws._ruleset(name))
         from bonus_agent.extract_rules import data_dictionary
+        from bonus_agent.review_population import requirements, check_populations
 
         structure = {
             'scheme': name,
@@ -485,8 +546,11 @@ class Workflow:
             'data_checks': self.state['receipts']['data']['payload'],
             'allocation': [{'level': lv.level, 'key': lv.key, 'parent_key': lv.parent_key} for lv in rs.allocation],
             'columns': {n: m.columns for n, m in self.ws.mapping.items()},
+            'source_mapping': {n: m.model_dump(mode='json', include={'file', 'sheet', 'header_rows', 'combine', 'unpivot'})
+                               for n, m in self.ws.mapping.items()},
             'details': [(d.name, d.level, d.desc) for d in (rs.report.details if rs.report else [])],
             'totals': [(t.name, t.level, t.desc) for t in (rs.report.totals if rs.report else [])],
+            'population_requirements': requirements(rs),
         }
         from bonus_agent.context import guard_messages
 
@@ -495,8 +559,20 @@ class Workflow:
                 'role': 'system',
                 'content': '【独立总额复核】只按原文和数据字典重建公式，不看生产公式或答案。只输出JSON对象：'
                 '{"pool":"独立奖金池表达式","helpers":{"变量":{"scope":"层级或global","expr":"表达式"}},'
-                '"tables":{},"details":{"报告名":"独立表达式"},"totals":{"汇总名":"独立表达式"},"unclear":[]}。'
-                '每个报告项都须给独立公式；材料不清楚写unclear，不猜测。金额由程序计算。',
+                '"tables":{},"details":{"报告名":"独立表达式"},"totals":{"汇总名":"独立表达式"},'
+                '"populations":{"待核范围名":{"dataset":"来源表名","key":"对象标识标准字段",'
+                '"filter":{},"period":null,"window":"period","sources":[{"doc":"规则文件","quote":"逐字范围依据"}]}},"unclear":[]}。'
+                'populations必须覆盖population_requirements；从原文件重新选取对象，不继承主规则的筛选、期间或默认值。'
+                'filter使用原始列名，period为日期标准字段或明确null；window为period/year_to_date/to_date。'
+                '对象范围key可来自当期业务明细，程序按标识去重；rows:开头的范围不用key，核对该表实际参与的原始行。'
+                '不得盲目照抄当前映射；如果独立范围需要的字段或依据缺失，写unclear。'
+                '每个报告项都须给独立公式；材料不清楚写unclear，不猜测。金额由程序计算。'
+                '数据概况中的期间、筛选、实体范围和关联是待核对的映射事实，不是已获业务批准的核算范围。'
+                '必须按原材料独立核对本期核算对象集合、历史累计窗口、真实分类值和空值口径。'
+                '父实体与当期明细覆盖不同，须区分本期奖金对象和历史累计数据；不能直接裁掉历史实体或默认所有父对象都应核算。'
+                '仅在同一映射上算出相同金额不足以证明范围正确；无法证明对象范围符合原文时，'
+                '在unclear中列出具体表、字段、期间或覆盖数量及需核对的来源，不能签发同意。'
+                '概况标记unknown、values_truncated或fields_complete=false时，不得将未展示内容当作不存在。',
             },
             {
                 'role': 'user',
@@ -509,9 +585,54 @@ class Workflow:
                 + self._dsl(),
             },
         ]
-        signature = fingerprint({'messages': msgs, 'execution_profile': _EXECUTION_PROFILE})
+        def model_identity(model, seen=()):
+            if model is None or id(model) in seen:
+                return None
+            return {
+                'name': getattr(model, 'name', ''), 'model': getattr(model, 'model', ''),
+                # Store a configuration digest, never credentials or endpoint secrets.
+                'configuration': fingerprint({k: getattr(model, k, None) for k in
+                                              ('base_url', 'think_body', 'extra_body', 'json_mode')}),
+                'think_route': model_identity(getattr(model, 'think_llm', None), (*seen, id(model))),
+            }
+
+        checker = getattr(self.ws.llm, 'checker_llm', None)
+        policy = {'checker': model_identity(checker), 'primary': model_identity(self.ws.llm),
+                  'checker_required': bool(getattr(self.ws.llm, 'checker_required', False))}
+        signature = fingerprint({'messages': msgs, 'execution_profile': _EXECUTION_PROFILE, 'reviewer_policy': policy})
         prior = self.state.get('references', {}).get(name)
-        cached = bool(prior and prior.get('input_signature') == signature)
+        same_input = bool(prior and prior.get('input_signature') == signature)
+        cached = bool(same_input and prior.get('spec_state') in ('valid', 'unresolved'))
+        if self.current('review:' + name) and cached and prior['report']['status'] == 'PASS':
+            return {'status': 'PASS', 'scheme': name, 'cached': True, 'by': prior['reviewer']['name'],
+                    'reviewer': copy.deepcopy(prior['reviewer']), 'next': '等待财务确认总额'}
+        # An explicit new review cannot borrow a previous review's PASS when its
+        # reviewer or evidence changes. Human approval receipts remain untouched.
+        self.state['receipts'].pop('review:' + name, None)
+        reviewer = copy.deepcopy(prior.get('reviewer')) if cached else None
+        spec, raw_response = None, None
+
+        def remember(report, spec_state='valid', diagnostic=None):
+            self.state.setdefault('references', {})[name] = {
+                'version': version, 'basis_digest': digest, 'input_signature': signature,
+                'spec': copy.deepcopy(spec), 'spec_state': spec_state, 'report': copy.deepcopy(report),
+                'reviewer': copy.deepcopy(reviewer), 'diagnostic': diagnostic, 'raw_response': raw_response,
+            }
+
+        def invalid(message, *, unresolved=False):
+            report = {'status': 'FAIL', 'issues': [message], 'basis_digest': digest,
+                      'cached': cached, 'checked_objects': 0, 'by': (reviewer or {}).get('name', ''),
+                      'reviewer': copy.deepcopy(reviewer)}
+            remember(report, 'unresolved' if unresolved else 'invalid', message)
+            self.state['last_review'] = report
+            fail(message)
+
+        def checked(fn, *args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except (ToolError, EvalError, EngineError, ValueError) as exc:
+                invalid('独立复核声明未通过程序检查：' + str(exc))
+
         if cached:
             spec = copy.deepcopy(prior['spec'])
         else:
@@ -519,22 +640,53 @@ class Workflow:
             attempts = self.state['attempts'].get(key, 0)
             if attempts >= 2:
                 fail('同份独立复核输入已达预算，须补充证据或修复程序；修改主公式不能重置顾问预算')
-            guard_messages(msgs, getattr(self.ws.llm, 'checker_llm', None) or self.ws.llm, output_tokens=8192)
+            request = copy.deepcopy(msgs)
+            if same_input and prior.get('spec_state') == 'invalid':
+                request += [
+                    {'role': 'assistant', 'content': prior.get('raw_response') or
+                     json.dumps(prior.get('spec'), ensure_ascii=False)},
+                    {'role': 'user', 'content': '独立声明的程序诊断：' + str(prior['diagnostic']) +
+                     '\n请仅根据原材料修复上述声明，重新输出完整JSON。没有增加调用次数上限；'
+                     '这里没有提供生产公式、生产金额或参考答案。业务依据不足仍须写unclear。'},
+                ]
+            guard_messages(request, checker or self.ws.llm, output_tokens=8192)
             self.state['attempts'][key] = attempts + 1
-            from bonus_agent.llm import parse_json
-
-            spec = parse_json(rr._ask(self.ws, msgs))
-        if not isinstance(spec, dict) or not isinstance(spec.get('pool'), str) or spec.get('unclear'):
-            fail(
-                '独立复核没有完整公式或存在未明确口径，保持阻断：'
-                + str(spec.get('unclear') if isinstance(spec, dict) else type(spec).__name__)
-            )
-        _, root, by_level, ev = self.ws._independent_env(name, spec, basis=True)
+            raw_response = rr._ask(self.ws, request)
+            actual = checker if checker is not None and not self.ws.checker_down else self.ws.llm
+            think = actual is checker or not bool(self.ws.checker_down and getattr(self.ws.llm, 'think_llm', None))
+            seen = set()
+            while think and getattr(actual, 'think_llm', None) is not None and id(actual) not in seen:
+                seen.add(id(actual))
+                actual = actual.think_llm
+            reviewer = model_identity(actual)
+            reviewer['fallback_reason'] = self.ws.checker_down
+            try:
+                spec = parse_json(raw_response)
+            except (LLMError, ValueError) as exc:
+                invalid('独立复核输出无法解析为JSON：' + str(exc))
+        if not isinstance(spec, dict) or not isinstance(spec.get('pool'), str) or not spec['pool'].strip():
+            invalid('独立复核须输出包含非空pool表达式的JSON对象')
+        if spec.get('unclear'):
+            invalid('独立复核存在未明确口径，补充原文依据前保持阻断：' + str(spec['unclear']), unresolved=True)
+        for field in ('helpers', 'tables', 'details', 'totals'):
+            if field in spec and not isinstance(spec[field], dict):
+                invalid(f'独立复核的{field}须为JSON对象')
+        _, root, by_level, ev = checked(self.ws._independent_env, name, spec, basis=True)
+        population = check_populations(self.ws, rs, spec, root, by_level)
+        if not population['contract_valid']:
+            invalid('独立核算范围声明无效：' + '；'.join(population['issues'][:3]))
+        if population['status'] != 'PASS':
+            report = {'status': 'FAIL', 'issues': population['issues'], 'population': population,
+                      'basis_digest': digest, 'cached': cached, 'checked_objects': 0,
+                      'by': reviewer['name'], 'reviewer': copy.deepcopy(reviewer)}
+            remember(report)
+            self.state['last_review'] = report
+            return report
         targets = ([root] if rs.pool.scope == 'global' else
                    by_level.get(rs.pool.scope) or list((root.index or {}).get(rs.pool.scope, {}).values()))
         if not targets:
             fail('独立奖金池没有核算对象：' + rs.pool.scope)
-        pools = self.ws._independent_eval(ev, spec['pool'], targets, '预核算奖金池')
+        pools = checked(self.ws._independent_eval, ev, spec['pool'], targets, '预核算奖金池')
         actual = {k: Decimal(v['amount']) for k, v in basis['objects'].items()}
         issues = []
         reference_pools = {k: round_pool(v) for k, v in pools.items()}
@@ -560,7 +712,7 @@ class Workflow:
         )
         if expected_total != Decimal(basis['pool']):
             issues.append('奖金池汇总不一致')
-        details = self.ws._independent_details(name, spec, basis=True)
+        details = checked(self.ws._independent_details, name, spec, basis=True)
         wanted = {
             json.dumps([report, nid], ensure_ascii=False): Decimal(v['amount'])
             for report, rows in basis['details'].items()
@@ -573,7 +725,7 @@ class Workflow:
         for item in rs.report.totals if rs.report else []:
             expr = (spec.get('totals') or {}).get(item.name)
             if not isinstance(expr, str) or not expr:
-                fail(f'缺少汇总项 {item.name} 的独立公式')
+                invalid(f'缺少汇总项 {item.name} 的独立公式')
             nodes = (
                 [root]
                 if item.level == 'global'
@@ -582,13 +734,13 @@ class Workflow:
             if not nodes:
                 fail('独立汇总没有核算对象')
             totals[item.name] = round_pool(
-                sum(self.ws._independent_eval(ev, expr, nodes, '预核算汇总' + item.name).values(), Decimal(0))
+                sum(checked(self.ws._independent_eval, ev, expr, nodes, '预核算汇总' + item.name).values(), Decimal(0))
             )
         actual_totals = {k: Decimal(v) for k, v in basis['totals'].items()}
         if totals != actual_totals:
             issues.append('各类汇总金额不一致')
             differences('汇总', actual_totals, totals)
-        self.ws._independent_holes(ev.rs, ev)
+        checked(self.ws._independent_holes, ev.rs, ev)
         report = {
             'status': 'FAIL' if issues else 'PASS',
             'issues': issues,
@@ -596,15 +748,11 @@ class Workflow:
             'basis_digest': digest,
             'cached': cached,
             'checked_objects': len(actual) + len(wanted),
-            'by': self.ws.checker_down or getattr(getattr(self.ws.llm, 'checker_llm', None), 'name', self.ws.llm.name),
+            'population': population,
+            'by': reviewer['name'],
+            'reviewer': copy.deepcopy(reviewer),
         }
-        self.state.setdefault('references', {})[name] = {
-            'version': version,
-            'basis_digest': digest,
-            'input_signature': signature,
-            'spec': spec,
-            'report': copy.deepcopy(report),
-        }
+        remember(report)
         if not issues:
             self.receipt('review:' + name, report, kind='basis')
             self.state['waiting'] = name

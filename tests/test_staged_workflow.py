@@ -18,23 +18,32 @@ from bonus_core.engine.run import Engine
 pytestmark=pytest.mark.evidence
 
 
-def make_workspace(tmp_path):
+def population_spec():
+    entry = {'dataset': 'projects', 'key': 'pid', 'filter': {}, 'period': None, 'window': 'period',
+             'sources': [{'doc': 'policy.md', 'quote': '每个项目按销售金额的10%计算奖金'}]}
+    return {'项目': copy.deepcopy(entry), 'projects': copy.deepcopy(entry),
+            'rows:projects': {k: copy.deepcopy(v) for k, v in entry.items() if k != 'key'}}
+
+
+def make_workspace(tmp_path, mutate_workbook=None, project_distinct=False):
     policy=tmp_path/'policy.md';policy.write_text('每个项目按销售金额的10%计算奖金，按名单比例分配。',encoding='utf8')
     p=tmp_path/'data.xlsx';wb=openpyxl.Workbook();s=wb.active;s.title='projects'
     s.append(['pid','amount']);s.append(['A',100]);s.append(['B',200])
     r=wb.create_sheet('people');r.append(['rid','pid','person','share'])
     r.append(['1','A','甲',1]);r.append(['2','B','甲',.5]);r.append(['3','B','乙',.5])
+    if mutate_workbook:
+        mutate_workbook(wb)
     wb.save(p);wb.close()
     llm=FakeLLM([])
     llm.checker_required=True;llm.checker_llm=FakeLLM([json.dumps({
         'pool':'amount * 0.1','helpers':{},'tables':{},'details':{'项目奖':'amount * 0.1'},
-        'totals':{'项目奖合计':'sum(amount, of: "projects") * 0.1'},'unclear':[]})])
+        'totals':{'项目奖合计':'sum(amount, of: "projects") * 0.1'},'populations':population_spec(),'unclear':[]})])
     ws=Workspace(llm,build_inventory([policy,p]));ws.workflow['enabled']=True
     ws.plan_calculation('按项目核算，再按名单分配',['项目底稿','总额','人员金额'],{policy.name:'rule',p.name:'data'},['S'])
     ws.record_facts([{'name':'提成率','file':policy.name,'quote':'销售金额的10%','value':'10%'}])
     ws.record_clauses([{'file':policy.name,'quote':'每个项目按销售金额的10%计算奖金','point':'项目销售金额乘提成率'}])
     f=lambda c,t:{'column':c,'type':t}
-    ws.define_dataset('projects',p.name,'projects',{'pid':f('pid','id'),'amount':f('amount','money')},key='pid')
+    ws.define_dataset('projects',p.name,'projects',{'pid':f('pid','id'),'amount':f('amount','money')},key='pid',distinct=project_distinct)
     ws.define_dataset('people',p.name,'people',{'rid':f('rid','id'),'pid':f('pid','id'),
         'person':f('person','text'),'share':f('share','ratio')},key='rid')
     source=[{'doc':policy.name,'quote':'每个项目按销售金额的10%计算奖金'}]
@@ -107,7 +116,7 @@ def test_raw_query_survives_broken_unrelated_parent_and_uses_decimal(tmp_path):
 def test_bad_independent_formula_never_gets_review_or_approval_receipt(tmp_path):
     ws=prepared(make_workspace(tmp_path));ws.calculate_basis('S')
     ws.llm.checker_llm=FakeLLM([json.dumps({'pool':'amount * 0.2','helpers':{},'tables':{},
-        'details':{'项目奖':'amount * 0.2'},'totals':{'项目奖合计':'sum(amount, of: "projects") * 0.2'},'unclear':[]})])
+        'details':{'项目奖':'amount * 0.2'},'totals':{'项目奖合计':'sum(amount, of: "projects") * 0.2'},'populations':population_spec(),'unclear':[]})])
     assert ws.review_basis('S')['status']=='FAIL'
     assert not ws._flow().current('review:S')
     with pytest.raises(ToolError):ws._flow().approve('S','财务',fingerprint(ws.workflow['basis']['S']))
@@ -244,7 +253,7 @@ def test_full_staged_financial_validation_without_skipping_checker_or_samples(tm
 def test_rewording_production_formula_cannot_resample_a_disagreeing_reference(tmp_path):
     ws=prepared(make_workspace(tmp_path));ws.calculate_basis('S')
     ws.llm.checker_llm=FakeLLM([json.dumps({'pool':'amount * 0.2','helpers':{},'tables':{},
-        'details':{'项目奖':'amount * 0.2'},'totals':{'项目奖合计':'sum(amount, of: "projects") * 0.2'},'unclear':[]})])
+        'details':{'项目奖':'amount * 0.2'},'totals':{'项目奖合计':'sum(amount, of: "projects") * 0.2'},'populations':population_spec(),'unclear':[]})])
     assert ws.review_basis('S')['status']=='FAIL'
     ws.set_rules(scheme='S',pool={'scope':'项目','expr':'amount * 0.1 + 0'})
     assert ws.compile_formulas()['status']=='PASS'

@@ -6,7 +6,7 @@
 
 输入边界由程序控制，不靠提示词：
 - 给：规则文档原文（含图片转写）、财务的答复和对话里的说明、不是数据表的小工作表（参数表、字段说明）、每张数据表的表头和列类型；
-- 不给：数据行（姓名、金额、名单）、智能体写的规则和对话。所以就算以后改用外部模型复读，也不涉及员工数据。
+- 不给：逐行姓名/金额/名单、智能体写的规则和对话。另给程序生成的分类频数和空值统计，供核对真实取值与缺失情况。
 
 比对完全由程序做（不让模型当裁判），只比能机械判断的几类：用到的列、常数（允许百分数、万元换算）、分档点、
 筛选取值、日期范围。复读本身对不对不重要：它只用来把可疑的地方挑出来。
@@ -86,6 +86,8 @@ def material(ws) -> str:
             f"{h}（{_col_type(c)}）" for h, c in zip(st.headers, cols) if h))
     if heads:
         parts.append("## 数据表（只有表头和列类型，没有数据行）\n" + "\n".join(heads))
+    from bonus_agent.data_profile import review_context
+    parts.append(review_context(ws))
     return "\n\n".join(parts)
 
 
@@ -94,7 +96,7 @@ def signature(text: str) -> str:
 
 
 def review_signature(ws, text):
-    text += '\nreference_schema:2'
+    text += '\nreference_schema:3'
     other = getattr(ws.llm, 'checker_llm', None)
     if other is not None:
         text += f'\nreviewer:{other.name}:{other.model}:{other.think_body}'

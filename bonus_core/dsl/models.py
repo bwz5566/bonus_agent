@@ -246,6 +246,7 @@ class ReportBalance(RuleItem):
     total: str
     parts: list[str] = Field(min_length=1)
     rounding: Literal["exact", "cent"] = "exact"
+    stage: Literal["basis", "distribution"] = "basis"
 
 
 class ReportPending(ReportTotal):

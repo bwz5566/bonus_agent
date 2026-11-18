@@ -21,12 +21,13 @@ def basis_rules(rs: RuleSet) -> RuleSet:
         result.report.details = [r for r in result.report.details if r.stage == 'basis']
         result.report.people = None
         result.report.pending = []
-        result.report.balances = []
+        result.report.balances = [b for b in result.report.balances if b.stage == 'basis']
         result.report.distributions = []
 
     pending = [result.pool.expr, *(c.expr for c in result.checks)]
     if result.report:
         pending += [r.expr for r in [*result.report.totals, *result.report.details]]
+        pending += [expr for b in result.report.balances for expr in [b.total, *b.parts]]
     variables, tables = set(), set()
     while pending:
         expr = pending.pop()

@@ -23,6 +23,10 @@ PREC = 28
 class EvalError(ValueError):
     def __init__(self, message: str, where: str = ""):
         self.where = where
+        # Failure evidence is separate from successful traces.  A diagnostic
+        # must not turn a failed expression into a value or a calculation receipt.
+        self.frames: list[dict] = []
+        self.aggregates: list[dict] = []
         super().__init__(message + (f"（位置：{where}）" if where else ""))
 
 
@@ -127,8 +131,12 @@ class Evaluator:
 
     # ---------------- 对外接口 ----------------
     def evaluate(self, expr: str, node: Node, trace_id: str, rule_item: str) -> Decimal:
-        val = self._eval_traced(expr, node, trace_id, rule_item)
-        return self._num(val, trace_id)
+        try:
+            val = self._eval_traced(expr, node, trace_id, rule_item)
+            return self._num(val, trace_id)
+        except EvalError as exc:
+            self._failure_frame(exc, expr, node, trace_id, rule_item)
+            raise
 
     def variable(self, name: str, node: Node, row: Row | None = None) -> Val:
         var = self.rs.variables[name]
@@ -151,9 +159,13 @@ class Evaluator:
         if trace_id in self._values:
             v = self._values[trace_id]
             return Val(v, fmt(v), frozenset({trace_id}))
-        with localcontext() as c:
-            c.prec = PREC
-            val = self.ev(parse(expr), Ctx(node, where=trace_id))
+        try:
+            with localcontext() as c:
+                c.prec = PREC
+                val = self.ev(parse(expr), Ctx(node, where=trace_id))
+        except EvalError as exc:
+            self._failure_frame(exc, expr, node, trace_id, rule_item)
+            raise
         self.traces[trace_id] = Trace(
             id=trace_id, rule_item=rule_item, expr=expr, rendered=val.text,
             value=str(val.v), inputs=tuple(sorted(val.deps)),
@@ -162,6 +174,14 @@ class Evaluator:
         )
         self._values[trace_id] = val.v
         return Val(val.v, fmt(val.v), frozenset({trace_id}))
+
+    @staticmethod
+    def _failure_frame(exc: EvalError, expr: str, node: Node, trace_id: str, rule_item: str) -> None:
+        if len(exc.frames) < 12 and not any(f['trace_id'] == trace_id for f in exc.frames):
+            exc.frames.append({
+                'trace_id': trace_id, 'node_id': node.id, 'rule_item': rule_item,
+                'expr': expr, 'source': str(node.attr_src) if node.attr_src else '',
+            })
 
     def _scope_node(self, scope: str, node: Node, name: str, row: Row | None = None) -> Node:
         if scope == "global":
@@ -494,8 +514,30 @@ class Evaluator:
         st["bands"][b] = st["bands"].get(b, 0) + 1
 
     def _aggregate(self, c: Call, ctx: Ctx) -> Val:
+        coverage = {}
+        try:
+            return self._aggregate_value(c, ctx, coverage)
+        except EvalError as exc:
+            if len(exc.aggregates) < 12:
+                item = {
+                    'operation': c.fn, 'expr': unparse(c),
+                    'node_id': coverage.get('node', ctx.node).id,
+                    'dataset': coverage.get('dataset', ''),
+                    'where': unparse(c.kw()['where']) if 'where' in c.kw() else '',
+                }
+                for key in ('visible', 'selected'):
+                    rows = coverage.get(key)
+                    item[key + '_rows'] = len(rows) if rows is not None else None
+                    item[key + '_sources'] = [str(r.src) for r in rows[:3] if r.src] if rows is not None else []
+                active = coverage.get('active_row')
+                item['active_row_source'] = str(active.src) if active is not None and active.src else ''
+                exc.aggregates.append(item)
+            raise
+
+    def _aggregate_value(self, c: Call, ctx: Ctx, coverage: dict) -> Val:
         kw = c.kw()
         ds = self._agg_dataset(c, ctx)
+        coverage['dataset'] = ds
         node = ctx.node
         if self.peer_scope and not node.aux:
             d = self.rs.datasets.get(ds)
@@ -523,6 +565,7 @@ class Evaluator:
             k = self.rs.datasets[ds].key
             if k and any(k in n.attrs for n in node.chain()):
                 rows, via_ref = [r.row for r in self._node_refs(node) if r.level == ds], True
+        coverage.update(node=node, visible=rows)
         if not rows and ctx.row is not None and node.aux and not self._linked(ds, node.level):
             # 在关联实体的行里（如逐张工单筛选时）对一张和它没有关联的表聚合（如员工的出勤确认）：这一行取不到那张表的任何行，
             # 原来会悄悄算成 0（条件永远不成立、金额少算），改成报错让写法改正
@@ -547,16 +590,23 @@ class Evaluator:
             return Ctx(home if home is not None and (node.aux or node in home.chain()) else node, r, ctx.where)
         if "where" in kw:
             cond = kw["where"]
-            rows = [r for r in rows if self._bool(self.ev(cond, rctx(r)), ctx)]
+            def matches(r):
+                coverage['active_row'] = r
+                return self._bool(self.ev(cond, rctx(r)), ctx)
+            rows = [r for r in rows if matches(r)]
+            coverage.pop('active_row', None)
+        coverage['selected'] = rows
         deps: set = set()
         if c.fn == "count":
             r = Decimal(len(rows))
         else:
             vals = []
             for row in rows:
+                coverage['active_row'] = row
                 v = self.ev(c.args[0], rctx(row))
                 deps |= v.deps
                 vals.append(v.v)
+            coverage.pop('active_row', None)
             if c.fn == "count_distinct":
                 r = Decimal(len(set(vals)))
             else:
@@ -566,9 +616,14 @@ class Evaluator:
                     return Val(r, fmt(r), frozenset(deps), tuple(rows))
                 text = next((v for v in vals if isinstance(v, str)), None)
                 if text is not None:
+                    coverage['active_row'] = rows[vals.index(text)]
                     raise EvalError(f"{c.fn} 要对数字求值，这里取到的是 {fmt(text)}（{ds} 的行）。数行数用 count(of: \"{ds}\", where: 条件)，"
                                     f"数不同取值的个数用 count_distinct(字段, of: \"{ds}\")", ctx.where)
-                nums = [self._num(Val(v, fmt(v)), ctx.where) for v in vals]
+                nums = []
+                for row, v in zip(rows, vals):
+                    coverage['active_row'] = row
+                    nums.append(self._num(Val(v, fmt(v)), ctx.where))
+                coverage.pop('active_row', None)
                 if c.fn == "sum":
                     r = sum(nums, Decimal(0))
                 elif not nums:

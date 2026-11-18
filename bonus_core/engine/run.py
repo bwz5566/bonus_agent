@@ -238,6 +238,7 @@ class Engine:
         self.pool_exact = self._pool()
         if self.pool_exact < 0 and self.rs.pool.negative != 'allow':
             raise EngineError([Issue.block('pool_negative', f'奖金池为负：{self.pool_exact}')])
+        self._check_balances(stage='basis')
         targets = self._report_nodes(self.rs.pool.scope)
         objects = {
             n.id: {
@@ -421,13 +422,15 @@ class Engine:
             }
         return out
 
-    def _report_totals(self) -> list[tuple[str, str]]:
-        """汇总核算：每一行在指定层的每个对象上算一遍再合计，保留到分。"""
-        rep = self.rs.report
-        if rep:
-            self._check_distributions(rep)
-        out = []
-        for balance in (rep.balances if rep else []):
+    def _check_balances(self, *, stage=None) -> None:
+        """Check each object's sourced decomposition, before any amount is confirmed.
+
+        Basis calculation defers only explicitly distribution-stage contracts;
+        final reporting rechecks every contract under the same rounding policy.
+        """
+        for balance in (self.rs.report.balances if self.rs.report else []):
+            if stage is not None and balance.stage != stage:
+                continue
             nodes = self._report_nodes(balance.level)
             if not nodes:
                 raise EngineError([Issue.block("report_balance_scope", f"对账「{balance.name}」没有可验证对象", balance.level)])
@@ -443,6 +446,14 @@ class Engine:
                         raise EngineError([Issue.block("report_unbalanced", f"对账「{balance.name}」不闭合：{values[0]} != {values[1:]}", n.id)])
                 except EvalError as e:
                     raise EngineError([Issue.block("report_balance_eval", str(e), n.id)]) from e
+
+    def _report_totals(self) -> list[tuple[str, str]]:
+        """汇总核算：每一行在指定层的每个对象上算一遍再合计，保留到分。"""
+        rep = self.rs.report
+        if rep:
+            self._check_distributions(rep)
+        self._check_balances()
+        out = []
         for t in (rep.totals if rep else []):
             nodes = self._report_nodes(t.level)
             total = Decimal(0)

@@ -28,7 +28,7 @@ from bonus_agent.auto import (DATA_SUFFIXES, MAX_FILES, Inventory, PlanDataset, 
 from bonus_agent import case as cs, clauses as cl, failure, fixes, lint
 from bonus_agent import facts as fx
 from bonus_agent.extract_rules import Extraction, Question, check_quotes, prompt
-from bonus_agent.llm import LLM, LLMError, image_part, parse_json
+from bonus_agent.llm import LLM, LLMError, RunBudgetError, image_part, parse_json
 from bonus_core.data.mapping import DatasetMapping, apply_mapping
 from bonus_core.data.population import prepare as apply_patches
 from bonus_core.data.table_detect import ROW_ID, add_row_ids, combine_columns, table_at, unpivot_by
@@ -4480,6 +4480,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
               reflect: int = MAX_REFLECT, deep: int = DEEP_LIMIT, scenario=None, period: str | None = None,
               run_budget=None) -> AgentResult:
     """max_steps 和 max_tokens 都是安全上限：模型调用 finish 就结束，正常不会用满。
+    run_budget：自动接续须传同一对象；max_tokens 只会进一步收紧作业总额，续轮不重置用量或时限。
     reflect：卡住时在本轮内反思、换做法的次数上限（清掉打转的对话历史，带上卡在哪、试过什么，工作区保留），用完再停下。
     deep：按需深度思考的步数上限。平时不思考；上一步出错、被拦下、原样重复或停下来反思后，下一步先分析错在哪、
     该怎么改（附一段分析提示，模型支持时同时打开思考），成功了就切回普通模式。0 表示不用。
@@ -4502,14 +4503,19 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         raise ToolError(str(e)) from None
     if not files:
         raise ToolError("没有找到可处理的文件（支持 .docx .pptx .pdf .xlsx .xlsm .png .jpg .txt .md .json .csv）")
-    ctx = llm.context_window()
+    used0 = llm.usage.prompt_tokens + llm.usage.completion_tokens
+    from bonus_agent.recovery import RecoveryJournal, RunBudget, local_advice
+    run_budget = run_budget or RunBudget(used0, max_tokens)
+    run_budget.tighten(max_tokens)
+    run_budget.bind(llm)
+    try:
+        ctx = None if run_budget.check(llm) else llm.context_window()
+    except RunBudgetError:
+        ctx = None  # Save the stopped job through the ordinary case/result path below.
     if getattr(llm,'workflow_mode','legacy')!='staged' and ctx is not None and ctx < MIN_CONTEXT:
         raise ToolError(f"模型服务的上下文长度只有 {ctx} tokens（max_model_len），智能体每一步的输入就有约 4～5 万 tokens，"
                         f"至少要 {MIN_CONTEXT}，建议 131072。请管理员调大模型服务的上下文长度（vLLM 启动参数 --max-model-len；"
                         "超过模型原生长度的要同时开 YaRN），再重试")
-    used0 = llm.usage.prompt_tokens + llm.usage.completion_tokens    # 本轮开始前的累计用量（自动接续时同一个模型对象接着用）
-    from bonus_agent.recovery import RecoveryJournal, RunBudget, local_advice
-    run_budget = run_budget or RunBudget(used0, max_tokens)
     u0, t0 = (llm.usage.calls, llm.usage.prompt_tokens, llm.usage.completion_tokens, getattr(llm.usage, "cached_tokens", 0)), time.time()
     ws = Workspace(llm, build_inventory(files))
     out = Path(out_dir) if out_dir is not None else None
@@ -4554,8 +4560,9 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                                 'code': rnd['code'], 'financial_context': ws.said})
     ws.notes.pop(ANSWER_NOTE, None)          # 上一轮的回答不带到这一轮
     handlers = {t["name"]: getattr(ws, t["name"]) for t in TOOLS}
-    ws.transcribe_all()
-    ws.triage_all()
+    if not run_budget.check(llm):
+        ws.transcribe_all()
+        ws.triage_all()
     pack = '' if ws.staged else ("\n\n【材料包】以下是本批次材料的内容（程序读取，图片已转写），每轮都附在这里、不会被裁剪。"
             "标了“全文 / 整表”的不要再用工具读；数据表只附了前几行，define_dataset 会读取全部行。\n\n" + ws.briefing())
     if message:             # 对话：财务的一条消息。先按现有规则试算一遍，便于回答和查算式
@@ -4597,7 +4604,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
     carry_chars = max(CARRY_CHARS, max_history_chars // 4)
     history: list[dict] = []
     steps: list[Step] = []
-    error = recovery.error
+    error = run_budget.check(llm) or recovery.error
     nudges = 0
     seen: dict[str, int] = {}          # 只读工具的调用 -> 第几步，用来发现原地打转
     recent_reads: dict[str, tuple] = {}  # 上次清空对话以来读过的工作区内容，清空时仍没变的附在说明里
@@ -4718,6 +4725,9 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                     on_step(len(steps), steps[-1])
                 continue
             except LLMError as e:
+                if isinstance(e, RunBudgetError):
+                    error = str(e)
+                    break
                 if _context_overflow(str(e)) and context_retries < 2:
                     context_retries += 1
                     _shrink(history, max(1500, _size(history) // 2), keep=2)
@@ -4766,6 +4776,9 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                     on_step(len(steps), steps[-1])
                 continue
             except LLMError as e:
+                if isinstance(e, RunBudgetError):
+                    error = str(e)
+                    break
                 if _context_overflow(str(e)) and context_retries < 2:
                     context_retries += 1
                     _shrink(history, max(1500, _size(history) // 2), keep=2)
@@ -5209,6 +5222,8 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             error = '本轮结束时仍未消除既有校验问题，不自动接续；先修复：' + '；'.join(sorted(progress_watch.previous)[:3])
         error = error or f"达到最大步数 {max_steps} 仍未完成"
 
+    if run_budget.error:
+        error, ws.done = run_budget.error, False
     if error and error.startswith(("纠错预算耗尽", "智能体卡住了")) and not ws.pending:
         # 卡住了不能只说“需要补充材料、明确答复”：把卡点变成一个具体问题（问什么、选项、怎么答）交给财务，
         # 本轮按“等答复”结束。答复会进入纠错记录的上下文，卡住记录随之清除，下一轮接着做。
@@ -5243,7 +5258,8 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
     ar.usage = {"secs": round(time.time() - t0), "steps": len(steps), "deep_steps": deep_used,
                 "calls": llm.usage.calls - u0[0], "prompt_tokens": llm.usage.prompt_tokens - u0[1],
                 "completion_tokens": llm.usage.completion_tokens - u0[2],
-                "cached_tokens": getattr(llm.usage, "cached_tokens", 0) - u0[3]}
+                "cached_tokens": getattr(llm.usage, "cached_tokens", 0) - u0[3],
+                "budget": run_budget.snapshot()}
     ar.reply = ws.reply_text
     ar.pending = [q.model_dump() for q in ws.pending]
     if last and last.get("digest") is not None and tested:
@@ -5707,6 +5723,10 @@ def _deep_reason(turn: list[Step], skipped: int, ws: Workspace, fails: dict[str,
             continue  # Partial native batches retain valid cells and identify exact rejections; no paid guessing.
         if not st.ok and st.tool == 'define_dataset' and fails.get(st.tool, 0) < 2:
             continue
+        if (not st.ok and fails.get(st.tool, 0) < 2
+                and ((st.tool == 'plan_formula_tasks' and 'construction.plan' in st.result)
+                     or (st.tool == 'update_dataset' and 'unmatched_basis' in st.result))):
+            continue  # First fix explicit tool contracts using their deterministic feedback.
         if _partial_facts(st.tool, st.ok, st.result):
             continue  # Rows were registered; each rejection already says what to fix. No paid deep step.
         head = st.result.removeprefix("错误：").split("\n", 1)[0][:300]

@@ -1,0 +1,131 @@
+"""Deterministic basis execution diagnostics, without results or approvals.
+
+This uses the same effective population and evaluator as the real calculation.
+It neither fixes rules nor drops rows, and does not expose a reusable basis
+result.  A PASS means the current inputs execute, not that policy is approved.
+"""
+from __future__ import annotations
+
+from bonus_core.data.table import Datasets
+from bonus_core.dsl.models import RuleSet
+from bonus_core.engine.evaluator import EvalError
+from bonus_core.engine.issues import EngineError
+from bonus_core.engine.run import Engine
+
+
+def preflight_basis(rs: RuleSet, data: Datasets, refs: dict | None = None, period=None) -> dict:
+    """Evaluate all basis roots once in an isolated, non-distributing context.
+
+    ``refs`` must be already available results supplied by the caller.  This
+    function never computes referenced schemes, invokes a model, or writes a
+    receipt. Missing prerequisites fail rather than being manufactured.
+    """
+    engine = None
+    phase = 'prepare'
+    try:
+        engine = Engine.prepare_basis(rs, data, refs=refs, period=period)
+        phase = 'evaluate'
+        engine.calculate_basis()  # Discard amounts/traces; this is only a preflight.
+    except EvalError as exc:
+        issues = [_evaluation_issue(exc, engine)]
+    except EngineError as exc:
+        issues = [_engine_issue(i.to_dict(), engine) for i in exc.issues[:8]]
+        return _report('FAIL', phase, engine, issues, issue_count=len(exc.issues))
+    except Exception as exc:
+        # Fail closed on implementation/data errors outside the normal engine
+        # exception contract. Do not mislabel an unexecuted preflight as PASS.
+        issues = [{
+            'severity': 'blocking', 'code': 'basis_preflight_internal',
+            'message': f'{type(exc).__name__}: {exc}', 'where': '',
+            'repair': ['保留当前规则与原始数据，检查此异常的引擎实现；不能用默认金额绕过。'],
+        }]
+    else:
+        warnings = [i.to_dict() for i in engine.issues if i.severity == 'warning']
+        report = _report('PASS', phase, engine, [])
+        report['warnings'] = warnings[:8]
+        report['warning_count'] = len(warnings)
+        return report
+    return _report('FAIL', phase, engine, issues)
+
+
+def _report(status, phase, engine, issues, *, issue_count=None):
+    report = {
+        'status': status, 'purpose': 'deterministic_basis_preflight',
+        'phase': phase, 'issues': issues,
+        'issue_count': len(issues) if issue_count is None else issue_count,
+        'note': '仅检查当前基础公式能否在真实数据上执行；不代表金额确认、业务规则审核或人员分配通过。',
+    }
+    if engine is not None:
+        report['summary'] = {
+            'dataset_rows': {name: len(table.rows) for name, table in engine.data.items()},
+            'pool_scope': engine.rs.pool.scope,
+            'candidate_objects': len(engine._report_nodes(engine.rs.pool.scope)),
+            'completed_expression_traces': len(engine.ev.traces),
+        }
+    return report
+
+
+def _evaluation_issue(exc, engine):
+    frames = exc.frames
+    first = frames[0] if frames else {}
+    issue = {
+        'severity': 'blocking', 'code': 'basis_preflight_eval',
+        'message': str(exc), 'where': exc.where,
+        'node_id': first.get('node_id', ''),
+        'source': first.get('source', ''),
+        'formula': first.get('expr', ''),
+        'rule_item': first.get('rule_item', ''),
+        'dependency_chain': frames,
+        'coverage': [dict(item) for item in exc.aggregates],
+    }
+    if engine is not None:
+        for item in issue['coverage']:
+            name = item['dataset']
+            table = engine.data.get(name)
+            item['dataset_rows'] = len(table.rows) if table is not None else None
+            spec = engine.rs.datasets.get(name)
+            if spec is not None:
+                item['relationship'] = {
+                    'key': spec.key, 'link': spec.link,
+                    'population_from': spec.population_from,
+                }
+    empty = next((item for item in issue['coverage'] if item.get('selected_rows') == 0), None)
+    if empty is not None:
+        if empty['visible_rows']:
+            issue['repair'] = [
+                f'对象有 {empty["visible_rows"]} 行「{empty["dataset"]}」，但 where 筛选后为 0；核对筛选字段、单位和期间。',
+                '若材料明确允许空集合，按材料补充条件分支；不得凭报错把 min/max/avg 改成 sum 或默认零。',
+            ]
+        else:
+            issue['repair'] = [
+                f'从对象来源行核对其是否属于本次核算范围，再检查「{empty["dataset"]}」的关联键和期间映射。',
+                '本期核算对象与历史参考数据应分别表达；如需调整 population_from 或关系，保留公式需要的历史行。',
+                '只有原文明确允许缺行时才补空集合分支；不得任意删对象或用零替代缺失依据。',
+            ]
+    else:
+        issue['repair'] = [
+            '按 source / active_row_source 回查失败对象及明细，再检查 formula 的字段类型、分母、关联与引用方案。',
+            '修改映射或公式后重新执行基础预检；缺少业务口径时应补依据，不能把失败改为通过。',
+        ]
+    return issue
+
+
+def _engine_issue(issue, engine):
+    if engine is None:
+        return issue
+    where = issue.get('where', '')
+    nodes = list(engine.nodes.values()) + [n for table in (engine.root.index or {}).values() for n in table.values()]
+    node = next((n for n in sorted(nodes, key=lambda n: len(n.id), reverse=True)
+                 if where == n.id or where.startswith(n.id + '/')), None)
+    if node is not None:
+        issue.update(node_id=node.id, source=str(node.attr_src) if node.attr_src else '')
+    if issue['code'] == 'check_failed':
+        failed = [t for t in engine.ev.traces.values() if t.rule_item == where and t.value == 'False']
+        by_id = {n.id: n for n in nodes}
+        issue['failed_objects'] = len(failed)
+        issue['examples'] = [{
+            'node_id': trace.node_id, 'formula': trace.expr,
+            'source': str(by_id[trace.node_id].attr_src) if by_id.get(trace.node_id) and by_id[trace.node_id].attr_src else '',
+            'rows': list(trace.rows[:3]),
+        } for trace in failed[:3]]
+    return issue

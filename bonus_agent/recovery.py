@@ -3,6 +3,8 @@ import hashlib
 import copy
 import json
 import time
+import math
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -18,9 +20,130 @@ class RunBudget:
     max_tokens: int | None
     max_seconds: float = 1800
     started: float = field(default_factory=time.monotonic)
+    _accounts: dict = field(default_factory=dict, init=False, repr=False)
+    _reserved: dict = field(default_factory=dict, init=False, repr=False)
+    _uncertain_tokens: int = field(default=0, init=False, repr=False)
+    _sequence: int = field(default=0, init=False, repr=False)
+    _halted: str = field(default='', init=False, repr=False)
+    _input_ratios: dict = field(default_factory=dict, init=False, repr=False)
+    _lock: object = field(default_factory=threading.RLock, init=False, repr=False)
+
+    @property
+    def error(self):
+        return self._halted
+
+    def bind(self, llm):
+        """Bind one job to every model route, without resetting already observed usage."""
+        pending, seen = [llm], set()
+        with self._lock:
+            while pending:
+                model = pending.pop()
+                if model is None or id(model) in seen:
+                    continue
+                seen.add(id(model))
+                model.run_budget = self
+                usage = model.usage
+                if id(usage) not in self._accounts:
+                    baseline = self.start_tokens if not self._accounts else usage.prompt_tokens + usage.completion_tokens
+                    self._accounts[id(usage)] = (usage, baseline)
+                pending.extend(getattr(model, role, None) for role in ('think_llm', 'checker_llm', 'vision_llm'))
+        return self
+
+    def tighten(self, max_tokens):
+        """A continuation may reduce the job ceiling; it cannot replenish the allowance."""
+        with self._lock:
+            if max_tokens:
+                self.max_tokens = min(self.max_tokens, max_tokens) if self.max_tokens else max_tokens
+        return self
+
+    def estimate_input(self, llm, baseline):
+        """Calibrate every model route, including tool-free reviewers and advisor copies."""
+        with self._lock:
+            ratio = self._input_ratios.get((llm.base_url, llm.model), 0)
+            ratio = max(ratio, getattr(llm, '_context_token_ratio', 0))
+            return math.ceil(baseline * max(1.2, ratio * 1.2)) + 256
+
+    def observe_input(self, llm, baseline, actual):
+        if baseline and actual:
+            with self._lock:
+                key = (llm.base_url, llm.model)
+                self._input_ratios[key] = max(self._input_ratios.get(key, 0), actual / baseline)
+
+    def record_usage(self, llm, usage):
+        with self._lock:
+            llm.usage += usage
+
+    def snapshot(self):
+        with self._lock:
+            used = sum(max(0, u.prompt_tokens + u.completion_tokens - baseline)
+                       for u, baseline in self._accounts.values())
+            reserved = sum(self._reserved.values())
+            accounted = used + self._uncertain_tokens + reserved
+            return {'actual_used_tokens': used, 'unconfirmed_reserved_tokens': self._uncertain_tokens,
+                    'inflight_reserved_tokens': reserved, 'max_tokens': self.max_tokens,
+                    'remaining_tokens': max(0, self.max_tokens - accounted) if self.max_tokens else None,
+                    'remaining_seconds': max(0.0, self.max_seconds - (time.monotonic() - self.started)) if self.max_seconds else None,
+                    'input_estimate_is_exact': False}
+
+    def request_timeout(self, requested):
+        from bonus_agent.llm import RunBudgetError
+        with self._lock:
+            if self._halted:
+                raise RunBudgetError(self._halted)
+            remaining = self.snapshot()['remaining_seconds']
+            if remaining is not None and remaining <= 0:
+                self._halted = f'作业达到总时间上限 {self.max_seconds:g} 秒，未发出新请求，停止自动接续'
+                raise RunBudgetError(self._halted)
+            return min(float(requested), remaining) if remaining is not None else float(requested)
+
+    def reserve(self, llm, input_tokens, output_tokens):
+        """Reserve conservative input estimate plus the actual requested output ceiling."""
+        from bonus_agent.llm import RunBudgetError
+        self.bind(llm)
+        with self._lock:
+            if error := self.check(llm):
+                self._halted = error
+                raise RunBudgetError(error)
+            amount = int(input_tokens) + int(output_tokens)
+            state = self.snapshot()
+            if state['remaining_tokens'] is not None and amount > state['remaining_tokens']:
+                self._halted = (f'作业预算事前拦截：已报告实际用量 {state["actual_used_tokens"]} tokens，'
+                                f'剩余额度 {state["remaining_tokens"]}，本请求估算输入 {input_tokens} '
+                                f'+ 输出上限 {output_tokens}，超过总上限 {self.max_tokens} 的剩余额度；'
+                                '输入为保守估算，未发出请求，停止自动接续')
+                raise RunBudgetError(self._halted)
+            self._sequence += 1
+            self._reserved[self._sequence] = amount
+            return self._sequence
+
+    def settle(self, reservation, *, reported=False, sent=True):
+        """Unknown remote usage is not refunded into another potentially billable retry."""
+        with self._lock:
+            amount = self._reserved.pop(reservation, 0)
+            if sent and not reported:
+                self._uncertain_tokens += amount
+                self._halted = self._halted or (
+                    '模型请求用量未确认（服务未返回完整有效 usage，或请求结果未知）；'
+                    f'已保留 {amount} tokens 估算额度，停止自动接续，不能把未知用量当作零')
+
+    def after_response(self):
+        """Late or unexpectedly over-budget responses cannot reach the tool executor."""
+        from bonus_agent.llm import RunBudgetError
+        state = self.snapshot()
+        if state['remaining_seconds'] == 0:
+            self._halted = f'作业达到总时间上限 {self.max_seconds:g} 秒；已记录响应实际用量，未执行返回动作'
+        elif self.max_tokens and state['actual_used_tokens'] > self.max_tokens:
+            self._halted = (f'服务报告实际用量 {state["actual_used_tokens"]} tokens 超过总上限 {self.max_tokens}；'
+                            '输入估算低于服务实际计数，已停止，未执行返回动作')
+        if self._halted:
+            raise RunBudgetError(self._halted)
 
     def check(self, llm):
-        used = llm.usage.prompt_tokens + llm.usage.completion_tokens - self.start_tokens
+        self.bind(llm)
+        if self._halted:
+            return self._halted
+        state = self.snapshot()
+        used = state['actual_used_tokens'] + state['unconfirmed_reserved_tokens']
         if self.max_tokens and used >= self.max_tokens:
             return f'作业 tokens 用量 {used} 达到总上限 {self.max_tokens}，停止自动接续'
         if self.max_seconds and time.monotonic() - self.started >= self.max_seconds:

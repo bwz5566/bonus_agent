@@ -1,5 +1,6 @@
 """Persistent construction tasks: model proposes dependencies, program validates every completion."""
 import copy
+import json
 from graphlib import TopologicalSorter, CycleError
 
 from bonus_agent import facts as fx, clauses as cl, lint
@@ -23,6 +24,8 @@ def _strings(value):
         for key, part in value.items():
             if key in ('expr', 'weight', 'pay_ratio', 'hold_ratio', 'people', 'total') and isinstance(part, str) and part:
                 yield part
+            elif key == 'parts' and isinstance(part, list):
+                yield from (expr for expr in part if isinstance(expr, str) and expr)
             elif key not in ('sources', 'desc'):
                 yield from _strings(part)
     elif isinstance(value, list):
@@ -108,7 +111,15 @@ class TaskBoard:
             proposed[spec['id']] = spec
         targets = [(s['scheme'], s['target']) for s in proposed.values()]
         if len(set(targets)) != len(targets):
-            raise ToolError('construction.plan：同一目标只允许一个任务，修改时复用id')
+            conflicts = []
+            for scheme, target in dict.fromkeys(targets):
+                ids = [n for n, item in proposed.items() if (item['scheme'], item['target']) == (scheme, target)]
+                if len(ids) > 1:
+                    existing = [n for n in ids if n in self.state['tasks']]
+                    conflicts.append({'scheme': scheme, 'target': target, 'ids': ids, 'existing_ids': existing})
+            raise ToolError('construction.plan：同一目标只允许一个任务，修改时复用id；本批未保存。冲突：'
+                            + json.dumps(conflicts, ensure_ascii=False)
+                            + '。用existing_ids中的原id修改；需要原任务详情时read_workspace(section="construction",name=原id)，无需遍历全部任务。')
         if any(set(s['depends_on']) - set(proposed) for s in proposed.values()):
             raise ToolError('construction.dependency：依赖任务不存在；按基础到上层分批登记，或在同批补齐')
         try:
