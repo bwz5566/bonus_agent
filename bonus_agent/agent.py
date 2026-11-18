@@ -3762,9 +3762,9 @@ class Workspace:
                     "继续做不受影响的部分，全部问完后调用 finish 结束本轮")
         return f"已记录提示 {q.id}（不影响金额，不必等答复）{note}"
 
-    def review_question(self, id: str, reason: str, evidence: list[dict]) -> dict:
+    def review_question(self, id: str, reason: str, evidence: list[dict], retry_technical: bool = False) -> dict:
         from bonus_agent.question_review import review_question
-        return review_question(self, id, reason, evidence)
+        return review_question(self, id, reason, evidence, retry_technical=retry_technical)
 
     def _dup_choice_check(self, st, fields, combine, unpivot, filter) -> None:
         """表里有几列同名（如两列都叫“客户简称”）时，用的那一列的取值要和其他表里同名的列对得上：另一列对得上得更多就不保存。
@@ -4711,6 +4711,10 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
     changes = None
     if resumed:
         cs.restore(ws, case["workspace"])
+        if last and isinstance(last.get('n'), int) and last['n'] < ws.round:
+            # Trusted saved-case provenance for bounded recovery of legacy
+            # technical review failures; never a financial answer or approval.
+            ws._resumed_from_round = last['n']
         if restored := case.pop('_recovery', None):
             rnd['recovery']=restored
             ws.notes['案卷恢复']=f'当前工作区从{restored["source"]}恢复；原快照损坏位置：{restored["damaged_path"]}。本轮重新核算后才能确认结果。'
@@ -4819,9 +4823,9 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         return saved if saved and ws._flow().compile_feedback(saved.get('phase', 'all')) else None
     highest_stage = reached_focus[0] if reached_focus else 0
     context_retries = 0
-    def compact_local_context(msgs, body, tail, definitions):
+    def compact_local_context(msgs, body, tail, definitions, output_tokens=8192):
         # Check the immutable floor first. Trimming history cannot fix an oversized floor.
-        guard_messages(msgs[:1]+body[:1]+tail,llm,tools=definitions)
+        guard_messages(msgs[:1]+body[:1]+tail,llm,tools=definitions,output_tokens=output_tokens)
         before=_size(history)
         if not before:
             return False
@@ -4938,6 +4942,8 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             think = False  # advice never inherits primary tools or the full conversation
         if think:
             deep_used += 1
+        request_think = think or bool(getattr(llm, 'tools_thinking', False))
+        request_output = max(8192, llm.think_max_tokens) if request_think else 8192
         tail = [{"role": "user", "content": ws.state() + (_deep_note(deep_why, steps) if think else "")}]
         # 缓存标记：系统提示 + 任务固定不变；历史在两次整理之间只追加，标在历史最后一条上
         body = [{"role": "user", "content": task, "_cache": True}] + history[:-1] \
@@ -4950,11 +4956,11 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             msgs = [{"role": "system", "content": sys + JSON_PROTOCOL + json.dumps(available_tools, ensure_ascii=False)}] + body + tail
             try:
                 if ws.staged:
-                    guard_messages(msgs,llm)
-                text = llm.chat(msgs, json_out=True, temperature=AGENT_TEMPERATURE, **({"think": True} if think else {}))
+                    guard_messages(msgs,llm,output_tokens=request_output)
+                text = llm.chat(msgs, json_out=True, temperature=AGENT_TEMPERATURE, **({"think": True} if request_think else {}))
             except ContextBudgetError as e:
                 try:
-                    compacted=context_retries<2 and compact_local_context(msgs,body,tail,None)
+                    compacted=context_retries<2 and compact_local_context(msgs,body,tail,None,request_output)
                 except ContextBudgetError as floor:
                     error=f'{floor}；固定系统指令、工具定义与当前任务本身已超过配置预算，未调用模型，也不重试或升级Pro。'
                     break
@@ -4983,8 +4989,9 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                 error = str(e)
                 break
             context_retries=0
-            reasoning = getattr(llm, "last_reasoning", "") if think else ""
-            history.append({"role": "assistant", "content": _short_thought(text)})
+            reasoning = getattr(llm, "last_reasoning", "") if request_think else ""
+            history.append({"role": "assistant", "content": _short_thought(text),
+                            **({"reasoning_content": reasoning} if reasoning else {})})
             try:
                 act = parse_json(text)
                 a = act.get("args") or {}
@@ -5001,11 +5008,11 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             msgs = [{"role": "system", "content": sys}] + body + tail
             try:
                 if ws.staged:
-                    guard_messages(msgs,llm,tools=openai_tools(available_tools))
-                reply = llm.chat_tools(msgs, openai_tools(available_tools), temperature=AGENT_TEMPERATURE, **({"think": True} if think else {}))
+                    guard_messages(msgs,llm,tools=openai_tools(available_tools),output_tokens=request_output)
+                reply = llm.chat_tools(msgs, openai_tools(available_tools), temperature=AGENT_TEMPERATURE, **({"think": True} if request_think else {}))
             except ContextBudgetError as e:
                 try:
-                    compacted=context_retries<2 and compact_local_context(msgs,body,tail,openai_tools(available_tools))
+                    compacted=context_retries<2 and compact_local_context(msgs,body,tail,openai_tools(available_tools),request_output)
                 except ContextBudgetError as floor:
                     error=f'{floor}；固定系统指令、工具定义与当前任务本身已超过配置预算，未调用模型，也不重试或升级Pro。'
                     break
@@ -5041,7 +5048,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                 break
             context_retries=0
             calls = [{**c, "raw": c["arguments"], "arguments": _fix_arguments(c["arguments"])} for c in reply["tool_calls"]]
-            reasoning = (reply.get("reasoning") or "") if think else ""
+            reasoning = (reply.get("reasoning") or "") if request_think else ""
             history.append({"role": "assistant", "content": reply["content"],
                             **({"reasoning_content": reasoning} if reasoning else {}),
                             **({"tool_calls": [{"id": c["id"], "type": "function",
@@ -5333,7 +5340,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                 history.append({"role": "user", "content": f"【{c['name']} 的结果】\n{result}"})
             else:
                 history.append({"role": "tool", "tool_call_id": c["id"], "content": result})
-        if think:
+        if request_think:
             for st in steps[turn_steps:]:
                 st.deep = True
             if reasoning and len(steps) > turn_steps:

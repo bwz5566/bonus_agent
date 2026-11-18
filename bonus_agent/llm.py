@@ -541,6 +541,7 @@ class LLM:
     max_input_tokens: int = 96000
     max_history_chars: int | None = None   # 对话历史上限（字符），见 models.yaml
     run_budget: object | None = field(default=None, repr=False, compare=False)
+    tools_thinking: bool = False     # agent tool turns request thinking without consuming recovery/advisor attempts
 
     @classmethod
     def from_config(cls, name: str | None = None, config: dict | None = None, checker: str | None = None,
@@ -568,6 +569,10 @@ class LLM:
         llm.think_max_tokens = int(m.get("think_max_tokens", llm.think_max_tokens))
         llm.think_timeout = float(m.get("think_timeout", max(llm.think_timeout, llm.timeout)))
         llm.think_echo = bool(m.get("think_echo", "thinking" in (llm.think_body or {})))
+        tools_thinking = m.get('tools_thinking', False)
+        if not isinstance(tools_thinking, bool):
+            raise LLMError(f'模型 {name} 的 tools_thinking 须为 true 或 false')
+        llm.tools_thinking = tools_thinking
         tm = m.get("think_model") if not _auxiliary else None
         if tm and tm != name:
             if tm not in cfg["models"]:
@@ -575,6 +580,8 @@ class LLM:
             llm.think_llm = cls.from_config(tm, cfg, _auxiliary=True, _path=route_path)
             llm.think_llm.usage = llm.usage            # 用量记在同一处
             llm.think_echo = llm.think_echo or llm.think_llm.think_echo
+        if llm.tools_thinking and not llm.can_think:
+            raise LLMError(f'模型 {name} 设置了 tools_thinking=true，但没有可用的 think 参数或 think_model')
         v = m.get("vision", True)       # true：自己看图；false：不能看图；模型名：用那个模型转写图片
         if isinstance(v, str):
             if v == name or cfg["models"].get(v, {}).get("vision", True) is not True:

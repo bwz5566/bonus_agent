@@ -251,8 +251,11 @@ TOOLS: list[dict] = [
     {"name": "review_question",
      "description": "已提出的待答问题可能源于错误映射/范围，或原文已明确解决时，提交理由和逐字依据给独立模型复核。"
                     "独立复核可撤回有充分原文依据的错误问题；不代答财务、不批准金额，不改规则。真正缺失的信息继续等待。"
-                    "同一证据状态的复核不会因改写理由而重复调用。",
+                    "同一证据状态的复核不会因改写理由而重复调用。已完成的业务KEEP不能重抽。"
+                    "仅技术length未完成可显式retry_technical续试一次：正常记录须已返回完整usage；"
+                    "旧记录用量未知只允许真实新轮恢复时一次协议修复，旧用量不返还；每次请求重新预留预算。",
      "parameters": _obj({"id": _S, "reason": _S,
+                         "retry_technical": {"type": "boolean", "description": "默认false返回同证据缓存；true仅申请一次受控技术续试，不改原问题、原理由、原引文或独立审核标准"},
                          "evidence": {"type": "array", "items": _obj({"file": _S, "quote": _S}, ["file", "quote"])}},
                         ["id", "reason", "evidence"])},
     {"name": "reply",
