@@ -68,12 +68,14 @@ def test_focus_and_output_limit_do_not_guess_which_detail_defines_population():
     assert not any(spec.population_from for spec in rs.datasets.values())
 
 
-def test_spelling_differences_are_labelled_exact_coverage_not_missing_business_objects():
+def test_spelling_differences_preserve_raw_coverage_but_use_runtime_links():
     ws, _, data = workspace()
     data['sales'].rows[0].values['pid'] = '202609-b'
     item = scope_diagnostics(ws, focus='sales')['comparisons'][0]
-    assert item['key_match'] == 'exact'
-    assert item['detail_without_parent'] == 1
+    assert item['key_match'] == 'runtime_resolved'
+    assert item['detail_without_parent'] == 0
+    assert item['runtime_linked_rows'] == 1
+    assert item['raw_exact']['detail_without_parent'] == 1
     assert '大小写' in scope_diagnostics(ws)['notes'][0]
 
 

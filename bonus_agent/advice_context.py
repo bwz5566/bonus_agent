@@ -100,7 +100,7 @@ def build_runtime_focus_context(ws, report=None):
         'kind': 'runtime_repair_focus', 'phase': phase, 'scheme': scheme,
         'version': saved.get('phase_version') or saved.get('version'),
         'failure': {k: issue[k] for k in ('code', 'message', 'node_id', 'node_scope', 'rule_item',
-                    'target', 'source', 'formula', 'evidence_kind') if k in issue},
+                    'target', 'source', 'formula', 'evidence_kind', 'policy', 'repair') if k in issue},
         'current_nodes': [], 'source_references': [], 'source_excerpts': [], 'omitted': [],
         'limits': {'max_chars': MAX_CONTEXT_CHARS, 'max_nodes': MAX_RUNTIME_NODES, 'truncated': False},
         'meaning': ('程序附上的当前失败及相关定义、既有任务和来源摘录；不是新工具读取、读取回执、业务批准或修复结论。'
@@ -122,7 +122,7 @@ def build_runtime_focus_context(ws, report=None):
 
     # Keep the exact failure as a whole, or its structured identity and address.
     if len(_json(packet)) > 2400:
-        packet['failure'] = {k: issue[k] for k in ('code', 'node_id', 'rule_item', 'target') if k in issue}
+        packet['failure'] = {k: issue[k] for k in ('code', 'node_id', 'rule_item', 'target', 'policy', 'repair') if k in issue}
         omitted.append({'section': 'failure', 'read_call': {
             'tool': 'read_workspace', 'args': {'section': 'checks', 'name': 'preflight:' + scheme}}})
 

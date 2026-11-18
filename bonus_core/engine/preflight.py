@@ -204,6 +204,16 @@ def _engine_issue(issue, engine):
         issue.update(node_id=node.id, node_scope='global' if node is engine.root else node.level,
                      source=str(node.attr_src) if node.attr_src else '')
     if issue['code'] == 'pool_negative':
+        issue['policy'] = {
+            'target': '/pool/negative', 'actual_policy': engine.rs.pool.negative,
+            'default': 'block', 'supported_options': ['block', 'allow'],
+        }
+        issue['repair'] = [
+            '先按失败对象及原文排除重复扣减、符号、单位或数据错误；负数报错本身不能证明业务应允许负数。',
+            '仅当材料或财务明确负数照算时，才把 pool.negative 设为 allow，并在 pool.sources 保留已核对的口径依据；原文明确归零才用 max(..., 0)，不能为过检编造政策。',
+            '已有 /pool 构建任务时，用 submit_formula_task(task=已有任务ID, changes={negative:"allow",sources:完整来源列表}) 局部修改；否则 set_rules 的 pool 必须携带完整 expr/scope/sources 等现有字段，不能只提交 negative。',
+            '保存后重新执行 compile_formulas、calculate_basis 和独立 review_basis；allow 只改变执行时的负数策略，不等于业务批准或金额核验通过。',
+        ]
         # The global pool rejection has no `where`; its root is nevertheless
         # the real global node. Never assign a guessed object for other scopes.
         if node is None and not where and engine.rs.pool.scope == 'global':
