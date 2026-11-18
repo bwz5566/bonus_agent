@@ -1,6 +1,7 @@
 """Measure resolution of validation problems, rather than successful tool responses."""
 from dataclasses import dataclass, field
 import json
+import re
 
 from bonus_agent.recovery import fingerprint
 
@@ -29,6 +30,8 @@ def discover(step, seen):
         except (ValueError, TypeError):
             return False
         section = value.get('section')
+        if section == 'checks':
+            return _discover_checks(value, seen)
         for item in value.get('items', []):
             nested = item.get('value') if isinstance(item.get('value'), dict) else item
             name = nested.get('id') or nested.get('name') or nested.get('dataset') or nested.get('scheme')
@@ -44,6 +47,60 @@ def discover(step, seen):
     fresh = {fingerprint(key) for key in keys} - seen
     seen.update(fresh)
     return bool(fresh)
+
+
+def _discover_checks(page, seen):
+    """Reading a new diagnostic record is finite evidence, not a repaired issue.
+
+    The checks reader has no record name for legacy string diagnostics. Use
+    their stable subject (parameter/cell/clause), never a page offset, report
+    version, suggested fix or message body. Unknown formats get one credit per
+    existing record slot instead of treating arbitrary prose as new evidence.
+    """
+    if page.get('status') in ('NOT_RUN', 'STALE', 'ERROR', 'DEFERRED'):
+        return False
+    discovered = False
+    for item in page.get('items', []):
+        if not isinstance(item, dict) or item.get('kind') not in ('issue', 'warning', 'preflight'):
+            continue
+        kind = item['kind']
+        # New structured runtime diagnostics have machine-owned locations.
+        location = {k: item[k] for k in ('code', 'where', 'node_id', 'rule_item', 'dataset', 'field', 'target', 'source', 'id')
+                    if isinstance(item.get(k), str) and item[k]}
+        slot = (fingerprint(('checks', kind, 'slot', item['index']))
+                if isinstance(item.get('index'), int) and not isinstance(item['index'], bool) and item['index'] >= 0 else None)
+        prose = False
+        if location:
+            key = ('checks', kind, location)
+        else:
+            message = item.get('message')
+            if not isinstance(message, str) or not message.strip():
+                continue
+            message = message.strip()
+            clause = re.match(r'^(C\d+)(?=[「：:\s])', message)
+            # Single colons delimit subjects; double colons belong to stable
+            # source-cell IDs or scheme-qualified rule paths.
+            pieces = re.split(r'：|(?<!:):(?!:)', message, maxsplit=1)
+            subject = clause.group(1) if clause else (pieces[0].strip() if len(pieces) == 2 else '')
+            if subject:
+                key = ('checks', kind, 'subject', subject)
+                # Source-cell and clause IDs are stable records. Other legacy
+                # headings are prose: changing a heading in an already-read
+                # slot must not manufacture another discovery.
+                prose = not clause and not re.search(r'::P\d+(?:\.\w+)+$', subject)
+            elif slot:
+                key = ('checks', kind, 'slot', item['index'])
+            else:
+                continue
+        key = fingerprint(key)
+        fresh = key not in seen and (not prose or (slot is not None and slot not in seen))
+        discovered = discovered or fresh
+        seen.add(key)
+        if slot:
+            seen.add(slot)
+    # Partial JSON fragments cannot establish a new record identity. In
+    # particular changing detail_offset or lengthening prose earns no credit.
+    return discovered
 
 
 def _compile_diagnostic(step):

@@ -89,7 +89,7 @@ def binding_errors(facts: list[Fact], drafts: dict) -> list[str]:
     positions = {}
     def spots_for(value):
         if value not in positions:
-            positions[value] = _spots(value, drafts)
+            positions[value] = _spots(value, drafts, limit=None)
         return positions[value]
     for f in facts:
         value = numeric(f)
@@ -107,11 +107,23 @@ def binding_errors(facts: list[Fact], drafts: dict) -> list[str]:
                     and spots_for(value / 100) and not spots):
                 errors.append(f'{f.name}：parameter.unit，原文裸数 {f.value} 与公式中的百分数系数相差100倍。'
                               '先核对该表单位；原文有明确%表头时补入quote并用bind_facts(unit="%")绑定；'
-                              '原文未明确单位则ask_question确认，不能删掉参数或凭相似数字自动换算')
+                              '也可用unit_basis={file,quote}引用已有明确单位依据。原文未明确时先读取财务对话核对已有答复，'
+                              '两者均未明确才ask_question确认，不能重复提问、删掉参数或凭相似数字自动换算')
                 continue
-            errors.append(f"{f.name}：缺少精确规则位置，用 bind_facts 绑定参数"
-                          + (f"（仅按数值检索的候选，尚未证明业务含义相同：{'、'.join(spots)}；须核对适用条件后绑定）" if spots else
-                             f"（规则里还没有用到 {f.value} 的位置：先在规则里用上它，或确认这条不是计算参数后 remove_facts）"))
+            grounded = _source_spots(f, spots, drafts)
+            if grounded:
+                shown = '、'.join(grounded[:3])
+                more = f'，另有 {len(grounded) - 3} 处同源候选' if len(grounded) > 3 else ''
+                hint = f'（同文件、原文引用重合的候选：{shown}{more}；仍须读取节点核对适用条件，不能仅凭数值绑定）'
+            elif len(spots) == 1:
+                hint = f'（仅按数值检索的唯一位置，尚未证明业务含义相同：{spots[0]}；须核对原文和适用条件后绑定）'
+            elif spots:
+                hint = (f'（有 {len(spots)} 处数值相同，但没有同源引用支持，不能任取一处绑定。'
+                        '先用 read_workspace(section="variables"或"tables", query=参数原文) 定位；'
+                        '查不到时按规则组件索引核对公式，必要时补建缺失公式）')
+            else:
+                hint = f'（规则里还没有用到 {f.value} 的位置：先在规则里用上它，或确认这条不是计算参数后 remove_facts）'
+            errors.append(f"{f.name}：缺少精确规则位置，用 bind_facts 绑定参数" + hint)
             continue
         for target in f.targets:
             matches = []
@@ -195,7 +207,7 @@ def prune_orphan_targets(facts: list[Fact], drafts: dict) -> list[str]:
     return removed
 
 
-def _spots(value: Decimal, drafts: dict, limit: int = 3) -> list[str]:
+def _spots(value: Decimal, drafts: dict, limit: int | None = 3) -> list[str]:
     """规则里取值等于 value 的位置（参数表的格、变量表达式里的数），写成 bind_facts 的 targets。
     实测场景说明里的“查不到预算系数为 1”“销售金额为 0 不计算”只报“缺少精确规则位置”，模型不知道能绑到变量的表达式上。"""
     from bonus_core.dsl.parser import parse, walk, Num, ExprError
@@ -211,9 +223,37 @@ def _spots(value: Decimal, drafts: dict, limit: int = 3) -> list[str]:
                     out.append(f"{scheme}::/variables/{str(name).replace('~', '~0').replace('/', '~1')}/expr")
             except ExprError:
                 continue
-        if len(out) >= limit:
+        if limit is not None and len(out) >= limit:
             break
-    return out[:limit]
+    return out if limit is None else out[:limit]
+
+
+def _source_spots(fact: Fact, spots: list[str], drafts: dict) -> list[str]:
+    """Rank locator hints by existing quotations, never infer or apply a binding.
+
+    Equal numbers in unrelated tables are not useful repair suggestions. A shared
+    document alone is also insufficient: require meaningful overlapping quotations
+    and the fact's page when one is known. This is a lookup aid, not proof that a
+    formula implements the quoted rule correctly.
+    """
+    quote = norm(fact.quote)
+    if not quote:
+        return []
+    out = []
+    for target in spots:
+        scheme, path = split_target(target)
+        parts = target_parts(path)
+        owner = drafts[scheme][parts[0]][parts[1]]
+        for source in owner.get('sources', []):
+            if source.get('doc') != fact.file or (fact.page is not None and source.get('page') != fact.page):
+                continue
+            cited = norm(source.get('quote', ''))
+            shared = min((quote, cited), key=len)
+            if (cited and (quote in cited or cited in quote)
+                    and sum(c.isalpha() for c in shared) >= 4):
+                out.append(target)
+                break
+    return out
 
 
 def norm(s: str) -> str:

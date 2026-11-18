@@ -46,6 +46,37 @@ class RunBudgetError(LLMError):
     """A shared job allowance stopped the request, not a provider/protocol failure."""
 
 
+def _safe_error_text(value, secret=''):
+    """Bound and redact exception text; callers do not separately attach raw requests/headers."""
+    text = str(value)
+    if secret:
+        text = text.replace(secret, '[redacted]')
+    text = re.sub(r'(?i)\bBearer\s+[^\s,;\"\'}]+', 'Bearer [redacted]', text)
+    text = re.sub(r'''(?i)(\b(?:api[_-]?key|authorization|access[_-]?token|token)["']?\s*[:=]\s*["']?)[^\s,;"'}]+''',
+                  r'\1[redacted]', text)
+    text = re.sub(r'(?i)(https?://)[^/\s:@]+:[^/\s@]+@', r'\1[redacted]@', text)
+    return text[:1600]
+
+
+def _request_error(exc, *, secret='', model='', sent=False, response_received=False):
+    detail = {'type': type(exc).__name__, 'message': _safe_error_text(exc, secret),
+              'model': model, 'transport_invoked': sent, 'response_received': response_received}
+    causes, seen, cause = [], {id(exc)}, exc.__cause__ or exc.__context__
+    while cause is not None and id(cause) not in seen and len(causes) < 4:
+        seen.add(id(cause))
+        causes.append({'type': type(cause).__name__, 'message': _safe_error_text(cause, secret)})
+        cause = cause.__cause__ or cause.__context__
+    if causes:
+        detail['causes'] = causes
+    status = getattr(exc, 'status_code', None)
+    if isinstance(status, int):
+        detail['status_code'] = status
+    request_id = getattr(exc, 'request_id', None)
+    if request_id:
+        detail['request_id'] = _safe_error_text(request_id, secret)[:160]
+    return detail
+
+
 THINK_BUDGET = 8192               # 百炼千问思考时每步思考 tokens 的上限
 THINK_KEYS = ("enable_thinking", "thinking")      # 各家“思考开关”的参数名：千问 / vLLM 模板用 enable_thinking，DeepSeek 用 thinking
 
@@ -372,23 +403,44 @@ class LLM:
                                       reserved_input_estimate=estimate, requested_output_tokens=output)
                 raise
             self.last_call.update(budget=budget.snapshot(), reserved_input_estimate=estimate,
+                                  budget_request_sequence=reservation,
                                   requested_output_tokens=output, transport_retries_limit=0)
-        t0, sent, reported = time.monotonic(), False, False
+        t0, sent, reported, response_received, failure = time.monotonic(), False, False, False, None
         try:
             client = self._client(think)
             sent = True
             resp = client.chat.completions.create(**kwargs)
+            response_received = True
             reported = self._usage(resp, t0)
             if budget is not None and reported:
                 budget.observe_input(self, baseline, resp.usage.prompt_tokens)
+            if not reported:
+                usage = getattr(resp, 'usage', None)
+                invalid = [key for key in ('prompt_tokens', 'completion_tokens')
+                           if not isinstance(getattr(usage, key, None), int)
+                           or isinstance(getattr(usage, key, None), bool) or getattr(usage, key) < 0]
+                failure = {'type': 'InvalidUsage', 'message': '响应未提供完整有效 usage；缺失或非法字段：' + '、'.join(invalid),
+                           'model': self.model, 'transport_invoked': sent, 'response_received': True,
+                           'response_id': _safe_error_text(getattr(resp, 'id', ''), self.api_key)[:160], 'invalid_usage_fields': invalid}
+                self.last_call.update(error_type=failure['type'], error_message=failure['message'], request_error=failure)
         except Exception as exc:
-            self.last_call.update(status='budget_blocked' if isinstance(exc, RunBudgetError) else 'failed', error_type=type(exc).__name__)
+            status = getattr(exc, 'status_code', None)
+            response_received = (response_received or getattr(exc, 'response', None) is not None
+                                 or isinstance(status, int) and 100 <= status <= 599)
+            failure = _request_error(exc, secret=self.api_key, model=self.model,
+                                     sent=sent, response_received=response_received)
+            self.last_call.update(status='budget_blocked' if isinstance(exc, RunBudgetError) else 'failed',
+                                  error_type=failure['type'], error_message=failure['message'], request_error=failure)
             if isinstance(exc, RunBudgetError):
                 raise
-            raise LLMError(f'{self.name} 调用失败：{exc}') from exc
+            raise LLMError(f'{self.name} 调用失败（{failure["type"]}）：{failure["message"]}') from exc
         finally:
+            self.last_call['request_seconds'] = round(time.monotonic() - t0, 3)
+            self.last_call['response_received'] = response_received
             if budget is not None and reservation is not None:
-                budget.settle(reservation, reported=reported, sent=sent)
+                if failure is not None:
+                    failure['budget_request_sequence'] = reservation
+                budget.settle(reservation, reported=reported, sent=sent, failure=failure)
                 self.last_call['budget'] = budget.snapshot()
         if budget is not None:
             try:

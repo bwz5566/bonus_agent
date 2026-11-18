@@ -113,6 +113,55 @@ def _bounded_page(result):
     return result
 
 
+def _pointer(parts):
+    return '/' + '/'.join(str(p).replace('~', '~0').replace('/', '~1') for p in parts)
+
+
+def _rule_bindings(ws, scheme, parts):
+    """Show existing bindings only; equal numeric values never create a binding."""
+    from bonus_agent.facts import split_target, target_parts
+    out = []
+    for fact in getattr(ws, 'facts', []):
+        targets = []
+        for target in fact.targets:
+            qualifier, path = split_target(target)
+            bound = target_parts(path)
+            if qualifier not in (None, scheme) or bound[:len(parts)] != parts:
+                continue
+            targets.append(target)
+        if targets:
+            out.append({'name': fact.name, 'file': fact.file, 'value': fact.value,
+                        'targets': targets[:5], 'targets_complete': len(targets) <= 5,
+                        'next_call': {'tool': 'read_workspace', 'args': {'section': 'facts', 'name': fact.name}}})
+    return out
+
+
+def _rule_index(ws, scheme, parts, value):
+    """Index immediate children with executable read calls, without serializing every rule."""
+    children = value.items() if isinstance(value, dict) else enumerate(value)
+    result = []
+    for key, child in children:
+        path = [*parts, str(key)]
+        item = {'scheme': scheme, 'name': str(key), 'target': f'{scheme}::{_pointer(path)}',
+                'kind': 'object' if isinstance(child, dict) else 'array' if isinstance(child, list) else 'value',
+                'binding_count': len(_rule_bindings(ws, scheme, path)),
+                'next_call': {'tool': 'read_workspace',
+                              'args': {'section': 'rules', 'scheme': scheme, 'name': _pointer(path)}}}
+        if isinstance(child, (dict, list)):
+            item['entries'] = len(child)
+        if isinstance(child, dict):
+            item.update({k: child[k] for k in ('scope', 'level', 'kind') if isinstance(child.get(k), str)})
+        result.append(item)
+    return result
+
+
+def _rule_node(ws, scheme, parts, value):
+    bindings = _rule_bindings(ws, scheme, parts)
+    return {'scheme': scheme, 'name': _pointer(parts), 'target': f'{scheme}::{_pointer(parts)}',
+            'definition': value, 'bindings': bindings[:8], 'binding_count': len(bindings),
+            'bindings_complete': len(bindings) <= 8}
+
+
 def workspace_view(
     ws,
     section,
@@ -138,6 +187,18 @@ def workspace_view(
     requested_limit = limit
     limit = max(1, min(limit, 50))  # Read-only sizing is safe to normalize, never a business correction.
     notes = []
+    rule_index = False
+    pointer = None
+    if section == 'rules' and isinstance(name, str) and (name.startswith('/') or '::/' in name):
+        from bonus_agent.facts import split_target
+        from bonus_agent.workflow import fail
+        qualifier, pointer = split_target(name)
+        if qualifier is not None:
+            if qualifier not in ws.schemes or (scheme is not None and qualifier != scheme):
+                fail('规则指针的方案不存在或与scheme不一致；须指定同一真实方案，不能改读其他方案')
+            scheme = qualifier
+        if scheme is not None and scheme not in ws.schemes:
+            fail('规则指针指定的scheme不存在，不能改读其他方案')
     if scheme and scheme not in ws.schemes and section in ('rules', 'variables', 'tables', 'basis'):
         # 只读：方案名写错（如共用部分已合并进各方案的「共用」）不报错，改读全部方案，免得反复撞同一个错被判卡住
         notes.append(f'没有方案「{scheme}」（共用部分已合并进每个方案），已改为读全部方案 {ws.schemes}')
@@ -157,7 +218,33 @@ def workspace_view(
         # A component query must not return fragments starting at the beginning of the entire rule.
         from bonus_agent.construction import ROOTS
         component = name if name is not None and name not in ws.schemes else query
-        if component in ROOTS:
+        if pointer is not None:
+            from bonus_agent.facts import target_parts, target_value
+            selected = []
+            parts = target_parts(pointer)
+            for item in items:
+                try:
+                    value = target_value(item['rule'], pointer)
+                except (KeyError, IndexError, TypeError, ValueError):
+                    notes.append(f'{item["scheme"]}::{pointer} 不存在；按规则组件索引核对真实名称和列表索引')
+                    continue
+                node = _rule_node(ws, item['scheme'], parts, value)
+                if (not detail and detail_offset is None and isinstance(value, (dict, list))
+                        and ((len(parts) == 1 and parts[0] in ROOTS - {'pool'})
+                             or isinstance(value, list)
+                             or len(json.dumps(node, ensure_ascii=False, default=str)) > PAGE_CHARS // 2)):
+                    selected += _rule_index(ws, item['scheme'], parts, value)
+                    rule_index = True
+                else:
+                    selected.append(node)
+            items = selected
+            # The pointer was resolved above; it is not a literal child name filter.
+            name = pointer
+        elif (name is None and query is None and not detail and detail_offset is None
+              and any(set(item['rule']) & ROOTS for item in items)):
+            items = [entry for item in items for entry in _rule_index(ws, item['scheme'], [], item['rule'])]
+            rule_index = True
+        elif component in ROOTS:
             items = [{'scheme': item['scheme'], 'name': component, 'definition': item['rule'].get(component)} for item in items]
             query = component
             name = None
@@ -218,7 +305,7 @@ def workspace_view(
         from bonus_agent.workflow import fail
 
         fail('section须为facts/clauses/rules/variables/tables/mapping/basis/checks/tool_results/construction')
-    if name is not None and section not in ('variables', 'tables'):
+    if name is not None and section not in ('variables', 'tables') and pointer is None:
         items = [
             item
             for item in items
@@ -254,9 +341,17 @@ def workspace_view(
     }
     if brief:
         result['view'] = 'brief：单条完整记录用 name 读取，或 detail=true；任务完整记录含条款、参数及检查报告'
+    if rule_index:
+        result['view'] = '规则组件索引：按每项next_call读取精确节点；已有绑定随节点列出，不按相同数字自动关联。detail=true可读取原完整定义。'
+    if pointer is not None and not items and notes:
+        parent = pointer.rsplit('/', 1)[0]
+        result.update(status='NOT_FOUND', next_call={'tool': 'read_workspace', 'args': {
+            'section': 'rules', **({'scheme': scheme} if scheme else {}),
+            **({'name': parent} if parent else {}),
+        }})
     if requested_limit != limit:
         notes.append(f'请求条数{requested_limit}已安全调整为{limit}；按next_call继续读取')
-    if name is not None and not items:
+    if name is not None and not items and pointer is None:
         # 名字对不上时说清楚有哪些，不让模型换着方案名、section 反复试
         pool = sorted({n for s in ws.schemes for sec in ('tables', 'variables') for n in (ws._merged(s).get(sec) or {})}
                       | set(ws.schemes) | set(ws.datasets))

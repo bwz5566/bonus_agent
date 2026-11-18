@@ -124,3 +124,103 @@ def test_compiler_phases_have_a_finite_shared_manual_automatic_allowance():
         assert not discover(step, seen)
         assert not discover(compile_step({'phase': phase, 'status': 'FAIL', 'issues': ['另一种错误描述']}), seen)
     assert len(seen) == 2
+
+
+def checks_step(items, **extra):
+    args = {'section': 'checks', 'offset': extra.get('offset', 0), 'query': extra.pop('query', '')}
+    return Step('read_workspace', args, json.dumps({'section': 'checks', 'items': items, **extra}, ensure_ascii=False), True)
+
+
+@pytest.mark.evidence
+def test_real_checks_pages_are_discovered_before_a_first_repair(tmp_path):
+    ws = unbound_workspace(tmp_path)
+    for name in ('待绑定阈值', '待绑定缺省值'):
+        ws.facts.append(ws.facts[0].model_copy(deep=True, update={'name': name, 'targets': []}))
+    report = ws.compile_formulas()
+    assert report['status'] == 'FAIL'
+    seen = set()
+    assert discover(compile_step(report), seen)
+    # The first-compile allowance was already consumed in the earlier round.
+    assert not discover(compile_step(report, automatic=True), seen)
+    watch = ProgressWatch({'compile_formulas'}, 1)
+    pages = []
+    offset = 0
+    while offset is not None:
+        page = ws.read_workspace('checks', offset=offset, limit=1)
+        step = Step('read_workspace', {'section': 'checks', 'offset': offset, 'limit': 1},
+                    json.dumps(page, ensure_ascii=False), True)
+        pages.append(step)
+        assert discover(step, seen), page
+        assert watch.observe({'compile_formulas'}, discovery=True) == 0
+        offset = page['next_offset']
+    assert len(pages) >= 3
+    # Reading all the concrete errors does not mark a single one fixed.
+    assert not ws._flow().current('formulas')
+    assert not ws.workflow.get('basis')
+    for step in reversed(pages):
+        assert not discover(step, seen)
+        watch.observe({'compile_formulas'})
+    assert watch.stagnant >= 3
+    assert not ws.llm.calls
+
+
+def test_checks_discovery_persists_by_record_across_paging_query_and_prose_changes(tmp_path):
+    journal = RecoveryJournal(tmp_path / 'recovery.json', {'input': 'same'})
+    seen = set()
+    first = [{'kind': 'issue', 'index': 0, 'message': 'policy.pptx::P2.T1.R2.C2.L1：parameter.unit，原文需核对'},
+             {'kind': 'issue', 'index': 1, 'message': 'C14「最初条款说明」：variables.rate 不存在'}]
+    second = [{'kind': 'issue', 'index': 2, 'message': 'policy.pptx::P3.T1.R2.C2.L1：缺少参数绑定'}]
+    assert discover(checks_step(first), seen)
+    assert discover(checks_step(second, offset=2), seen)
+    journal.state['progress'] = {'reads': sorted(seen), 'previous': ['compile_formulas'], 'stagnant': 0}
+    journal.save()
+    resumed = RecoveryJournal(journal.path, {'input': 'same'})
+    restored = set(resumed.state['progress']['reads'])
+    rewritten = [
+        {'kind': 'issue', 'index': 10, 'message': 'C14「重写条款说明」：另一种修复建议'},
+        {'kind': 'issue', 'index': 11, 'message': 'policy.pptx::P2.T1.R2.C2.L1：改写说明，候选和数值已改变'},
+        {'kind': 'issue', 'index': 12, 'message': 'policy.pptx::P3.T1.R2.C2.L1：修改后的长说明'},
+    ]
+    assert not discover(checks_step(rewritten, query='另一种查询', offset=10, version='edited-description'), restored)
+    assert not discover(checks_step(first + second, offset=0, version='another'), restored)
+
+
+def test_legacy_heading_or_unknown_message_rewrite_cannot_mint_new_credits():
+    seen = set()
+    initial = [{'kind': 'issue', 'index': 0, 'message': '参数名：参数需要绑定'},
+               {'kind': 'issue', 'index': 1, 'message': '无结构化标识的检查说明'}]
+    assert discover(checks_step(initial), seen)
+    for n in range(4):
+        rewritten = [{'kind': 'issue', 'index': 0, 'message': f'另一种描述{n}：新的措辞'},
+                     {'kind': 'issue', 'index': 1, 'message': f'重写说明{n}'}]
+        assert not discover(checks_step(rewritten, query=str(n), version=n), seen)
+    # Moving an already read parameter to another slot is also just a replay.
+    assert not discover(checks_step([{'kind': 'issue', 'index': 40, 'message': '参数名：换个修复建议'}]), seen)
+
+
+def test_structured_diagnostics_track_real_new_locations_not_formula_prose():
+    seen = set()
+    issue = {'kind': 'preflight', 'index': 0, 'code': 'basis_preflight_eval',
+             'where': 'Project:A/base', 'node_id': 'Project:A', 'rule_item': 'base',
+             'message': 'empty rows', 'formula': 'min(amount, of: "sales")'}
+    assert discover(checks_step([issue]), seen)
+    assert not discover(checks_step([{**issue, 'index': 20, 'message': 'rewritten', 'formula': 'edited prose'}], version='v2'), seen)
+    assert discover(checks_step([{**issue, 'where': 'Project:B/base', 'node_id': 'Project:B'}]), seen)
+    assert not discover(checks_step([issue], query='different'), seen)
+
+
+@pytest.mark.parametrize('status', ['STALE', 'NOT_RUN', 'ERROR', 'DEFERRED'])
+def test_unavailable_checks_are_not_read_progress(status):
+    seen = set()
+    assert not discover(checks_step([{'kind': 'issue', 'index': 0, 'message': '参数：错误'}], status=status), seen)
+    assert not seen
+
+
+def test_empty_or_fragment_offsets_do_not_count_as_new_diagnostic_records():
+    seen = set()
+    assert not discover(checks_step([], offset=1), seen)
+    for n in range(5):
+        page = checks_step([], offset=n, item_fragment={'text': 'x' * 2000, 'offset': n * 1000,
+                                                       'next_detail_offset': (n + 1) * 1000})
+        assert not discover(page, seen)
+    assert not seen

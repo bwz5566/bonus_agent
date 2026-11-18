@@ -25,6 +25,7 @@ class RunBudget:
     _uncertain_tokens: int = field(default=0, init=False, repr=False)
     _sequence: int = field(default=0, init=False, repr=False)
     _halted: str = field(default='', init=False, repr=False)
+    _request_failure: dict = field(default_factory=dict, init=False, repr=False)
     _input_ratios: dict = field(default_factory=dict, init=False, repr=False)
     _lock: object = field(default_factory=threading.RLock, init=False, repr=False)
 
@@ -79,11 +80,14 @@ class RunBudget:
                        for u, baseline in self._accounts.values())
             reserved = sum(self._reserved.values())
             accounted = used + self._uncertain_tokens + reserved
-            return {'actual_used_tokens': used, 'unconfirmed_reserved_tokens': self._uncertain_tokens,
+            state = {'actual_used_tokens': used, 'unconfirmed_reserved_tokens': self._uncertain_tokens,
                     'inflight_reserved_tokens': reserved, 'max_tokens': self.max_tokens,
                     'remaining_tokens': max(0, self.max_tokens - accounted) if self.max_tokens else None,
                     'remaining_seconds': max(0.0, self.max_seconds - (time.monotonic() - self.started)) if self.max_seconds else None,
                     'input_estimate_is_exact': False}
+            if self._request_failure:
+                state['request_failure'] = copy.deepcopy(self._request_failure)
+            return state
 
     def request_timeout(self, requested):
         from bonus_agent.llm import RunBudgetError
@@ -116,15 +120,22 @@ class RunBudget:
             self._reserved[self._sequence] = amount
             return self._sequence
 
-    def settle(self, reservation, *, reported=False, sent=True):
+    def settle(self, reservation, *, reported=False, sent=True, failure=None):
         """Unknown remote usage is not refunded into another potentially billable retry."""
         with self._lock:
             amount = self._reserved.pop(reservation, 0)
             if sent and not reported:
                 self._uncertain_tokens += amount
+                if failure and not self._request_failure:
+                    self._request_failure = copy.deepcopy(failure)
+                original = ''
+                if self._request_failure:
+                    original = '；原始请求错误：' + ' ← '.join(
+                        f'{item["type"]}: {item["message"]}'
+                        for item in [self._request_failure, *self._request_failure.get('causes', [])])
                 self._halted = self._halted or (
                     '模型请求用量未确认（服务未返回完整有效 usage，或请求结果未知）；'
-                    f'已保留 {amount} tokens 估算额度，停止自动接续，不能把未知用量当作零')
+                    f'已保留 {amount} tokens 估算额度，停止自动接续，不能把未知用量当作零' + original)
 
     def after_response(self):
         """Late or unexpectedly over-budget responses cannot reach the tool executor."""
