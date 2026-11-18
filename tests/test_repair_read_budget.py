@@ -210,6 +210,21 @@ def test_failed_unit_to_value_diagnostic_does_not_start_a_new_allowance():
     assert observe(guard, journal, [read(8)])['halt']
 
 
+@pytest.mark.parametrize('location', ['variables.rate', 'S::/variables/rate'])
+def test_atomic_saved_target_tracks_global_failure_instead_of_only_task_id(location):
+    journal = RecoveryJournal(None, 'same'); guard = RepairReadBudget({})
+    report = {'phase': 'basis', 'status': 'FAIL', 'static_checks_complete': True,
+              'issues': [f'C1：{location} 未进入本阶段依赖']}
+    assert not observe(guard, journal, [], report)['active']
+    args = {'task': 'T31', 'value': {'expr': '1'}}
+    failed = Step('submit_formula_task', args, json.dumps({'saved': False, 'target': '/variables/rate'}), True)
+    assert not observe(guard, journal, [failed], report)['active']
+    saved = Step('submit_formula_task', args,
+                 json.dumps({'saved': True, 'task': 'T31', 'target': '/variables/rate'}) + '\n（程序提醒）', True)
+    result = observe(guard, journal, [saved, read(1)], report)
+    assert result['active'] and result['subject'] == 'C1' and result['reads'] == 1
+
+
 def test_real_runner_stops_after_eight_reads_without_advisor(tmp_path):
     ws = make_workspace(tmp_path); out = tmp_path / 'out'; save_staged_case(ws, out)
     args = {'bindings': [{'name': '提成率', 'targets': ['S::/variables/does_not_exist/expr']}]}

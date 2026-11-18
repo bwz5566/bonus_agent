@@ -185,6 +185,17 @@ class RepairReadBudget:
             objects.update(f'/{group}/{name}' for name in args.get(group, {}) or {})
         objects.update(key for key in ('pool', 'report', 'allocation', 'checks') if key in args)
         objects.update(str(args[key]) for key in ('name', 'task', 'dataset') if args.get(key))
+        if step.tool == 'submit_formula_task':
+            try:
+                # The atomic tool reports its actual saved target; a task ID
+                # alone does not match compiler diagnostics about that target.
+                report, _ = json.JSONDecoder().raw_decode(step.result.lstrip())
+                if isinstance(report, dict) and report.get('saved') is True and isinstance(report.get('target'), str):
+                    from bonus_agent.facts import split_target, target_parts
+                    _, path = split_target(report['target'])
+                    objects.update((path, '.'.join(target_parts(path))))
+            except (TypeError, ValueError):
+                pass
         return objects
 
     def observe(self, steps, native, report, read_tools, *, attempts=None):

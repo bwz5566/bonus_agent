@@ -1673,7 +1673,7 @@ class Workspace:
 
     def _binding_gaps(self) -> list[str]:
         import hashlib
-        gaps = []
+        gaps = list(getattr(self, '_phase_binding_gaps', []))
         hashes = {}
         ignored = {i.get("ref") for i in self.ignored if i.get("rules") == self._rules_print()}
         used = [f for f in self.facts if f.targets]
@@ -1858,7 +1858,21 @@ class Workspace:
                 continue
             err = cl.check_where(c.where, known, qids)
             if err:
-                out.append(f"{c.id}「{c.point}」：{err}")
+                original = getattr(self, '_phase_source_drafts', None)
+                omitted = []
+                if original is not None:
+                    missing = set(cl.refs(c.where)) - known
+                    for scheme, draft in original.items():
+                        for ref in missing & cl.known_refs({scheme: draft}, self.datasets):
+                            omitted.append({'scheme': scheme, 'path': '/' + '/'.join(
+                                p.replace('~', '~0').replace('/', '~1') for p in ref.split('.'))})
+                if omitted:
+                    out.append(f'{c.id}「{c.point}」：clause.phase_reference，'
+                               + cl.phase_reference_message(self._phase_name, sorted(omitted, key=lambda x: (x['scheme'], x['path']))))
+                    # Keep genuinely missing references blocking as well; projection is not an exemption.
+                    err = cl.check_where(c.where, cl.known_refs(original, self.datasets), qids)
+                if err:
+                    out.append(f"{c.id}「{c.point}」：{err}")
         return out
 
     # ---- 数据表 ----

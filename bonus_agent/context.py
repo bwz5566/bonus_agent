@@ -284,6 +284,16 @@ def workspace_view(
         items += [{'kind': 'preflight', 'name': 'preflight:' + scheme, 'index': i, **issue}
                   for scheme, report in saved['report'].get('preflight', {}).items()
                   for i, issue in enumerate(report.get('issues', []))]
+        if name == 'graph':
+            items = []
+            for graph_scheme, graph in saved['report'].get('graph', {}).items():
+                if scheme is not None and scheme != graph_scheme:
+                    continue
+                items.append({'kind': 'graph', 'name': 'graph', 'scheme': graph_scheme,
+                              'phase': saved['report'].get('phase'), 'order': graph.get('order', [])})
+                items += [{'kind': 'dependency', 'name': 'graph', 'scheme': graph_scheme,
+                           'node': node, 'depends_on': dependencies}
+                          for node, dependencies in graph.get('dependencies', {}).items()]
     elif section == 'tool_results':
         reports = ws.workflow.get('tool_reports', {})
         chosen = {name: reports[name]} if name in reports else (reports if name is None else {})

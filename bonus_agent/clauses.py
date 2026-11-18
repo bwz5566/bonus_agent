@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import re
+import json
 
 from pydantic import BaseModel
 
@@ -148,6 +149,18 @@ def known_refs(drafts: dict, datasets: dict) -> set[str]:
         out |= {f"revisions.{r['name']}" for r in d.get("revisions") or [] if isinstance(r, dict) and r.get("name")}
         out |= {f"patches.{x['source']}" for x in d.get("patches") or [] if isinstance(x, dict) and x.get("source")}
     return out
+
+
+def phase_reference_message(phase, locations):
+    """Explain omitted, existing evidence paths without claiming an equivalent replacement."""
+    reads = [{'tool': 'read_workspace', 'args': {'section': 'rules',
+              'name': item['scheme'] + '::' + item['path']}} for item in locations]
+    refs = '、'.join(item['scheme'] + '::' + item['path'] for item in locations[:4])
+    return (f'{refs} 在完整草稿中存在，但未进入本阶段（{phase}）计算/报表依赖。'
+            '须核对实际生效公式与条款/参数归属，或按原文接入必要依赖；不代表变量未创建，不能按同值自动换绑、'
+            '把死变量全部放回计算或直接豁免。完整节点读取：' + json.dumps(reads[:4], ensure_ascii=False)
+            + (f'；另有{len(reads)-4}处同类引用' if len(reads) > 4 else '')
+            + '；当前阶段依赖图：read_workspace(section="checks", name="graph")。修改后须重新编译，门禁仍阻断。')
 
 
 def next_id(clauses: list[Clause]) -> str:

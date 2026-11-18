@@ -55,6 +55,10 @@ class Workflow:
         from bonus_agent.extract_rules import Extraction
 
         view = copy.copy(self.ws)
+        view._phase_source_drafts = {s: self.ws._merged(s) for s in self.ws.schemes}
+        view._phase_name = 'basis'
+        view._phase_binding_gaps = []
+        view._phase_binding_evidence = []
         view.drafts = {s: basis_rules(self.ws._ruleset(s)).model_dump(mode='json', include=set(Extraction.model_fields))
                        for s in self.ws.schemes}
         for scheme, draft in view.drafts.items():
@@ -75,14 +79,22 @@ class Workflow:
             scheme, path = fx.split_target(target)
             parts = fx.target_parts(path)
             if not parts or parts[0] in ('allocation', 'payout', 'offsets'):
-                return []
+                return [], []
             if parts[0] == 'report' and len(parts) > 1 and parts[1] not in ('totals', 'details', 'balances'):
-                return []
+                return [], []
             candidates = view.drafts if scheme in (None, '共用') else {scheme: view.drafts.get(scheme, {})}
-            out = []
+            out, omitted = [], []
             for name, draft in candidates.items():
                 if parts[0] in ('variables', 'tables') and len(parts) > 1 and parts[1] not in draft.get(parts[0], {}):
-                    continue
+                    original = self.ws._merged(name) if name in self.ws.schemes else {}
+                    try:
+                        fx.target_value(original, path)
+                    except (KeyError, IndexError, TypeError, ValueError):
+                        pass  # A genuinely missing target must reach normal binding validation.
+                    else:
+                        omitted.append({'scheme': name, 'path': '/' + '/'.join(
+                            str(p).replace('~', '~0').replace('/', '~1') for p in parts)})
+                        continue
                 mapped = list(parts)
                 array_path = parts[:2] if parts[0] == 'report' and len(parts) > 2 else (parts[:1] if parts[0] == 'checks' and len(parts) > 1 else None)
                 if array_path:
@@ -98,12 +110,32 @@ class Workflow:
                     except (KeyError, IndexError, ValueError, TypeError, StopIteration):
                         pass  # Keep an invalid original target visible to binding validation.
                 out.append(name + '::/' + '/'.join(str(p).replace('~', '~0').replace('/', '~1') for p in mapped))
-            return out
+            return out, omitted
 
         view.facts = []
         for fact in self.ws.facts:
-            targets = list(dict.fromkeys(t for original in fact.targets for t in projected_targets(original)))
-            if fact.targets and not targets:
+            projected = [projected_targets(original) for original in fact.targets]
+            targets = list(dict.fromkeys(t for selected, _ in projected for t in selected))
+            omissions = []
+            for _, omitted in projected:
+                for entry in omitted:
+                    parts = fx.target_parts(entry['path'])
+                    owners = {n for n, spec in tasks.items() if spec['scheme'] == entry['scheme']
+                              and parts[:len(fx.target_parts(spec['target']))] == fx.target_parts(spec['target'])}
+                    is_required = bool(owners & required) if owners else (
+                        fact.name in required_facts or fact.name not in deferred_facts)
+                    if fact.name in required_facts and not targets:
+                        # Sharing a fact may defer its other targets, but cannot erase its
+                        # only proof when an active basis task explicitly requires it.
+                        is_required = True
+                    if is_required:
+                        omissions.append(entry)
+            if omissions:
+                from bonus_agent.clauses import phase_reference_message
+                view._phase_binding_evidence.append({'fact': fact.model_dump(mode='json'), 'targets': omissions})
+                view._phase_binding_gaps.append(f'{fact.name}：parameter.binding.phase_reference，'
+                                               + phase_reference_message('basis', omissions))
+            if fact.targets and not targets and (omissions or fact.name not in required_facts):
                 continue
             if not fact.targets and fact.name in deferred_facts - required_facts:
                 continue
@@ -138,6 +170,9 @@ class Workflow:
                 ws = self.basis_view()
                 from bonus_agent.construction import TaskBoard
                 required = TaskBoard(self.ws).required('basis')
+                # Evidence omitted from executable rules still invalidates old PASS receipts.
+                # Hash source/target identities, never presentation text from diagnostics.
+                body['phase_binding_evidence'] = ws._phase_binding_evidence
             body.update(
                 rules=ws._rules_print(),
                 plan=self.state.get('plan'),

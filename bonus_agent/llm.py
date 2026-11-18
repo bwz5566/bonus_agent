@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import base64
+import errno
 import json
 import logging
 import mimetypes
 import os
 import re
+import ssl
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -74,7 +76,7 @@ def _close_client(client, *, secret='', diagnostics=None, field='cleanup_error')
         logging.getLogger(__name__).warning('HTTP client cleanup failed: %s: %s', detail['type'], detail['message'])
 
 
-def _request_error(exc, *, secret='', model='', sent=False, response_received=False):
+def _request_error(exc, *, secret='', model='', sent=False, response_received=False, extra_causes=()):
     detail = {'type': type(exc).__name__, 'message': _safe_error_text(exc, secret),
               'model': model, 'transport_invoked': sent, 'response_received': response_received}
     causes, seen, cause = [], {id(exc)}, exc.__cause__ or exc.__context__
@@ -82,6 +84,12 @@ def _request_error(exc, *, secret='', model='', sent=False, response_received=Fa
         seen.add(id(cause))
         causes.append({'type': type(cause).__name__, 'message': _safe_error_text(cause, secret)})
         cause = cause.__cause__ or cause.__context__
+    # httpcore's pool may re-raise the same exception "from None" after tracing;
+    # preserve only the causes captured synchronously from that exact failure.
+    for cause in extra_causes:
+        if id(cause) not in seen and len(causes) < 8:
+            seen.add(id(cause))
+            causes.append({'type': type(cause).__name__, 'message': _safe_error_text(cause, secret)})
     if causes:
         detail['causes'] = causes
     status = getattr(exc, 'status_code', None)
@@ -91,6 +99,125 @@ def _request_error(exc, *, secret='', model='', sent=False, response_received=Fa
     if request_id:
         detail['request_id'] = _safe_error_text(request_id, secret)[:160]
     return detail
+
+
+def _exception_chain(exc):
+    chain, seen = [], set()
+    while exc is not None and id(exc) not in seen and len(chain) < 16:
+        chain.append(exc)
+        seen.add(id(exc))
+        exc = exc.__cause__ or exc.__context__
+    return chain
+
+
+class _PresendProbe:
+    """Conservative proof for this attempt, never an inference from an error class.
+
+    Only the installed httpx2/httpcore2 transport is covered. Any application
+    write (including CONNECT and HTTP/2 initialization), redirect, missing or
+    malformed trace disables the proof. No request data enters diagnostics.
+    """
+    STAGES = {'connection.connect_tcp', 'connection.start_tls'}
+
+    def __init__(self):
+        self.installed = False
+        self.supported = False
+        self.valid = True
+        self.requests = 0
+        self.write_started = False
+        self.active = None
+        self.failed_stage = ''
+        self.failed_exception = None
+        self.failure_causes = ()
+        self.failure_count = 0
+
+    def install(self, client):
+        try:
+            import httpx2
+            import httpcore2
+            http = getattr(client, '_client', None)
+            if not isinstance(http, httpx2.Client):
+                return
+            transports = [http._transport, *http._mounts.values()]
+            self.supported = all(t is None or (
+                type(t) is httpx2.HTTPTransport and
+                type(t._pool) in (httpcore2.ConnectionPool, httpcore2.HTTPProxy)
+                and getattr(t._pool, '_retries', None) == 0
+            ) for t in transports)
+            http.event_hooks['request'].append(self.on_request)
+            self.installed = True
+        except Exception:
+            self.valid = False
+
+    def on_request(self, request):
+        try:
+            self.requests += 1
+            if self.requests != 1 or request.extensions.get('trace') is not None:
+                self.valid = False  # redirects/auth replay must not reset earlier send evidence
+                return
+            request.extensions['trace'] = self.on_trace
+        except Exception:
+            self.valid = False
+
+    def on_trace(self, event, info):
+        try:
+            stage, transition = event.rsplit('.', 1)
+            if '.send_' in event:
+                # started is before the write; even a failed/partial header write is unknown.
+                self.write_started = True
+            if stage not in self.STAGES or transition not in ('started', 'complete', 'failed'):
+                self.valid = False
+                return
+            if self.failure_count:
+                self.valid = False  # an internal retry or continuation is outside this proof
+            if transition == 'started':
+                if self.active is not None:
+                    self.valid = False
+                self.active = stage
+            else:
+                if self.active != stage:
+                    self.valid = False
+                self.active = None
+                if transition == 'failed':
+                    self.failure_count += 1
+                    self.failed_stage = stage
+                    self.failed_exception = info.get('exception')
+                    if not isinstance(self.failed_exception, BaseException):
+                        self.valid = False
+                    else:
+                        self.failure_causes = tuple(_exception_chain(self.failed_exception))
+        except Exception:
+            self.valid = False  # instrumentation must never replace the original outcome
+
+    def not_sent(self, exc):
+        return bool(self.installed and self.supported and self.valid and self.requests == 1
+                    and not self.write_started and self.active is None and self.failure_count == 1
+                    and any(cause is self.failed_exception for cause in _exception_chain(exc)))
+
+    def causes_for(self, exc):
+        # A broken trace cannot authorize a retry, but its captured cause can
+        # still explain the very same exception later stripped by the pool.
+        return self.failure_causes if any(cause is self.failed_exception for cause in _exception_chain(exc)) else ()
+
+    def retryable(self, exc):
+        if not self.not_sent(exc):
+            return False
+        causes = [*_exception_chain(exc), *self.failure_causes]
+        if any(isinstance(cause, (ssl.SSLCertVerificationError, ssl.CertificateError)) for cause in causes):
+            return False
+        # A generic ConnectError/SSLError says nothing about whether the cause is transient.
+        return any(isinstance(cause, (TimeoutError, ConnectionResetError, ConnectionAbortedError, ssl.SSLEOFError))
+                   or (type(cause) is OSError and (
+                       cause.errno in (errno.ETIMEDOUT, errno.ECONNRESET, errno.ECONNABORTED)
+                       or getattr(cause, 'winerror', None) in (10060, 10054, 10053)))
+                   for cause in causes)
+
+    def summary(self, exc=None):
+        return {'installed': self.installed, 'supported_transport': self.supported,
+                'trace_valid': self.valid, 'single_request': self.requests == 1,
+                'application_write_started': self.write_started, 'failed_stage': self.failed_stage,
+                'failure_paired': self.failure_count == 1 and self.active is None,
+                'not_sent': self.not_sent(exc) if exc is not None else False}
 
 
 THINK_BUDGET = 8192               # 百炼千问思考时每步思考 tokens 的上限
@@ -414,6 +541,31 @@ class LLM:
         return client
 
     def _send(self, kwargs, think):
+        if self.run_budget is None:
+            return self._send_once(kwargs, think)  # ordinary calls retain only the SDK retry policy
+        started = time.monotonic()
+        attempts = self.last_call['request_attempts'] = []
+        try:
+            for attempt in range(3):  # initial request plus at most two proven pre-send retries
+                for field in ('error_type', 'error_message', 'request_error'):
+                    self.last_call.pop(field, None)
+                try:
+                    return self._send_once(kwargs, think, probe=_PresendProbe(), attempts=attempts)
+                except LLMError as exc:
+                    if not getattr(exc, '_presend_retry_safe', False) or attempt == 2:
+                        raise
+                    self.last_call['presend_retries'] = attempt + 1
+                    # Backoff consumes the same deadline. The next attempt must reserve anew.
+                    try:
+                        delay = self.run_budget.request_timeout((0.2, 0.5)[attempt])
+                        time.sleep(delay)
+                    except RunBudgetError:
+                        self.last_call.update(status='budget_blocked', budget=self.run_budget.snapshot())
+                        raise
+        finally:
+            self.last_call['request_seconds'] = round(time.monotonic() - started, 3)
+
+    def _send_once(self, kwargs, think, *, probe=None, attempts=None):
         budget, reservation = self.run_budget, None
         if budget is not None:
             from bonus_agent.context import estimate_tokens
@@ -433,9 +585,11 @@ class LLM:
                                   budget_request_sequence=reservation,
                                   requested_output_tokens=output, transport_retries_limit=0)
         t0, sent, reported, response_received, failure = time.monotonic(), False, False, False, None
-        client = None
+        client, request_exception, not_sent = None, None, False
         try:
             client = self._client(think)
+            if probe is not None:
+                probe.install(client)
             sent = True
             resp = client.chat.completions.create(**kwargs)
             response_received = True
@@ -452,16 +606,22 @@ class LLM:
                            'response_id': _safe_error_text(getattr(resp, 'id', ''), self.api_key)[:160], 'invalid_usage_fields': invalid}
                 self.last_call.update(error_type=failure['type'], error_message=failure['message'], request_error=failure)
         except Exception as exc:
+            request_exception = exc
+            not_sent = probe.not_sent(exc) if probe is not None else False
             status = getattr(exc, 'status_code', None)
             response_received = (response_received or getattr(exc, 'response', None) is not None
                                  or isinstance(status, int) and 100 <= status <= 599)
+            not_sent = not_sent and not response_received
             failure = _request_error(exc, secret=self.api_key, model=self.model,
-                                     sent=sent, response_received=response_received)
+                                     sent=sent, response_received=response_received,
+                                     extra_causes=probe.causes_for(exc) if probe is not None else ())
             self.last_call.update(status='budget_blocked' if isinstance(exc, RunBudgetError) else 'failed',
                                   error_type=failure['type'], error_message=failure['message'], request_error=failure)
             if isinstance(exc, RunBudgetError):
                 raise
-            raise LLMError(f'{self.name} 调用失败（{failure["type"]}）：{failure["message"]}') from exc
+            error = LLMError(f'{self.name} 调用失败（{failure["type"]}）：{failure["message"]}')
+            error._presend_retry_safe = not_sent and probe.retryable(exc) if probe is not None else False
+            raise error from exc
         finally:
             self.last_call['request_seconds'] = round(time.monotonic() - t0, 3)
             self.last_call['response_received'] = response_received
@@ -469,8 +629,19 @@ class LLM:
             if budget is not None and reservation is not None:
                 if failure is not None:
                     failure['budget_request_sequence'] = reservation
-                budget.settle(reservation, reported=reported, sent=sent, failure=failure)
+                budget.settle(reservation, reported=reported, sent=sent and not not_sent, failure=failure)
                 self.last_call['budget'] = budget.snapshot()
+            if attempts is not None:
+                diagnostic = {'attempt': len(attempts) + 1, 'budget_request_sequence': reservation,
+                              'transport_invoked': sent, 'usage_reported': reported,
+                              'request_seconds': self.last_call['request_seconds'],
+                              'dispatch_status': 'response' if response_received else
+                                                 'not_sent' if not_sent or not sent else 'unknown',
+                              'transport_evidence': probe.summary(request_exception)}
+                if failure is not None:
+                    diagnostic['request_error'] = failure
+                    self.last_call.setdefault('first_request_error', failure)
+                attempts.append(diagnostic)
         if budget is not None:
             try:
                 budget.after_response()
