@@ -77,11 +77,72 @@ def _report(status, phase, engine, issues, *, issue_count=None):
         report['execution_evidence'] = {
             'successful': [{'node_id': node, 'rule_item': item} for node, item in identities[:128]],
             'successful_complete': len(identities) <= 128,
+            'successful_scope': 'expression_evaluated_only',
             'object_ids': [node.id for node in objects[:128]],
             'objects_complete': len(objects) <= 128,
             'object_scope': engine.rs.pool.scope,
         }
+        # A scalar trace can exist before its amount/check policy rejects it.
+        # Only a completed basis execution certifies the current execution
+        # contracts. This is never approval of business policy or amounts.
+        policies = _policy_successes(engine, objects) if status == 'PASS' else []
+        report['execution_evidence'].update(
+            policy_successful=policies[:128],
+            policy_successful_complete=len(policies) <= 128,
+            # A warning predicate may remain false despite overall PASS. Do
+            # not let changing its severity manufacture proof it now passed.
+            policy_checks_complete=status == 'PASS' and not any(i.code == 'check_failed' for i in engine.issues),
+            policy_success_scope='current_execution_contracts_only_not_business_or_amount_approval',
+        )
     return report
+
+
+def _target(engine, item):
+    """Canonical component roots; projected check indexes are not source indexes."""
+    if item == 'pool':
+        return '/pool'
+    if item in engine.rs.variables:
+        return '/variables/' + item.replace('~', '~0').replace('/', '~1')
+    if any(item == 'checks.' + check.id for check in engine.rs.checks):
+        return '/checks'
+    if item in ('report.details', 'report.balances', 'report.totals'):
+        return '/' + item.replace('.', '/')
+    if item == 'basis':
+        return '/report/totals'
+    return ''
+
+
+def _policy_successes(engine, objects):
+    """Use real executed roots, never similarly named variable traces."""
+    identities = []
+    seen = set()
+
+    def add(node, item, target, trace_ids):
+        traces = [engine.ev.traces.get(key) for key in trace_ids]
+        if traces and all(t is not None and t.rule_item == item and t.node_id == node.id for t in traces):
+            entry = {'node_id': node.id, 'rule_item': item, 'target': target,
+                     'evidence_kind': 'execution_contract_passed'}
+            key = (node.id, item, target)
+            if key not in seen:
+                seen.add(key)
+                identities.append(entry)
+
+    for node in objects:
+        add(node, 'pool', '/pool', [f'{node.id}/奖金池'])
+    for check in engine.rs.checks:
+        for node in engine._report_nodes(check.scope):
+            key = f'{node.id}/校验/{check.id}'
+            trace = engine.ev.traces.get(key)
+            # A failed warning did execute, but its predicate did not pass.
+            if trace is not None and trace.value == 'True':
+                add(node, 'checks.' + check.id, '/checks', [key])
+    for balance in engine.rs.report.balances if engine.rs.report else []:
+        if balance.stage != 'basis':
+            continue
+        for node in engine._report_nodes(balance.level):
+            add(node, 'report.balances', '/report/balances',
+                [f'{node.id}/对账/{balance.name}/{i}' for i in range(1 + len(balance.parts))])
+    return identities
 
 
 def _evaluation_issue(exc, engine):
@@ -98,6 +159,9 @@ def _evaluation_issue(exc, engine):
         'coverage': [dict(item) for item in exc.aggregates],
     }
     if engine is not None:
+        if target := _target(engine, issue['rule_item']):
+            issue['target'] = target
+        issue['evidence_kind'] = 'expression_failure'
         for item in issue['coverage']:
             name = item['dataset']
             table = engine.data.get(name)
@@ -137,7 +201,19 @@ def _engine_issue(issue, engine):
     node = next((n for n in sorted(nodes, key=lambda n: len(n.id), reverse=True)
                  if where == n.id or where.startswith(n.id + '/')), None)
     if node is not None:
-        issue.update(node_id=node.id, source=str(node.attr_src) if node.attr_src else '')
+        issue.update(node_id=node.id, node_scope='global' if node is engine.root else node.level,
+                     source=str(node.attr_src) if node.attr_src else '')
+    if issue['code'] == 'pool_negative':
+        # The global pool rejection has no `where`; its root is nevertheless
+        # the real global node. Never assign a guessed object for other scopes.
+        if node is None and not where and engine.rs.pool.scope == 'global':
+            node = engine.root
+            issue.update(node_id=node.id, node_scope='global', source=str(node.attr_src) if node.attr_src else '')
+        if node is not None:
+            issue.update(rule_item='pool', target='/pool', evidence_kind='policy_failure',
+                         formula=engine.rs.pool.expr)
+    elif issue['code'] in ('report_unbalanced', 'report_balance_eval') and node is not None:
+        issue.update(rule_item='report.balances', target='/report/balances', evidence_kind='policy_failure')
     if issue['code'] == 'check_failed':
         failed = [t for t in engine.ev.traces.values() if t.rule_item == where and t.value == 'False']
         by_id = {n.id: n for n in nodes}
@@ -147,4 +223,11 @@ def _engine_issue(issue, engine):
             'source': str(by_id[trace.node_id].attr_src) if by_id.get(trace.node_id) and by_id[trace.node_id].attr_src else '',
             'rows': list(trace.rows[:3]),
         } for trace in failed[:3]]
+        if failed and any(where == 'checks.' + check.id for check in engine.rs.checks):
+            first = issue['examples'][0]
+            issue.update(node_id=first['node_id'], source=first['source'], formula=first['formula'],
+                         rule_item=where, target='/checks', evidence_kind='policy_failure')
+            failed_node = by_id.get(first['node_id'])
+            if failed_node is not None:
+                issue['node_scope'] = 'global' if failed_node is engine.root else failed_node.level
     return issue

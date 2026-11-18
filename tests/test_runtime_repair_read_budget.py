@@ -120,10 +120,10 @@ def test_real_successful_trace_allows_next_failure_but_recurrence_does_not_refil
     progress = observe(guard, second, [write('sum(amount, of: "sales")')])
     assert progress['reads'] == 0 and '/variables/bonus' in progress['subject']
     observe(guard, second, [read(10), read(11)])
-    passed = copy.deepcopy(second)
-    passed.update(status='PASS', issues=[])
-    passed['preflight']['S'] = {'status': 'PASS'}
-    assert not observe(guard, passed)['active']
+    rs.variables['bonus'].expr = 'base * 0.1'
+    passed = wrap(preflight_basis(rs, from_records(rs, records)))
+    assert passed['status'] == 'PASS'
+    assert not observe(guard, passed, [write('base * 0.1')])['active']
     recurrence = observe(guard, first)
     assert recurrence['reads'] == 6
     assert observe(guard, first, [read(12), read(13)])['halt']
@@ -177,8 +177,9 @@ def test_verified_runtime_halt_is_archived_and_recurrence_gets_new_halt_identity
     observe(guard, next_failure, [write()])
     assert old_marker['id'] in guard.state['resolved_halts'] and not journal.error
     # Completing the next target cannot erase the remembered exhausted quota.
-    passed = {'phase': 'basis', 'status': 'PASS', 'issues': [], 'preflight': {'S': {'status': 'PASS'}}}
-    observe(guard, passed)
+    passed = {'phase': 'basis', 'status': 'PASS', 'issues': [], 'preflight': {
+        'S': {'status': 'PASS', 'execution_evidence': success('later')}}}
+    observe(guard, passed, [write()])
     repeated = observe(guard, runtime())
     assert repeated['halt'] and repeated['reads'] == 8
     journal.halt(repeated['message'], repair_read=repeated)

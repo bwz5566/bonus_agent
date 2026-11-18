@@ -253,6 +253,7 @@ class RunBudget:
             if error := self.check(llm):
                 self._halted = error
                 raise RunBudgetError(error)
+            self.ensure_request_window(llm)
             amount = int(input_tokens) + int(output_tokens)
             state = self.snapshot()
             if state['remaining_tokens'] is not None and amount > state['remaining_tokens']:
@@ -264,6 +265,23 @@ class RunBudget:
             self._sequence += 1
             self._reserved[self._sequence] = amount
             return self._sequence
+
+    def ensure_request_window(self, llm):
+        """Do not start a model request with less than its configured completion window."""
+        from bonus_agent.llm import RunBudgetError
+        with self._lock:
+            if self._halted:
+                raise RunBudgetError(self._halted)
+            minimum = getattr(llm, 'min_request_seconds', 0)
+            remaining = self.snapshot()['remaining_seconds']
+            if remaining is not None and remaining < minimum:
+                self._halted = (f'作业请求时间事前拦截：剩余 {remaining:.1f} 秒，'
+                                f'模型 {llm.name} 要求至少 {minimum:g} 秒；未发出请求，停止自动接续')
+                error = RunBudgetError(self._halted)
+                # This exact exception proves only the current request was not sent.
+                # Existing sticky failures and after-response stops never inherit it.
+                error.request_not_sent = True
+                raise error
 
     def settle(self, reservation, *, reported=False, sent=True, failure=None):
         """Unknown remote usage is not refunded into another potentially billable retry."""
@@ -655,6 +673,7 @@ def local_advice(llm, reason, steps, facts, hint, *, context=None):
     advisor = copy.copy(llm)
     advisor.think_max_tokens = 4096
     advisor.think_timeout = min(llm.think_timeout, 180)
+    advisor.min_request_seconds = min(llm.min_request_seconds, advisor.think_timeout)
     if 'thinking' in (advisor.think_body or {}):
         advisor.think_body = {**advisor.think_body, 'reasoning_effort': 'low'}
     try:

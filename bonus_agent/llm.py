@@ -5,6 +5,7 @@ import base64
 import errno
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -542,6 +543,7 @@ class LLM:
     max_history_chars: int | None = None   # 对话历史上限（字符），见 models.yaml
     run_budget: object | None = field(default=None, repr=False, compare=False)
     tools_thinking: bool = False     # agent tool turns request thinking without consuming recovery/advisor attempts
+    min_request_seconds: float = 0   # minimum job time remaining before a potentially billable request
 
     @classmethod
     def from_config(cls, name: str | None = None, config: dict | None = None, checker: str | None = None,
@@ -573,6 +575,14 @@ class LLM:
         if not isinstance(tools_thinking, bool):
             raise LLMError(f'模型 {name} 的 tools_thinking 须为 true 或 false')
         llm.tools_thinking = tools_thinking
+        minimum = m.get('min_request_seconds', 0)
+        try:
+            minimum = float(minimum) if isinstance(minimum, (int, float)) and not isinstance(minimum, bool) else math.nan
+        except OverflowError:
+            minimum = math.nan
+        if not math.isfinite(minimum) or minimum < 0:
+            raise LLMError(f'模型 {name} 的 min_request_seconds 须为有限非负数字')
+        llm.min_request_seconds = minimum
         tm = m.get("think_model") if not _auxiliary else None
         if tm and tm != name:
             if tm not in cfg["models"]:
@@ -717,6 +727,8 @@ class LLM:
             client = self._client(think)
             if probe is not None:
                 probe.install(client)
+            if budget is not None:
+                budget.ensure_request_window(self)  # client setup may consume the remaining admission margin
             sent = True
             resp = client.chat.completions.create(**kwargs)
             response_received = True

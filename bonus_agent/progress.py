@@ -348,20 +348,35 @@ class RepairReadBudget:
             if not isinstance(result, dict) or result.get('status') != 'FAIL':
                 continue
             for issue in result.get('issues', []):
-                if (not isinstance(issue, dict) or issue.get('code') != 'basis_preflight_eval'
-                        or not isinstance(issue.get('node_id'), str) or not issue['node_id']
-                        or not isinstance(issue.get('rule_item'), str) or not issue['rule_item']):
+                if (not isinstance(issue, dict)
+                        or not isinstance(issue.get('node_id'), str) or not issue['node_id']):
                     continue
-                item = issue['rule_item']
-                if item == 'pool':
-                    target = '/pool'
-                elif item.startswith('report.'):
-                    target = '/' + item.replace('.', '/')
-                elif item == 'basis':
-                    target = 'rule_item:basis'  # report identity is not a variable name
+                failure = dict(issue)
+                # Older persisted pool failures already have a real object
+                # identity, but predate canonical contract metadata. Normalize
+                # this known program error; never infer identities from prose.
+                if failure.get('code') == 'pool_negative':
+                    failure.update(target='/pool', rule_item='pool', evidence_kind='policy_failure')
+                item = failure.get('rule_item')
+                if not isinstance(item, str) or not item:
+                    continue
+                target = failure.get('target')
+                if failure.get('evidence_kind') == 'policy_failure':
+                    if not isinstance(target, str) or not target.startswith('/'):
+                        continue
+                elif failure.get('code') == 'basis_preflight_eval':
+                    if not isinstance(target, str) or not target.startswith('/'):
+                        if item == 'pool':
+                            target = '/pool'
+                        elif item.startswith('report.'):
+                            target = '/' + item.replace('.', '/')
+                        elif item == 'basis':
+                            target = 'rule_item:basis'  # not a variable name
+                        else:
+                            target = '/variables/' + item.replace('~', '~0').replace('/', '~1')
                 else:
-                    target = '/variables/' + item.replace('~', '~0').replace('/', '~1')
-                yield scheme, target, issue
+                    continue
+                yield scheme, target, failure
                 break  # preflight stops at its first executed failure
 
     @staticmethod
@@ -384,7 +399,7 @@ class RepairReadBudget:
                     'column', 'combine', 'unpivot', 'unmatched', 'distinct', 'type', 'nullable',
                     'steps', 'mapping', 'mode', 'lower_inclusive', 'below_first', 'default',
                     'applies_when', 'level', 'parent_key', 'weight', 'people', 'total',
-                    'rounding', 'allocation', 'checks', 'payout', 'offsets'}
+                    'rounding', 'allocation', 'checks', 'payout', 'offsets', 'negative'}
         def meaningful(value):
             if isinstance(value, dict):
                 return any(key in semantic or meaningful(child) for key, child in value.items()
@@ -402,10 +417,25 @@ class RepairReadBudget:
         evidence = result.get('execution_evidence')
         if not isinstance(evidence, dict):
             return False
+        policy = runtime.get('evidence_kind') == 'policy_failure'
+        successes = evidence.get('policy_successful' if policy else 'successful', [])
         if any(isinstance(item, dict) and item.get('node_id') == runtime['node_id']
-               and item.get('rule_item') == runtime['rule_item'] for item in evidence.get('successful', [])):
+               and item.get('rule_item') == runtime['rule_item']
+               and (not policy or (item.get('target') == runtime['target']
+                    and item.get('evidence_kind') == 'execution_contract_passed'))
+               for item in successes):
             return True
         scope, ids = evidence.get('object_scope'), evidence.get('object_ids')
+        # A bounded identity list can omit a later repaired object. A complete
+        # executed contract is a separate positive proof, never inferred from
+        # a status label or from an expression having produced a scalar.
+        if (policy and result.get('status') == 'PASS'
+                and result.get('purpose') == 'deterministic_basis_preflight'
+                and result.get('phase') == 'evaluate' and result.get('issues') == []
+                and result.get('issue_count') == 0
+                and evidence.get('policy_checks_complete') is True
+                and isinstance(scope, str) and scope and runtime.get('object_scope') == scope):
+            return True
         return bool(evidence.get('objects_complete') is True and isinstance(scope, str) and scope
                     and isinstance(ids, list) and all(isinstance(item, str) for item in ids)
                     and runtime.get('object_scope') == scope and runtime['node_id'] not in ids)
@@ -465,7 +495,8 @@ class RepairReadBudget:
                     # even overall PASS can contain DEFERRED upstream-dependent
                     # preflights. Only this scheme's executed PASS resolves it.
                     result = report.get('preflight', {}).get(runtime.group(1), {})
-                    if result.get('status') == 'PASS' or self._runtime_verified(row, result):
+                    if (self._runtime_verified(row, result)
+                            or (not row.get('runtime') and result.get('status') == 'PASS')):
                         if row.get('runtime'):
                             remembered = copy.deepcopy(row)
                             remembered.pop('halt_marker', None)
@@ -492,6 +523,8 @@ class RepairReadBudget:
                     continue
                 identity = {'scheme': scheme, 'target': target,
                             'node_id': issue['node_id'], 'rule_item': issue['rule_item']}
+                if issue.get('evidence_kind') == 'policy_failure':
+                    identity['evidence_kind'] = 'policy_failure'
                 evidence = report['preflight'][scheme].get('execution_evidence', {})
                 object_scope, object_ids = evidence.get('object_scope'), evidence.get('object_ids')
                 if (isinstance(object_scope, str) and object_scope and isinstance(object_ids, list)
@@ -500,6 +533,11 @@ class RepairReadBudget:
                     # old object's scope. IDs alone cannot disambiguate a colon
                     # in a legitimate scope name from one in an object key.
                     identity['object_scope'] = object_scope
+                elif (issue.get('evidence_kind') == 'policy_failure'
+                      and isinstance(issue.get('node_scope'), str) and issue['node_scope']):
+                    # New structured issues carry the actual engine object's
+                    # scope even when its identity is outside the bounded list.
+                    identity['object_scope'] = issue['node_scope']
                 if key not in records:
                     remembered = copy.deepcopy(self.state['seen_runtime_targets'].get(key, {}))
                     records[key] = remembered or {'kind': 'compile', 'phase': phase, 'reads': 0,
@@ -509,7 +547,8 @@ class RepairReadBudget:
                 # A repeated target shares its quota even on a different node.
                 # Retain the first unresolved node until its execution is proven.
                 row.setdefault('runtime', identity)
-                brief = {k: issue[k] for k in ('code', 'message', 'where', 'node_id', 'rule_item') if k in issue}
+                brief = {k: issue[k] for k in ('code', 'message', 'where', 'node_id', 'rule_item',
+                                             'target', 'evidence_kind') if k in issue}
                 row.update(subject=subject, issue=prefix + '：' + json.dumps(brief, ensure_ascii=False)[:1000],
                            tool='compile_formulas')
             attempted = set().union(*(self._write_objects(step) for step in attempted_steps)) if attempted_steps else set()

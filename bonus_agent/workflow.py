@@ -608,7 +608,7 @@ class Workflow:
     def review_basis(self, scheme=None):
         from bonus_agent import reread as rr
         from bonus_agent.agent import ToolError
-        from bonus_agent.llm import LLMError, parse_json
+        from bonus_agent.llm import LLMError, RunBudgetError, parse_json
         from bonus_core.engine.evaluator import EvalError
         from bonus_core.engine.issues import EngineError
 
@@ -742,9 +742,19 @@ class Workflow:
                      '\n请仅根据原材料修复上述声明，重新输出完整JSON。没有增加调用次数上限；'
                      '这里没有提供生产公式、生产金额或参考答案。业务依据不足仍须写unclear。'},
                 ]
-            guard_messages(request, checker or self.ws.llm, output_tokens=8192)
+            request_model = rr.guard_request(self.ws, request)
             self.state['attempts'][key] = attempts + 1
-            raw_response = rr._ask(self.ws, request)
+            try:
+                raw_response = rr._ask(self.ws, request)
+            except RunBudgetError as exc:
+                call = getattr(request_model, 'last_call', {})
+                reserve_block = (call.get('status') == 'budget_blocked' and call.get('request_attempts') == []
+                                 and not call.get('budget_request_sequence') and not call.get('response_received'))
+                if getattr(exc, 'request_not_sent', False) or reserve_block:
+                    # The deadline can cross its minimum between guard and reserve.
+                    # No reviewer opinion was requested; preserve this attempt.
+                    self.state['attempts'][key] = attempts
+                raise
             actual = checker if checker is not None and not self.ws.checker_down else self.ws.llm
             think = actual is checker or not bool(self.ws.checker_down and getattr(self.ws.llm, 'think_llm', None))
             seen = set()

@@ -29,6 +29,7 @@ default: qwen-a
 #   tool_mode: native | json      native 为原生工具调用（默认）；服务不支持时会自动改用 json
 #   tools_thinking: false        工具轮次显式请求think参数（含工具JSON协议），不消耗故障升级次数；普通抽取调用不受影响
 #   timeout: 300                  单次请求的超时（秒），默认 300；本地模型打开思考时可加大到 600
+#   min_request_seconds: 0        作业剩余时间不足此值时不发新请求；默认0保留原行为，不代表响应时长保证
 #   max_history_chars: 24000      智能体对话历史的上限（字符）。超过时整理一次，压到一半；加大会让每步输入变多
 #   workflow_mode: staged        默认使用阶段回执：准备数据、编译、基础金额、独立复核、总额确认后分配；legacy仅用于旧协议兼容
 #   max_input_tokens: 96000      单次输入token估算预算（中英数字分开估算，并用API实际用量向上校正），包含系统提示、工具schema、历史及任务卡
@@ -139,8 +140,9 @@ models:
     json_mode: json_object
     extra_body: {thinking: {type: disabled}}
     think: {thinking: {type: enabled}, reasoning_effort: high}  # 关键独立复核；局部纠错另限low/4096/180秒
-    think_max_tokens: 8192
+    think_max_tokens: 16384
     think_timeout: 300
+    min_request_seconds: 300      # 关键独立复核须保留完整请求窗口
     vision: deepseek-flash
 
   deepseek-pro-repair:          # 明确选择的修复执行配置；不改变默认模型或Flash执行配置
@@ -152,7 +154,25 @@ models:
     think: {thinking: {type: enabled}, reasoning_effort: low}
     think_max_tokens: 16384
     think_timeout: 300
+    min_request_seconds: 120      # 修复执行不在作业最后几十秒发起高成本请求
     checker: deepseek-v4-pro     # 独立对象，沿用high思考复核，不与工具执行共享会话
+    checker_required: true
+    workflow_mode: staged
+    max_input_tokens: 160000
+    max_history_chars: 80000
+    vision: deepseek-flash
+
+  deepseek-pro-repair-high:     # 关键修复的可选高思考对照；保留low配置，须显式选择
+    provider: deepseek
+    model: deepseek-v4-pro
+    json_mode: json_object
+    extra_body: {thinking: {type: disabled}}
+    tools_thinking: true
+    think: {thinking: {type: enabled}, reasoning_effort: high}
+    think_max_tokens: 16384
+    think_timeout: 300
+    min_request_seconds: 300
+    checker: deepseek-v4-pro
     checker_required: true
     workflow_mode: staged
     max_input_tokens: 160000

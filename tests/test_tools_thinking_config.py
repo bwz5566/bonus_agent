@@ -37,6 +37,24 @@ def test_repair_profile_is_optional_and_keeps_an_independent_high_effort_checker
     assert llm.vision_llm.model == 'deepseek-flash'
 
 
+def test_high_repair_profile_is_explicit_and_keeps_low_profile_unchanged():
+    cfg = config()
+    high = LLM.from_config('deepseek-pro-repair-high', cfg)
+    low = LLM.from_config('deepseek-pro-repair', cfg)
+    assert cfg['default'] == 'qwen-a'
+    assert high.model == low.model == 'deepseek-v4-pro'
+    assert high.tools_thinking and high.think_llm is None
+    assert high.think_body['reasoning_effort'] == 'high'
+    assert high.min_request_seconds == high.think_timeout == 300
+    assert high.think_max_tokens == 16384
+    assert high.checker_required and high.checker_llm is not high
+    assert high.checker_llm.name == 'deepseek-v4-pro'
+    assert high.checker_llm.think_body['reasoning_effort'] == 'high'
+    assert (high.workflow_mode, high.max_input_tokens, high.max_history_chars) == ('staged', 160000, 80000)
+    assert high.vision_llm.model == 'deepseek-flash'
+    assert low.think_body['reasoning_effort'] == 'low' and low.min_request_seconds == 120
+
+
 @pytest.mark.parametrize('value', ['true', 'false', 1, None])
 def test_tools_thinking_is_a_boolean_config_option(value):
     cfg = config()
