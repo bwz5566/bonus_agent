@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -56,6 +57,21 @@ def _safe_error_text(value, secret=''):
                   r'\1[redacted]', text)
     text = re.sub(r'(?i)(https?://)[^/\s:@]+:[^/\s@]+@', r'\1[redacted]@', text)
     return text[:1600]
+
+
+def _close_client(client, *, secret='', diagnostics=None, field='cleanup_error'):
+    """Release owned transport without replacing request outcomes or their usage accounting."""
+    if client is None:
+        return
+    try:
+        close = getattr(client, 'close', None)
+        if close is not None:
+            close()
+    except Exception as exc:
+        detail = {'type': type(exc).__name__, 'message': _safe_error_text(exc, secret)}
+        if diagnostics is not None:
+            diagnostics[field] = detail
+        logging.getLogger(__name__).warning('HTTP client cleanup failed: %s: %s', detail['type'], detail['message'])
 
 
 def _request_error(exc, *, secret='', model='', sent=False, response_received=False):
@@ -189,17 +205,24 @@ def openai_client(base_url: str, api_key: str, timeout: float):
     from openai import DefaultHttpxClient, OpenAI
     http = DefaultHttpxClient(trust_env=False) if direct(base_url) else None
     # Transport retries are bounded separately from business recovery; six retries can hide minutes of failure.
-    return OpenAI(base_url=base_url, api_key=api_key, timeout=timeout, http_client=http, max_retries=MAX_RETRIES)
+    try:
+        return OpenAI(base_url=base_url, api_key=api_key, timeout=timeout, http_client=http, max_retries=MAX_RETRIES)
+    except BaseException:
+        _close_client(http, secret=api_key)
+        raise
 
 
 def list_remote(provider: str, cfg: dict) -> list[str]:
     """用当前 Key 向服务商查询可调用的模型 ID（/models 接口）。"""
     prov = cfg["providers"][provider]
+    client, key = None, provider_key(prov)
     try:
-        client = openai_client(prov["base_url"], provider_key(prov), 60)
+        client = openai_client(prov["base_url"], key, 60)
         return sorted(m.id for m in client.models.list())
     except Exception as e:
-        raise LLMError(f"查询 {provider} 模型列表失败：{e}") from e
+        raise LLMError(f"查询 {provider} 模型列表失败：{_safe_error_text(e, key)}") from e
+    finally:
+        _close_client(client, secret=key)
 
 
 def image_part(data: bytes | str | Path, mime: str | None = None) -> dict:
@@ -383,7 +406,11 @@ class LLM:
         if self.run_budget is not None:
             # A retry is another potentially billable request. SDK retries cannot reserve
             # tokens or re-evaluate the job deadline, so budgeted jobs disable them.
-            client = client.with_options(max_retries=0, timeout=self.run_budget.request_timeout(timeout))
+            try:
+                client = client.with_options(max_retries=0, timeout=self.run_budget.request_timeout(timeout))
+            except BaseException:
+                _close_client(client, secret=self.api_key, diagnostics=self.last_call)
+                raise
         return client
 
     def _send(self, kwargs, think):
@@ -406,6 +433,7 @@ class LLM:
                                   budget_request_sequence=reservation,
                                   requested_output_tokens=output, transport_retries_limit=0)
         t0, sent, reported, response_received, failure = time.monotonic(), False, False, False, None
+        client = None
         try:
             client = self._client(think)
             sent = True
@@ -437,6 +465,7 @@ class LLM:
         finally:
             self.last_call['request_seconds'] = round(time.monotonic() - t0, 3)
             self.last_call['response_received'] = response_received
+            _close_client(client, secret=self.api_key, diagnostics=self.last_call)
             if budget is not None and reservation is not None:
                 if failure is not None:
                     failure['budget_request_sequence'] = reservation
@@ -460,6 +489,7 @@ class LLM:
         """模型服务的上下文长度（vLLM 在 /models 里返回 max_model_len）；查不到返回 None，不影响调用。"""
         if not hasattr(self, "_ctx"):
             self._ctx = None
+            client = None
             try:
                 timeout = self.run_budget.request_timeout(20) if self.run_budget is not None else 20
                 client = openai_client(self.base_url, self.api_key, timeout)
@@ -477,6 +507,8 @@ class LLM:
                 raise
             except Exception:
                 pass
+            finally:
+                _close_client(client, secret=self.api_key, diagnostics=self.last_call, field='context_cleanup_error')
         return self._ctx
 
     def chat(self, messages: list[dict], *, schema: dict | None = None, json_out: bool = False,

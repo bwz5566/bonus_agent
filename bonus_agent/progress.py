@@ -142,3 +142,123 @@ class ProgressWatch:
             self.stagnant += 1
         self.previous = current
         return self.stagnant
+
+
+class RepairReadBudget:
+    """Bound exploration of a concrete failed repair, not initial discovery.
+
+    A new page is evidence, not resolution. Counts survive new queries, harmless
+    writes and restarts; only a successful program check removes the obligation.
+    Four reads leave room for the fact, source, target and mapping; eight allow
+    follow-up evidence before stopping further model spending.
+    """
+    WARN = 4
+    LIMIT = 8
+    WRITES = {'set_rules', 'bind_facts', 'submit_formula_task', 'update_dataset',
+              'define_dataset', 'record_facts', 'compile_table', 'compile_coefficient_table'}
+
+    def __init__(self, state):
+        self.state = state
+        state.setdefault('records', {})
+        state.setdefault('seen_compile', [])
+
+    @property
+    def active(self):
+        return bool(self.state['records'])
+
+    @staticmethod
+    def _subject(message):
+        # Keep source-cell IDs (which contain ::) intact. Do not key allowances
+        # by query, description, generated remedy text or workspace version.
+        return re.split(r'：|(?<!:):(?!:)', str(message), maxsplit=1)[0].strip()
+
+    @staticmethod
+    def _write_objects(step):
+        if step.tool not in RepairReadBudget.WRITES or step.result.lstrip().startswith('no-op'):
+            return set()
+        args = step.args
+        objects = {str(item.get('name') or item.get('id'))
+                   for group in ('bindings', 'facts') for item in args.get(group, [])
+                   if isinstance(item, dict) and (item.get('name') or item.get('id'))}
+        for group in ('variables', 'tables'):
+            objects.update(f'{group}.{name}' for name in args.get(group, {}) or {})
+            objects.update(f'/{group}/{name}' for name in args.get(group, {}) or {})
+        objects.update(key for key in ('pool', 'report', 'allocation', 'checks') if key in args)
+        objects.update(str(args[key]) for key in ('name', 'task', 'dataset') if args.get(key))
+        return objects
+
+    def observe(self, steps, native, report, read_tools, *, attempts=None):
+        records = self.state['records']
+        native_keys = set()
+        for item in native.values():
+            # An initial compiler error is a first diagnosis, not a failed
+            # repair attempt. The object-specific compile path below owns it.
+            if item['tool'] == 'compile_formulas':
+                continue
+            for obj in item.get('objects') or [item['tool']]:
+                key = fingerprint(('native', item['tool'], item.get('scheme'), obj))
+                native_keys.add(key)
+                row = records.setdefault(key, {'kind': 'native', 'reads': 0, 'seen': [], 'warned': False})
+                row.update(subject=obj, issue=item['issue'], tool=item['tool'])
+        for key in list(records):
+            if records[key]['kind'] == 'native' and key not in native_keys:
+                del records[key]  # native feedback clears only validated successes
+
+        phase = report.get('phase') if report else None
+        if phase in ('basis', 'all') and report.get('status') in ('PASS', 'FAIL'):
+            issues = {self._subject(message): str(message) for message in report.get('issues', [])}
+            static_complete = report['status'] == 'PASS' or (
+                report.get('static_checks_complete') is True
+                and report.get('issue_count', len(issues)) <= len(report.get('issues', [])))
+            for key, row in list(records.items()):
+                if row['kind'] != 'compile' or row['phase'] != phase:
+                    continue
+                runtime = re.match(r'^方案「([^」]+)」基础求值预检[：:]', row['issue'])
+                if runtime:
+                    # Static errors can prevent the runtime check from running;
+                    # even overall PASS can contain DEFERRED upstream-dependent
+                    # preflights. Only this scheme's executed PASS resolves it.
+                    if report.get('preflight', {}).get(runtime.group(1), {}).get('status') == 'PASS':
+                        del records[key]
+                elif static_complete and row['subject'] not in issues:
+                    del records[key]
+            attempted_steps = steps if attempts is None else attempts
+            attempted = set().union(*(self._write_objects(step) for step in attempted_steps)) if attempted_steps else set()
+            if phase in self.state['seen_compile'] and report['status'] == 'FAIL' and attempted:
+                for subject, message in issues.items():
+                    if not any(obj == subject or obj in message for obj in attempted):
+                        continue
+                    key = fingerprint(('compile', phase, subject))
+                    row = records.setdefault(key, {'kind': 'compile', 'phase': phase, 'reads': 0,
+                                                   'seen': [], 'warned': False})
+                    row.update(subject=subject, issue=message, tool='compile_formulas')
+            if phase not in self.state['seen_compile']:
+                self.state['seen_compile'].append(phase)
+
+        focus = self.state.get('focus')
+        if focus not in records:
+            focus = next(iter(records), None)
+            self.state['focus'] = focus
+        if focus is None:
+            return {'active': False, 'warn': False, 'halt': False, 'message': ''}
+        row = records[focus]
+        for step in steps:
+            if step.tool not in read_tools:
+                continue
+            row['reads'] += 1
+            args = step.args
+            location = {'tool': step.tool, **{k: args[k] for k in ('section', 'name', 'query', 'file', 'page', 'sheet', 'detail_offset') if k in args}}
+            if location not in row['seen']:
+                row['seen'] = [*row['seen'][-5:], location]
+        warn = row['reads'] >= self.WARN and not row['warned']
+        row['warned'] = row['warned'] or warn
+        action = ('bind_facts；目标公式缺分支时set_rules(bindings=...)；绑定已经一致时validate_parameters核验剩余缺口' if row['tool'] == 'bind_facts' else
+                  'submit_formula_task（使用已有任务ID）/set_rules，然后程序局部检查')
+        message = (f'当前未解决对象「{row["subject"]}」已读取 {row["reads"]}/{self.LIMIT} 次，'
+                   '换页面、换query、note、no-op或改描述不会增加额度。'
+                   f'程序反例：{row["issue"][:600]}\n'
+                   '已读位置：' + json.dumps(row['seen'], ensure_ascii=False) + '\n'
+                   f'下一步：仅提交该对象的{action}，按已核对原文修复并验证。'
+                   '需要补充证据时明确尚缺的原文位置；不能猜值、改无关公式或降低验证。')
+        return {'active': True, 'warn': warn, 'halt': row['reads'] >= self.LIMIT, 'message': message,
+                'subject': row['subject'], 'reads': row['reads'], 'limit': self.LIMIT}

@@ -119,10 +119,14 @@ def binding_errors(facts: list[Fact], drafts: dict) -> list[str]:
                 hint = f'（仅按数值检索的唯一位置，尚未证明业务含义相同：{spots[0]}；须核对原文和适用条件后绑定）'
             elif spots:
                 hint = (f'（有 {len(spots)} 处数值相同，但没有同源引用支持，不能任取一处绑定。'
-                        '先用 read_workspace(section="variables"或"tables", query=参数原文) 定位；'
+                        '公式参数用 read_workspace(section="variables"或"tables", query=参数原文) 定位；'
+                        '数据筛选参数须用 read_workspace(section="mapping", name=数据表名) 核对真实filter，'
+                        '再绑定方案::/mapping/数据表/filter/列名/条件位置，不能借用无关公式中的相同数字；'
                         '查不到时按规则组件索引核对公式，必要时补建缺失公式）')
             else:
-                hint = f'（规则里还没有用到 {f.value} 的位置：先在规则里用上它，或确认这条不是计算参数后 remove_facts）'
+                hint = (f'（公式变量和参数表尚未检索到 {f.value}，须按原文核对它属于公式还是数据筛选。'
+                        '数据筛选先用 read_workspace(section="mapping", name=数据表名) 核对真实filter，'
+                        '绑定方案::/mapping/数据表/filter/列名/条件位置；确实缺少实现时按原文补建，不能为通过检查随意插入常量或删除参数）')
             errors.append(f"{f.name}：缺少精确规则位置，用 bind_facts 绑定参数" + hint)
             continue
         for target in f.targets:

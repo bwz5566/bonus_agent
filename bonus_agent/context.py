@@ -412,6 +412,115 @@ def workspace_view(
     return _bounded_page(result)
 
 
+def _fact_evidence(ws, fact):
+    item = {key: getattr(fact, key) for key in
+            ('name', 'value', 'unit', 'file', 'page', 'quote', 'context', 'source_cell', 'unit_basis', 'targets')}
+    item['read_source'] = {'tool': 'read_document', 'args': {'file': fact.file, **({'page': fact.page} if fact.page else {})}}
+    # These are existing quotations, not an inferred unit or a newly accepted binding.
+    lines = ws._chat_text().splitlines()
+    excerpts = []
+    for index, line in enumerate(lines):
+        if fact.file in line or fact.context and fact.context in line:
+            excerpt = '\n'.join(lines[index:index + 2])
+            if excerpt not in excerpts and len(excerpt) <= 1400:
+                excerpts.append(excerpt)
+            if len(excerpts) == 2:
+                break
+    if excerpts or fact.unit_basis:
+        item['existing_financial_context'] = {
+            'excerpts': excerpts,
+            'next_call': {'tool': 'read_document', 'args': {'file': '财务对话'}},
+            'instruction': '按原文适用范围复用已有确认及unit_basis，不重复询问已确认单位；这里没有自动改值或绑定。',
+        }
+    return item
+
+
+def _issue_tasks(issue, fact, tasks, schemes):
+    """Match recorded ownership/paths, never numbers or names occurring in advice examples."""
+    from bonus_agent.facts import split_target, target_parts
+
+    if fact is not None:
+        owners = [t for t in tasks if fact.name in t.get('facts', [])]
+        for target in fact.targets:
+            scheme, path = split_target(target)
+            parts = target_parts(path)
+            owners += [t for t in tasks if (scheme is None or scheme == t['scheme'])
+                       and parts[:len(target_parts(t['target']))] == target_parts(t['target'])]
+        return list({t['id']: t for t in owners}.values())
+    # Error messages append examples and repair advice after their diagnostic sentence.
+    head = re.split(r'[。；\n（]', issue, maxsplit=1)[0]
+    qualified = [s for s in schemes if f'方案「{s}」' in head or f'{s}::' in head]
+    found = []
+    for task in tasks:
+        if qualified and task['scheme'] not in qualified:
+            continue
+        aliases = (task['target'], '.'.join(target_parts(task['target'])))
+        if any(re.search(r'(?<![\w./])' + re.escape(path) + r'(?=$|[./\s：:,，;；)）])', head) for path in aliases):
+            found.append(task)
+    return found
+
+
+def _repair_focus(ws, flow, construction):
+    """One current compiler blocker becomes actionable context; no rules/receipts are changed."""
+    if construction is None or construction.get('active'):
+        return None
+    saved = ws.workflow.get('formula_report', {}).get('report', {})
+    report = flow.compile_feedback(saved.get('phase', 'all'))
+    if not report or report.get('status') != 'FAIL' or not report.get('issues'):
+        return None
+    from bonus_agent.construction import TaskBoard
+    tasks = list(ws.workflow.get('construction', {}).get('tasks', {}).values())
+    required = TaskBoard(ws).required(report.get('phase'))
+    cases = []
+    for issue in report['issues']:
+        fact = next((f for f in ws.facts if issue.startswith(f.name + '：')), None)
+        cases.append((issue, fact, _issue_tasks(issue, fact, tasks, ws.schemes)))
+    # An exact target/declared owner outranks an unassigned global fact. Ambiguity is retained.
+    issue, fact, owners = next((c for c in cases if len(c[2]) == 1),
+                              next((c for c in cases if c[1] is not None or c[2]), cases[0]))
+    focus = {'phase': report.get('phase'), 'issue': issue[:1200], 'issue_truncated': len(issue) > 1200,
+             'remaining_issues': len(report['issues']) - 1,
+             'full_report': {'tool': 'read_workspace', 'args': {'section': 'checks'}}}
+    def entry(task):
+        return {**{k: task.get(k) for k in ('id', 'scheme', 'target')},
+                'deferred': task['id'] not in required,
+                'clauses': task.get('clauses', [])[:4], 'clause_count': len(task.get('clauses', [])),
+                'facts': task.get('facts', [])[:2], 'fact_count': len(task.get('facts', []))}
+    if len(owners) == 1:
+        task = owners[0]
+        focus.update(kind='task', task=entry(task),
+                     next_call={'tool': 'read_workspace', 'args': {'section': 'construction', 'name': task['id']}},
+                     instruction=f'全局检查回流到已有任务{task["id"]}；按本条反例修复来源、公式或绑定，再check_formula_task。局部PASS不代表全局已通过，deferred仅记录当前计划阶段。')
+        selected = [fact] if fact is not None else [f for f in ws.facts if f.name in task.get('facts', [])][:3]
+        focus['evidence'] = {'facts': [_fact_evidence(ws, f) for f in selected],
+                             'clauses': [{'id': c.id, 'file': c.file, 'quote': c.quote}
+                                         for c in ws.clauses if c.id in task.get('clauses', [])][:4]}
+    elif fact is not None:
+        kind = 'parameter_owner_ambiguous' if owners else ('parameter_ownership' if not fact.targets else 'parameter_binding')
+        focus.update(kind=kind, fact= fact.name,
+                     candidate_tasks=[entry(t) for t in (owners or tasks)[:8]],
+                     candidate_count=len(owners or tasks),
+                     candidates_are='仅已有声明的中性索引，不是推荐；未按数值、角色名称或业务阶段推断归属。',
+                     next_call={'tool': 'read_workspace', 'args': {'section': 'facts', 'name': fact.name}},
+                     task_index={'tool': 'read_workspace', 'args': {'section': 'construction', 'limit': 8}},
+                     instruction=f'先明确参数「{fact.name}」的归属，有多个owner须按原文核对适用范围。已有合适目标则用plan_formula_tasks复用原id、scheme、target并保留depends_on/clauses/已有facts，在facts中加入本参数；材料要求的新目标尚不存在时，按原文新建带依赖和来源的公式任务，禁止新建同目标重复任务。归属不是绑定或豁免：仍须核对节点并bind_facts，不按相同数字选节点，不自动延后无主参数。',
+                     plan_usage='plan_formula_tasks(tasks=[已有任务完整声明（facts保留原项并加入本参数），或原文要求的新目标任务（含id/scheme/target/depends_on/clauses/facts）], replace=False)',
+                     evidence={'facts': [_fact_evidence(ws, fact)], 'clauses': []})
+        cell = fact.source_cell or {}
+        peers = [f for f in ws.facts if f.file == fact.file and f.page == fact.page
+                 and (not cell or (f.source_cell or {}).get('table') == cell.get('table'))
+                 and not f.targets and not any(f.name in t.get('facts', []) for t in tasks)
+                 and any(message.startswith(f.name + '：') for message in report['issues'])]
+        focus['same_source_unassigned_count'] = len(peers)
+    else:
+        focus.update(kind='compile_issue', next_call=focus['full_report'],
+                     instruction='先处理这一具体编译反例；当前没有唯一任务归属，不能猜节点或把全局FAIL当局部PASS。')
+        if owners:
+            focus['candidate_tasks'] = [entry(t) for t in owners[:8]]
+            focus['candidate_count'] = len(owners)
+    return focus
+
+
 def task_card(ws):
     from bonus_agent.workflow import Workflow
 
@@ -451,10 +560,23 @@ def task_card(ws):
         }
     active = (data['workflow'].get('construction') or {}).get('active')
     if active:
-        data['evidence']['uncovered'] = [x for x in data['evidence']['uncovered'] if x['id'] in active['clauses']]
+        data['evidence']['uncovered'] = [x for x in data['evidence']['uncovered'] if x['id'] in active.get('clauses', [])]
         data['current_task_evidence'] = {
-            'clauses':[{'id':c.id,'file':c.file,'quote':c.quote} for c in ws.clauses if c.id in active['clauses']][:6],
+            'clauses':[{'id':c.id,'file':c.file,'quote':c.quote} for c in ws.clauses if c.id in active.get('clauses', [])][:6],
             'facts':[{'name':f.name,'value':f.value,'unit':f.unit,'file':f.file,'page':f.page}
-                     for f in ws.facts if f.name in active['facts']][:6],
+                     for f in ws.facts if f.name in active.get('facts', [])][:6],
         }
+    elif focus := _repair_focus(ws, flow, data['workflow'].get('construction')):
+        data['current_task_evidence'] = focus.pop('evidence', {'facts': [], 'clauses': []})
+        data['repair_focus'] = focus
+        data['workflow']['next'] = focus['instruction']
+        construction = data['workflow']['construction']
+        construction['next'] = focus['instruction']
+        if 'compile_failure' in construction:
+            # The full report remains pageable; do not repeat dozens of unrelated blockers here.
+            construction['compile_failure'] = {k: v for k, v in construction['compile_failure'].items()
+                                               if k in ('status', 'phase', 'issue_count')}
+            construction['compile_failure'].update(issue_count=focus['remaining_issues'] + 1,
+                                                   issues=[focus['issue']], remaining_issues=focus['remaining_issues'])
+        data['last_formula_check']['first_issues'] = [focus['issue']]
     return json.dumps(data, ensure_ascii=False, default=str)

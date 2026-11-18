@@ -35,6 +35,7 @@ def test_ambiguous_numeric_matches_do_not_become_repair_instructions():
     assert '4 处数值相同' in error
     assert '/tables/unrelated' not in error and '/variables/default_value' not in error
     assert 'read_workspace' in error
+    assert 'section="mapping"' in error and '/mapping/数据表/filter/' in error
 
 
 def test_same_quote_on_another_page_or_document_is_not_grounding():

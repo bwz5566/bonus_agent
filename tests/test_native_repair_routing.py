@@ -39,7 +39,7 @@ def test_binding_failure_followed_by_only_reads_stops_without_pro(tmp_path):
     assert not llm.think_llm.calls and not any(s.tool == '（局部诊断）' for s in ar.steps)
     assert '纠错预算耗尽' in ar.error
     state = json.loads((out / 'recovery.json').read_text(encoding='utf-8'))
-    assert state['native_repairs'] and state['progress']['stagnant'] >= 12
+    assert state['native_repairs'] and any(row['reads'] >= 8 for row in state['repair_reads']['records'].values())
     assert state['failures'] and not state['advised']
 
 

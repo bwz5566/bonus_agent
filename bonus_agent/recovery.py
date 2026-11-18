@@ -236,6 +236,9 @@ class RecoveryJournal:
 
     def observe_native_feedback(self, tool, args, result, ok):
         """Keep explicit failures pending across reads/resumes until program validation resolves them."""
+        if ok and result.lstrip().startswith('no-op') and not (
+                tool == 'bind_facts' and '已复验类型、数值、目标、出处' in result):
+            return False  # only the binding endpoint's complete revalidation is evidence of resolution
         pending = self.state.setdefault('native_repairs', {})
         previous = set(pending)
         if ok:

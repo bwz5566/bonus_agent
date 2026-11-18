@@ -1433,7 +1433,7 @@ class Workspace:
                             changed += 1
         # Evidence metadata cannot change computed money. Do not invalidate an existing trial.
         return (f"已校验绑定 {len(updates)} 条参数，类型、数值、目标均一致；更新 {changed} 处。"
-                if changed else "no-op：绑定已一致，没有状态变化；无需重新试算。")
+                if changed else "no-op：绑定已一致，已复验类型、数值、目标、出处；没有状态变化，无需重新试算。")
 
     def validate_parameters(self, repair: bool = True) -> dict:
         """Deterministic local recovery only for targets already explicitly declared."""
@@ -4609,9 +4609,14 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                                {'files': prints, 'period': period_obj.label if period_obj else None,
                                 'answers': [(q.id, q.answer) for q in ws.questions if q.answer is not None],
                                 'code': rnd['code'], 'financial_context': ws.said})
+    from bonus_agent.progress import RepairReadBudget
+    repair_reads = RepairReadBudget(recovery.state.setdefault('repair_reads', {}))
+    resumed_read_budget = repair_reads.observe([], recovery.state.get('native_repairs', {}), None, READ_ONLY)
+    if resumed_read_budget['halt']:
+        recovery.halt(resumed_read_budget['message'])
     ws.notes.pop(ANSWER_NOTE, None)          # 上一轮的回答不带到这一轮
     handlers = {t["name"]: getattr(ws, t["name"]) for t in TOOLS}
-    if not run_budget.check(llm):
+    if not run_budget.check(llm) and not recovery.error:
         ws.transcribe_all()
         ws.triage_all()
     pack = '' if ws.staged else ("\n\n【材料包】以下是本批次材料的内容（程序读取，图片已转写），每轮都附在这里、不会被裁剪。"
@@ -4683,6 +4688,12 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
     saved_progress = recovery.state.get('progress', {})
     progress_watch = ProgressWatch(set(saved_progress.get('previous', [])), saved_progress.get('stagnant', 0))
     discovered_reads = set(saved_progress.get('reads', []))
+
+    def current_compile_report():
+        if not ws.staged:
+            return None
+        saved = ws.workflow.get('formula_report', {}).get('report', {})
+        return saved if saved and ws._flow().compile_feedback(saved.get('phase', 'all')) else None
     highest_stage = reached_focus[0] if reached_focus else 0
     context_retries = 0
     def compact_local_context(msgs, body, tail, definitions):
@@ -4732,6 +4743,11 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             recovery.save()
             reached, reached_focus = ws.phase(), ws._flow().stage()
             highest_stage = max(highest_stage, reached_focus[0])
+    initial_read_budget = repair_reads.observe([], recovery.state.get('native_repairs', {}), current_compile_report(), READ_ONLY)
+    if initial_read_budget['halt']:
+        recovery.halt(initial_read_budget['message'])
+        error = recovery.error  # enforce a persisted exhausted allowance before a new request
+    recovery.save()
     for turn in range(max_steps if not error else 0):
         if ws.done:
             break
@@ -5028,6 +5044,12 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             step = Step(c["name"], args if isinstance(args, dict) else {}, result, ok, thought,
                         at=time.strftime("%H:%M:%S", time.localtime(t_tool)), secs=round(time.time() - t_tool, 2),
                         request=dict(llm.last_call))
+            if c['name'] == 'compile_formulas' and ws.staged:
+                # Retain the program's complete report at this exact point in a
+                # batch. A later tool can replace it; the displayed summary may
+                # omit issues and is not proof that omitted objects were fixed.
+                step._repair_compile_report = json.loads(json.dumps(
+                    current_compile_report() or {}, default=str))
             failed_validation = ok and isinstance(value, dict) and value.get('status') == 'FAIL'
             # 工具名不存在是调用协议的错，与案卷无关：本轮的卡住检测照常计数，但不写进跨轮的纠错记录，
             # 否则下一轮一开始就被“同一问题累计失败”拦停，重新运行也没用
@@ -5192,9 +5214,25 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             first.model_secs, (first.tokens_in, first.tokens_out) = round(model_secs, 2), model_tokens
         model_steps = steps[turn_steps:]
         native_changed = False
-        for st in model_steps:
+        read_budget_warned = False
+        for step_index, st in enumerate(model_steps):
             native_changed = recovery.observe_native_feedback(st.tool, st.args, st.result, st.ok) or native_changed
+            # Native feedback and reads are observed in execution order: reads
+            # before the first failed attempt must not spend its new allowance.
+            observed_budget = repair_reads.observe([st], recovery.state.get('native_repairs', {}),
+                                                   getattr(st, '_repair_compile_report', None), READ_ONLY,
+                                                   attempts=model_steps[:step_index + 1])
+            read_budget_warned = read_budget_warned or observed_budget['warn']
         rechecked = automatic_recheck()
+        read_budget = repair_reads.observe([], recovery.state.get('native_repairs', {}),
+                                           current_compile_report(), READ_ONLY, attempts=model_steps)
+        if read_budget['active'] and (read_budget_warned or read_budget['halt']):
+            ws.notes['当前修复读取预算'] = read_budget['message']
+            history.append({'role': 'user', 'content': '【当前修复读取预算】' + read_budget['message']})
+        elif not read_budget['active']:
+            ws.notes.pop('当前修复读取预算', None)
+        if read_budget['halt']:
+            recovery.halt(read_budget['message'])
         if recovery.native_guidance:
             ws.notes['程序修复指引'] = recovery.native_guidance
             if native_changed:
@@ -5214,14 +5252,14 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                 st.tool in {"bind_facts", "compile_table", "validate_parameters", "trial_run", "finish", "set_rules", "apply_repair"}
                 for st in steps[turn_steps:]):
             frontier = ws.blocker_frontier()
-            stagnant = progress_watch.observe(frontier, discovery=discovery)
-            if discovery:
+            stagnant = progress_watch.observe(frontier, discovery=discovery and not read_budget['active'])
+            if discovery and not read_budget['active']:
                 quiet = 0
             recovery.state['progress'] = {'previous': sorted(progress_watch.previous), 'stagnant': stagnant, 'reads': sorted(discovered_reads)}
             recovery.save()
             if stagnant >= 2:
                 progress_reason = f"连续 {stagnant + 1} 次检查没有消除既有问题；工具返回成功不代表有进展。" + "；".join(sorted(frontier)[:3])
-                deep_why = '' if recovery.native_guidance else progress_reason
+                deep_why = '' if recovery.native_guidance or read_budget['active'] else progress_reason
                 ws.notes["纠错进度"] = (progress_reason + ('。当前明确动作：' + ws._flow().hint() if ws.staged and not ws.results else
                                       "。先做局部参数预检；金额问题用 review_calculation 定位，"
                                       "按原文修复，已有独立基线时使用 preview_repair / verify_repair / apply_repair。"
@@ -5237,6 +5275,9 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             recovery.state['progress'] = {'previous':sorted(progress_watch.previous), 'stagnant':progress_watch.stagnant,
                                           'reads':sorted(discovered_reads)}
             recovery.save()
+        if read_budget['active']:
+            deep_why = ''  # the existing program counterexample needs a bounded repair, not another advisor
+        recovery.save()
         if skipped and skipped == len(calls) and not rechecked:
             # 整轮都是被拦下的重复调用：不把它留在历史里，否则小模型会照着历史接着重复；只留一句说明
             del history[turn_start:]

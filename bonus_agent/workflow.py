@@ -356,7 +356,8 @@ class Workflow:
             self._invalidate_compilation(phase or 'basis')
             if isinstance(exc, ToolError):
                 self._save_compile_report({'status': 'FAIL', 'issues': [str(exc)], 'warnings': [],
-                                           'graph': {}, 'repaired': [], 'phase': phase or 'basis', 'preflight': {}})
+                                           'graph': {}, 'repaired': [], 'phase': phase or 'basis', 'preflight': {},
+                                           'static_checks_complete': False})
             raise
         if report['status'] != 'PASS':
             self._invalidate_compilation(phase)
@@ -490,7 +491,10 @@ class Workflow:
                                          for c in issue.get('coverage', [])[:2]]
                     issues.append(f'方案「{name}」基础求值预检：' + json.dumps(brief, ensure_ascii=False)[:2400])
         report = {'status': 'FAIL' if issues else 'PASS', 'issues': issues, 'warnings': warnings,
-                  'graph': graph, 'repaired': repaired, 'phase': phase, 'preflight': preflight}
+                  'graph': graph, 'repaired': repaired, 'phase': phase, 'preflight': preflight,
+                  # Static diagnostics were enumerated, not necessarily passed.
+                  # Runtime preflight coverage is recorded separately by scheme above.
+                  'static_checks_complete': True}
         self._save_compile_report(report)
         if not issues:
             self.receipt('allocation_formulas' if phase == 'all' else 'formulas', report,
@@ -515,6 +519,7 @@ class Workflow:
             'next': '按issues逐项修复；完整检查见read_workspace(section="checks")。草稿保存不等于校验通过。'
                     if report['issues'] else ('trial_run' if report.get('phase') == 'all' else 'calculate_basis'),
             'phase': report.get('phase', 'all'),
+            'static_checks_complete': report.get('static_checks_complete') is True,
             'preflight': {s: {'status': r['status'], 'summary': r.get('summary'),
                               'dependencies': r.get('dependencies', []),
                               'details_call': {'tool': 'read_workspace', 'args': {'section': 'checks', 'name': 'preflight:' + s}} if r.get('issues') else None}
