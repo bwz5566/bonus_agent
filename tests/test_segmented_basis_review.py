@@ -6,6 +6,7 @@ import pytest
 
 from bonus_agent import case
 from bonus_agent.agent import ToolError, Workspace
+from bonus_agent.basis_review_parts import source_catalog
 from bonus_agent.llm import FakeLLM, LLMError
 from tests.test_staged_workflow import make_workspace, population_spec, prepared
 
@@ -102,6 +103,34 @@ def test_report_cannot_override_independent_pool_or_exceed_retry_limit(tmp_path)
     assert not ws.results
 
 
+def test_source_id_is_expanded_and_rechecked_without_exposing_ledger_annotations(tmp_path):
+    ws = review_workspace(tmp_path)
+    population, pool, reports = responses()
+    literal = population['populations']['项目']['sources'][0]
+    ws.clauses[0].point = 'PRIVATE_LEDGER_INTERPRETATION'
+    ws.compile_formulas()
+    ws.calculate_basis('S')
+    ident = next(k for k, ref in source_catalog(ws).items() if ref == literal)
+    population['populations']['项目']['sources'] = [{'source_id': ident}]
+    checker = attach_checker(ws, [population, pool, reports])
+    assert ws.review_basis('S')['status'] == 'PASS'
+    assert ws.workflow['references']['S']['spec']['populations']['项目']['sources'] == [literal]
+    text = checker.calls[0][1]['content']
+    assert '允许的标准数据集名称：' + json.dumps(sorted(ws.datasets), ensure_ascii=False) in text
+    assert ident in text and 'PRIVATE_LEDGER_INTERPRETATION' not in text
+
+
+def test_catalog_id_cannot_override_its_quote(tmp_path):
+    ws = review_workspace(tmp_path)
+    population, _, _ = responses()
+    ident = next(iter(source_catalog(ws)))
+    population['populations']['项目']['sources'] = [{'source_id': ident, 'quote': 'invented'}]
+    attach_checker(ws, [population])
+    with pytest.raises(ToolError, match='invalid_source_catalog_id'):
+        ws.review_basis('S')
+    assert not ws._flow().current('review:S')
+
+
 def test_valid_segmented_disagreement_stays_frozen(tmp_path):
     ws = review_workspace(tmp_path)
     population, pool, reports = responses()
@@ -154,6 +183,9 @@ def test_population_counterexample_stops_before_paid_formula_slices(tmp_path, ot
         assert result['status'] == 'FAIL'
         rows = result['population']['checks']
         assert next(r['extra'] for r in rows if r['scope'] == '项目') == ['B']
+    if other_invalid:
+        saved = next(iter(ws.workflow['basis_review_parts']['S'].values()))
+        assert saved['accepted'] == {'项目': population['populations']['项目']}
     assert len(checker.calls) == 1 and not ws._flow().current('review:S')
 
 

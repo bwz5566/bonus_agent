@@ -5,6 +5,8 @@ import json
 
 from bonus_agent import reread
 from bonus_agent.agent import ToolError
+from bonus_agent.clauses import check_quote
+from bonus_agent.facts import MAX_QUOTE, norm
 from bonus_agent.llm import LLMError, RunBudgetError, parse_json
 from bonus_agent.recovery import fingerprint
 from bonus_agent.review_population import check_populations
@@ -18,6 +20,43 @@ def groups(items, size):
 
 def _json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def source_catalog(ws, evidence=None):
+    """Expose only verified original excerpts and sheet headers, never ledger explanations or calculated rows."""
+    corpus = ws._corpus()
+    visible = norm(evidence if evidence is not None else reread.material(ws))
+    sources = {}
+    def add(doc, text):
+        quote = text.strip()
+        if not 3 <= len(quote) <= MAX_QUOTE or len(sources.get(doc, {})) >= 48:
+            return
+        literal = norm(quote)
+        if literal not in visible or literal not in corpus.get(doc, '') or check_quote(doc, quote, corpus):
+            return
+        ref = {'doc': doc, 'quote': quote}
+        sources.setdefault(doc, {})['src_' + fingerprint(ref)[:16]] = ref
+
+    for doc in sorted(ws.inv.docs, key=lambda d: d.name):
+        for line in ws._lines(doc.name):
+            if len(sources.get(doc.name, {})) >= 48:
+                break
+            if not line.strip().startswith('#'):
+                add(doc.name, line)
+    for sheet in sorted(ws.inv.sheets, key=lambda s: (s.file, s.sheet)):
+        # Synthetic or combined headers which don't occur in the workbook itself are excluded by add().
+        add(sheet.file, ' | '.join(str(h) for h in sheet.headers[:8]))
+    authorized = {p.name for p in ws.inv.files}
+    for doc, quote in sorted({(c.file, c.quote) for c in ws.clauses if c.file in authorized}):
+        add(doc, quote)
+    catalog = {}
+    for offset in range(48):
+        for doc in sorted(sources):
+            entries = list(sources[doc].items())
+            if offset < len(entries) and len(catalog) < 120:
+                key, ref = entries[offset]
+                catalog[key] = ref
+    return catalog
 
 
 class PopulationDifference(Exception):
@@ -40,7 +79,7 @@ class BasisReviewParts:
         self.base = structure['base']
 
     @staticmethod
-    def visible_structure(flow, name, structure):
+    def visible_structure(flow, name, structure, evidence=None):
         base = {k: structure[k] for k in ('scheme', 'pool_scope', 'period', 'allocation', 'columns',
                                          'source_mapping', 'data_scope')}
         base['upstream_schemes'] = []
@@ -51,6 +90,7 @@ class BasisReviewParts:
                     'pool_scope': upstream.pool.scope, 'levels': [{'level': lv.level, 'key': lv.key} for lv in upstream.allocation],
                     'approved': flow.current('approved:' + scheme)})
         return {'base': base, 'population_requirements': structure['population_requirements'],
+                'dataset_names': sorted(flow.ws.datasets), 'source_catalog': source_catalog(flow.ws, evidence),
                 'reports': [(field, row[:2]) for field in ('details', 'totals') for row in structure[field]]}
 
     def _part(self, section, targets, instruction, contract, validate):
@@ -58,7 +98,11 @@ class BasisReviewParts:
                '已列出的映射、范围、期间和分类是待核事实。核对当期对象、历史累计窗口、空值和真实分类。'
                'unknown、values_truncated 或 fields_complete=false 均不证明未展示的值不存在。'
                '业务口径无法从原文或财务答复确定时用 unclear 字符串数组具体指出问题；程序计算金额。' + instruction)
-        prefix = self.evidence + '\n独立复核结构：' + _json(self.base) + '\n本段输入：'
+        prefix = self.evidence + '\n独立复核结构：' + _json(self.base)
+        if section == 'populations':
+            prefix += '\n允许的标准数据集名称：' + _json(self.structure['dataset_names'])
+            prefix += '\n可选来源目录 source_catalog：' + _json(self.structure['source_catalog'])
+        prefix += '\n本段输入：'
         messages = [{'role': 'system', 'content': sys}, {'role': 'user', 'content': prefix + _json(contract)}]
         checker = self.ws.llm.checker_llm
         sig = fingerprint((self.signature, section, messages, getattr(checker, 'basis_review_reasoning_effort', None)))
@@ -120,6 +164,9 @@ class BasisReviewParts:
                     raise ValueError('补充声明只能包含本次剩余的范围名，禁止重写已保存的独立范围')
                 value['populations'] = {**accepted, **returned}
             validate(value)
+        except PopulationDifference as exc:
+            row.update(state='partial', accepted=copy.deepcopy(exc.selection))
+            raise
         except InvalidPopulations as exc:
             row.update(state='invalid', accepted=copy.deepcopy(exc.accepted), contract_errors=exc.errors, diagnostic=str(exc))
             raise ToolError(f'独立复核分段 {section} {targets} 未通过：{exc}') from None
@@ -144,6 +191,19 @@ class BasisReviewParts:
         self._shape(value, ['populations'])
         if set(value['populations']) - set(labels):
             raise ValueError('populations 须且仅须覆盖：' + '、'.join(labels))
+        invalid_ids = set()
+        for label, cfg in value['populations'].items():
+            if not isinstance(cfg, dict) or not isinstance(cfg.get('sources'), list):
+                continue
+            for i, source in enumerate(cfg['sources']):
+                if isinstance(source, dict) and 'source_id' in source:
+                    ident = source['source_id']
+                    ref = self.structure['source_catalog'].get(ident) if isinstance(ident, str) else None
+                    if set(source) == {'source_id'} and ref:
+                        cfg['sources'][i] = copy.deepcopy(ref)
+                    else:
+                        invalid_ids.add(label)
+                        cfg['sources'][i] = {}  # Cannot masquerade as a literal citation using extra fields.
         _, root, levels, _ = self.ws._independent_env(self.name, {}, basis=True)
         report = check_populations(self.ws, self.rs, value, root, levels, scope_names=labels)
         if not report['contract_valid']:
@@ -151,7 +211,9 @@ class BasisReviewParts:
             if any(r['status'] == 'FAIL' for r in report['checks']):
                 checked = check_populations(self.ws, self.rs, {'populations': valid}, root, levels, scope_names=valid)
                 raise PopulationDifference(checked, valid)
-            raise InvalidPopulations(valid, report['contract_errors'])
+            errors = [{**e, 'code': 'invalid_source_catalog_id'} if e['scope'] in invalid_ids else e
+                      for e in report['contract_errors']]
+            raise InvalidPopulations(valid, errors)
         self.population_report = report
 
     def _validate_formulas(self, value, pool=None, items=()):
@@ -203,7 +265,10 @@ class BasisReviewParts:
                 '占位或小计行是否参与须有独立材料依据；原列排除可写 {"列名":{"not":["占位标签"]}}。'
                 'output_template 按本次请求逐个给出 JSON 键；所有尖括号占位符都要据原文换成正确类型的声明。'
                 'sources 引用支持本次对象、资格或期间口径的原文。材料确有歧义、原表缺少关键字段，'
-                '或无法用以上方式表示时，说明具体缺口并保留 unclear；示例条件不能替代本批依据。',
+                '或无法用以上方式表示时，说明具体缺口并保留 unclear；示例条件不能替代本批依据。'
+                'dataset 必须从允许的标准数据集名称中逐字选取，文件名和工作表名用于引用材料。'
+                '每条 sources 可采用 {"source_id":"目录中的完整ID"} 或 {"doc":"材料名","quote":"原文"}；'
+                '程序将 ID 展开后逐字核验。目录仅帮助定位；表头只可证明表结构，只有原文确实支持本范围时才引用。',
                 {'population_requirements': {k: required[k] for k in labels}, 'output_template': template},
                 lambda value: self._validate_populations(value, labels))
             if part.get('unclear'):

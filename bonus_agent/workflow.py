@@ -715,7 +715,7 @@ class Workflow:
         split_signature, split_structure = None, None
         if split or prior_split:
             from bonus_agent.basis_review_parts import BasisReviewParts
-            split_structure = BasisReviewParts.visible_structure(self, name, structure)
+            split_structure = BasisReviewParts.visible_structure(self, name, structure, evidence)
             split_signature = fingerprint({'evidence': evidence, 'structure': split_structure, 'dsl': self._dsl(),
                                            'execution_profile': _EXECUTION_PROFILE, 'reviewer_policy': policy})
         source_signature = split_signature if split else legacy_signature
