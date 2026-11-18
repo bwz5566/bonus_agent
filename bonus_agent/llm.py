@@ -689,11 +689,12 @@ class LLM:
         if think and self.think_llm is not None:
             if self.run_budget is not None:
                 self.run_budget.bind(self)
-            out = self.think_llm.chat(messages, schema=schema, json_out=json_out, temperature=temperature,
-                                      max_tokens=max_tokens, think=True)
-            self.last_reasoning = self.think_llm.last_reasoning
-            self.last_call = self.think_llm.last_call
-            return out
+            try:
+                return self.think_llm.chat(messages, schema=schema, json_out=json_out, temperature=temperature,
+                                           max_tokens=max_tokens, think=True)
+            finally:
+                self.last_reasoning = self.think_llm.last_reasoning
+                self.last_call = self.think_llm.last_call
         think, body, max_tokens = self._think(think, dict(self.extra_body or {}), max_tokens)
         if getattr(self,'_max_output_tokens',None):max_tokens=min(max_tokens,int(self._max_output_tokens))
         kwargs = dict(model=self.model, messages=self._prepare(messages), temperature=temperature, max_tokens=max_tokens)
@@ -729,9 +730,11 @@ class LLM:
         if think and self.think_llm is not None:
             if self.run_budget is not None:
                 self.run_budget.bind(self)
-            out = self.think_llm.chat_tools(messages, tools, temperature=temperature, max_tokens=max_tokens, think=True)
-            self.last_call = self.think_llm.last_call
-            return out
+            try:
+                return self.think_llm.chat_tools(messages, tools, temperature=temperature, max_tokens=max_tokens, think=True)
+            finally:
+                self.last_reasoning = self.think_llm.last_reasoning
+                self.last_call = self.think_llm.last_call
         think, body, max_tokens = self._think(think, _merge(self.extra_body, self.tools_extra_body), max_tokens)
         if getattr(self,'_max_output_tokens',None):max_tokens=min(max_tokens,int(self._max_output_tokens))
         kwargs = dict(model=self.model, messages=self._prepare(messages), tools=tools, temperature=temperature,

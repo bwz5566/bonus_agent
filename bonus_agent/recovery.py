@@ -26,13 +26,55 @@ def _repair_objects(args, result=''):
     return [str(args[key]) for key in ('name', 'task', 'dataset') if args.get(key)]
 
 
+_NATIVE_CODE = r'(parameter\.(?:binding|type|unit|range|ref|order)|construction\.(?:plan|task)|source\.(?:cell|page|scope)|tool\.contract|unmatched_basis)\b'
+_NATIVE_PREFIX = re.compile(r'^(?:[^\n。；;！？!?“”"\'{}]+?[：:]\s*)?' + _NATIVE_CODE)
+_GUIDANCE = re.compile(r'(?:程序判断的下一步|下一步[（(:：]|\n\s*(?:注意|建议|历史(?:错误|诊断)?|引用(?:原文)?|原文)[：:]|\n\s*（提醒[：:])')
+_QUOTED_HEADING = re.compile(r'^(?:引用(?:原文)?|原文|历史(?:错误|诊断|建议)?|建议|上次(?:错误|诊断)?|下一步)[：:]')
+_REPLAY_NOTICE = re.compile(r'^(?:这次调用与第\s*\d+\s*步完全相同，内容没有变化，已跳过|内容和上面说明里【之前读过、内容没变的工作区内容】)')
+
+
+def _native_diagnostics(result):
+    """Read current diagnostic fields, never search arbitrary echoed material or advice."""
+    text = result.strip()
+    report = _feedback_report(text)
+    if report:
+        if report.get('status') not in ('FAIL', 'ERROR', 'PARTIAL'):
+            return []
+        entries = [entry for field in ('issues', 'errors', 'gaps', 'failed', 'rejected')
+                   for entry in (report[field] if isinstance(report.get(field), list) else [])]
+    else:
+        explicit = text.startswith(('错误：', '错误:', '草稿已保存，校验未通过'))
+        if not explicit and not re.match(_NATIVE_CODE, text):
+            return []
+        text = _GUIDANCE.split(text, maxsplit=1)[0]
+        text = re.sub(r'^错误[：:]\s*', '', text)
+        if explicit and text.startswith(('参数', '没有工具')):
+            return [('tool.arguments', text)]
+        entries = text.splitlines()
+    found = []
+    for entry in entries:
+        if isinstance(entry, dict):
+            # Explicit structured code is authoritative; quote/next/history are not.
+            code = entry.get('code')
+            entry = f'{code}：{entry.get("message", "")}' if isinstance(code, str) else entry.get('message', '')
+        if not isinstance(entry, str):
+            continue
+        entry = _GUIDANCE.split(entry.strip(), maxsplit=1)[0]
+        entry = re.sub(r'^错误[：:]\s*', '', entry)
+        if _QUOTED_HEADING.match(entry):
+            continue
+        if match := _NATIVE_PREFIX.match(entry):
+            found.append((match.group(1), entry))
+    return found
+
+
 def native_repair_feedback(tool, args, result):
-    """Classify an explicit program contract error, not every unsuccessful model action."""
-    match = re.search(r'\b(parameter\.(?:binding|type|unit|range|ref|order)|construction\.(?:plan|task)|'
-                      r'source\.(?:cell|page|scope)|tool\.contract|unmatched_basis)\b', result)
-    code = match.group() if match else ('tool.arguments' if result.startswith(('错误：参数', '错误：没有工具')) else None)
-    if code is None:
+    """Classify an explicit current program error, not quoted or suggested diagnostics."""
+    diagnostics = _native_diagnostics(result)
+    if not diagnostics:
         return None
+    code = diagnostics[0][0]
+    issue = '\n'.join(message for _, message in diagnostics)
     if code == 'parameter.binding':
         guide = ('先读取失败参数和精确目标定义。literal可以绑定含该数值的expr AST；目标不存在须纠正路径，'
                  '目标存在但缺所需数值/分支时，按原文修复公式后再绑定，不能借用无关同值。'
@@ -42,9 +84,9 @@ def native_repair_feedback(tool, args, result):
                  '不能猜单位、删参数或改金额绕过验证。证据不足按具体原文缺口处理。')
     else:
         guide = '按下列程序反例核对工具参数、已登记对象和原文坐标，使用已公布接口修复；重复读取或改描述不代表修复。'
-    objects = [str(args['task'])] if code == 'construction.task' and args.get('task') else _repair_objects(args, result)
+    objects = [str(args['task'])] if code == 'construction.task' and args.get('task') else _repair_objects(args, issue)
     return {'tool': tool, 'code': code, 'objects': objects,
-            'scheme': args.get('scheme'), 'issue': result.removeprefix('错误：')[:900], 'guide': guide}
+            'scheme': args.get('scheme'), 'issue': issue[:900], 'guide': guide}
 
 
 def _feedback_phase(result):
@@ -221,6 +263,17 @@ class RecoveryJournal:
         key = fingerprint(context)
         if self.state.get('context') != key:
             self.state = {'context': key, 'failures': {}, 'advised': [], 'halted': ''}
+        # Older versions searched echoed next-step guidance as if it were the
+        # read operation's own error. Remove only unmistakable non-error prose;
+        # genuine legacy issues often lack the former "错误：" wrapper.
+        pending, removed = self.state.get('native_repairs', {}), False
+        for repair_key, item in list(pending.items()):
+            issue = str(item.get('issue', '')).strip()
+            if _REPLAY_NOTICE.match(issue) or _QUOTED_HEADING.match(issue):
+                del pending[repair_key]
+                removed = True
+        if removed:
+            self.save()
 
     @property
     def error(self):

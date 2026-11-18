@@ -129,17 +129,93 @@ def _compile_diagnostic(step):
     return phase
 
 
+def compile_objects(report, fact_names=()):
+    """Stable program-owned objects, never diagnostic prose or error counts."""
+    if not isinstance(report, dict) or report.get('phase') not in ('basis', 'all'):
+        return {}
+    phase, facts, out = report['phase'], set(fact_names), {}
+    for issue in report.get('issues', []):
+        message = issue.get('message', '') if isinstance(issue, dict) else str(issue)
+        runtime = re.match(r'^方案「([^」]+)」基础求值预检[：:]', message)
+        kind, scheme = 'static', ''
+        if runtime:
+            kind, scheme, identity = 'runtime', runtime.group(1), 'runtime:' + runtime.group(1)
+        else:
+            clause = re.match(r'^(C\d+)(?=[「：:\s])', message)
+            subject = re.split(r'：|(?<!:):(?!:)', message, maxsplit=1)[0].strip()
+            code = issue.get('code') if isinstance(issue, dict) else None
+            target = (issue.get('target') or issue.get('where')) if isinstance(issue, dict) else None
+            validator = re.match(r'^\[阻断\]\s+([A-Za-z_][\w.]*):.*\(([^()]+)\)\s*$', message, re.S)
+            contract = re.match(r'^方案「([^」]+)」\s+((?:variables|tables)\.[A-Za-z_]\w*)[：:]\s*'
+                                r'([A-Za-z_][\w.]*)(?=[，,：:\s]|$)', message)
+            task = re.match(r'^construction\.task[：:]\s*(\S+?)未通过局部检查或已失效', message)
+            if clause:
+                identity = 'clause:' + clause.group(1)
+            elif subject in facts or re.search(r'::P\d+(?:\.\w+)+$', subject):
+                identity = 'fact:' + subject
+            elif isinstance(code, str) and isinstance(target, str) and code and target:
+                identity = 'check:' + json.dumps([issue.get('scheme', ''), code, target], ensure_ascii=False)
+            elif validator:
+                identity = 'check:' + json.dumps(list(validator.groups()), ensure_ascii=False)
+            elif contract:
+                identity = 'check:' + json.dumps([contract[1], contract[3], contract[2]], ensure_ascii=False)
+            elif task:
+                identity = 'task:' + task[1]
+            else:
+                # Legacy/free-text errors share one obligation. Rephrasing or
+                # reducing their count is not proof of a resolved object.
+                identity = 'unclassified'
+        out[f'compile:{phase}:{identity}'] = {'phase': phase, 'kind': kind, 'scheme': scheme}
+    return out
+
+
+def compile_frontier(state, report, fact_names=()):
+    """Keep masked obligations until their checker actually covers them again."""
+    rows = state.setdefault('objects', {})
+    if not isinstance(report, dict) or report.get('phase') not in ('basis', 'all') or report.get('status') not in ('PASS', 'FAIL'):
+        return set(rows)
+    phase = report['phase']
+    current = compile_objects(report, fact_names)
+    complete = (report.get('status') == 'PASS' or report.get('static_checks_complete') is True)
+    complete = complete and report.get('issue_count', len(report.get('issues', []))) <= len(report.get('issues', []))
+    for key, row in list(rows.items()):
+        if row['phase'] != phase or key in current:
+            continue
+        if row['kind'] == 'runtime':
+            covered = report.get('preflight', {}).get(row['scheme'], {}).get('status') == 'PASS'
+        else:
+            covered = complete
+        if covered:
+            del rows[key]
+    rows.update(current)
+    return set(rows)
+
+
 @dataclass
 class ProgressWatch:
     previous: set[str] = field(default_factory=set)
     stagnant: int = 0
+    compile_state: dict = field(default_factory=dict)
 
-    def observe(self, blockers, *, discovery=False):
-        current = set(blockers)
-        if discovery or not current or not self.previous or self.previous - current:
+    def observe(self, blockers, *, discovery=False, compile_report=None, fact_names=()):
+        old_objects = set(self.compile_state.get('objects', {}))
+        objects = compile_frontier(self.compile_state, compile_report, fact_names)
+        current = {x for x in blockers if not x.startswith('compile:')} | objects
+        resolved = old_objects - objects
+        credited = set(self.compile_state.get('resolved', []))
+        had_compile_history = bool(old_objects or credited)
+        real_resolution = bool(resolved - credited)
+        self.compile_state['resolved'] = sorted(credited | resolved)
+        # While a compiler obligation exists, moving to another task or making
+        # the report stale is not resolution. Only covered objects can clear it.
+        ordinary_resolution = bool(self.previous - current) if not old_objects else False
+        if discovery or real_resolution or ordinary_resolution or (
+                not had_compile_history and (not current or not self.previous)):
             self.stagnant = 0
-        else:
+        elif current:
             self.stagnant += 1
+        # An empty frontier permits later stages to proceed, but cannot refill
+        # the allowance for reintroducing and fixing the same compiler object.
         self.previous = current
         return self.stagnant
 

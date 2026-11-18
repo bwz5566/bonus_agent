@@ -916,6 +916,12 @@ def compile_warnings(rs: RuleSet, reached_elsewhere: set[str] | None = None) -> 
     live = reached(rs) | (reached_elsewhere or set())
     out = [f'参数表 {name} 尚未接入金额、明细或校验；核对是否漏用，或说明其仅供参考。'
            for name in sorted(set(rs.tables) - live)]
+    from bonus_agent.contracts import ratio_default_warnings
+    try:
+        out += [message for path, message in ratio_default_warnings(rs)
+                if path.removeprefix('variables.') in live]
+    except ExprError:
+        pass  # Ordinary syntax validation owns incomplete draft expressions.
     for where, ast in _parsed(rs):
         if where.startswith('variables.') and where.removeprefix('variables.') not in live:
             continue

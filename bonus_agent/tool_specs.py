@@ -93,7 +93,7 @@ TOOLS: list[dict] = [
          ["facts"])},
     {"name": "bind_facts", "description": "把已登记的参数绑定到精确规则或数据筛选位置；多页文档须给page和原文适用标题context。expr字符串本身可绑定其中明确使用的数值，无需虚构threshold/default_value子节点。筛选参数先read_workspace(section='mapping',name=数据表名)核对实际列和条件。不能以另一处相同数字代替。",
      "parameters": _obj({"bindings": {"type": "array", "items": _obj({"name": _S,
-          "targets": {"type": "array", "items": _S, "description": "如 tables.eu.steps.0.1、方案::/variables/bonus/expr；真实筛选值用 方案::/mapping/数据表/filter/销售金额/not/0（排除列表首项），包含列表为/filter/列名/0，单值为/filter/列名。路径中~和/分别转义为~0和~1。仅支持真实执行的filter，不支持任意映射备注。"},
+          "targets": {"type": "array", "items": _S, "description": "如 tables.eu.steps.0.1、方案::/variables/bonus/expr；真实筛选值用 方案::/mapping/数据表/filter/销售金额/not/0（排除列表首项），包含列表为/filter/列名/0，单值为/filter/列名；展开时有人名但缺比例的显式默认值用 方案::/mapping/数据表/unpivot/default_share（缺少声明时先按原文update_dataset补写）。路径中~和/分别转义为~0和~1。仅支持真实执行的filter和default_share，不支持任意映射备注或隐式默认值。"},
          "page": _I, "context": _S, "component": {"type": "string", "enum": ["literal", "lower", "upper"]},
           "unit": _S, "unit_basis": _obj({'file': _S, 'quote': {**_S, 'description': '原文或财务确认，必须明确提及此参数名/适用标题和单位；不能借用其他数字的百分号'}}, ['file', 'quote'])}, ["name", "targets"])}}, ["bindings"])},
     {"name": "validate_parameters", "description": "局部参数预检：自动修正已声明阶梯下界绑定的共享单位区间投影，返回剩余缺口与具体动作；不重跑金额、不改规则数值。",
@@ -176,12 +176,16 @@ TOOLS: list[dict] = [
                                      '{"columns": ["列1", "列2"], "value": "展开后的列名", "label": "记原列名的列名，如 角色"}。'
                                      '空格子不展开；fields 和 filter 用展开后的列名。从这几列取全部对象时配合 key + distinct。'
                                      '格子里写成“名字+百分比”（如 张三50%）、财务答复了怎么拆之后：加 "share": "记比例的列名"，名字和比例就拆开'
-                                     '（比例是小数，没写百分比的是 1，字段类型用 ratio，权重里乘上它）；财务说余下的部分记为“未分配”时再加 '
+                                      '（比例是小数，字段类型用 ratio，权重里乘上它）。有人名但比例为空时，按原文显式写 "default_share": "1" '
+                                      '（示例，不能作为其他业务默认口径；可用0到1或明确百分数字符串）；省略只兼容旧行为1，不产生参数绑定证据。'
+                                      'default_share作用于展开过程，字段if_empty不能改变已展开的比例；空人员的blank占位仍是独立的一整份。'
+                                      '显式默认值可绑定 方案::/mapping/数据表/unpivot/default_share；可用update_dataset局部补写，不能绑到无关公式中的同值。'
+                                      '非空比例文本解析失败仍报错；default_share小于1与remainder暂不支持组合。财务说余下的部分记为“未分配”时再加 '
                                      '"remainder": "{label}未分配"（{label} 换成原列名；余下的部分另记一行，比例是 1 − 写明的比例）。'
                                      '空格子默认不展开；材料或财务说空着的那一份也要单列（如某个角色没填人，记为“××未分配”）时加 '
                                      '"blank": "{label}未分配"，空格子也记一行。'
                                      '几个人的比例集中写在表里另一列的文字里（如“甲60%，乙40%”）、人名格子里只有名字时：加 "share_from": "那一列的列名"，'
-                                     '按名字到那一列取比例（该列为空表示只有一个人、比例 1；格子里自己写了百分比的用格子里的）；要同时写 share。'
+                                      '按名字到那一列取比例（该列为空时使用已声明default_share，省略兼容1；格子里自己写了百分比的用格子里的）；要同时写 share。'
                                      '这一列的比例只管其中几列（如两个技术支持列）时，用 "share_from_columns": ["列名"] 指明，其余列只认格子里自己写的比例。'
                                      '写了 blank 时，某几列空着就是没有这个人（如第二个人那列）、不该记未分配的，把它们列进 "blank_except": ["列名"]。'
                                      '展开后没有每行唯一的编号、又要当最末层时，加字段 {"column": "（行号）", "type": "id"} 作 key'},

@@ -1338,10 +1338,10 @@ class Workspace:
         return "\n".join(out)
 
     def _binding_scopes(self) -> dict:
-        """Read-only evidence view of rules and the filters actually used by mapping.
+        """Read-only evidence view of rules and executable mapping parameters.
 
         Mapping remains workspace-owned, never persisted in a rule draft. Only
-        executable filter values are exposed; notes and arbitrary metadata cannot
+        executable filters and declared share defaults are exposed; arbitrary metadata cannot
         satisfy a parameter. Missing/deleted datasets deliberately leave dangling
         targets visible to validation instead of erasing their evidence.
         """
@@ -1357,6 +1357,17 @@ class Workspace:
                     continue
                 valid[column] = copy.deepcopy(value)
             filters[name] = {'filter': valid}
+            spec = mapping.unpivot or {}
+            if 'default_share' in spec and any(column == spec.get('share') and field in self.datasets[name].fields
+                                               for field, column in mapping.columns.items()):
+                from bonus_core.data.table_detect import normalize_unpivot_default_share
+                try:
+                    default = normalize_unpivot_default_share(spec['default_share'], share=spec.get('share'),
+                                                             remainder=spec.get('remainder') or '')
+                except ValueError:
+                    pass  # an invalid/non-executable setting cannot prove a parameter
+                else:
+                    filters[name]['unpivot'] = {'default_share': str(default)}
         scopes = {s: self._merged(s) for s in self.schemes}
         if SHARED in self.drafts:
             scopes[SHARED] = self.drafts[SHARED]
@@ -4045,7 +4056,12 @@ class Workspace:
                 if stage == 3:
                     summary = TaskBoard(self).summary()
                     active = summary['active']
-                    return {f'construction:{active["id"]}:{active["target"]}'} if active else {summary['next']}
+                    out = {f'construction:{active["id"]}:{active["target"]}'} if active else {summary['next']}
+                    from bonus_agent.progress import compile_objects
+                    saved = self.workflow.get('formula_report', {}).get('report', {})
+                    report = self._flow().compile_feedback(saved.get('phase', 'basis'))
+                    out.update(compile_objects(report, (f.name for f in self.facts)))
+                    return out
                 return set()
             return set()
         bindings = self._binding_gaps()
@@ -4700,7 +4716,8 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
     deep_why, deep_used = "", 0        # 下一步要深度思考的原因（空：普通模式）；本轮已用的深度思考步数
     from bonus_agent.progress import ProgressWatch, discover
     saved_progress = recovery.state.get('progress', {})
-    progress_watch = ProgressWatch(set(saved_progress.get('previous', [])), saved_progress.get('stagnant', 0))
+    progress_watch = ProgressWatch(set(saved_progress.get('previous', [])), saved_progress.get('stagnant', 0),
+                                   saved_progress.get('compile', {}))
     discovered_reads = set(saved_progress.get('reads', []))
 
     def current_compile_report():
@@ -4751,9 +4768,10 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             discovery = False
             for st in steps:
                 discovery = discover(st, discovered_reads) or discovery
-            progress_watch.observe(ws.blocker_frontier(), discovery=discovery)
+            progress_watch.observe(ws.blocker_frontier(), discovery=discovery,
+                                   compile_report=current_compile_report(), fact_names=(f.name for f in ws.facts))
             recovery.state['progress'] = {'previous': sorted(progress_watch.previous), 'stagnant': progress_watch.stagnant,
-                                          'reads': sorted(discovered_reads)}
+                                          'reads': sorted(discovered_reads), 'compile': progress_watch.compile_state}
             recovery.save()
             reached, reached_focus = ws.phase(), ws._flow().stage()
             highest_stage = max(highest_stage, reached_focus[0])
@@ -5266,28 +5284,31 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                 st.tool in {"bind_facts", "compile_table", "validate_parameters", "trial_run", "finish", "set_rules", "apply_repair"}
                 for st in steps[turn_steps:]):
             frontier = ws.blocker_frontier()
-            stagnant = progress_watch.observe(frontier, discovery=discovery and not read_budget['active'])
+            stagnant = progress_watch.observe(frontier, discovery=discovery and not read_budget['active'],
+                                               compile_report=current_compile_report(), fact_names=(f.name for f in ws.facts))
+            frontier = progress_watch.previous  # includes unresolved objects masked by incomplete checks
             if discovery and not read_budget['active']:
                 quiet = 0
-            recovery.state['progress'] = {'previous': sorted(progress_watch.previous), 'stagnant': stagnant, 'reads': sorted(discovered_reads)}
+            recovery.state['progress'] = {'previous': sorted(progress_watch.previous), 'stagnant': stagnant,
+                                          'reads': sorted(discovered_reads), 'compile': progress_watch.compile_state}
             recovery.save()
-            if stagnant >= 2:
+            if stagnant >= 2 and frontier:
                 progress_reason = f"连续 {stagnant + 1} 次检查没有消除既有问题；工具返回成功不代表有进展。" + "；".join(sorted(frontier)[:3])
                 deep_why = '' if recovery.native_guidance or read_budget['active'] else progress_reason
                 ws.notes["纠错进度"] = (progress_reason + ('。当前明确动作：' + ws._flow().hint() if ws.staged and not ws.results else
                                       "。先做局部参数预检；金额问题用 review_calculation 定位，"
                                       "按原文修复，已有独立基线时使用 preview_repair / verify_repair / apply_repair。"
                                       "禁止通过改答案、降低校验或把分配池归零消除问题。"))
-            elif not stagnant:
+            elif not stagnant or not frontier:
                 ws.notes.pop("纠错进度", None)
-            if stagnant >= (12 if ws.staged and not ws.results else 5):
+            if frontier and stagnant >= (12 if ws.staged and not ws.results else 5):
                 if ws.pending:
                     repeats, stuck = MAX_STUCK, progress_reason
                 else:
                     recovery.halt(progress_reason)
         elif discovery:
             recovery.state['progress'] = {'previous':sorted(progress_watch.previous), 'stagnant':progress_watch.stagnant,
-                                          'reads':sorted(discovered_reads)}
+                                          'reads':sorted(discovered_reads), 'compile':progress_watch.compile_state}
             recovery.save()
         if read_budget['active']:
             deep_why = ''  # the existing program counterexample needs a bounded repair, not another advisor
@@ -5679,9 +5700,17 @@ def _unpivot_spec(spec, st) -> dict:
     share, remainder = str(spec.get("share") or "").strip(), str(spec.get("remainder") or "").strip()
     blank = str(spec.get("blank") or "").strip()
     share_from = str(spec.get("share_from") or "").strip()
-    unknown = sorted(set(spec) - {"columns", "value", "label", "share", "remainder", "blank", "share_from", "blank_except", "share_from_columns"})
+    unknown = sorted(set(spec) - {"columns", "value", "label", "share", "remainder", "blank", "share_from", "blank_except", "share_from_columns", "default_share"})
     if unknown:
-        raise ToolError(f"unpivot 不认识 {unknown}，可以写的是 columns、value、label、share、remainder、blank、share_from、blank_except、share_from_columns")
+        raise ToolError(f"unpivot 不认识 {unknown}，可以写的是 columns、value、label、share、remainder、blank、share_from、blank_except、share_from_columns、default_share")
+    default = {}
+    if 'default_share' in spec:
+        from bonus_core.data.table_detect import normalize_unpivot_default_share
+        try:
+            ratio = normalize_unpivot_default_share(spec['default_share'], share=share, remainder=remainder)
+        except ValueError as exc:
+            raise ToolError(str(exc)) from None
+        default = {'default_share': str(ratio)}
     if not share_from:
         # 名单里同一角色几个人、各人比例写在另一列的文字里（如“甲80%，乙20%”），展开时没用上这一列：会按平分或全额算错到人
         from bonus_core.data.table_detect import parse_shares, split_name_share
@@ -5748,7 +5777,7 @@ def _unpivot_spec(spec, st) -> dict:
             **({"remainder": remainder} if remainder else {}), **({"blank": blank} if blank else {}),
             **({"share_from": share_from} if share_from else {}),
             **({"blank_except": [str(c) for c in spec["blank_except"]]} if spec.get("blank_except") else {}),
-            **({"share_from_columns": [str(c) for c in spec["share_from_columns"]]} if spec.get("share_from_columns") else {})}
+            **({"share_from_columns": [str(c) for c in spec["share_from_columns"]]} if spec.get("share_from_columns") else {}), **default}
 
 
 def _code_version() -> str:
