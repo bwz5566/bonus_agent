@@ -6,7 +6,7 @@ from graphlib import CycleError, TopologicalSorter
 from bonus_core.dsl.functions import FUNCTIONS
 from bonus_core.dsl.models import RuleSet, TierTable
 from bonus_core.dsl.parser import BinOp, BoolOp, Call, Cmp, ExprError, Name, Neg, Not, Str, names, parse, walk
-from bonus_core.dsl.phases import basis_rules
+from bonus_core.dsl.phases import basis_rules, funding_only
 from bonus_core.dsl.scope import Layout, is_aggregate
 from bonus_core.engine.issues import Issue
 
@@ -39,6 +39,8 @@ def _exprs(rs: RuleSet, *, include_distribution=True):
                 yield f"report.balances.{b.name}.{i}", expr, None if b.level == "global" else b.level
         for d in rs.report.distributions:
             yield f'report.distributions.{d.name}', d.total, None if d.level == 'global' else d.level
+            if d.source_funding:
+                yield f'report.distributions.{d.name}.allocated', d.source_funding.allocated, d.source_funding.level
 
 
 def _weighted(rs: RuleSet):
@@ -50,9 +52,8 @@ def _weighted(rs: RuleSet):
 def validate_structure(rs: RuleSet, *, require_allocation=False) -> list[Issue]:
     """Validate identities and relationships without requiring money formulas.
 
-    An allocation declaration, when present, must be structurally valid. An
-    empty declaration is allowed for entity-scoped basis calculations only;
-    final validation calls this with require_allocation=True.
+    An allocation declaration, when present, must be structurally valid.
+    A source of earmarked funding retains its original entity scope.
     """
     issues: list[Issue] = []
     levels = [lv.level for lv in rs.allocation]
@@ -125,7 +126,8 @@ def validate_basis(rs: RuleSet) -> list[Issue]:
 
 
 def _validate(rs: RuleSet, *, basis=False) -> list[Issue]:
-    issues = validate_structure(rs, require_allocation=not basis)
+    entity_funds = funding_only(rs)
+    issues = validate_structure(rs, require_allocation=not (basis or entity_funds))
     levels = [lv.level for lv in rs.allocation]
     all_fields = set(rs.field_owner())
     kw_names = set()
@@ -148,7 +150,8 @@ def _validate(rs: RuleSet, *, basis=False) -> list[Issue]:
             issues.append(Issue.block("scope_bad", f"变量 {n} 的 scope「{v.scope}」不是 global、分配层级或关联实体表名", f"variables.{n}"))
         if n in all_fields:
             issues.append(Issue.block("name_clash", f"变量 {n} 与数据字段重名", f"variables.{n}"))
-    if rs.pool.scope != "global" and rs.pool.scope not in levels and not (basis and rs.pool.scope in lay.aux):
+    if (rs.pool.scope != "global" and rs.pool.scope not in levels
+            and not ((basis or entity_funds) and rs.pool.scope in lay.aux)):
         issues.append(Issue.block("scope_bad", f"pool 的 scope「{rs.pool.scope}」不是 global 或分配层级", "pool"))
     for lv in ([] if basis else _weighted(rs)):
         if not lv.weight.strip():
@@ -259,6 +262,8 @@ def _validate(rs: RuleSet, *, basis=False) -> list[Issue]:
                         issues.append(Issue.block("fn_of", f"{node.fn} 的 of 必须是数据表名字符串", where))
                 if node.fn == "scheme_paid" and not all(isinstance(a, Str) for a in node.args):
                     issues.append(Issue.block("fn_args", 'scheme_paid 的参数是方案名和修订名字符串，如 scheme_paid("方案名", "修订名")', where))
+                if node.fn == 'has_ref' and node.args and not (isinstance(node.args[0], Str) and node.args[0].value in lay.aux):
+                    issues.append(Issue.block('fn_args', 'has_ref 的参数须为已声明的关联实体名字符串', where))
                 if node.fn in ("tier", "tier_rate", "tier_ratio", "lookup") and node.args:
                     a0 = node.args[0]
                     want = "tier" if node.fn != "lookup" else "lookup"
@@ -335,6 +340,12 @@ def validate_distribution_contracts(rs: RuleSet) -> list[Issue]:
         if len(set(contract.pending)) != len(contract.pending) or claimed & set(contract.pending):
             issues.append(Issue.block('distribution_pending_duplicate', '待分配项被重复计入去向对账', where))
         claimed.update(contract.pending)
+        if source := contract.source_funding:
+            entity = rs.datasets.get(source.level)
+            if (contract.rounding != 'after_sum' or not source.scheme.strip()
+                    or not source.allocated.strip() or not entity or not entity.key):
+                issues.append(Issue.block('funding_reconciliation_shape',
+                    '来源资金对账须按有主键的来源实体声明方案及逐实体实名原值，并在人员汇总后舍入', where))
         for name in contract.pending:
             item = pending.get(name)
             if item is None:
@@ -342,6 +353,8 @@ def validate_distribution_contracts(rs: RuleSet) -> list[Issue]:
                     f'待分配项「{name}」必须在 report.pending 中定义；同名 totals 汇总不能替代待分配金额', where))
             elif contract.rounding != 'after_sum' and item.level != contract.level:
                 issues.append(Issue.block('distribution_pending_missing', f'待分配项「{name}」与对账层级不同', where))
+            elif source and item.level != source.level:
+                issues.append(Issue.block('funding_reconciliation_scope', f'待分配项「{name}」须按资金来源实体列明', where))
             elif not item.sources:
                 issues.append(Issue.block('distribution_pending_source', f'待分配项「{name}」缺少原文依据', where))
     return issues
@@ -456,15 +469,16 @@ class _ScopeCheck:
                 f"仅在原文明确当前对象应有唯一属性时，可用 single_value({value}, of: \"{shown[0]}\") 断言"
                 "（空值或多值仍阻断）；需合计时先核对业务粒度，不要把重复出现的系数求和")
 
-    def _shared_ids(self, ds: str, ctx: int) -> list[tuple[str, str]]:
+    def _shared_ids(self, ds: str, ctx: int, ent: str | None = None) -> list[tuple[str, str]]:
         """上层的表 ds 和 ctx 这一层的表共有的编号/文字字段（如客户编码），可以用来把 ds 变成关联实体。"""
-        mine = [n for n, lv in self.lay.table_level.items() if lv == ctx and n != ds]
+        mine = [ent] if ent else [n for n, lv in self.lay.table_level.items() if lv == ctx and n != ds]
         d = self.rs.datasets[ds]
         out = []
         for f, fd in d.fields.items():
             if fd.type not in ("id", "text"):
                 continue
-            own = next((n for n in mine if f in self.rs.datasets[n].fields), None)
+            own = next((n for n in mine if f in self.rs.datasets[n].fields
+                        and self.rs.datasets[n].fields[f].type in ('id', 'text')), None)
             if own:
                 out.append((f, own))
         return sorted(out, key=lambda x: d.fields[x[0]].type != "id")
@@ -505,6 +519,14 @@ class _ScopeCheck:
                         hint = (f"。「{ds}」的行能归到「{both[0]}」，「{ent}」的行也能取到「{both[0]}」："
                                 f"把这个变量的 scope 改成「{both[0]}」，「{ent}」及行里有它编号的表直接引用这个变量；不要再改 link"
                                 if both else "")
+                        if not hint:
+                            shared = self._shared_ids(ds, ctx, ent)
+                            if shared:
+                                fields = '、'.join(f for f, _ in shared[:4])
+                                hint = (f"。两张表共有编号字段 {fields}。核对原文应按哪个编号汇总。"
+                                        f"若应按该编号计算，用 define_dataset 从有效业务明细建立以该字段为 key 的关联实体，"
+                                        f"将「{ds}」用 link 挂到它。在该实体 scope 聚合，再按同一编号从「{ent}」引用结果。"
+                                        "where 只能筛选当前对象已能读取的行。")
                         self._block("agg_unrelated", f"在「{ent}」作用域聚合「{ds}」：这张表的行没有{ent}的编号，"
                                                      f"聚合不到属于本{ent}的行{hint}")
                 else:
@@ -548,6 +570,15 @@ class _ScopeCheck:
                 for a in list(args) + [v for k, v in kws if k == "where"]:
                     self._visit(a, ctx, inner, ds)
             case Call(args=args, kwargs=kws):
+                if node.fn == 'between' and len(args) == 3:
+                    value = args[0]
+                    owner = agg or ent
+                    dataset = self.rs.datasets.get(owner)
+                    field = dataset.fields.get(value.id) if dataset is not None and isinstance(value, Name) else None
+                    if isinstance(value, Str) or (field is not None and field.type in ('text', 'id', 'enum', 'bool')):
+                        subject = '首个参数是文本常量' if isinstance(value, Str) else f'「{owner}.{value.id}」声明为 {field.type}'
+                        self._block('fn_type', f'between 的首个参数须为数值或日期，{subject}。'
+                                    '先核对数据集已应用的期间和窗口；仍需按日期筛选时，须使用可验证的日期值。')
                 if node.fn in ('tier', 'tier_rate', 'tier_ratio', 'lookup') and args and isinstance(args[0], Name):
                     name = args[0].id
                     table = self.rs.tables.get(name)

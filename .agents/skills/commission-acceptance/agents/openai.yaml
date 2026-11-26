@@ -1,0 +1,3 @@
+interface:
+  display_name: "提成奖核算验收"
+  short_description: "复现提成核算故障并对账项目、人员金额，验收跨批自动算奖"

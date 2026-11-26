@@ -179,8 +179,11 @@ def build_tree(rs: RuleSet, data: Datasets) -> tuple[Node, dict[str, list[Node]]
         if name not in data:
             issues.append(Issue.block("dataset_missing", f"缺少数据表「{name}」", where=name))
             continue
-        key = rs.datasets[name].key
+        definition = rs.datasets[name]
+        key = definition.key
         tbl = index.setdefault(name, {})
+        kind, target, match_field = lay.parent[name]
+        inferred_missing = [] if definition.link is None and kind == "aux" else None
         for row in data[name].rows:
             k = row.values.get(key)
             if k is None:
@@ -192,10 +195,17 @@ def build_tree(rs: RuleSet, data: Datasets) -> tuple[Node, dict[str, list[Node]]
             n = Node(node_id(name, k), name, str(k), aux=True, row=row, attrs=dict(row.values), attr_src=row.src)
             n.own_rows[name] = [row]
             tbl[str(k)] = n
-            parent = _parent_node(lay, name, row, root, nodes, index, issues)
+            parent = _parent_node(lay, name, row, root, nodes, index, issues, inferred_missing)
             if parent is not None:
                 n.parent = parent
                 parent.aux_children.append(n)
+        if inferred_missing:
+            examples = "、".join(list(dict.fromkeys(inferred_missing))[:5])
+            issues.append(Issue.block("link_unmatched",
+                f"「{name}」按同名字段 {match_field} 被推断挂到「{target}」，"
+                f"有 {len(inferred_missing)} 行找不到上级（如 {examples}）。"
+                "先按材料核对匹配键、期间和关联方向。若上级实际是可缺失的参考表，"
+                "应以完整核算对象定义主表，并按来源规则处理缺失的参考值。", where=name))
     root.index = index
     data = _canonical_refs(rs, lay, data, nodes, index, issues)
 
@@ -338,7 +348,8 @@ def _loose_get(pool: dict, k: str):
     return hit[1].get(_SEP.sub("", k))
 
 
-def _parent_node(lay: Layout, name: str, row: Row, root: Node, nodes, index, issues, dropped: list | None = None) -> Node | None:
+def _parent_node(lay: Layout, name: str, row: Row, root: Node, nodes, index, issues,
+                 missing_keys: list[str] | None = None) -> Node | None:
     kind, target, f = lay.parent[name]
     if kind == "root":
         return root
@@ -356,8 +367,8 @@ def _parent_node(lay: Layout, name: str, row: Row, root: Node, nodes, index, iss
             issues.append(Issue.warn("key_separator", f"「{name}」的 {f} 和「{level}」的编号只差分隔符（如 {k} ↔ {n.key or n.id}），"
                                      "已按去掉分隔符后的写法对上", where=str(row.src)))
     if n is None:
-        if dropped is not None:        # 财务确认过查不到的不参与：不阻断，汇总成一条提示
-            dropped.append(str(k))
+        if missing_keys is not None:
+            missing_keys.append(str(k))
             return None
         issues.append(Issue.block("link_unmatched", f"「{name}」中 {f}={k} 在「{level}」中找不到", where=str(row.src)))
     return n

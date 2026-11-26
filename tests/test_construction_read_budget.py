@@ -45,3 +45,28 @@ def test_obligation_changes_only_for_a_new_executable_target():
     assert next_focus['id'] != focus['id'] and not next_focus['warn']
     assert budget.state['reads'] == 0
     assert budget.observe([]) is None and not budget.state
+
+
+def test_pending_report_does_not_stop_reads_for_its_preceding_formula(tmp_path):
+    ws = make_workspace(tmp_path)
+    plan = ws.workflow['plan']
+    ws.plan_calculation(plan['summary'], plan['outputs'], plan['files'], plan['schemes'],
+                        output_targets={'项目底稿': ['S::/report/details/新增项目字段'],
+                                        '总额': ['S::/report/totals'], '人员金额': ['S::/report/people']})
+    ws.plan_formula_tasks([
+        {'id': 'base_amount', 'scheme': 'S', 'target': '/variables/base_amount'},
+        {'id': 'report', 'scheme': 'S', 'target': '/report', 'depends_on': ['base_amount']},
+    ])
+    assert ws.prepare_data()['status'] == 'PASS'
+    out = tmp_path / 'case'
+    save_staged_case(ws, out)
+    reads = [{'tool': 'read_workspace', 'args': {'section': 'facts', 'name': f'证据{i}'}}
+             for i in range(ConstructionReadBudget.LIMIT)]
+    change = {'tool': 'submit_formula_task', 'args': {
+        'task': 'base_amount', 'value': {'scope': '项目', 'expr': 'amount'},
+    }}
+    primary = FakeLLM([*reads, change])
+    primary.workflow_mode = 'staged'
+    result = run_agent(primary, ws.inv.files, out, max_steps=len(reads) + 1)
+    assert any(step.tool == 'submit_formula_task' and step.ok for step in result.steps), result.error
+    assert not result.error.startswith('公式构建停滞')

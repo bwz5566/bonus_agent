@@ -33,14 +33,15 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 from urllib.parse import quote
 
 import yaml
 
 from bonus_agent import case as cs
 from bonus_agent import review as rv
-from bonus_agent.failure import explain as explain_failure, retryable, to_text
+from bonus_agent import commission_revision as cr
+from bonus_agent.failure import diagnosis_items, explain as explain_failure, retryable, to_text
 from bonus_agent.parsing.docs import PARSERS
 
 ROLES = {"editor": "传材料、答复问题、运行、按模板计算", "approver": "确认结果、发布规则版本"}
@@ -90,6 +91,11 @@ class Users:
     def load(self) -> dict:
         return (yaml.safe_load(self.path.read_text(encoding="utf-8")) or {}) if self.path.exists() else {}
 
+    def _save(self, users: dict) -> None:
+        from bonus_agent.infra.atomic import write_text
+        write_text(self.path, yaml.safe_dump(users, allow_unicode=True, sort_keys=True))
+        self.path.chmod(0o600)
+
     def add(self, name: str, password: str, roles: list[str], display: str = "") -> None:
         bad = [r for r in roles if r not in ROLES]
         if bad:
@@ -98,11 +104,32 @@ class Users:
             raise ValueError("用户名只能用字母（含中文）、数字、下划线、点、减号、@")
         if len(password) < 8:
             raise ValueError("口令至少 8 位")
-        users = self.load()
-        users[name] = {"password": hash_password(password), "roles": roles, "display": display or name}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(yaml.safe_dump(users, allow_unicode=True, sort_keys=True), encoding="utf-8")
-        self.path.chmod(0o600)
+        with cs.case_lock(self.path.parent / '.account-admin'):
+            users = self.load()
+            users[name] = {"password": hash_password(password), "roles": roles, "display": display or name}
+            self._save(users)
+
+    def single(self, name: str) -> Path | None:
+        """Keep one existing login, preserving its password and audit identity.
+
+        Server requests reload the active file, so removed accounts' sessions
+        cease to work immediately. The backup is not an active account store.
+        """
+        with cs.case_lock(self.path.parent / '.account-admin'):
+            users=self.load()
+            if name not in users or not isinstance(users[name],dict) or not users[name].get('password'):
+                raise ValueError(f'要保留的现有账号不存在：{name}')
+            retained={**users[name], 'roles': list(ROLES)}
+            target={name:retained}
+            if users==target:return None
+            backup=self.path.with_name(f'.users-before-single-{datetime.now().strftime("%Y%m%d-%H%M%S")}-{secrets.token_hex(3)}.yaml')
+            shutil.copy2(self.path,backup);backup.chmod(0o600)
+            self._save(target)
+            if self.load()!=target:
+                from bonus_agent.infra.atomic import write_text
+                write_text(self.path,backup.read_text(encoding='utf8'))
+                raise ValueError('单账号配置回读失败，已恢复原配置。')
+            return backup
 
     def check(self, name: str, password: str) -> dict | None:
         u = self.load().get(name)
@@ -220,7 +247,8 @@ class Runner:
     """每个案卷同时只跑一轮；全局最多同时跑 max_parallel 轮（大模型调用量大）。"""
 
     def __init__(self, store: Store, llm_factory: Callable[[], object], max_parallel: int = 2, max_steps: int = 150,
-                 max_tokens: int = 4_000_000, auto_continue: int = 2, registry=None):
+                 max_tokens: int = 4_000_000, auto_continue: int = 2, registry=None, *,
+                 unlimited_case_tokens: Iterable[str] = ()):
         from bonus_agent.scenarios import Registry
         self.store, self.llm_factory = store, llm_factory
         self.registry = registry or Registry([store.root / "scenarios"])
@@ -229,6 +257,12 @@ class Runner:
         self.lock = threading.Lock()
         self.slots = threading.Semaphore(max_parallel)
         self.max_steps, self.max_tokens = max_steps, max_tokens
+        self.unlimited_case_tokens = frozenset(unlimited_case_tokens)
+        if any(not CID.fullmatch(cid) for cid in self.unlimited_case_tokens):
+            raise ValueError("--unlimited-case-tokens 须填写 12 位案卷编号")
+
+    def token_limit(self, cid: str) -> int | None:
+        return None if cid in self.unlimited_case_tokens else self.max_tokens
 
     def running(self, cid: str) -> bool:
         j = self.jobs.get(cid)
@@ -268,19 +302,26 @@ class Runner:
 
     def _run(self, job: Job, new: bool, message: str | None = None, instruction: str | None = None) -> None:
         from bonus_agent.agent import run_agent
+        from bonus_agent.recovery import RunBudget
+
         d = self.store.dir(job.cid)
         try:
             meta = self.store.meta(job.cid)
             scenario = None
             if meta.get("scenario"):          # 编制模式：带上场景说明、输入模板检查和场景记忆
                 from bonus_agent.scenarios.context import prepare
-                scenario = prepare(self.registry, meta["scenario"], [d / "materials"], use_memory=meta.get("memory", True))
-            with self.slots:
+                scenario = prepare(self.registry, meta["scenario"], [d / "materials"], use_memory=meta.get("memory", True),
+                                   period=meta.get("period"))
+            budget_dir = d / ".model_budget"
+            with self.slots, cs.case_lock(budget_dir):
                 llm = self.llm_factory()
-                from bonus_agent.recovery import RunBudget
-                budget = RunBudget(llm.usage.prompt_tokens + llm.usage.completion_tokens, self.max_tokens)
+                max_tokens = self.token_limit(job.cid)
+                budget = RunBudget.for_case(budget_dir / "usage.json", d / "out",
+                                            llm.usage.prompt_tokens + llm.usage.completion_tokens, max_tokens)
+                if error := budget.check(llm):
+                    raise RuntimeError(error)
                 ar = run_agent(llm, [d / "materials"], d / "out", resume=not new, max_steps=self.max_steps,
-                               max_tokens=self.max_tokens, message=message, by=job.by,
+                               max_tokens=max_tokens, message=message, by=job.by,
                                chat=self.store.chat(job.cid)[:-1] if message else self.store.chat(job.cid),
                                on_step=lambda n, s: self._step(job, d / "out", n, s), should_stop=lambda: job.cancel,
                                instruction=instruction, scenario=scenario, period=meta.get("period"), run_budget=budget)
@@ -294,9 +335,10 @@ class Runner:
                                         f"程序自动接着做第 {ar.round + 1} 轮（自动接续第 {auto} 次，最多 {self.auto_continue} 次）。")
                     self.store.audit(job.cid, job.by, "自动接续", round=ar.round + 1)
                     ar = run_agent(llm, [d / "materials"], d / "out", resume=True, max_steps=self.max_steps,
-                                   max_tokens=self.max_tokens, by=job.by, chat=self.store.chat(job.cid),
+                                   max_tokens=max_tokens, by=job.by, chat=self.store.chat(job.cid),
                                    on_step=lambda n, s: self._step(job, d / "out", n, s), should_stop=lambda: job.cancel,
                                    scenario=scenario, period=meta.get("period"), run_budget=budget)
+                budget.persist()
                 expected = sorted((d / "expected").glob("*.xlsx"))
                 if expected and ar.results:
                     from bonus_agent.compare import compare_expected, report
@@ -314,7 +356,7 @@ class Runner:
             if message:
                 made = bool(ar.outputs)          # 对话里改了东西才会生成新的一轮
                 note = (f"\n\n（已按修改生成第 {ar.round} 轮" + ("" if ar.error else f"：{job.message}") + "）" if made else "")
-                self.store.chat_add(job.cid, "agent", "智能体", (ar.reply or (f"（没有完成）{to_text(ar.error)}" if ar.error else f"（已处理：{ar.ws.summary or job.message}）")) + note)
+                self.store.chat_add(job.cid, "agent", "智能体", (ar.reply or (f"（没有完成）{to_text(ar.error, diagnosis=ar.failure_context)}" if ar.error else f"（已处理：{ar.ws.summary or job.message}）")) + note)
                 if not made:
                     job.result, job.message = "", "已回复"
             else:                                # 每轮的结果都在对话里交代：没完成先说原因，再说需要什么帮助
@@ -332,6 +374,12 @@ OUT_GROUPS = ("给财务核对", "留档：计算口径（确认后作为模板�
 
 def output_kind(name: str) -> tuple[str, str]:
     """输出文件属于哪一类、有什么用。"""
+    if name == "总额预核算.xlsx":
+        return OUT_GROUPS[0], "预核算总额、逐对象金额和公式来源"
+    if name == '修订差异.xlsx':
+        return OUT_GROUPS[0], '新旧总额、逐项目指标、人员、规则及财务反馈处理结论'
+    if name == 'commission_revisions.json':
+        return OUT_GROUPS[1], '财务反馈历史与规则、人员修订记录'
     if name == "result.xlsx":
         return OUT_GROUPS[0], "奖金结果（有多个方案时是总览）"
     if name.startswith("result_") and name.endswith(".xlsx"):
@@ -367,22 +415,31 @@ def usage_text(u: dict | None) -> str:
     """一轮的用时和用量，附在每轮的交代后面。"""
     if not u:
         return ""
+    budget = u.get("budget") or {}
+    case_usage = ""
+    if budget.get("scope") == "case":
+        case_usage = f"\n案卷累计已报告用量 {budget['actual_used_tokens']:,} tokens。"
+        if budget["unconfirmed_reserved_tokens"]:
+            case_usage += f"另有 {budget['unconfirmed_reserved_tokens']:,} tokens 用量待确认。"
+        if budget["remaining_tokens"] is not None:
+            case_usage += f"剩余额度 {budget['remaining_tokens']:,} tokens。"
     return (f"\n（本轮用时 {u.get('secs', 0) // 60} 分 {u.get('secs', 0) % 60} 秒，{u.get('steps', 0)} 步"
             + (f"，其中深度思考 {u['deep_steps']} 步" if u.get("deep_steps") else "")
             + f"；调用模型 {u.get('calls', 0)} 次，输入 {u.get('prompt_tokens', 0):,} tokens"
             + (f"（其中命中缓存 {u['cached_tokens']:,}）" if u.get("cached_tokens") else "")
-            + f"，输出 {u.get('completion_tokens', 0):,} tokens）")
+            + f"，输出 {u.get('completion_tokens', 0):,} tokens）" + case_usage)
 
 
 def _round_status(ar) -> str:
     if ar.error:
-        return f"第 {ar.round} 轮没做完。{to_text(ar.error)}"
+        return f"第 {ar.round} 轮没做完。{to_text(ar.error, diagnosis=getattr(ar, 'failure_context', None))}"
     if ar.status == "NEEDS_CONFIRMATION":
         qs = [q for q in ar.pending][:8]
         def one(q):    # ar.pending 是 dict（model_dump）；原来按属性取，对话里显示成整段 dict
             get = q.get if isinstance(q, dict) else (lambda k, d=None: getattr(q, k, d))
             opts = get("options") or []
             return (f"- {get('id', '')} {get('text', q)}"
+                    + ''.join(f'\n  {label} {value}' for label, value in diagnosis_items(get('diagnosis')))
                     + "".join(f"\n  {chr(65 + i)}. {o}" for i, o in enumerate(opts[:6])))
         return (f"第 {ar.round} 轮暂停：有 {len(ar.pending)} 个问题需要你回答，回答前不出结果。\n"
                 + "\n".join(one(q) for q in qs)
@@ -402,9 +459,12 @@ def load_questions(out: Path) -> list[dict]:
     return (yaml.safe_load(p.read_text(encoding="utf-8")) or []) if p.exists() else []
 
 
-def save_answers(out: Path, form: dict[str, str], user: str) -> list[str]:
-    """把网页表单的答复写进 questions.yaml（记录答复人和时间）。返回本次答复的问题编号。"""
-    qs = load_questions(out)
+def render_diagnosis(details) -> str:
+    items = diagnosis_items(details)
+    return ('<dl>' + ''.join(f'<dt><b>{e(label)}</b></dt><dd>{e(value)}</dd>' for label, value in items) + '</dl>') if items else ''
+
+
+def _answer_updates(qs, form, user):
     done = []
     for q in qs:
         if q.get("withdrawn"):
@@ -421,6 +481,13 @@ def save_answers(out: Path, form: dict[str, str], user: str) -> list[str]:
             continue
         q.update(answer=ans, answered_by=user, answered_at=now())
         done.append(q["id"])
+    return done
+
+
+def save_answers(out: Path, form: dict[str, str], user: str) -> list[str]:
+    """把网页表单的答复写进 questions.yaml（记录答复人和时间）。返回本次答复的问题编号。"""
+    qs = load_questions(out)
+    done = _answer_updates(qs,form,user)
     if done:
         (out / "questions.yaml").write_text(QUESTIONS_HEAD + yaml.safe_dump(qs, allow_unicode=True, sort_keys=False),
                                             encoding="utf-8")
@@ -455,6 +522,9 @@ pre{white-space:pre-wrap;background:var(--bg);padding:8px;border-radius:6px;max-
 .msg.user .bubble{background:var(--acc);color:#fff;border-color:var(--acc)}
 """
 STATUS = {"OK": ("已出结果，待财务核对", "ok"), "NEEDS_CONFIRMATION": ("等财务答复，本轮不出结果", "warn"),
+          "AWAITING_TOTAL_CONFIRMATION": ("总额已独立复核，等待财务确认后继续人员分配", "warn"),
+          "REVISION_PENDING": ("已登记财务异议，旧版交付停止，等待修订", "warn"),
+          "APPROVED": ("本版本总额已确认，等待人员核验", "warn"),
           "FAILED": ("未完成", "bad")}
 
 
@@ -491,9 +561,78 @@ def status_text(case: dict | None) -> str:
     if not case or not case.get("rounds"):
         return "<span class='mut'>还没有运行</span>"
     r = case["rounds"][-1]
-    label, cls = STATUS.get(r.get("status"), (r.get("status"), "mut"))
-    conf = " · <span class='ok'>已确认</span>" if r.get("confirmed") else ""
+    status = (cr.state_of(case) or {}).get('status') or r.get('status')
+    label, cls = STATUS.get(status, (status, "mut"))
+    conf = " · <span class='ok'>已确认</span>" if r.get("confirmed") and status=='OK' else ""
     return f"第 {r['n']} 轮：<span class='{cls}'>{e(label)}</span>{conf}"
+
+
+def pending_basis_confirmations(case: dict, out=None):
+    from bonus_agent.recovery import fingerprint
+
+    flow = case.get('workspace', {}).get('workflow', {})
+    if fixed := flow.get('fixed_commission'):
+        from bonus_agent.commission_chain import SCHEME
+        if out:
+            try:cr.validate_current(out,case)
+            except cs.ConfirmError:return
+        basis=fixed.get('basis_view');digest=fixed.get('basis_digest')
+        if (fixed.get('status')=='AWAITING_TOTAL_CONFIRMATION' and basis and digest
+                and fixed.get('receipts',{}).get('basis_review',{}).get('status')=='PASS'
+                and not cr.approval_matches(fixed) and fingerprint(basis)==digest):
+            yield SCHEME,basis,cr.receipt_token(fixed)
+        return
+    if not flow.get('enabled'):
+        return
+    latest = (case.get('rounds') or [{}])[-1]
+    view_version = flow.get('view_basis_version', flow.get('view_version'))
+    saved_wait = flow.get('waiting') if latest.get('status') == 'AWAITING_TOTAL_CONFIRMATION' else None
+    receipts = flow.get('receipts', {})
+    for name, basis in flow.get('basis', {}).items():
+        review = receipts.get('review:' + name, {})
+        version = review.get('version')
+        if not version or (version != view_version and name != saved_wait):
+            continue
+        current = receipts.get('basis:' + name, {})
+        payload = review.get('payload', {})
+        digest = fingerprint(basis)
+        if version != view_version and 'view_basis_version' in flow:
+            # Funding receipts use a scheme-scoped version. The independent opinion also binds
+            # the global view and exact amounts, including for snapshots saved before this UI change.
+            reference = flow.get('references', {}).get(name, {})
+            opinion = reference.get('report', {})
+            if (reference.get('version') != view_version or reference.get('spec_state') != 'valid'
+                    or opinion.get('status') != 'PASS' or opinion.get('basis_digest') != digest):
+                continue
+        if (current.get('version') != version or current.get('payload', {}).get('digest') != digest
+                or payload.get('status') != 'PASS' or payload.get('basis_digest') != digest):
+            continue
+        approved = receipts.get('approved:' + name, {})
+        if approved.get('version') == version and approved.get('payload', {}).get('basis_digest') == digest:
+            continue
+        yield name, basis, digest
+
+
+def basis_confirmation_section(cid, out, case, csrf, approver, busy, current_issue=''):
+    """Always make the next financial action and the reason for blocking visible."""
+    blocks=[]
+    for name,basis,digest in pending_basis_confirmations(case or {},out):
+        amounts='<br>'.join(f'{e(k)}：{e(v)} 元' for k,v in {'奖金池':basis['pool'],**basis['totals']}.items())
+        block=f'<p><b>{e(name)}</b>：{amounts}<br>核算对象 {len(basis["objects"])} 个。请同时核对逐对象底稿和金额组成。</p>'
+        if approver and not busy:
+            block+=form(f'/cases/{cid}/confirm-totals',f'<input type="hidden" name="scheme" value="{e(name)}">'
+                        f'<input type="hidden" name="digest" value="{e(digest)}">'
+                        '<button>确认本版本总额并继续人员分配</button>',csrf)
+        else:
+            reason='本轮仍在保存，结束后即可确认。' if busy else '当前登录账号没有审批权限，请使用具有审批权限的账号确认。经办账号无需重复运行下一轮。'
+            block+='<p><button type="button" disabled>确认本版本总额并继续人员分配</button></p>'+f'<p class="warn">{e(reason)}</p>'
+        blocks.append(block)
+    fixed=cr.state_of(case) or {}
+    if not blocks and fixed.get('status')=='AWAITING_TOTAL_CONFIRMATION':
+        reason=current_issue or '本版项目复核或金额凭据尚未达到确认条件，请查看当前状态和节点回执。'
+        blocks.append('<p class="warn">'+e(reason)+'</p><p><button type="button" disabled>确认本版本总额并继续人员分配</button></p>')
+    if not blocks:return ''
+    return '<section id="basis-confirmation"><h2>总额预核算确认：下一步操作</h2>'+''.join(blocks)+'</section>'
 
 
 def files_table(base: Path, href: str, csrf: str | None = None, delete: str | None = None) -> str:
@@ -508,6 +647,53 @@ def files_table(base: Path, href: str, csrf: str | None = None, delete: str | No
         rows.append(f"<tr><td><a href='{e(href)}/{e(rel)}'>{e(rel)}</a></td><td class='mut'>{p.stat().st_size:,} 字节</td>"
                     f"<td class='mut'>{datetime.fromtimestamp(p.stat().st_mtime).strftime('%Y-%m-%d %H:%M')}</td><td>{act}</td></tr>")
     return "<div class='wrap'><table>" + "".join(rows) + "</table></div>"
+
+
+def commission_feedback_section(cid, out, case, csrf, editor, approver, busy):
+    state=cr.state_of(case)
+    if not state:return ''
+    ledger=cr.load(out);rev=cr.active(ledger)
+    body='<p>任何异议先登记成新版本，再按责任节点复核。历史审批和旧底稿保留；不会按期望金额反推规则。</p>'
+    if rev:
+        body+=f"<p><b>当前修订 {e(rev['id'])}</b> · {e(STATUS.get(rev['status'],(rev['status'],''))[0])}；原对照第 {e(rev['base_round'])} 轮；"+('项目总额需要重新确认。' if rev['basis_changed'] else '仅人员/报表范围，项目确认必须完全一致才能沿用。')+'</p>'
+        for r in rev['requests']:
+            body+=f"<p><b>{e(cr.KINDS.get(r['kind'],r['kind']))}</b> · {e(r['created_by'])}：{e(r['description'])}<br><span class='mut'>责任环节：{e(cr.OWNERS.get(r['owner'],r['owner']))}</span></p>"
+        body+=f"<p><a href='/cases/{cid}/dl/out/revisions/{e(rev['baseline'])}/baseline.json'>修订前核算及审批快照</a></p>"
+        if (out/'revision_diff.json').is_file():
+            try:
+                diff=json.loads((out/'revision_diff.json').read_text(encoding='utf8'))
+                if diff.get('revision')==rev['id']:
+                    body+=f"<p><a href='/cases/{cid}/dl/out/修订差异.xlsx'>下载本版修订差异</a> · 项目变化 {e(diff['projects']['changed'])} 个；逐条结论请查看报告。</p>"
+            except (ValueError,OSError):pass
+    if ledger.get('revisions') or ledger.get('scheduled'):
+        records=[f"<li>{e(x['id'])} · {e(x['created_at'])} · {e(x['status'])} · 第 {e(x['base_round'])} 轮</li>" for x in reversed(ledger['revisions'])]
+        records.extend(f"<li>已登记适用版本 {e(x['rule']['label'])}：{e(x['rule']['value'])}（{e(x['rule']['from'])} 起；不影响未适用期间）</li>" for x in ledger.get('scheduled',[]))
+        body+='<details><summary>历次财务反馈及已登记规则</summary><ul>'+''.join(records)+'</ul></details>'
+    if busy or not (editor or approver):return '<section><h2>财务反馈与版本修订</h2>'+body+'</section>'
+    version=f"<input type='hidden' name='base_version' value='{e(cr.edit_token(case,ledger))}'>"
+    action=f'/cases/{cid}/commission-feedback'
+    buttons="<p><button name='run' value='1'>登记并开始复核</button> <button name='run' value='0'>仅登记，稍后运行</button></p>"
+    options=''.join(f"<option value='{e(k)}'>{e(v)}</option>" for k,v in cr.OWNERS.items() if k!='settlement')
+    dissent=version+"<input type='hidden' name='kind' value='discrepancy'>"+"<p>范围：<select name='stage'><option value='unknown'>自动定位（总额/项目）</option><option value='basis'>项目/总额</option><option value='settlement'>人员分配</option><option value='output'>报表回读</option></select></p>"+f"<p>已知环节（可不选）：<select name='owner'><option value=''>自动定位</option>{options}</select></p>"+"<p>项目四键（可不填，多个换行）：<textarea name='project_keys' rows='2'></textarea></p>"+"<textarea name='description' rows='3' required placeholder='具体金额/指标有误或疑义；说明实际看到什么、期望核对什么。'></textarea>"+"<input type='text' name='observed' placeholder='现值或反例（可选）'><input type='text' name='evidence' placeholder='材料文件、行列、条款依据（可选）'>"+buttons
+    body+='<details open><summary><b>总额有误 / 撤回确认 / 人员金额有误</b></summary>'+form(action,dissent,csrf)+'</details>'
+    if approver:
+        available=[]
+        for key,(node,path,_,label,typ) in cr.FIELDS.items():
+            try:old=cr._get(state['specs'][node],path)
+            except KeyError:continue
+            choices='；可选 '+ '/'.join(f'{v}（{cr.VALUE_LABELS.get(v,v)}）' for v in typ) if isinstance(typ,tuple) else ''
+            available.append(f"<option value='{e(key)}'>{e(label)}（当前 {e(old)}{e(choices)}）</option>")
+        if available:
+            fields=version+"<input type='hidden' name='kind' value='rule_change'>"+f"<p>被替代的规则：<select name='field'>{''.join(available)}</select></p>"+"<p>明确新值：<input name='value' type='text' required placeholder='例如 24、multiplicative、after_sum'></p>"+"<p>适用范围：<select name='scope'><option value='this_case'>仅本案</option><option value='this_period'>指定月份的场景</option><option value='future_periods'>从指定月份开始</option><option value='scenario'>场景指定有效区间</option></select></p>"+"<p>生效月份（跨案必填）：<input name='effective_from' type='month'> 终止月份（可选）：<input name='effective_to' type='month'></p>"+"<textarea name='description' rows='3' required placeholder='新规则、替代原因及适用范围；此操作是正式财务确认，不是期望答案。'></textarea>"+"<input name='evidence' type='text' placeholder='制度文件/会议/财务确认依据'>"+buttons
+            body+='<details><summary><b>调整业务规则及登记适用版本</b></summary>'+form(action,fields,csrf)+'</details>'
+        projects=(state.get('basis_view') or {}).get('projects',{})
+        if projects:
+            choices=''.join(f"<option value='{e(p)}'>{e(p)} · {e(v['alloc'])} 元</option>" for p,v in projects.items())
+            roles=''.join(f"<option>{e(r)}</option>" for r in cr.ROLES)
+            recipients=version+"<input type='hidden' name='kind' value='recipient_change'>"+f"<p>项目：<select name='project_keys'>{choices}</select></p><p>角色：<select name='role'>{roles}</select></p>"+"<input type='text' name='shares' required placeholder='例如 张三70%，李四30%'><textarea name='description' rows='2' required placeholder='本项目本角色实际名单变更原因；未指定的剩余份额保留待分配。'></textarea>"+buttons
+            body+='<details><summary><b>仅修订指定项目角色的人员份额</b></summary>'+form(action,recipients,csrf)+'</details>'
+    body+='<p class="mut">更正材料使用原上传入口，程序自动登记失效范围。新公式超出当前可复用算子时，不会擅自猜测，请提供正式材料后核对扩展需求。</p>'
+    return '<section><h2>财务反馈与版本修订</h2>'+body+'</section>'
 
 
 def review_section(cid: str, out: Path, csrf: str, can_mark: bool) -> str:
@@ -552,7 +738,8 @@ def review_section(cid: str, out: Path, csrf: str, can_mark: bool) -> str:
 
 
 def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_parallel: int = 2, model_name: str = "",
-               max_steps: int = 150, max_tokens: int = 4_000_000, scenario_dirs: list[str | Path] | None = None):
+               max_steps: int = 150, max_tokens: int = 4_000_000, scenario_dirs: list[str | Path] | None = None,
+               unlimited_case_tokens: Iterable[str] = ()):
     """scenario_dirs：另外的场景目录（如财务维护的共享目录）；数据目录下的 scenarios/ 总会用上，规则版本和记忆默认写在那里。"""
     from fastapi import Depends, FastAPI, HTTPException, Request
     from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
@@ -561,7 +748,8 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
     from bonus_agent.scenarios import Registry, ScenarioError
     from bonus_agent.scenarios import releases as rl
     registry = Registry([store.root / "scenarios", *(scenario_dirs or [])])
-    runner = Runner(store, llm_factory, max_parallel, max_steps, max_tokens, registry=registry)
+    runner = Runner(store, llm_factory, max_parallel, max_steps, max_tokens, registry=registry,
+                    unlimited_case_tokens=unlimited_case_tokens)
     app = FastAPI(title="奖金计算", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store, app.state.runner, app.state.registry = store, runner, registry
     sessions: dict[str, tuple[str, float]] = {}            # 会话号 -> (用户名, 到期时间)；服务重启后要重新登录
@@ -782,21 +970,35 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         else:
             parts.append(f"<p class='mut'>{e(ptext)}</p>")
         last = (case or {}).get("rounds", [{}])[-1] if case else {}
+        fixed_saved=cr.state_of(case)
+        revision=cr.active(cr.load(out)) if fixed_saved else None
+        current_issue=''
+        if fixed_saved:
+            try:cr.validate_current(out,case,final=last.get('status')=='OK')
+            except cs.ConfirmError as err:current_issue=str(err)
+            if not current_issue and fixed_saved.get('status')=='AWAITING_TOTAL_CONFIRMATION' and not list(pending_basis_confirmations(case)):
+                current_issue='本版总额复核回执或金额凭据不完整，需要重新核验后确认。'
         info = f"<p>{status_text(case)}</p>"
+        if current_issue:info+=f"<p class='warn'>{e(current_issue)} 历史文件可查看，不是当前有效交付。</p>"
         if last.get("summary"):
             info += f"<p class='mut'>方案概述：{e(last['summary'])}</p>"
         failed = (job.status == "failed" if job and not busy else False) or (last.get("status") == "FAILED" and not busy)
         if last.get("error") or (job and job.status == "failed" and not busy):
-            x = explain_failure((job.message if job and job.status == "failed" else "") or last.get("error", ""))
-            info += (f"<div class='fail'><p class='bad'><b>{e(x['title'])}</b></p><p>{e(x['advice'])}</p>"
+            error = (job.message if job and job.status == "failed" else "") or last.get("error", "")
+            saved = last.get('failure_context') if error == last.get('error') else None
+            x = explain_failure(error, workspace=(case or {}).get('workspace'), diagnosis=saved)
+            info += (f"<div class='fail'><p class='bad'><b>{e(x['title'])}</b></p>{render_diagnosis(x['diagnosis'])}"
+                     + f"<p>{e(x['advice'])}</p>"
                      + (form(f"/cases/{cid}/run", "<p><button>重试</button> <span class='mut'>不补充信息，从上一轮做到的地方接着做"
                                                  "（网络断了、步数或用量用完、手动停止后用）。需要补充说明或材料时，"
                                                  "在下方对话框写清楚后点「发送」</span></p>", csrf) if editor and failed else "")
                      + f"<details><summary class='mut'>详细信息（给开发排查）</summary><pre>{e(x['detail'])}</pre></details></div>")
         if model_name:
             info += f"<p class='mut'>模型：{e(model_name)}</p>"
+        if cid in runner.unlimited_case_tokens:
+            info += "<p class='mut'>本案卷当前不设累计 token 上限，用量继续记账。</p>"
         check = out / "expected_check.txt"
-        if check.exists() and not busy:
+        if check.exists() and not busy and not current_issue:
             info += f"<p class='mut'>与期望结果核对：</p><pre>{e(check.read_text(encoding='utf-8'))}</pre>"
         if job:
             cls = "warn" if job.status == "running" else "bad" if job.status == "failed" else STATUS.get(job.result, ("", "mut"))[1]
@@ -810,9 +1012,43 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             info += form(f"/cases/{cid}/stop", "<p><button>停止</button> <span class='mut'>当前这一步做完后停下，已做的部分会保存</span></p>"
                          if not job.cancel else "<p class='mut'>正在停止……</p>", csrf)
         if editor and not busy:
-            info += form(f"/cases/{cid}/run", "<p><button>运行下一轮</button> <label class='mut'><input type='checkbox' "
-                                              "name='new' value='1'> 从头开始（不接着上一轮）</label></p>", csrf)
+            if fixed_saved and fixed_saved.get('status')=='AWAITING_TOTAL_CONFIRMATION' and not current_issue:
+                info+="<p class='mut'>本版总额已完成复核，下一步是审批确认；金额有误才发起财务修订。</p>"
+            elif fixed_saved and fixed_saved.get('status')=='AWAITING_TOTAL_CONFIRMATION' and current_issue:
+                info+=form(f'/cases/{cid}/run','<p><button>重新核验总额（保留已核验节点）</button></p>',csrf)
+            else:
+                info += form(f"/cases/{cid}/run", "<p><button>运行下一轮</button> <label class='mut'><input type='checkbox' "
+                                                  "name='new' value='1'> 从头开始（不接着上一轮）</label></p>", csrf)
         parts.append(f"<section><h2>状态</h2>{info}</section>")
+        # Approval is the primary next action, not buried under revision forms,
+        # logs and historical downloads. Viewers can see exactly why it is disabled.
+        parts.append(basis_confirmation_section(cid,out,case,csrf,approver,busy,current_issue))
+        # Fixed-chain progress uses actual per-node receipts, not number of
+        # generic tool calls. A running CLI acceptance writes the same atomic
+        # checkpoint as the web worker, so it can also be inspected here.
+        fixed=fixed_saved
+        checkpoint=out/'commission_checkpoint.json'
+        if checkpoint.is_file():
+            try:
+                live=json.loads(checkpoint.read_text(encoding='utf-8'))
+                if (not revision or live.get('revision_id')==revision['id']) and (not fixed or live.get('checkpoint_at',0)>=fixed.get('checkpoint_at',0)):fixed=live
+            except (OSError,ValueError):pass
+        if fixed:
+            names=[('inventory','来源盘点'),('scope_mapping','项目四键/首发/毛利/欠款'),('reference_mapping','历史/预算/库存/逾期数据'),
+                   ('project_policy','计算基数/新老/阶梯'),('coefficient_policy','各考核系数'),('hold_policy','提成总额/暂扣/项目舍入'),
+                   ('basis','项目基础金额'),('basis_review','独立项目复核'),('confirm_basis','本版总额确认'),('roster','人员名单及角色'),
+                   ('settlement','逐角色与人员汇总'),('settlement_review','人员独立复核'),('export','正式输出回读')]
+            observed={x.get('node'):x for x in fixed.get('events',[])}
+            lines=[]
+            for node,label in names:
+                r=fixed.get('node_receipts',{}).get(node) or ({} if revision and node in revision['affected'] else fixed.get('receipts',{}).get(node) or observed.get(node,{}))
+                passed=cr.approval_matches(fixed) if node=='confirm_basis' else r.get('status')=='PASS'
+                text='已核验' if passed else '有反例' if r.get('status')=='FAIL' else '等待执行/确认'
+                lines.append(f"<tr><td>{e(label)}</td><td class='{'ok' if passed else 'warn'}'>{e(text)}</td><td>{e(r.get('reviewer') or r.get('model') or '程序')}</td></tr>")
+            parts.append("<section><h2>固定提成核算节点</h2><p class='mut'>节点通过代表已保存本版本验收回执；实际财务金额仍须独立核对。</p>"
+                         "<div class='wrap'><table><thead><tr><th>节点</th><th>状态</th><th>处理者</th></tr></thead><tbody>"+''.join(lines)+"</tbody></table></div>"
+                         +(f"<p class='bad'>{e(fixed['error'])}</p>" if fixed.get('status')=='FAILED' and fixed.get('error') else '')+"</section>")
+        if fixed_saved:parts.append(commission_feedback_section(cid,out,case,csrf,editor,approver,busy))
         msgs = "".join(f"<div class='msg {m['role']}'><div class='mut'>{e(m['user'])} · {e(m['at'][5:16].replace('T', ' '))}</div>"
                        f"<div class='bubble'>{e(m['text'])}</div></div>" for m in store.chat(cid)[-40:])
         if busy and job and job.steps:
@@ -834,17 +1070,31 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
                      f"{box}{files}</section>")
         # 问题
         qs = load_questions(out)
+        if fixed_saved:
+            # Current persisted withdrawal states take precedence over an old
+            # questions.yaml that predates the financial revision.
+            withdrawn={q['id']:q.get('withdrawn') for q in fixed_saved.get('questions',[]) if q.get('withdrawn')}
+            for q in qs:
+                if q['id'] in withdrawn:q['withdrawn']=withdrawn[q['id']]
         if qs:
             items = []
+            workflow = (case or {}).get('workspace', {}).get('workflow', {})
             for q in qs:
+                effect = workflow.get('batch_question_effects', {}).get(q['id'], {})
+                scope = workflow.get('applicability_questions', {}).get(q['id'], {})
+                inactive = (effect.get('version') and effect['version'] == workflow.get('view_basis_version')
+                            and effect.get('question') == scope.get('question') and effect.get('scheme') == scope.get('scheme')
+                            and last.get('period') == m.get('period') and q['id'] not in last.get('pending', ())
+                            and not q.get('answer') and not q.get('withdrawn'))
                 state = (f"<span class='mut'>已撤回：{e(q['withdrawn'])}</span>" if q.get("withdrawn") else
                          f"<span class='ok'>已答复：{e(q['answer'])}</span>" + (f"<span class='mut'>（{e(q.get('answered_by'))} "
                                                                              f"{e(str(q.get('answered_at', ''))[:16])}）</span>"
                                                                              if q.get("answered_by") else "")
                          if q.get("answer") not in (None, "") else
+                         f"<span class='ok'>第 {e(last.get('n'))} 轮已核验，本期未触发</span>" if inactive else
                          "<span class='warn'>等待答复</span>" if q.get("blocking", True) else "<span class='mut'>提示</span>")
                 opts = ""
-                if editor and not q.get("withdrawn"):
+                if (editor or (fixed_saved and approver)) and not q.get("withdrawn") and not inactive:
                     opts = "".join(f"<label class='opt'><input type='radio' name='ans_{e(q['id'])}' value='{i}'> {e(o)}</label>"
                                    for i, o in enumerate(q.get("options") or []))
                     opts += (f"<label class='opt'><input type='radio' name='ans_{e(q['id'])}' value='{OTHER}'> 其他（在下面写明）</label>"
@@ -860,10 +1110,12 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
                         + "</ul></div>")
                 elif hint:
                     hint += "<div class='warn'>智能体没有给出建议的依据，请对照材料判断</div>"
+                if inactive:
+                    hint += f"<div class='mut'>{e(effect.get('evidence', {}).get('reason', ''))}</div>"
                 items.append(f"<div class='q'><b>{e(q['id'])}</b> <span class='mut'>第 {e(q.get('round', 1))} 轮</span> {state}"
-                             f"<div>{e(q['text'])}</div>{hint}{opts}</div>")
+                             f"<div>{e(q['text'])}</div>{render_diagnosis(q.get('diagnosis'))}{hint}{opts}</div>")
             body = "".join(items)
-            if editor and not busy:
+            if (editor or (fixed_saved and approver)) and not busy:
                 body = form(f"/cases/{cid}/answers", body + "<p><button>保存答复</button> "
                                                            "<span class='mut'>保存后点“运行下一轮”</span></p>", csrf)
             parts.append(f"<section><h2>问题</h2>{body}</section>")
@@ -871,12 +1123,25 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         if (out / rv.FILE).exists():
             parts.append(review_section(cid, out, csrf, approver and not busy))
         # 结果
+        reports=[];preferred_report=None
+        if fixed_saved:
+            from bonus_agent.commission_report import reports_for_case
+            reports=reports_for_case(out,case)
+            preferred_report=next((entry for entry in reports if entry['current'] and not current_issue),None)
         top = [p for p in sorted(out.glob("*")) if p.is_file() and p.name != cs.CASE_FILE]
+        if fixed_saved:
+            last_files={v[0] for v in last.get('outputs',{}).values()} if not revision or last.get('revision_id')==revision['id'] else set()
+            if current_issue:last_files-=cr.CURRENT_FINANCIAL_FILES
+            top=[p for p in top if p.name in last_files or p.name==cr.FILE]
         groups: dict[str, list[str]] = {}
         for p in top:
             g, note = output_kind(p.name)
-            groups.setdefault(g, []).append(f"<li><a href='/cases/{cid}/dl/out/{e(p.name)}'>{e(p.name)}</a> "
-                                            f"<span class='mut'>{e(note)}</span></li>")
+            if p.name=='result.xlsx' and preferred_report:
+                groups.setdefault(g,[]).append(f"<li><b><a href='/cases/{cid}/dl/out/{e(preferred_report['relative'])}'>新版核算底稿和汇总.xlsx</a></b> "
+                    f"<span class='ok'>当前已核验金额的新版报表</span> · <a href='/cases/{cid}/dl/out/result.xlsx'>原已核验报表（留档）</a></li>")
+            else:
+                groups.setdefault(g, []).append(f"<li><a href='/cases/{cid}/dl/out/{e(p.name)}'>{e(p.name)}</a> "
+                                                f"<span class='mut'>{e(note)}</span></li>")
         res = "".join((f"<p><b>{e(g)}</b></p><ul>{''.join(groups[g])}</ul>" if g == OUT_GROUPS[0] else
                        f"<details><summary>{e(g)}（{len(groups[g])} 个）</summary><ul>{''.join(groups[g])}</ul></details>")
                       for g in OUT_GROUPS if g in groups)
@@ -886,28 +1151,20 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
                 f"<details><summary>{e(h.name)}</summary>{files_table(h, f'/cases/{cid}/dl/out/history/{h.name}')}</details>"
                 for h in hist) + "</details>" if hist else "")
         parts.append(f"<section><h2>本轮输出</h2>{res}</section>")
+        if fixed_saved:
+            report_body=''
+            for entry in reports:
+                r=entry['metadata'];current=entry['current'] and not current_issue
+                label='当前核验金额对应的报表' if current else '历史报表（不是当前核验金额）'
+                report_body+=f"<p><b>{e(label)}</b> · 第 {e(r['source_round'])} 轮<br><a href='/cases/{cid}/dl/out/{e(entry['relative'])}'>下载新版核算底稿和汇总（{e(r['format'])}）</a> · {e(r['created_at'])}<br><span class='mut'>逐项目及人员金额已从原件重新复算；不产生新的财务审批。</span></p>"
+            if (editor or approver) and not busy and not current_issue and last.get('status')=='OK':
+                report_body+=form(f'/cases/{cid}/reexport','<p><button>按当前已核验结果重新导出（不调用大模型）</button> <span class="mut">仅报表结构修订，保留原结果和审批。</span></p>',csrf)
+            if report_body:parts.append('<section><h2>新版报表 / 历史导出修订</h2>'+report_body+'</section>')
         # 确认
-        flow=(case or {}).get('workspace',{}).get('workflow',{})
-        if flow.get('enabled'):
-            from bonus_agent.recovery import fingerprint
-            blocks=[]
-            for name,basis in flow.get('basis',{}).items():
-                rec=flow.get('receipts',{}).get('review:'+name)
-                approved=flow.get('receipts',{}).get('approved:'+name)
-                if not rec or rec.get('version')!=flow.get('view_version') or approved and approved.get('version')==rec.get('version'):continue
-                amounts='<br>'.join(f'{e(k)}：{e(v)} 元' for k,v in {'奖金池':basis['pool'],**basis['totals']}.items())
-                block=f'<p><b>{e(name)}</b>：{amounts}<br>核算对象 {len(basis["objects"])} 个。请同时核对逐对象底稿和金额组成。</p>'
-                if approver and not busy:
-                    block+=form(f'/cases/{cid}/confirm-totals',
-                        f'<input type="hidden" name="scheme" value="{e(name)}">'
-                        f'<input type="hidden" name="digest" value="{e(fingerprint(basis))}">'
-                        '<button>确认本版本总额并继续人员分配</button>',csrf)
-                blocks.append(block)
-            if blocks:parts.append('<section><h2>总额预核算确认</h2>'+''.join(blocks)+'</section>')
         conf = (case or {}).get("confirmed")
-        cbody = (f"<p class='ok'>已确认：第 {e(conf['round'])} 轮，{e(conf['by'])}，{e(conf['at'][:16])}"
+        cbody = (f"<p class='{'ok' if not current_issue and conf['round']==last.get('n') else 'mut'}'>{'已确认' if not current_issue and conf['round']==last.get('n') else '历史已确认（不是本版确认）'}：第 {e(conf['round'])} 轮，{e(conf['by'])}，{e(conf['at'][:16])}"
                  + (f"，{e(conf['note'])}" if conf.get("note") else "") + "</p>") if conf else "<p class='mut'>尚未确认</p>"
-        if approver and not busy and last.get("status") == "OK" and not last.get("confirmed"):
+        if approver and not busy and not current_issue and last.get("status") == "OK" and not last.get("confirmed"):
             opts = cs.confirm_options(out)
             ask = ("<p><b>录入模板的规则" + ("（相对已有模板的改动）" if opts["has_template"] else "") + "：</b><br>"
                    + "<br>".join(e(x) for x in opts["rule_changes"] or ["规则没有改动"]) + "</p>")
@@ -920,14 +1177,20 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
                     + (f"（方案 {e('、'.join(r['required_by']))} 引用了它的结果，必须录入）" if r["required_by"] else "") + "：" + e("；".join(f"{x['node']} {x['amount']}（{x['reason']}）"
                                                                     for x in r["adjustments"][:5]))
                     + ("……" if len(r["adjustments"]) > 5 else "") + "</label></p>" for r in opts["revisions"])
-            cbody += form(f"/cases/{cid}/confirm", ask + "<p><input type='text' name='note' placeholder='确认说明（可选）'></p>"
-                          f"<p><button name='save' value='template'>确认第 {e(last['n'])} 轮结果并录入模板</button> "
-                          "<button name='save' value='result'>只确认结果，不录入模板</button></p>", csrf)
+            fixed=(case or {}).get('workspace',{}).get('workflow',{}).get('fixed_commission')
+            if fixed:
+                cbody += form(f"/cases/{cid}/confirm", "<p>固定提成链路已逐节点验收。后续每期重新绑定材料，不使用旧版自由编制模板。</p>"
+                              "<p><input type='text' name='note' placeholder='确认说明（可选）'></p>"
+                              f"<button name='save' value='result'>确认第 {e(last['n'])} 轮核算结果</button>",csrf)
+            else:
+                cbody += form(f"/cases/{cid}/confirm", ask + "<p><input type='text' name='note' placeholder='确认说明（可选）'></p>"
+                              f"<p><button name='save' value='template'>确认第 {e(last['n'])} 轮结果并录入模板</button> "
+                              "<button name='save' value='result'>只确认结果，不录入模板</button></p>", csrf)
         if (out / rv.FILE).exists():
             st = rv.status(out)
             cbody += (f"<p class='{'ok' if not st['pending'] else 'warn'}'>口径单：已确认 {st['confirmed']} / {st['total']} 行"
                       + (f"，{len(st['wrong'])} 行有误" if st["wrong"] else "") + "（全部确认后才能确认结果）</p>")
-        cbody += "<p class='mut'>确认前会核对口径单已逐条确认、输出文件没被改过，并按模板复算、与该轮结果逐分一致。确认后每期换数据直接按模板计算，不再调用大模型。</p>"
+        cbody += ("<p class='mut'>固定提成确认绑定本版规则、对象、金额及来源。以后更换规则或材料须重新绑定并核验。</p>" if fixed_saved else "<p class='mut'>确认前会核对口径单已逐条确认、输出文件没被改过，并按模板复算、与该轮结果逐分一致。确认后每期换数据直接按模板计算，不再调用大模型。</p>")
         parts.append(f"<section><h2>确认</h2>{cbody}</section>")
         if m.get("scenario") and conf and (out / "template" / "manifest.yaml").exists():
             pub = [x for x in m.get("published") or [] if x.get("confirmed_at") == conf.get("at")]
@@ -959,7 +1222,7 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         f = await posted(request, u)
         return await _save(cid, u, [x for x in f.getlist("files") if getattr(x, "filename", "")], area, single)
 
-    async def _save(cid: str, u: dict, files: list, area: str, single: bool = False) -> list[str]:
+    async def _save(cid: str, u: dict, files: list, area: str, single: bool = False, description: str = '') -> list[str]:
         d = case_dir(cid)
         if not files:
             raise HTTPException(400, "没有选择文件")
@@ -975,15 +1238,24 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             if len(data) > MAX_UPLOAD:
                 raise HTTPException(413, f"{name} 超过 {MAX_UPLOAD // 1024 // 1024} MB")
             got.append((name, data))
-        if single:
-            for old in (d / area).glob("*"):
-                old.unlink()
         saved = []
-        for name, data in got:
-            (d / area / name).write_bytes(data)
-            saved.append(name)
-            store.audit(cid, u["display"], "上传" + ("期望结果" if area == "expected" else "材料"), file=name,
-                        sha256=hashlib.sha256(data).hexdigest(), size=len(data))
+        try:
+            with cs.case_lock(d/'out'):
+                obj=cs.load_case(d/'out')
+                if area=='materials' and cr.state_of(obj):
+                    changed=[d/area/name for name,data in got if not (d/area/name).is_file() or cs.sha256(d/area/name)!=hashlib.sha256(data).hexdigest()]
+                    if changed or description:
+                        cr.submit_locked(d/'out',obj,by=u['display'],kind='material_correction' if changed else 'discrepancy',
+                                         description='上传材料：'+'、'.join(name for name,_ in got)+(f'；{description}' if description else ''),source_changes=changed)
+                if single:
+                    for old in (d / area).glob("*"):
+                        old.unlink()
+                for name, data in got:
+                    (d / area / name).write_bytes(data)
+                    saved.append(name)
+                    store.audit(cid, u["display"], "上传" + ("期望结果" if area == "expected" else "材料"), file=name,
+                                sha256=hashlib.sha256(data).hexdigest(), size=len(data))
+        except (cr.RevisionError,cs.CaseBusyError) as err:raise HTTPException(409,str(err)) from None
         return saved
 
     @app.post("/cases/{cid}/materials")
@@ -1007,7 +1279,13 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             p = inside(d / area, str(f.get("name", "")))
         except KeyError:
             raise HTTPException(404, "没有这个文件") from None
-        p.unlink()
+        try:
+            with cs.case_lock(d/'out'):
+                obj=cs.load_case(d/'out')
+                if area=='materials' and cr.state_of(obj):
+                    cr.submit_locked(d/'out',obj,by=u['display'],kind='material_correction',description=f'删除原始材料 {p.name}',source_changes=[p])
+                p.unlink()
+        except (cr.RevisionError,cs.CaseBusyError) as err:raise HTTPException(409,str(err)) from None
         store.audit(cid, u["display"], "删除" + ("期望结果" if area == "expected" else "材料"), file=p.name)
         return back(cid)
 
@@ -1021,11 +1299,30 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
 
     @app.post("/cases/{cid}/answers")
     async def answers(cid: str, request: Request, u: dict = Depends(user)):
-        need(u, "editor")
         d = case_dir(cid)
         idle(cid)
         f = await posted(request, u)
-        done = save_answers(d / "out", {k: str(v) for k, v in f.items()}, u["display"])
+        out=d/'out'
+        try:
+            with cs.case_lock(out):
+                obj=cs.load_case(out);fixed=cr.state_of(obj)
+                if fixed:
+                    if not {'editor','approver'}.intersection(u['roles']):raise HTTPException(403,'需要财务经办或审批权限')
+                    qs=load_questions(out)
+                    persisted={q['id']:q for q in fixed.get('questions',[])}
+                    for q in qs:
+                        if persisted.get(q['id'],{}).get('withdrawn'):q['withdrawn']=persisted[q['id']]['withdrawn']
+                    before={q['id']:q.get('answer') for q in qs}
+                    done=_answer_updates(qs,{k:str(v) for k,v in f.items()},u['display'])
+                    if any(before.get(qid) for qid in done) and 'approver' not in u['roles']:
+                        raise HTTPException(403,'更正已经确认过的财务答复需要审批权限')
+                    if done:
+                        from bonus_agent.infra.atomic import write_text
+                        write_text(out/'questions.yaml',QUESTIONS_HEAD+yaml.safe_dump(qs,allow_unicode=True,sort_keys=False))
+                else:
+                    need(u,'editor')
+                    done=save_answers(out,{k:str(v) for k,v in f.items()},u['display'])
+        except cs.CaseBusyError as err:raise HTTPException(409,str(err)) from None
         for qid in done:
             q = next(q for q in load_questions(d / "out") if q["id"] == qid)
             store.audit(cid, u["display"], "答复问题", question=qid, answer=q["answer"])
@@ -1095,24 +1392,67 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         if not text and not files:
             return back(cid)
         idle(cid)
+        out=case_dir(cid)/'out';obj=cs.load_case(out);fixed=cr.state_of(obj)
         try:
             if files and f.get("expected") == "1":       # 期望结果：只登记，不交给智能体
                 names = await _save(cid, u, files, "expected", single=True)
                 store.chat_add(cid, "user", u["display"], f"上传了期望结果：{'、'.join(names)}（只用于核对，不交给智能体）")
-                if text:
+                if text and not fixed:
                     runner.start(cid, u["display"], message=text)
+                elif text and fixed:
+                    store.chat_add(cid,'user',u['display'],text)
+                    store.chat_add(cid,'agent','智能体','期望结果只用于独立核对，不用于更改计算规则。请通过「财务反馈与版本修订」登记具体异议；原计算未改变。')
             elif files:                                  # 材料：附言作为说明，按新材料处理一轮
-                names = await _save(cid, u, files, "materials")
+                names = await _save(cid, u, files, "materials",description=text if fixed else '')
                 store.chat_add(cid, "user", u["display"], f"上传了材料：{'、'.join(names)}" + (f"\n{text}" if text else ""))
-                runner.start(cid, u["display"], instruction=text or None)
+                runner.start(cid, u["display"], instruction=None if fixed else text or None)
+            elif fixed:
+                store.chat_add(cid,'user',u['display'],text)
+                if cr.is_explanation(text):
+                    reply=cr.explanation(out,obj,text)
+                    store.chat_add(cid,'agent','智能体',reply)
+                    return back(cid,'已解释本版计算，不启动新轮次')
+                if cr.needs_structured_change(text):
+                    store.chat_add(cid,'agent','智能体','识别到正式规则/分配变更请求。请在「调整业务规则及登记适用版本」或「仅修订指定项目角色的人员份额」选择原规则、新值及范围；由财务明确确认后才改变计算。若只是对原规则执行有异议，请使用金额异议入口。')
+                    return back(cid,'新规则或份额需要明确范围和财务确认；未静默改变金额')
+                if re.match(r'^q[-\w]+\s*[:：选]',text,re.I):
+                    return back(cid,'请在本页具体问题处保存答复，随后运行下一轮；不将答复误登记为新的异议。')
+                rev=cr.submit(out,by=u['display'],description=text,stage=cr.feedback_stage(text))
+                store.audit(cid,u['display'],'登记财务反馈',revision=rev['id'],owners=rev['owners'])
+                runner.start(cid,u['display'])
             elif _unfinished(case_dir(cid) / "out"):      # 上一轮没完成：文字作为说明，接着做这一轮
                 store.chat_add(cid, "user", u["display"], text)
                 runner.start(cid, u["display"], instruction=text)
             else:
                 runner.start(cid, u["display"], message=text)
-        except RuntimeError as err:
+        except (RuntimeError,cr.RevisionError) as err:
             raise HTTPException(409, str(err)) from None
         return back(cid)
+
+    @app.post('/cases/{cid}/commission-feedback')
+    async def commission_feedback(cid: str, request: Request, u: dict = Depends(user)):
+        if not {'editor','approver'}.intersection(u['roles']):raise HTTPException(403,'需要财务经办或审批权限')
+        d=case_dir(cid);idle(cid);f=await posted(request,u)
+        kind=str(f.get('kind','discrepancy'))
+        meta=store.meta(cid)
+        rule_store=registry.data_dir(meta['scenario'])/'commission_rules'/'versions.json' if meta.get('scenario') else None
+        try:
+            revision=cr.submit(d/'out',by=u['display'],kind=kind,stage=str(f.get('stage','unknown')),
+                owner=str(f.get('owner','')),description=str(f.get('description',''))[:20000],
+                project_keys=str(f.get('project_keys','')).splitlines(),observed=str(f.get('observed',''))[:2000],
+                evidence=str(f.get('evidence',''))[:4000],field=str(f.get('field','')),value=str(f.get('value',''))[:200],
+                scope=str(f.get('scope','this_case')),effective_from=str(f.get('effective_from','')),
+                effective_to=str(f.get('effective_to','')),role=str(f.get('role','')),shares=str(f.get('shares',''))[:8000],
+                rule_store=rule_store,approver='approver' in u['roles'],base_version=str(f.get('base_version','')))
+        except (cr.RevisionError,cs.CaseBusyError) as err:return back(cid,f'未登记：{err}')
+        store.audit(cid,u['display'],'登记财务修订',revision=revision['id'],kind=kind,affected=revision['affected'])
+        if revision['status']=='SCHEDULED':return back(cid,'已登记规则生效版本；不改变不在适用范围内的本期结果')
+        store.chat_add(cid,'user',u['display'],'财务修订：'+str(f.get('description','')))
+        if str(f.get('run','0'))=='1':
+            try:runner.start(cid,u['display'])
+            except RuntimeError as err:return back(cid,f'反馈已保存，暂不能启动：{err}')
+            return back(cid,'已保存财务反馈，开始按责任节点核验；历史结果不变')
+        return back(cid,'已登记修订，旧版交付停止；点击运行下一轮执行')
 
     @app.post('/cases/{cid}/confirm-totals')
     async def confirm_totals(cid: str, request: Request, u: dict = Depends(user)):
@@ -1125,6 +1465,8 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         except cs.ConfirmError as err:
             store.audit(cid, u['display'], '总额确认被拒绝', reason=str(err))
             return back(cid, f'不能确认：{err}')
+        if result.get('already_confirmed'):
+            return back(cid, '本版总额已确认，请查看当前核算进度')
         store.audit(cid, u['display'], '确认核算总额', scheme=result['scheme'], digest=result['digest'])
         runner.start(cid, u['display'])
         return back(cid, '总额已确认，继续计算人员金额')
@@ -1140,12 +1482,22 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         picked = [str(x) for x in f.getlist("revision")] if hasattr(f, "getlist") else []
         try:   # 页面上没勾选就是都不录入：选择已经摆在表单里了
             tpl = cs.confirm(d / "out", by=u["display"], note=note, save_template=save, revisions=picked)
-        except cs.ConfirmError as err:
+        except (cs.CaseBusyError, cs.ConfirmError) as err:
             store.audit(cid, u["display"], "确认被拒绝", reason=str(err))
             return back(cid, f"不能确认：{err}")
         store.audit(cid, u["display"], "确认结果", round=cs.load_case(d / "out")["confirmed"]["round"], note=note,
                     template=str(tpl.relative_to(d)) if tpl else "未录入", revisions=picked if tpl else [])
         return back(cid, "已确认并录入模板" if tpl else "已确认结果，未录入模板")
+
+    @app.post('/cases/{cid}/reexport')
+    async def reexport(cid: str, request: Request, u: dict = Depends(user)):
+        if not {'editor','approver'}.intersection(u['roles']):raise HTTPException(403,'需要财务核算或审批权限')
+        d=case_dir(cid);idle(cid);await posted(request,u)
+        from bonus_agent.commission_report import reexport_fixed_case
+        try:workbook,meta=reexport_fixed_case(d/'out',u['display'])
+        except (cs.ConfirmError,cs.CaseBusyError,ValueError,OSError) as exc:return back(cid,f'重新导出失败：{exc}')
+        store.audit(cid,u['display'],'仅报表重新导出',report=meta['id'],source_round=meta['source_round'],sha256=meta['workbook_sha256'])
+        return back(cid,'已生成新版报表，原项目、角色及人员金额完全不变；在「新版报表」下载。')
 
     @app.post("/cases/{cid}/template")
     async def template(cid: str, request: Request, u: dict = Depends(user)):
@@ -1194,6 +1546,16 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
         except ValueError as err:
             return back(cid, str(err))
         m = store.meta(cid)
+        if period!=m.get('period'):
+            out=case_dir(cid)/'out'
+            try:
+                with cs.case_lock(out):
+                    obj=cs.load_case(out)
+                    if cr.state_of(obj):
+                        from bonus_agent.commission_chain import one_month
+                        one_month(period)
+                        cr.submit_locked(out,obj,by=u['display'],kind='material_correction',description=f"核算期间由 {m.get('period')} 改为 {period}")
+            except (ValueError,cs.CaseBusyError) as err:return back(cid,f'不能修改本案卷期间：{err}')
         if period:
             m["period"] = period
         else:
@@ -1325,8 +1687,23 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             raise HTTPException(404, "没有这个文件") from None
         if p.name == cs.CASE_FILE:
             raise HTTPException(404)
+        download_name=p.name
+        if area=='out' and p.name=='result.xlsx' and p.is_relative_to((d/'out'/'report_versions').resolve()):
+            from bonus_agent.commission_report import read_report
+            try:read_report(p)
+            except (cs.ConfirmError,ValueError,OSError) as err:raise HTTPException(409,str(err)) from None
+            download_name='新版核算底稿.xlsx'
+        if area=='out' and p.parent==d/'out' and p.name in cr.CURRENT_FINANCIAL_FILES:
+            obj=cs.load_case(d/'out')
+            if cr.state_of(obj):
+                try:
+                    cr.validate_current(d/'out',obj,final=p.name in ('result.xlsx','engine_results.json','results.json','commission_details.json','expected_check.txt'))
+                    rnd=obj['rounds'][-1]
+                    if p.name!='expected_check.txt' and not any(name==p.name and cs.sha256(p)==digest for name,digest in rnd.get('outputs',{}).values()):
+                        raise cs.ConfirmError('该文件不属于当前核验轮次。')
+                except cs.ConfirmError as err:raise HTTPException(409,str(err)+'；原文件请从历次存档查看。') from None
         store.audit(cid, u["display"], "下载", file=f"{area}/{rel}")
-        return FileResponse(p, filename=p.name)
+        return FileResponse(p, filename=download_name)
 
     return app
 

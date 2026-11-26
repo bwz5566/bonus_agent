@@ -6,11 +6,14 @@ result.  A PASS means the current inputs execute, not that policy is approved.
 """
 from __future__ import annotations
 
+from collections import Counter
+
 from bonus_core.data.table import Datasets
 from bonus_core.dsl.models import RuleSet
 from bonus_core.engine.evaluator import EvalError
 from bonus_core.engine.issues import EngineError
 from bonus_core.engine.run import Engine
+from bonus_core.engine.tree import _norm_id
 
 
 def preflight_basis(rs: RuleSet, data: Datasets, refs: dict | None = None, period=None) -> dict:
@@ -158,6 +161,18 @@ def _evaluation_issue(exc, engine):
         'dependency_chain': frames,
         'coverage': [dict(item) for item in exc.aggregates],
     }
+    if exc.field_conflict:
+        issue['field_conflict'] = conflict = dict(exc.field_conflict)
+        if engine is not None:
+            dataset = issue['coverage'][0]['dataset'] if issue['coverage'] else ''
+            conflict['source_scopes'] = _source_scope_observations(engine,
+                (source['dataset'] for source in conflict['sources']), dataset)
+    if exc.table_applicability:
+        issue['table_applicability'] = dict(exc.table_applicability)
+    if exc.scope_reference:
+        issue['scope_reference'] = reference = dict(exc.scope_reference)
+        if engine is not None:
+            reference['coverage'] = _source_scope_observations(engine, [reference['scope']], '')
     if engine is not None:
         if target := _target(engine, issue['rule_item']):
             issue['target'] = target
@@ -172,6 +187,8 @@ def _evaluation_issue(exc, engine):
                     'key': spec.key, 'link': spec.link,
                     'population_from': spec.population_from,
                 }
+            if item.get('competing_values'):
+                item['source_scopes'] = _competing_value_scopes(engine, item)
     empty = next((item for item in issue['coverage'] if item.get('selected_rows') == 0), None)
     if empty is not None:
         if empty['visible_rows']:
@@ -191,6 +208,64 @@ def _evaluation_issue(exc, engine):
             '修改映射或公式后重新执行基础预检；缺少业务口径时应补依据，不能把失败改为通过。',
         ]
     return issue
+
+
+def _competing_value_scopes(engine, aggregate):
+    """Measure current group reach for entities that supplied both conflicting values."""
+    first, second = aggregate['competing_values']
+    other_sources = {source.get('dataset') for source in second['sources']}
+    names = (source['dataset'] for source in first['sources']
+             if source.get('dataset') in other_sources and 'dataset' in source)
+    return _source_scope_observations(engine, names, aggregate['dataset'])
+
+
+def _source_scope_observations(engine, names, aggregate_dataset):
+    pool_scope = engine.rs.pool.scope
+    pool_nodes = engine._report_nodes(pool_scope)
+    pool_definition = engine.ev.layout.aux.get(pool_scope)
+    if pool_scope in engine.ev.layout.index:
+        level = engine.rs.allocation[engine.ev.layout.index[pool_scope]]
+        entity = engine.rs.entity_dataset(level.key)
+        pool_definition = entity[1] if entity else None
+    scopes = []
+    for name in dict.fromkeys(names):
+        definition = engine.rs.datasets[name]
+        if not definition.key:
+            continue
+        level = engine.ev.layout.key_level.get(definition.key)
+        scope = name if level is None else engine.rs.allocation[level].level
+        groups = engine._report_nodes(scope)
+        reached = 0
+        for node in pool_nodes:
+            try:
+                engine.ev._scope_node(scope, node, '')
+            except EvalError:
+                continue
+            reached += 1
+        item = {'dataset': name, 'scope': scope, 'key': definition.key,
+                'pool_scope': pool_scope, 'pool_objects': len(pool_nodes),
+                'pool_objects_reaching_scope': reached, 'scope_objects': len(groups)}
+        if aggregate_dataset:
+            item['scopes_with_aggregate_rows'] = sum(bool(node.rows(aggregate_dataset)) for node in groups)
+        if pool_definition and reached < len(pool_nodes):
+            reference_keys = {n.key for n in groups}
+            normalized = Counter(_norm_id(key) for key in reference_keys)
+            candidates = []
+            for field, field_def in pool_definition.fields.items():
+                if field == definition.key or field_def.type not in ('id', 'text', 'enum'):
+                    continue
+                values = [str(node.attrs[field]) for node in pool_nodes if node.attrs.get(field) not in (None, '')]
+                exact = sum(value in reference_keys for value in values)
+                loose = sum(value not in reference_keys and normalized[_norm_id(value)] == 1 for value in values)
+                if exact + loose > reached:
+                    candidates.append({'field': field, 'exact_pool_objects': exact,
+                                       'unique_normalized_only_pool_objects': loose})
+            candidates.sort(key=lambda entry: (-entry['exact_pool_objects'] -
+                                                entry['unique_normalized_only_pool_objects'], entry['field']))
+            if candidates:
+                item['key_candidates'] = candidates[:3]
+        scopes.append(item)
+    return scopes
 
 
 def _engine_issue(issue, engine):

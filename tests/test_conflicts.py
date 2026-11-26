@@ -272,6 +272,26 @@ def test_date_spellings_are_not_conflicts():
     assert len(q) == 1 and len(q[0].options) == 3      # 两个不同日期 + 其他
 
 
+def test_column_group_has_one_value_for_equivalent_sources_and_preserves_actual_differences():
+    first = fx.Fact(name="核算对象列", value="月份、区域、产品", file="a.md", quote="月份、区域、产品",
+                    meaning="三列组合确定一个对象")
+    same = first.model_copy(update={"file": "b.xlsx", "value": "月份，区域，产品", "meaning": "三列组合确定对象"})
+    changed = same.model_copy(update={"value": "月份，区域，客户"})
+    assert fx.detect([first, same], {}, [], 1) == []
+    questions = fx.detect([first, changed], {}, [], 1)
+    assert len(questions) == 1 and len(questions[0].options) == 3
+
+    old = fx.Conflict(name=first.name, values=[fx.norm(f.meaning) for f in (first, same)],
+                      labels=[fx.label(f) for f in (first, same)], question=questions[0].id)
+    question = questions[0]
+    conflicts = {"old": old}
+    question.answer = "项目要额外包含客户编号"
+    assert fx.withdraw_stale([first, same], conflicts, questions) == []
+    question.answer = question.options[0]
+    assert fx.withdraw_stale([first, same], conflicts, questions) == [question]
+    assert not conflicts and question.withdrawn and question.answer == question.options[0]
+
+
 def test_saving_rules_with_same_blocking_issue_stops(tmp_path):
     """set_rules 每次都“保存成功”，但同一个阻断问题一直没改掉：第 3 次停下（内容不同，不算原样重复）。"""
     from bonus_agent.agent import run_agent

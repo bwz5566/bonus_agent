@@ -7,6 +7,7 @@ from bonus_core.data.table import from_records
 from bonus_core.dsl.models import DatasetDef, FieldDef, RuleSet
 from bonus_core.dsl.validator import validate, validate_basis
 from bonus_core.engine.evaluator import EvalError, Evaluator
+from bonus_core.engine.preflight import preflight_basis
 from bonus_core.engine.run import Engine
 from bonus_core.engine.tree import build_tree
 
@@ -84,6 +85,25 @@ def test_entity_with_its_own_reference_retains_direct_access(expr):
     assert not [i for i in validate(rs) if i.severity == 'blocking']
     engine = Engine.prepare(rs, from_records(rs, records))
     assert engine.ev.variable('total', engine.by_level['Project'][0]).v == Decimal('0.5')
+
+
+def test_optional_reference_is_tested_at_the_same_scope_as_the_value():
+    rs, records = example(entity_key=True)
+    records['projects'][1]['region'] = 'not_in_budget'
+    data = from_records(rs, records)
+    report = preflight_basis(rs, data)
+    failure = report['issues'][0]['scope_reference']
+    assert failure['key'] == 'region' and failure['values'][0]['value'] == 'not_in_budget'
+    assert failure['coverage'][0]['pool_objects_reaching_scope'] == 1
+    rs.variables['total'].expr = 'if(has_ref("regions"), region_factor, 1)'
+    assert not [issue for issue in validate_basis(rs) if issue.severity == 'blocking']
+    amounts = Engine.prepare_basis(rs, data).calculate_basis()['objects']
+    assert {k: v['amount'] for k, v in amounts.items()} == {'Project:A': '0.50', 'Project:B': '1.00'}
+    records['projects'][1]['region'] = None
+    missing_key = preflight_basis(rs, from_records(rs, records))
+    assert missing_key['status'] == 'FAIL' and missing_key['issues'][0]['scope_reference']['values'] == []
+    rs.variables['total'].expr = 'if(has_ref("sales"), region_factor, 1)'
+    assert any(i.code == 'fn_args' for i in validate_basis(rs))
 
 
 def test_transitive_entity_reference_remains_valid_for_direct_variable_access():

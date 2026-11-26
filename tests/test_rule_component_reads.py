@@ -15,6 +15,19 @@ def follow(ws, entry):
     return ws.read_workspace(**entry['next_call']['args'])
 
 
+def test_coefficient_step_index_contains_the_actual_limits_and_values(tmp_path):
+    ws = make_workspace(tmp_path)
+    table = {'kind': 'tier', 'purpose': 'coefficient', 'mode': 'whole',
+             'steps': [[0, 0.8], [0.5, 1.2]], 'below_first': 'first',
+             'sources': [{'doc': 'policy.md', 'quote': 'long evidence ' * 500}]}
+    ws.drafts['S']['tables'] = {'adjust': table}
+    page = ws.read_workspace('rules', scheme='S', name='/tables/adjust')
+    indexed = {item['name']: item for item in page['items']}
+    assert indexed['steps']['value'] == table['steps'] and indexed['below_first']['value'] == 'first'
+    assert [item['value'] for item in follow(ws, indexed['steps'])['items']] == table['steps']
+    assert 'value' not in indexed['sources']
+
+
 def test_default_rules_index_reaches_exact_formula_and_existing_binding(tmp_path):
     ws = make_workspace(tmp_path)
     ws.drafts['S']['variables'] = {'threshold': {'scope': 'global', 'expr': '18', 'sources': []}}

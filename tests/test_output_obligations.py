@@ -6,6 +6,7 @@ from bonus_agent import case
 from bonus_agent.agent import ToolError, Workspace
 from bonus_agent.construction import TaskBoard
 from bonus_agent.llm import FakeLLM
+from bonus_agent.recovery import fingerprint
 from tests.test_staged_workflow import make_workspace, prepared
 
 
@@ -19,7 +20,7 @@ def output_map(scheme='S'):
             '人员金额': [scheme + '::/report/people']}
 
 
-def test_person_obligation_invalidates_basis_if_project_details_still_exist(tmp_path):
+def test_person_obligation_blocks_distribution_after_the_project_basis_is_confirmed(tmp_path):
     ws = make_workspace(tmp_path)
     update_plan(ws, ['S'], output_map())
     prepared(ws)
@@ -27,13 +28,17 @@ def test_person_obligation_invalidates_basis_if_project_details_still_exist(tmp_
     report = copy.deepcopy(ws.drafts['S']['report'])
     report.pop('people')
     ws.set_rules(scheme='S', report=report)
-    assert not ws._flow().current('formulas')
-    assert TaskBoard(ws).output_obligations() == [
+    assert ws._flow().current('formulas')
+    assert not TaskBoard(ws).output_obligations('basis')
+    assert TaskBoard(ws).output_obligations('all') == [
         {'output': '人员金额', 'scheme': 'S', 'target': '/report/people',
          'task_target': '/report', 'kind': 'missing_component'}]
+    ws.calculate_basis('S')
+    assert ws.review_basis('S')['status'] == 'PASS'
+    ws._flow().approve('S', '财务', fingerprint(ws.workflow['basis']['S']))
     result = ws.compile_formulas()
     assert result['status'] == 'FAIL' and any('S::/report/people' in i for i in result['issues'])
-    assert not ws.workflow.get('basis') and not ws.results
+    assert ws._flow().current('approved:S') and not ws.results
 
 
 def test_missing_new_scheme_is_actionable_with_legacy_plan_and_with_named_outputs(tmp_path):
@@ -43,12 +48,13 @@ def test_missing_new_scheme_is_actionable_with_legacy_plan_and_with_named_output
     missing = board.output_obligations()
     assert any(i['scheme'] == 'B' and i['task_target'] == '/pool' and i['kind'] == 'missing_task' for i in missing)
     update_plan(ws, ['S', 'B'], output_map('B'))
-    row = next(i for i in board.output_obligations() if i['output'] == '人员金额')
+    assert all(i['output'] != '人员金额' for i in board.output_obligations('basis'))
+    row = next(i for i in board.output_obligations('all') if i['output'] == '人员金额')
     assert row == {'output': '人员金额', 'scheme': 'B', 'target': '/report/people',
                    'task_target': '/report', 'kind': 'missing_task'}
     clone = Workspace(FakeLLM([]), ws.inv)
     case.restore(clone, case.snapshot(ws))
-    assert TaskBoard(clone).output_obligations() == board.output_obligations()
+    assert TaskBoard(clone).output_obligations('all') == board.output_obligations('all')
     assert 'B' not in clone.drafts and not clone.results
 
 

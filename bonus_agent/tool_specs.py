@@ -11,6 +11,23 @@ def _obj(props: dict, required: list[str] = ()) -> dict:
 
 _S = {"type": "string"}
 _I = {"type": "integer"}
+DATA_REQUIREMENTS = {'type': 'array', 'items': _obj({
+    'dataset': _S, 'fields': {'type': 'array', 'items': _S},
+    'window': {'type': 'string', 'enum': ['period', 'year_to_date', 'to_date']},
+    'period_field': _S, 'link': {**_S, 'description': '明细关联对象的字段；计算实体自身作用域时可填写该实体的主键。'},
+}, ['dataset', 'fields']), 'description': '公式所需的数据表和字段；按条款明确期间范围、日期字段、关联键。可先声明尚未映射的表。'}
+FORMULA_SUBMISSION = _obj({
+    'task': _S,
+    'expected_scope': {**_S, 'description': '已登记原文条款规定的变量对象粒度；同时改变取数粒度时必填，并全量执行该对象的公式'},
+    'data_requirements': DATA_REQUIREMENTS,
+    'depends_on': {'type': 'array', 'items': _S, 'description': '公式及映射修复所依赖的完整任务 ID 列表'},
+    'value': {'description': '完整目标对象；allocation等列表目标传完整列表',
+              'anyOf': [{'type': 'object'}, {'type': 'array', 'items': {'type': 'object'}}]},
+    'changes': {'type': 'object', 'description': '只替换指定的目标顶层字段，保留未提供的字段'},
+    'facts': {'type': 'array', 'items': {'type': 'object'}, 'description': '同 record_facts'},
+    'bindings': {'type': 'array', 'items': _obj({'name': _S, 'targets': {'type': 'array', 'items': _S}}, ['name', 'targets']),
+                 'description': '只传制度参数的已登记名称和精确目标。修改公式分支或表条件时可省略，原绑定沿用。'},
+}, ['task'])
 FIELD_SCHEMA = _obj({"column": {**_S, "description": "Excel 表头原文"},
                      "type": {"type": "string", "enum": ["money", "number", "int", "ratio", "text", "enum", "date", "id"]},
                      "unit": {"type": "string", "enum": ["元", "万元"], "description": "money 字段必填"},
@@ -44,22 +61,26 @@ TOOLS: list[dict] = [
                     "较早的对话会被裁剪，重要内容请及时记下。同一 topic 再次记录会覆盖，text 为空则删除。",
      "parameters": _obj({"topic": _S, "text": _S}, ["topic", "text"])},
     {"name": "update_dataset", "description": "局部修改已保存的数据定义，支持补字段和修正合成键。fields按字段合并属性（值写null删除字段），combine按目标列合并；其他字段、筛选和展开方式保留，不重抄成功映射。",
-      "parameters": _obj({"name":_S,"changes":{"type":"object","properties":{"key":{"type":["string","null"]},"link":{"type":["string","null"]},"period":_S,"window":_S,"filter":{"type":"object"},"population_from":_S,"unmatched":{"type":"string","enum":["block","ignore"],"description":"ignore 须同时给 unmatched_basis（写明对不上的记录不参与的原文）"},"unmatched_basis":_obj({"file":_S,"quote":_S},["file","quote"]),"unpivot":{"type":"object","description":"仅合并要修正的展开属性，如share_from；保留已保存的columns/value等"},"fields":{"type":"object","description":"只提供要添加、修改或删除的字段：值为属性对象表示添加/修改，值为null表示删除该字段；其他字段保留"},"combine":{"type":"object","description":"要更新的合成键及组成原列；字段column须指向该合成列"}}}},["name","changes"])},
+      "parameters": _obj({"name":_S,"changes":{"type":"object","properties":{"key":{"type":["string","null"]},"link":{"type":["string","null"]},"period":_S,"window":_S,"filter":{"type":"object"},"population_from":_S,"unmatched":{"type":"string","enum":["block","ignore"],"description":"首次设为 ignore 或变更关联键时，提供 unmatched_basis 原文；仅改其他字段时复用同一关联已经核验的原文"},"unmatched_basis":_obj({"file":_S,"quote":_S},["file","quote"]),"unpivot":{"type":"object","description":"仅合并要修正的展开属性，如share_from；保留已保存的columns/value等"},"fields":{"type":"object","description":"只提供要添加、修改或删除的字段：值为属性对象表示添加/修改，值为null表示删除该字段；其他字段保留"},"combine":{"type":"object","description":"要更新的合成键及组成原列；字段column须指向该合成列"}}}},["name","changes"])},
     {"name":"diagnose_datasets","description":"不建树、不算金额，检查数据表身份、主外键及期间覆盖，返回缺失编号、日期列候选和可执行局部修复建议。建树失败时先用本工具，不要反复evaluate。",
      "parameters":_obj({})},
+    {"name":"set_scheme_datasets","description":"声明某个方案使用的完整数据集清单。为人员方案增添名单、人员或分配明细时保留已确认资金方案的原数据范围。已登记的表可用其他方案。这张清单的实际变动须重新校验相应方案。",
+     "parameters":_obj({'scheme':_S,'datasets':{'type':'array','items':_S,'minItems':1}},['scheme','datasets'])},
     {"name":"plan_calculation","description":"先盘点全部材料，声明核算目标、需要的输出和全部方案。涉及多个方案或不同汇总层次且各项交付均能对应报表时，用output_targets标记其实际位置。含无法映射的文字说明等交付时可省略。files为文件名到rule/data/rule_and_data/reference/ignore的映射，不能漏文件。",
      "parameters":_obj({'summary':_S,'outputs':{'type':'array','items':_S},'files':{'type':'object','additionalProperties':_S},'schemes':{'type':'array','items':_S},'ignored':{'type':'array','items':_obj({'ref':_S,'reason':_S},['ref','reason'])},
          'output_targets':{'type':'object','description':'键为每项outputs原名，值为该输出所需的报表位置数组，例如 ["方案名::/report/details/明细名称"] 或 ["方案名::/report/people","方案名::/report/pending"]。使用已声明的方案和真实交付要求；指针按名称定位，不填数组下标。',
                            'additionalProperties':{'type':'array','items':_S,'minItems':1}}},['summary','outputs','files','schemes'])},
     {"name":"read_workspace","description":"分页检索facts/clauses/rules/variables/tables/mapping/basis/checks/tool_results/construction。rules默认给组件索引，按next_call读取节点和已有绑定；name可为/variables/变量名/expr或方案::/tables/表名等精确指针。construction按name=任务id读取计划和局部检查；checks读整体编译问题；tool_results按工具名读取其最近一次完整长结果。",
      "parameters":_obj({'section':_S,'scheme':_S,'name':_S,'query':{**_S,'description':'全文片段检索，可按参数名称片段查已有项'},'file':_S,'page':_I,'offset':{**_I,'minimum':0},'limit':{**_I,'minimum':1,'maximum':50,'description':'最多50条；同时按结果长度缩页，必须使用返回的next_call，不自行猜offset'},'detail_offset':{**_I,'minimum':0,'description':'单条过大时按next_call分片续读'},'detail':{'type':'boolean','description':'facts/clauses列表默认只给名称、取值、含义；true返回完整原文与坐标。rules的true读取完整定义，默认优先组件索引和定向节点。'}},['section'])},
-    {"name":"query_dataset","description":"独立统计一张已定义原表，使用DSL聚合表达式，如sum(amount, of: \"明细表\")。无需allocation，不受其他表的建树错误影响；不用于证明正式金额正确。",
-     "parameters":_obj({'dataset':_S,'expr':_S},['dataset','expr'])},
-    {"name":"prepare_data","description":"检查全部已声明数据的转换、有效范围、身份、关联和期间，程序签发当前数据版本的通过回执。失败必须修正，不能直接试算。","parameters":_obj({})},
+    {"name":"query_dataset","description":"独立核对已映射原表。查看类别实际写法用values_of=字段，返回取值、行数、源行及相关原文；分页沿用next_call。做统计用expr，如count_distinct(区域)或sum(amount)。分类按条款映射。expr与values_of每次选一项。",
+     "parameters":_obj({'dataset':_S,'expr':_S,'values_of':_S,'offset':{**_I,'minimum':0}},['dataset'])},
+    {"name":"prepare_data","description":"检查计算数据文件、场景输入模板和明确的原始报表列是否实际取数，再核验转换、有效范围、身份、关联和期间。缺来源先按原始位置补映射，逐项证据用read_workspace(section=\"checks\",name=\"data\")。","parameters":_obj({})},
     {"name":"compile_formulas","description":"编译当前阶段公式并签发版本回执：总额确认前检查基础金额依赖，确认后检查完整分配/发放/报表。均检查循环、字段、作用域及参数/条款绑定，基础通过不能代替正式分配检查。","parameters":_obj({})},
-    {"name":"plan_formula_tasks","description":"先规划构建小任务：每项一个变量、一张参数表或pool/allocation/report，声明依赖、条款ID、参数名。按id分批合并；程序检查完成后才推进，不能自行标完成。",
+    {"name":"plan_formula_tasks","description":"每个核算方案须有独立的/pool任务，声明项目可分配总额直接依赖的金额任务ID；/allocation在总额确认后分配，/report可包含项目及人员输出。每个变量或参数表单独建任务，按原文声明depends_on、条款ID和参数名。不同适用费率列分别建表。按id分批合并，以程序检查回执为准。",
      "parameters":_obj({'tasks':{'type':'array','items':_obj({'id':_S,'scheme':_S,'target':{**_S,'description':'如/variables/base、/tables/rate、/pool、/allocation、/report'},'title':_S,
-         'depends_on':{'type':'array','items':_S},'clauses':{'type':'array','items':_S},'facts':{'type':'array','items':_S}},['id','scheme','target'])},'replace':{'type':'boolean','description':'默认按id合并；true明确替换计划，受影响的检查失效'}},['tasks'])},
+         'depends_on':{'type':'array','items':_S},'clauses':{'type':'array','items':_S},'facts':{'type':'array','items':_S},
+         'data_requirements': DATA_REQUIREMENTS,
+         'expected_scope':{**_S,'description':'变量任务可按已登记的条款ID声明计算对象粒度，填 global、分配层级名或关联实体名。提交变量时校验实际 scope，并另行核验原文和真实分组。'}},['id','scheme','target'])},'replace':{'type':'boolean','description':'默认按id和目标增量合并，省略字段沿用原值。true明确替换计划，受影响的检查失效'}},['tasks'])},
     {"name":"check_formula_task","description":"程序检查小任务的依赖、公式、参数绑定和明确算法语义。成功才推进下一项；局部通过不是金额验收，全部任务通过后仍须整体编译及独立核算。",
      "parameters":_obj({'task':_S},['task'])},
     {"name":"submit_formula_task","description":"原子提交当前构建任务：新建用完整value；已有对象仅改部分字段时优先用changes（例如只改applies_when），避免重抄已核对的档位。value与changes二选一。可同时提交来源facts和bindings；隔离工作区全部检查通过才一起保存，失败保留原版本。仍须独立金额核算。",
@@ -67,14 +88,34 @@ TOOLS: list[dict] = [
          'changes':{'type':'object','description':'仅用于已存在的对象：按目标顶层字段显式替换，未提供字段原样保留；如{applies_when:新条件}。已有/pool任务可用{negative:"allow",sources:完整来源列表}，仅限已排除计算错误且材料明确负数照算，保留expr/scope；默认negative="block"。不是递归合并，列表须显式提供整个新列表。不再包variables或tables。'},
          'facts':{'type':'array','items':{'type':'object'},'description':'同record_facts；原文位置、取值和引文须有效'},
          'bindings':{'type':'array','items':{'type':'object'},'description':'同bind_facts；仅给本目标绑定，程序自动保留该参数在其他目标的已有绑定'}},['task'])},
+    {"name": "submit_construction_repair",
+      "description": "同时修复关联的来源映射及公式。先按任务卡中的实际反例和原文确定正确对象、字段和期间；整包在隔离副本重建取数、重检并原子保存。明确传入的映射纳入当前方案已有数据集清单。保持其他任务和口径。返回失败时修正具体位置。",
+     "parameters": _obj({
+         'scheme': _S,
+         'task': {**_S, 'description': '当前直接反例的原任务 ID，必须包含在 formulas'},
+         'formulas': {'type': 'array', 'minItems': 1, 'maxItems': 12, 'items': FORMULA_SUBMISSION,
+                      'description': '相互依赖的已有任务，单项结构同 submit_formula_task，按依赖检查'},
+         'datasets': {'type': 'array', 'maxItems': 8, 'items': _obj({
+             'operation': {'type': 'string', 'enum': ['define', 'update']},
+             'args': {'type': 'object', 'description': 'define 用 name,file,sheet,fields（字段->{column,type}）,key/link,period,window；'
+                      '只改现有表用 update 的 {name,changes}。换文件/表或 distinct 必须用 define。'
+                      'unmatched_basis 可用已登记条款 ID 或 {file,quote}。'},
+         }, ['operation', 'args'])},
+         'tiers': {'type': 'array', 'maxItems': 6, 'description': '缺少的原文档位列，可直接使用 tier_repair.variant_candidates。'
+                   '构建失败时不保存映射、参数和公式。',
+                   'items': _obj({'name': _S, 'task': _S, 'clauses': {'type': 'array', 'items': _S},
+                                  'register': {'type': 'object'}, 'compile': {'type': 'object'}},
+                                 ['name', 'task', 'clauses', 'register', 'compile'])},
+     }, ['scheme', 'task', 'formulas'])},
     {"name":"calculate_basis","description":"仅计算当前方案基础金额、逐对象底稿及各类总额，不计算分配权重、人员分配或实发。须先通过prepare_data和compile_formulas。",
      "parameters":_obj({'scheme':_S})},
     {"name":"review_basis","description":"独立模型按原文重建当前方案的总额、逐对象及汇总公式，程序全量比较。通过后本轮停止，等待财务在页面确认总额；模型不能自行确认。",
      "parameters":_obj({'scheme':_S})},
     {"name":"read_parameter_table", "description":"省略page时列出PPT每页真实文字、标题候选、表格数、已登记参数；指定page则返回同页文字、原表与坐标。标题即使在表格下方也属于本页。结合page_context及行列标题核对适用条件后，优先record_parameter_cells按坐标登记，不转抄。",
      "parameters":_obj({"file":_S,"page":_I},["file"])},
-    {"name":"record_parameter_cells","description":"按PPT已核对的页/表/单元格登记，value、quote、参数名和来源由程序生成；不传自拟的数值或原文。applies_to写这些单元格适用的区分范围（区域、事业部、产品线或页标题），程序核对它在本页原文里，防止选错相似的页。已有同坐标且验证有效的参数直接复用。多行单元格必须指定line，unit仅在原文明确时提供。",
-     "parameters":_obj({'file':_S,'page':_I,'table':_I,'applies_to':_S,'cells':{'type':'array','items':_obj({'row':_I,'column':_I,'line':_I,'unit':_S},['row','column'])}},['file','page','table','applies_to','cells'])},
+    {"name":"record_parameter_cells","description":"按PPT已核对的页/表/单元格登记，value、quote、参数名和来源由程序生成。applies_to写这些单元格适用的原文范围。多行单元格须指定line。单位另见材料或财务答复时，传该表的unit_basis原文；需要换算的格各自显式填unit。",
+     "parameters":_obj({'file':_S,'page':_I,'table':_I,'applies_to':_S,'unit_basis':_obj({'file':_S,'quote':_S},['file','quote']),
+                        'cells':{'type':'array','items':_obj({'row':_I,'column':_I,'line':_I,'unit':_S},['row','column'])}},['file','page','table','applies_to','cells'])},
     {"name": "record_facts",
      "description": "登记从材料里读到的参数和口径（比例、金额、阶梯、系数、门槛、日期、取数口径等），程序据此比对冲突。"
                     "每个文件里出现的都要登记，同一参数在几个文件（或一个文件的几处）出现就登记几次，用同一个 name；"
@@ -90,7 +131,8 @@ TOOLS: list[dict] = [
                           "properties": {"table": _I, "row": _I, "column": _I, "line": _I}, "required": ["table","row","column"]},
          "meaning": {**_S, "description": "可选：文字口径的规范说法，如 含税"},
          "component": {"type": "string", "enum": ["literal", "lower", "upper"], "description": "区间值选择下界或上界，保留原文如1000-3000万"},
-         "unit": {**_S, "description": "裸数的明确单位，如%，quote须同时包含单位表头；不得凭参数名猜测"},
+         "unit": {**_S, "description": "裸数的明确单位，如%。单位来自其他材料时同时给unit_basis和适用标题context"},
+         "unit_basis": _obj({'file': _S, 'quote': {**_S, 'description': '逐字复制明确写出该参数名或适用标题及单位的原文或财务答复'}}, ['file', 'quote']),
          "override": {"type": "boolean", "description": "原文明确写了修改旧规定（修改为 / 以本通知为准）时为 true，"
                                                          "quote 要包含这句话"}}, ["name", "value", "file", "quote"])}},
          ["facts"])},
@@ -187,6 +229,11 @@ TOOLS: list[dict] = [
                                      '"remainder": "{label}未分配"（{label} 换成原列名；余下的部分另记一行，比例是 1 − 写明的比例）。'
                                      '空格子默认不展开；材料或财务说空着的那一份也要单列（如某个角色没填人，记为“××未分配”）时加 '
                                      '"blank": "{label}未分配"，空格子也记一行。'
+                                     '原列的格子本身决定全部人员和比例（如“甲60%，乙40%”）时，设置 "split_shares_columns": ["原列名"] 和 share。'
+                                     '原列须在 columns 中，允许只展开这一列。每人一行，各份额相加后才应用 remainder，坏写法会报告文件、表和行号。'
+                                     '姓名和比例分列时，设置 "share_columns": {"姓名原列": "比例原列"} 和 share。'
+                                     '比例列用0到1的小数或显式百分数，非空非法值和两处比例冲突会报错。空比例按原文显式声明 default_share。'
+                                     '同一姓名列只能使用一种份额来源。重名比例列可用物理列号区分，如 角色分配比例(J列)。'
                                      '几个人的比例集中写在表里另一列的文字里（如“甲60%，乙40%”）、人名格子里只有名字时：加 "share_from": "那一列的列名"，'
                                       '按名字到那一列取比例（该列为空时使用已声明default_share，省略兼容1；格子里自己写了百分比的用格子里的）；要同时写 share。'
                                      '这一列的比例只管其中几列（如两个技术支持列）时，用 "share_from_columns": ["列名"] 指明，其余列只认格子里自己写的比例。'
@@ -247,14 +294,21 @@ TOOLS: list[dict] = [
      "description": "向财务提问：材料之间有冲突、缺少必要的信息（参数、口径、数据）、或能有两种理解时使用。"
                     "不要自行假设或补出算法；提问后继续做不受影响的部分，问完后调用 finish 结束本轮，"
                     "财务答复后下一轮接着做。options 列出可选的理解，suggested 是你的建议（只供财务参考，不会被采用）。"
+                    "diagnosis 写清涉及项目、已识别的事实、待确认的具体事项及影响，不能只写无法判断。"
                     "related 写受影响的方案或规则（如 方案名.offsets）；回应程序检查或复读的某一条时写它给的编号。blocking=false 只用于不影响任何金额的提示。",
      "parameters": _obj({"text": _S, "options": {"type": "array", "items": _S}, "suggested": _I, "related": _S,
                          "blocking": {"type": "boolean"},
+                         "diagnosis": _obj({
+                             "item": {**_S, "description": "涉及的核算方案、指标或项目编号。有具体项目时列出编号及必要的行号。"},
+                             "identified": {**_S, "description": "已核对的材料、列、取值、有效范围或冲突。数据数量必须来自实际检查。"},
+                             "missing": {**_S, "description": "还缺的具体表、列、规则或审批。已读材料中找不到时写明在哪些材料中核对过。"},
+                             "impact": {**_S, "description": "会影响哪项取数、分组或金额。可区分时指出哪些部分已核算。"},
+                         }, ["item", "identified", "missing", "impact"]),
                          "evidence": {"type": "array", "description": "问题和建议的依据，显示在答复页上给财务对照：每条 file 写材料文件名"
                                       "（财务在对话里说的写「财务对话」），quote 逐字复制原文或数据行里的取值（一句、一行）。"
                                        "写了 suggested 时所有引用必须核对通过。Excel可改传sheet、row（原Excel行号）、columns（精确列名），程序生成真实引用；禁止省略号拼接。",
                                        "items": _obj({"file": _S, "quote": _S, "sheet": _S, "row": _I,
-                                                      "columns": {"type": "array", "items": _S}}, ["file"])}}, ["text", "options"])},
+                                                      "columns": {"type": "array", "items": _S}}, ["file"])}}, ["text", "options", "diagnosis"])},
     {"name": "review_question",
      "description": "已提出的待答问题可能源于错误映射/范围，或原文已明确解决时，提交理由和逐字依据给独立模型复核。"
                     "独立复核可撤回有充分原文依据的错误问题；不代答财务、不批准金额，不改规则。真正缺失的信息继续等待。"
@@ -267,7 +321,8 @@ TOOLS: list[dict] = [
                         ["id", "reason", "evidence"])},
     {"name": "reply",
      "description": "对话时用：回复财务这条消息并结束本次对话。改过规则、数据表或台账时，程序会先自动试算全部方案并做完成前检查，"
-                    "不通过会把原因返回给你修正。回复里的金额要来自 evaluate / explain / 试算结果，不要自己算。",
+                    "不通过会把原因返回给你修正。回复里的金额要来自 evaluate / explain / 试算结果，不要自己算。"
+                    "解释阻塞或差异时，写出涉及的项目或指标、已识别的证据、具体缺口和影响。",
      "parameters": _obj({"text": _S, "ignored": {"type": "array", "items": _obj({"ref": _S, "reason": _S})}}, ["text"])},
     {"name": "answer_question",
      "description": "记录待确认问题的答复，两种情况：① 对话时，财务在消息里明确答复了，把他的原话记为答复（没说清楚的不要替他选，用 reply 反问）；"

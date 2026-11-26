@@ -46,6 +46,7 @@ class Question(BaseModel):
     answered_by: str = ""      # 答复人（网页答复时记录）
     answered_at: str = ""
     evidence: list[dict] = []  # 选项和建议的依据：[{file, quote, ok}]，ok 为程序逐字核对过原文（答复页上给财务对照）
+    diagnosis: dict[str, str] = {}  # 涉及事项、已识别内容、缺口及影响
 
 
 class Extraction(BaseModel):

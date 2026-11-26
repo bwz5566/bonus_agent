@@ -83,6 +83,37 @@ def table_cells(tables: dict):
                 yield prefix + '/default', Decimal(str(table['default']))
 
 
+def unbound_table_cells(tables: dict, facts: list[Fact], scheme: str):
+    """Require a source at each exact cell, including repeated rates at different positions."""
+    cells = list(table_cells(tables))
+    if not cells:
+        return
+    bound = set()
+    for fact in facts:
+        value = numeric(fact)
+        for target in fact.targets:
+            qualifier, path = split_target(target)
+            if qualifier in (None, scheme, '共用'):
+                bound.add((tuple(target_parts(path)), value))
+    for path, value in cells:
+        if (tuple(target_parts(path)), value) not in bound:
+            yield path, value
+
+
+def table_percentage_evidence(tables: dict, facts: list[Fact], scheme: str) -> set[tuple[str, Decimal]]:
+    """A repeated table value is sourced as a percentage only if each cell has that binding."""
+    bound = {(tuple(target_parts(path)), numeric(fact)) for fact in facts
+             if fact.unit == '%' or fact.value.strip().endswith(('%', '％'))
+             for target in fact.targets for owner, path in (split_target(target),)
+             if owner in (None, scheme, '共用')}
+    sourced, missing = set(), set()
+    for path, value in table_cells(tables):
+        parts = tuple(target_parts(path))
+        entry = (f'tables.{parts[1]}', value)
+        (sourced if (parts, value) in bound else missing).add(entry)
+    return sourced - missing
+
+
 def binding_errors(facts: list[Fact], drafts: dict) -> list[str]:
     """A number at another rule position does not satisfy a declared parameter binding."""
     errors = []
@@ -435,12 +466,23 @@ def date_key(value: str) -> str | None:
     return f"date:{y}-{mo:02d}-{d:02d}"
 
 
+def _column_group(f: Fact) -> str | None:
+    """Compare a declared grouping by its ordered source headers and object type."""
+    declared = re.fullmatch(r'(\d+|[一二三四五六七八九十]+)列组合确定(?:同?一个)?(\w+)', norm(f.meaning))
+    if not declared:
+        return None
+    fields = [part.strip() for part in re.split('[,、]', unicodedata.normalize('NFKC', f.value))]
+    if len(fields) < 2 or any(not re.fullmatch(r'[^\W\d]\w*', part) for part in fields):
+        return None
+    return 'columns:' + json.dumps([*declared.groups(), fields], ensure_ascii=False)
+
+
 def same_value(f: Fact) -> str:
     """用来判断两条记录是否一致的取值。"""
     n = numeric(f)
     if n is not None:
         return format(n.normalize(), "f")
-    return date_key(f.value) or norm(f.meaning or f.value)
+    return date_key(f.value) or _column_group(f) or norm(f.meaning or f.value)
 
 
 def label(f: Fact) -> str:
@@ -458,6 +500,19 @@ def quote_scalars(text: str):
                 and re.search(r'[=/*×÷]', line)):
             value = value[1:]  # e.g. rate - 0.05: minus is the operator, 0.05 is the source literal.
         yield Decimal(value), unit
+
+
+def unit_basis_matches(f: Fact, corpus: dict[str, str]) -> bool:
+    basis = f.unit_basis or {}
+    quote, file = basis.get('quote'), basis.get('file')
+    if not f.unit or not isinstance(quote, str) or not isinstance(file, str):
+        return False
+    if not norm(quote) or len(quote) > MAX_QUOTE or norm(quote) not in corpus.get(file, ''):
+        return False
+    without_numbers = re.sub(r'[-+]?\d+(?:\.\d+)?\s*(亿元|万元|亿|万|元|%|‰)', '',
+                             unicodedata.normalize('NFKC', quote))
+    explicit = f.unit in without_numbers or f.unit == '%' and bool(re.search(r'百分比|百分数|百分率', quote))
+    return explicit and any(scope_norm(x) in scope_norm(quote) for x in (f.name, f.context) if scope_norm(x or ''))
 
 
 def check_fact(f: Fact, corpus: dict[str, str]) -> str | None:
@@ -479,16 +534,9 @@ def check_fact(f: Fact, corpus: dict[str, str]) -> str | None:
     if f.unit and (not scalar or not scalar.group(2)):
         without_values = re.sub(r'[-+]?\d+(?:\.\d+)?\s*(亿元|万元|亿|万|元|%|‰)', '',
                                 unicodedata.normalize('NFKC', f.quote))
-        if f.unit not in without_values:
-            basis = f.unit_basis or {}
-            quote = str(basis.get('quote', ''))
-            body = corpus.get(basis.get('file'), '')
-            explicit = f.unit in re.sub(r'[-+]?\d+(?:\.\d+)?\s*(亿元|万元|亿|万|元|%|‰)', '', quote)
-            explicit = explicit or f.unit == '%' and bool(re.search(r'百分比|百分数|百分率', quote))
-            scoped = any(norm(x) in norm(quote) for x in (f.name, f.context) if x)
-            if not (quote and len(quote) <= MAX_QUOTE and norm(quote) in body and explicit and scoped):
-                return ('parameter.unit：quote须有明确单位表头；或unit_basis={file,quote}提供明确写出该参数名/适用标题和单位的原文或财务确认。'
-                        '不能借用其他数字的单位；没有依据就ask_question，不能猜测百分数')
+        if f.unit not in without_values and not unit_basis_matches(f, corpus):
+            return ('parameter.unit：quote须有明确单位表头；或unit_basis={file,quote}提供明确写出该参数名/适用标题和单位的原文或财务确认。'
+                    '不能借用其他数字的单位；没有依据就ask_question，不能猜测百分数')
     if f.unit and numeric(f) is None:
         return "parameter.unit：原值与所声明单位冲突，或不是可转换的单个数值"
     if f.component != "literal" and interval(f.value) is None:
@@ -609,18 +657,29 @@ def mixed_names(facts: list[Fact]) -> list[str]:
     return [n for n, kinds in groups.items() if len(kinds) > 1]
 
 
-def withdraw_stale(facts: list[Fact], conflicts: dict[str, Conflict], questions: list[Question]) -> list[Question]:
-    """冲突所依据的某个取值已经没有材料支持（文件修改或删除）且还没答复的问题，由程序撤回。返回撤回的问题。"""
+def withdraw_stale(facts: list[Fact], conflicts: dict[str, Conflict], questions: list[Question],
+                   answers: list[dict] | None = None) -> list[Question]:
+    """Withdraw unsupported unanswered conflicts and legacy questions with equivalent options."""
     out = []
     for k, c in list(conflicts.items()):
         q = next((q for q in questions if q.id == c.question), None)
-        if q is None or q.answer or q.withdrawn:
+        if q is None or q.withdrawn:
             continue
-        now = {same_value(f) for f in facts if f.name.strip() == c.name}
-        if not set(c.values) <= now:
+        same_name = [f for f in facts if f.name.strip() == c.name]
+        now = {same_value(f) for f in same_name}
+        legacy_groups = {norm(f.meaning or f.value) for f in same_name if _column_group(f)}
+        supplied = next((a['answer'] for a in answers or () if a.get('answer') not in (None, '')
+                         and (a.get('id') == q.id or a.get('text') == q.text)), q.answer)
+        equivalents = (len(now) == 1 and len(c.values) > 1 and set(c.values) <= legacy_groups)
+        if equivalents and (not supplied or supplied in q.options[:len(c.values)]
+                            or type(supplied) is int and 0 <= supplied < len(c.values)):
+            q.withdrawn = "复核后各来源使用同一组字段。原问题及答复保留备查"
+        elif not supplied and not set(c.values) <= now:
             q.withdrawn = "冲突所依据的材料已修改或删除，冲突不再成立"
-            del conflicts[k]
-            out.append(q)
+        else:
+            continue
+        del conflicts[k]
+        out.append(q)
     return out
 
 

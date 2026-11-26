@@ -23,7 +23,7 @@ def reply(model='deepseek-v4-pro'):
 def test_repair_profile_is_optional_and_keeps_an_independent_high_effort_checker():
     cfg = config()
     llm = LLM.from_config('deepseek-pro-repair', cfg)
-    assert cfg['default'] == 'qwen-a'
+    assert cfg['default'] == 'deepseek-flash'
     assert not LLM.from_config('deepseek-flash', cfg).tools_thinking
     assert llm.model == 'deepseek-v4-pro' and llm.tools_thinking
     assert llm.think_body == {'thinking': {'type': 'enabled'}, 'reasoning_effort': 'low'}
@@ -41,7 +41,7 @@ def test_high_repair_profile_is_explicit_and_keeps_low_profile_unchanged():
     cfg = config()
     high = LLM.from_config('deepseek-pro-repair-high', cfg)
     low = LLM.from_config('deepseek-pro-repair', cfg)
-    assert cfg['default'] == 'qwen-a'
+    assert cfg['default'] == 'deepseek-flash'
     assert high.model == low.model == 'deepseek-v4-pro'
     assert high.tools_thinking and high.think_llm is None
     assert high.think_body['reasoning_effort'] == 'high'

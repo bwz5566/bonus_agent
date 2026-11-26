@@ -9,6 +9,7 @@
                                            --out 是案卷目录：有问题时本轮停下等答复；在 questions.yaml 填答复、
                                            补充材料后用同一个目录再运行，从上一轮接着做（--new 从头开始）
                                            （--pipeline 改用固定流程：规划 → 抽取 → 计算）
+  template-check --out 案卷目录             离线复算并核对金额及材料指纹，供财务确认
   confirm --out 案卷目录 --by 确认人 [--note 说明] [--no-review] [--only-result] [--revision 方案/修订 ...] [--no-revisions] [数据文件...]
                                            财务确认最新一轮结果：复算核对后把规则、映射和调整冻结为 案卷目录/template/，
                                            以后每期用 bonus run-template 计算，不再调用大模型
@@ -25,12 +26,15 @@
                                            内网网页服务：看问题、填答复、传材料、运行下一轮、确认、按模板计算
   user add --data 数据目录 用户名 --roles editor,approver [--display 姓名]
                                            添加或修改网页用户（口令从终端输入，只存哈希）
+  user single --data 数据目录 用户名        保留指定现有账号及原口令，启用全部核算/审批功能，停用其他登录账号
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import time
 from decimal import Decimal
 import sys
 from pathlib import Path
@@ -94,11 +98,20 @@ def main(argv=None) -> int:
     p.add_argument("--revision", action="append", default=None, help="录入模板的人工调整修订（方案/修订名，可写多次）；录入的调整以后每期都会自动带上")
     p.add_argument("--no-revisions", action="store_true", help="本轮的人工调整修订都不录入模板")
     p.add_argument("data", nargs="*", help="复算用的数据文件（默认用该轮的输入文件）")
+    p = sub.add_parser("template-check", help="离线复算候选模板并核对完整金额基线")
+    p.add_argument("--out", required=True, help="已出正式结果的案卷目录")
+    revisions = p.add_mutually_exclusive_group()
+    revisions.add_argument("--revision", action="append", help="用于复算的人工调整修订（方案/修订名，可写多次）")
+    revisions.add_argument("--no-revisions", action="store_true", help="只使用依赖所需的修订")
+    p.add_argument("data", nargs="*", help="复算用的数据文件（默认用该轮的输入文件）")
     p = sub.add_parser('confirm-totals',help='核对预核算后确认指定版本总额；不会调用模型')
     p.add_argument('--out',required=True)
     p.add_argument('--scheme',required=True)
     p.add_argument('--digest',required=True,help='workflow.json中待确认方案的basis内容指纹')
     p.add_argument('--by',required=True)
+    p = sub.add_parser('reexport',help='从已核验固定提成案卷生成新报表版本，不改变金额或原审批，不调用模型')
+    p.add_argument('--out',required=True,help='原案卷输出目录')
+    p.add_argument('--by',required=True,help='实际报表修订人')
     p = sub.add_parser("negcheck")
     p.add_argument("--out", required=True, help="案卷目录（读其中 case.json 的规则）")
     p.add_argument("--cases", required=True, help="坏数据用例 JSON")
@@ -130,12 +143,14 @@ def main(argv=None) -> int:
     p.add_argument("--max-parallel", type=int, default=2, help="同时最多运行几个案卷")
     p.add_argument("--max-steps", type=int, default=150, help="每轮最多多少步（工具调用），默认 150")
     p.add_argument("--max-tokens", type=int, default=8_000_000,
-                   help="每轮最多用多少 tokens，默认 800 万（每步要重发约 3 万 tokens 的上下文，150 步约需 500 万）")
+                   help="每个网页案卷的累计 token 上限，默认 800 万，跨续跑和服务重启保留用量")
+    p.add_argument("--unlimited-case-tokens", action="append", default=[], metavar="CASE_ID",
+                   help="为指定案卷解除累计 token 上限，继续记账；可以重复传入案卷编号")
     p = sub.add_parser("user")
-    p.add_argument("action", choices=["add"])
+    p.add_argument("action", choices=["add", "single"])
     p.add_argument("--data", required=True)
     p.add_argument("name")
-    p.add_argument("--roles", default="editor", help="逗号分隔：editor（传材料、答复、运行）、approver（确认结果）")
+    p.add_argument("--roles", default="editor,approver", help="新增账号默认全部功能；需要分工时才明确指定 editor 或 approver")
     p.add_argument("--display", default="", help="显示的姓名（记入答复人、确认人）")
     p.add_argument("--password-stdin", action="store_true", help="从标准输入读口令（脚本用）")
     p = sub.add_parser("auto")
@@ -151,19 +166,44 @@ def main(argv=None) -> int:
     p.add_argument("--max-files", type=int, default=30, help="一批最多处理的文件数，防止误传整个目录")
     p.add_argument("--max-steps", type=int, default=150, help="安全上限：智能体最多调用工具的轮数，完成即停，正常用不满")
     p.add_argument("--max-tokens", type=int, default=4_000_000, help="安全上限：本次最多消耗的 tokens，超过即停止")
+    p.add_argument("--max-seconds", type=float, help="本次作业的秒数上限，覆盖主模型、独立复核和纠错请求")
     p.add_argument("--expected", help="期望结果 Excel，只在算完后用来逐个对象核对，不会交给智能体；不要放在输入文件夹里")
     p.add_argument("--expected-column", help="期望结果中应得金额的列名（自动识别不出或有几列时指定）")
     p.add_argument("--pipeline", action="store_true", help="使用固定流程（规划 → 抽取 → 计算），不让模型自主调度")
     p.add_argument("paths", nargs="+", help="本批次的规则文档、Excel 数据，或只包含它们的文件夹")
     a = ap.parse_args(argv)
 
+    if a.cmd == "auto" and a.max_seconds is not None:
+        if not math.isfinite(a.max_seconds) or a.max_seconds <= 0:
+            ap.error("--max-seconds 必须是正的有限秒数")
+        if a.pipeline:
+            ap.error("--max-seconds 仅支持智能体工作流，不能与 --pipeline 同用")
+
     if a.cmd in {"scenarios", "publish", "compute", "impact"}:
         return _scenario_cmd(a)
+
+    if a.cmd=='reexport':
+        from bonus_agent import case as cs
+        from bonus_agent.commission_report import reexport_fixed_case
+        try:workbook,meta=reexport_fixed_case(Path(a.out),a.by)
+        except (cs.ConfirmError,cs.CaseBusyError,ValueError,OSError) as exc:
+            print(f'不能重新导出：{exc}');return 1
+        print(f'已生成报表版本 {meta["id"]}：{workbook}')
+        print('逐项目、逐角色及人员金额与原正式结果一致；原报告和审批未修改。')
+        return 0
 
     if a.cmd == "user":
         import getpass
 
         from bonus_agent.web import Users
+        if a.action=='single':
+            try:
+                backup=Users(Path(a.data)/'users.yaml').single(a.name)
+            except (ValueError,RuntimeError,OSError) as e:
+                print(f'失败：{e}');return 1
+            print(f'仅保留现有账号 {a.name}，原密码不变，具备全部核算及审批功能。')
+            if backup:print('原账户配置已保留为非活动备份；其他账号不能登录。')
+            return 0
         if a.password_stdin:
             pw = sys.stdin.readline().rstrip("\n")
         else:
@@ -234,7 +274,7 @@ def main(argv=None) -> int:
     if a.cmd == "serve":
         from bonus_agent.web import serve
         serve(a.data, a.host, a.port, a.model, max_parallel=a.max_parallel, checker=a.checker,
-              max_steps=a.max_steps, max_tokens=a.max_tokens)
+              max_steps=a.max_steps, max_tokens=a.max_tokens, unlimited_case_tokens=a.unlimited_case_tokens)
         return 0
     cfg = load_config()
     if a.cmd == "models":
@@ -306,8 +346,18 @@ def main(argv=None) -> int:
             print(f'不能确认：{exc}');return 1
         print(f'已确认 {result["scheme"]} 总额；用同一输出目录继续auto进行人员分配。')
         return 0
+    if a.cmd == "template-check":
+        from bonus_agent.case import CaseBusyError, ConfirmError, check_template
+        try:
+            result = check_template(Path(a.out), [Path(x) for x in a.data] or None,
+                                    revisions=[] if a.no_revisions else a.revision)
+        except (CaseBusyError, ConfirmError) as exc:
+            print(f"候选模板复算失败：{exc}")
+            return 1
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
     if a.cmd == "confirm":
-        from bonus_agent.case import ConfirmError, confirm, confirm_options
+        from bonus_agent.case import CaseBusyError, ConfirmError, confirm, confirm_options
         opts = confirm_options(Path(a.out))
         if not a.only_result:     # 录入前先列出要录入什么：规则改动、人工调整修订
             print(f"第 {opts['round']} 轮将录入模板的规则" + ("（相对已有模板的改动）" if opts["has_template"] else "") + "：")
@@ -322,7 +372,7 @@ def main(argv=None) -> int:
         try:
             tpl = confirm(Path(a.out), a.by, a.note, [Path(x) for x in a.data] or None, review=not a.no_review,
                           save_template=not a.only_result, revisions=revisions)
-        except ConfirmError as e:
+        except (CaseBusyError, ConfirmError) as e:
             print(f"不能确认：{e}")
             if opts["revisions"] and revisions is None and not a.only_result:
                 print("选择：--revision 方案/修订（可写多次）录入指定修订；--no-revisions 都不录入；--only-result 只确认结果不录入模板")
@@ -435,13 +485,17 @@ def _scenario_cmd(a) -> int:
 
 def _agent(a, cfg) -> int:
     from bonus_agent.agent import ToolError, run_agent
+    from bonus_agent.recovery import RunBudget
+
+    budget = (RunBudget(0, a.max_tokens, a.max_seconds, started=time.monotonic())
+              if a.max_seconds is not None else None)
     answers = yaml.safe_load(Path(a.answers).read_text(encoding="utf-8")) if a.answers else None
     scenario = None
     if a.scenario:
         from bonus_agent.scenarios import Registry, ScenarioError
         from bonus_agent.scenarios.context import prepare
         try:
-            scenario = prepare(Registry(a.scenario_dir), a.scenario, a.paths, use_memory=not a.no_memory)
+            scenario = prepare(Registry(a.scenario_dir), a.scenario, a.paths, use_memory=not a.no_memory, period=a.period)
         except ScenarioError as e:
             print(f"失败：{e}")
             return 1
@@ -472,7 +526,7 @@ def _agent(a, cfg) -> int:
         ar = run_agent(llm, a.paths, a.out, answers=answers, max_steps=a.max_steps, max_tokens=a.max_tokens,
                        exclude=[a.expected] if a.expected else [],
                        max_history_chars=hist, resume=not a.new,
-                       max_files=a.max_files, on_step=show, scenario=scenario, period=a.period)
+                       max_files=a.max_files, on_step=show, scenario=scenario, period=a.period, run_budget=budget)
     except ToolError as e:
         print(f"失败：{e}")
         return 1
@@ -513,7 +567,7 @@ def _agent(a, cfg) -> int:
         print('\n【等待独立复核】'+ar.ws.workflow.get('review_error',{}).get('error',''))
     if ar.error:
         from bonus_agent.failure import to_text
-        print(f"\n未完成：{to_text(ar.error).replace('点「重试」', '用同一个 --out 再运行一次')}\n  详细信息：{ar.error}")
+        print(f"\n未完成：{to_text(ar.error, diagnosis=ar.failure_context).replace('点「重试」', '用同一个 --out 再运行一次')}\n  详细信息：{ar.error}")
     print(f"\n输出目录：{a.out}（result*.xlsx、rules*.yaml、mapping.yaml、questions.yaml、agent_log.json）")
     u = llm.usage
     cached = f"（其中命中缓存 {u.cached_tokens}）" if u.cached_tokens else ""

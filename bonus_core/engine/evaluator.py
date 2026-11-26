@@ -28,6 +28,10 @@ class EvalError(ValueError):
         # must not turn a failed expression into a value or a calculation receipt.
         self.frames: list[dict] = []
         self.aggregates: list[dict] = []
+        self.field_conflict: dict | None = None
+        self.table_applicability: dict | None = None
+        self.scope_reference: dict | None = None
+        self.detail_field_binding: dict | None = None
         super().__init__(message + (f"（位置：{where}）" if where else ""))
 
 
@@ -184,7 +188,7 @@ class Evaluator:
                 'expr': expr, 'source': str(node.attr_src) if node.attr_src else '',
             })
 
-    def _scope_node(self, scope: str, node: Node, name: str, row: Row | None = None) -> Node:
+    def _find_scope(self, scope: str, node: Node, row: Row | None = None) -> Node | None:
         if scope == "global":
             return self.root
         for n in node.chain():
@@ -194,11 +198,33 @@ class Evaluator:
             for n in ref.chain():
                 if n.level == scope:
                     return n
+        return None
+
+    def _reference_failure(self, scope, node, name, row):
+        key = self.rs.datasets[scope].key
+        rows = [(row.values, row.src)] if row is not None else [(n.attrs, n.attr_src) for n in node.chain()]
+        refs = self._refs(row) if row is not None else self._node_refs(node)
+        rows.extend((ref.attrs, ref.attr_src) for ref in refs)
+        values = {}
+        for fields, source in rows:
+            value = fields.get(key)
+            if value not in (None, ''):
+                values.setdefault(str(value), str(source) if source else '')
+        sample = list(values.items())[:3]
+        detail = ('已读到关联编号 ' + '、'.join(repr(value) for value, _ in sample) + '，在目标实体中无对应记录'
+                  if sample else f'当前可达行没有非空关联键 {key}')
+        error = EvalError(f'{name} 取不到关联实体「{scope}」。{detail}。'
+                          '核对关联键及期间；原文确认确实允许缺行时，可用 has_ref 判断并使用明确的缺失口径。', node.id)
+        error.scope_reference = {'scope': scope, 'key': key, 'variable': name,
+                                 'values': [{'value': v, 'source': src} for v, src in sample]}
+        return error
+
+    def _scope_node(self, scope: str, node: Node, name: str, row: Row | None = None) -> Node:
+        target = self._find_scope(scope, node, row)
+        if target is not None:
+            return target
         if scope in self.layout.aux:
-            raise EvalError(f"变量 {name} 属于关联实体「{scope}」，这里取不到对应的{scope}（当前行没有它的编号 "
-                            f"{self.rs.datasets[scope].key}）。在「{node.level}」层要用{scope}的数，这一层的行上要有{scope}的编号；"
-                            f"一个对象对应多个{scope}时（如一个人参与多个项目），不要让它单独成一层：最末层用逐条记录的表"
-                            f"（如分配名单每行一条，key 用行号，parent_key 写上一层的编号），按人汇总写在 report.people 里", node.id)
+            raise self._reference_failure(scope, node, name, row)
         raise EvalError(f"变量 {name} 属于「{scope}」层级，不能在「{node.level}」层直接引用（需要聚合）", node.id)
 
     def _node_refs(self, node: Node):
@@ -207,19 +233,19 @@ class Evaluator:
             if n.attrs:
                 yield from self._refs(Row(n.attrs, n.attr_src))
 
-    def _refs(self, row: Row):
+    def _refs(self, row: Row, *, with_depth=False):
         """当前行经编号字段引用到的关联实体，近的在前（如回款 → 销售单 → 项目）。"""
-        seen, todo = set(), [row]
+        seen, todo = set(), [(row, 1)]
         while todo:
-            r = todo.pop(0)
+            r, depth = todo.pop(0)
             for f, v in r.values.items():
                 tbl = self.index.get(self.layout.aux_by_key.get(f, ""))
                 n = tbl.get(str(v)) if tbl is not None and v is not None else None
                 if n is None or n.row is r or id(n) in seen:
                     continue
                 seen.add(id(n))
-                yield n
-                todo.append(n.row)
+                yield (depth, n) if with_depth else n
+                todo.append((n.row, depth + 1))
 
     def _num(self, val: Val, where: str) -> Decimal:
         if isinstance(val.v, bool) or not isinstance(val.v, Decimal):
@@ -289,6 +315,31 @@ class Evaluator:
         return val.v
 
     # ---- 名字解析 ----
+    def _referenced_field(self, name, row, where):
+        found = []
+        nearest = None
+        for depth, ref in self._refs(row, with_depth=True):
+            if nearest is not None and depth > nearest:
+                break
+            if name in ref.attrs:
+                nearest = depth
+                found.append(ref)
+                if len(found) == 2:
+                    error = EvalError(f'字段 {name} 同时来自等距关联实体'
+                                      f'「{found[0].level}」「{found[1].level}」。'
+                                      '按原文选定源表，在该实体作用域取值或给源字段分别命名。', where)
+                    error.field_conflict = {'field': name, 'sources': [
+                        {'dataset': node.level, 'source': str(node.attr_src) if node.attr_src else '',
+                         'node_id': node.id} for node in found]}
+                    raise error
+        if not found:
+            return None
+        ref, = found
+        value = ref.attrs[name]
+        if value is None:
+            raise EvalError(f"{ref.id} 的字段 {name} 为空", str(ref.attr_src))
+        return Val(value, f"{name}[{ref.key}]", rows=(ref.row,))
+
     def _name(self, n: str, ctx: Ctx) -> Val:
         if ctx.row is not None and n in ctx.row.values:
             v = ctx.row.values[n]
@@ -297,13 +348,8 @@ class Evaluator:
             return Val(v, n, rows=(ctx.row,))
         if n in self.rs.variables:
             return self.variable(n, ctx.node, ctx.row)
-        if ctx.row is not None:
-            for ref in self._refs(ctx.row):
-                if n in ref.attrs:
-                    v = ref.attrs[n]
-                    if v is None:
-                        raise EvalError(f"{ref.id} 的字段 {n} 为空", str(ref.attr_src))
-                    return Val(v, f"{n}[{ref.key}]", rows=(ref.row,))
+        if ctx.row is not None and (value := self._referenced_field(n, ctx.row, ctx.where)) is not None:
+            return value
         for node in ctx.node.chain():
             if n in node.attrs:
                 v = node.attrs[n]
@@ -311,12 +357,9 @@ class Evaluator:
                     raise EvalError(f"{node.id} 的字段 {n} 为空", str(node.attr_src))
                 return Val(v, fmt(v))
         if ctx.row is None:
-            for ref in self._node_refs(ctx.node):
-                if n in ref.attrs:
-                    v = ref.attrs[n]
-                    if v is None:
-                        raise EvalError(f"{ref.id} 的字段 {n} 为空", str(ref.attr_src))
-                    return Val(v, f"{n}[{ref.key}]", rows=(ref.row,))
+            for node in ctx.node.chain():
+                if node.attrs and (value := self._referenced_field(n, Row(node.attrs, node.attr_src), ctx.where)) is not None:
+                    return value
         if n in self.rs.tables:
             return Val(self.rs.tables[n], n)
         if n in self.detail_fields and ctx.row is not None:
@@ -328,7 +371,10 @@ class Evaluator:
                             + (f"（这一行能取到：{'、'.join(refs)}）" if refs else "")
                             + f"。要用「{src}」的数：先在能取到的对象上定义变量（scope 写那个对象）把它汇总好，再在这里引用这个变量", ctx.where)
         if n in self.detail_fields:
-            raise EvalError(f"{n} 是明细字段，需要放在 sum/avg/count 等聚合函数里使用", ctx.where)
+            error = EvalError(f"{n} 是明细字段，需要放在 sum/avg/count 等聚合函数里使用", ctx.where)
+            error.detail_field_binding = {'code': 'detail_field_requires_aggregation', 'field': n,
+                                          'datasets': sorted(self.detail_fields[n])}
+            raise error
         if n in self.rs.datasets:
             raise EvalError(f"{n} 是数据表名，不能直接当数用：对它的字段聚合，表名写在 of 里，如 sum(字段, of: \"{n}\")", ctx.where)
         raise EvalError(f"无法识别的名字 {n}", ctx.where)
@@ -337,6 +383,17 @@ class Evaluator:
     def _call(self, c: Call, ctx: Ctx) -> Val:
         fn = c.fn
         kw = c.kw()
+        if fn == 'has_ref':
+            scope = c.args[0]
+            if not isinstance(scope, Str) or scope.value not in self.layout.aux:
+                raise EvalError('has_ref 的参数须为已声明的关联实体名字符串', ctx.where)
+            found = self._find_scope(scope.value, ctx.node, ctx.row) is not None
+            if not found:
+                failure = self._reference_failure(scope.value, ctx.node, fn, ctx.row)
+                if not failure.scope_reference['values']:
+                    raise failure
+            self._seen(ctx, 'ref', scope, '匹配' if found else '没有对应记录')
+            return Val(found, f'关联实体「{scope.value}」' + ('已匹配' if found else '无对应记录'))
         if fn == "period_value":
             if self.period is None:
                 raise EvalError("period_value 需要明确核算期间", ctx.where)
@@ -360,7 +417,7 @@ class Evaluator:
             table, num = self.ev(c.args[0], ctx), self.ev(c.args[1], ctx)
             if not isinstance(table.v, TierTable):
                 raise EvalError("tier_ratio 第一个参数必须是阶梯表", ctx.where)
-            self._table_guard(table.v, ctx)
+            self._table_guard(table.v, table.text, ctx)
             ratio = self._num(num, ctx.where) / self._num(den, ctx.where)
             self._tier_seen(c.args[0], table, ratio, "tier_rate")
             self._seen(ctx, "tier", c.args[0], str(tier_band(table.v, ratio)))
@@ -385,7 +442,7 @@ class Evaluator:
             t, x = self.ev(c.args[0], ctx), self.ev(c.args[1], ctx)
             if not isinstance(t.v, TierTable):
                 raise EvalError(f"{fn} 的第一个参数必须是阶梯表，得到 {t.text}", ctx.where)
-            self._table_guard(t.v, ctx)
+            self._table_guard(t.v, t.text, ctx)
             xv = self._num(x, ctx.where)
             r = tier_amount(t.v, xv) if fn == "tier" else tier_rate(t.v, xv)
             self._tier_seen(c.args[0], t, xv, fn)
@@ -396,7 +453,7 @@ class Evaluator:
             if not isinstance(t.v, LookupTable):
                 raise EvalError(f"lookup 的第一个参数必须是查找表，得到 {t.text}", ctx.where)
             key = lookup_key(k.v)
-            self._table_guard(t.v, ctx)
+            self._table_guard(t.v, t.text, ctx)
             if key in t.v.mapping:
                 r = t.v.mapping[key]
             elif t.v.default is not None:
@@ -462,10 +519,14 @@ class Evaluator:
             if ref is None:
                 raise EvalError(f"scheme_paid 需要方案 {key} 的结果，请先计算该方案", ctx.where)
             p = ref.payouts.get(ctx.node.id) or getattr(ref, "rollups", {}).get(ctx.node.id)
-            if p is None:
-                raise EvalError(f"方案 {key} 的结果里没有 {ctx.node.id} 的发放记录（只能在最末层或抵扣汇总到的实体上使用）", ctx.where)
-            r = Decimal(p.paid)
-            return Val(r, f"{key} 实发 {fmt(r)}", frozenset({f"{key}:{ctx.node.id}"}))
+            trace = frozenset({f"{key}:{ctx.node.id}"})
+            if p is not None:
+                r = Decimal(p.paid)
+                return Val(r, f"{key} 实发 {fmt(r)}", trace)
+            if ctx.node.id in getattr(ref, 'funding', {}):
+                r = Decimal(ref.funding[ctx.node.id])
+                return Val(r, f"{key} 可分配资金 {fmt(r)}", trace)
+            raise EvalError(f"方案 {key} 的结果里没有 {ctx.node.id} 的发放或资金记录", ctx.where)
         if fn in ("period_start", "period_end"):
             if self.period is None:
                 raise EvalError(f"{fn}() 要用本次的核算期间，但这次计算没有指定期间（新建案卷或计算时选择期间）", ctx.where)
@@ -484,9 +545,17 @@ class Evaluator:
         return (f"分母 {unparse(den)} 在对象「{ctx.node.id}」上是 0：查这个对象的数据是否缺失，"
                 "筛选条件（期间、取值、所属对象）是否写对，或者材料对分母为 0 有没有规定")
 
-    def _table_guard(self, table, ctx):
-        if table.applies_when and not self._bool(self.ev(parse(table.applies_when), ctx), ctx):
-            raise EvalError(f"参数表适用条件不成立：{table.applies_when}，不能套用该表", ctx.where)
+    def _table_guard(self, table, name, ctx):
+        if not table.applies_when:
+            return
+        observed = self.ev(parse(table.applies_when), ctx)
+        if self._bool(observed, ctx):
+            return
+        error = EvalError(f"参数表适用条件不成立：{table.applies_when}，不能套用该表", ctx.where)
+        source = ctx.row.src if ctx.row is not None else ctx.node.attr_src
+        error.table_applicability = {'table': name, 'condition': table.applies_when,
+                                     'evaluated': observed.text, 'source': str(source) if source else ''}
+        raise error
 
     def _seen(self, ctx: Ctx, kind: str, what, outcome: str) -> None:
         item = ctx.where.removeprefix(ctx.node.id + "/")
@@ -513,6 +582,12 @@ class Evaluator:
         st["min"], st["max"] = min(st["min"], x), max(st["max"], x)
         b = tier_band(t.v, x)
         st["bands"][b] = st["bands"].get(b, 0) + 1
+        for i in (b, b + 1):
+            if 0 <= i < len(t.v.steps) and t.v.steps[i][0] == x:
+                key = str(t.v.steps[i][0])
+                hits = st.setdefault("boundary_hits", {})
+                hits[key] = hits.get(key, 0) + 1
+                break
 
     def _aggregate(self, c: Call, ctx: Ctx) -> Val:
         coverage = {}
@@ -534,8 +609,26 @@ class Evaluator:
                 item['active_row_source'] = str(active.src) if active is not None and active.src else ''
                 if 'conflicting_sources' in coverage:
                     item['conflicting_sources'] = coverage['conflicting_sources']
+                    item['competing_values'] = coverage['competing_values']
                 exc.aggregates.append(item)
             raise
+
+    def _competing_value(self, dataset, row, value, sources):
+        origins = []
+        for source in sources:
+            if not source.src:
+                continue
+            origin = {'source': str(source.src)}
+            if source is row:
+                origin['dataset'] = dataset
+            elif entity := self._row_node.get(id(source)):
+                origin['dataset'] = entity.level
+            if origin not in origins:
+                origins.append(origin)
+            if len(origins) == 3:
+                break
+        return {'value': str(value)[:160], 'type': type(value).__name__,
+                'aggregate_source': str(row.src) if row.src else '', 'sources': origins}
 
     def _aggregate_value(self, c: Call, ctx: Ctx, coverage: dict) -> Val:
         kw = c.kw()
@@ -604,11 +697,14 @@ class Evaluator:
             r = Decimal(len(rows))
         else:
             vals = []
+            value_origins = [] if c.fn == 'single_value' else None
             for row in rows:
                 coverage['active_row'] = row
                 v = self.ev(c.args[0], rctx(row))
                 deps |= v.deps
                 vals.append(v.v)
+                if value_origins is not None:
+                    value_origins.append(v.rows)
             coverage.pop('active_row', None)
             if c.fn == "count_distinct":
                 r = Decimal(len(set(vals)))
@@ -616,7 +712,7 @@ class Evaluator:
                 if not vals:
                     raise EvalError(f'single_value.empty：当前对象在「{ds}」的关联、期间及筛选范围内没有明细行，无法证明唯一值。'
                                     '核对对象范围、关系和筛选；不得取第一条、补默认值或删对象来通过检查', ctx.where)
-                for row, value in zip(rows, vals):
+                for index, (row, value) in enumerate(zip(rows, vals)):
                     coverage['active_row'] = row
                     if value is None or isinstance(value, str) and not value.strip():
                         raise EvalError(f'single_value.missing：「{ds}」选中行存在空值，不能忽略该行或用其他行的值补齐；'
@@ -627,6 +723,10 @@ class Evaluator:
                         raise EvalError(f'single_value.type：「{ds}」的值不是受支持的有限标量（类型{type(value).__name__}）', ctx.where)
                     if type(value) is not type(vals[0]) or value != vals[0]:
                         coverage['conflicting_sources'] = [str(item.src) for item in (rows[0], row) if item.src]
+                        coverage['competing_values'] = [
+                            self._competing_value(ds, rows[i], vals[i], value_origins[i])
+                            for i in (0, index)
+                        ]
                         raise EvalError(f'single_value.multiple：「{ds}」在当前对象范围内存在不同值或类型：'
                                         f'{fmt(vals[0])}（{type(vals[0]).__name__}）与{fmt(value)}（{type(value).__name__}）。'
                                         '唯一属性尚未成立；核对来源行、关联键和业务粒度，不得取第一条或补默认值', ctx.where)

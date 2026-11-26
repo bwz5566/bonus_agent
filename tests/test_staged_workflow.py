@@ -25,8 +25,8 @@ def population_spec():
             'rows:projects': {k: copy.deepcopy(v) for k, v in entry.items() if k != 'key'}}
 
 
-def make_workspace(tmp_path, mutate_workbook=None, project_distinct=False):
-    policy=tmp_path/'policy.md';policy.write_text('每个项目按销售金额的10%计算奖金，按名单比例分配。',encoding='utf8')
+def make_workspace(tmp_path, mutate_workbook=None, project_distinct=False, policy_tail=''):
+    policy=tmp_path/'policy.md';policy.write_text('每个项目按销售金额的10%计算奖金，按名单比例分配。' + policy_tail,encoding='utf8')
     p=tmp_path/'data.xlsx';wb=openpyxl.Workbook();s=wb.active;s.title='projects'
     s.append(['pid','amount']);s.append(['A',100]);s.append(['B',200])
     r=wb.create_sheet('people');r.append(['rid','pid','person','share'])
@@ -70,6 +70,17 @@ def reviewed(ws):
     return ws
 
 
+def test_looking_at_a_changed_clause_does_not_expire_formula_receipts(tmp_path):
+    ws = make_workspace(tmp_path)
+    flow = ws._flow()
+    version = flow.version()
+    clause, = ws.clauses
+    ws._side_by_side([clause])
+    assert clause.checked and flow.version() == version
+    clause.where = 'report.details.项目奖'
+    assert flow.version() != version
+
+
 def test_pool_preview_never_allocates_and_requires_human_approval(tmp_path,monkeypatch):
     ws=prepared(make_workspace(tmp_path))
     monkeypatch.setattr(Engine,'_apply',lambda *a:pytest.fail('preview must not allocate'))
@@ -92,6 +103,90 @@ def test_confirmed_basis_allocation_matches_exact_people_and_reports(tmp_path):
     assert dict(ws.results['S']['R0'].totals)==basis['totals']
 
 
+@pytest.mark.parametrize('with_source', [False, True])
+def test_matching_pool_rebinds_only_required_project_detail(tmp_path, with_source):
+    quote = '保留逐项目正常分配金额的核算明细。'
+    ws = make_workspace(tmp_path, policy_tail='\n' + quote)
+    if with_source:
+        ws.record_clauses([{'file': 'policy.md', 'quote': quote, 'point': '输出逐项目分配金额'}])
+    report = ws.drafts['S']['report']
+    report['details'][0]['expr'] = 'amount'
+    totals = copy.deepcopy(report['totals'])
+    basis = {'objects': {'项目:A': {'amount': '10.00'}, '项目:B': {'amount': '20.00'}}}
+    row_a = json.dumps(['项目奖', '项目:A'], ensure_ascii=False)
+    row_b = json.dumps(['项目奖', '项目:B'], ensure_ascii=False)
+    production = {row_a: Decimal(100), row_b: Decimal(200)}
+    independent = {row_a: Decimal(10), row_b: Decimal(20)}
+    spec = {'pool': 'amount / 10', 'details': {'项目奖': 'amount / 10'}}
+    repair = ws._flow()._repair_pool_detail('S', ws._ruleset('S'), basis, spec, production, independent)
+    assert bool(repair) == with_source
+    row = ws.drafts['S']['report']['details'][0]
+    if with_source:
+        assert row['expr'] == ws._ruleset('S').pool.expr
+        assert row['sources'] == [{'doc': 'policy.md', 'quote': quote}]
+        assert repair['matched_objects'] == 2
+    else:
+        assert row['expr'] == 'amount'
+    assert ws.drafts['S']['report']['totals'] == totals
+    assert not ws._flow().current('review:S') and not ws._flow().current('approved:S')
+
+
+@pytest.mark.parametrize('write_before_data_check', [False, True])
+def test_distribution_field_mapping_is_checked_only_for_distribution(tmp_path, write_before_data_check):
+    ws = make_workspace(tmp_path)
+    # Saved drafts can still declare a field whose workbook mapping is unfinished.
+    ws.datasets['people'].fields['adjusted_share'] = ws.datasets['people'].fields['share']
+    levels = copy.deepcopy(ws.drafts['S']['allocation'])
+    levels[1]['weight'] = 'adjusted_share'
+    if write_before_data_check:
+        ws.set_rules(scheme='S', allocation=levels)
+    prepared(ws)
+    if not write_before_data_check:
+        ws.set_rules(scheme='S', allocation=levels)
+
+    basis = ws.calculate_basis('S')
+    assert basis['pool'] == '30.00'
+    assert ws.review_basis('S')['status'] == 'PASS'
+    assert ws._flow().approve('S', '测试确认人', basis['digest'])['status'] == 'PASS'
+
+    allocation = ws.compile_formulas()
+    assert allocation['status'] == 'FAIL'
+    assert any('people' in problem and 'adjusted_share' in problem for problem in allocation['issues'])
+    assert all('value_empty' not in problem for problem in allocation['issues'])
+    assert ws._flow().current('approved:S')
+    with pytest.raises(ToolError, match='adjusted_share'):
+        ws.trial_run('S')
+    assert not ws.results
+
+    # The correct source is already known. Repairing only the weight preserves
+    # the approval of the unchanged project amounts and clears the failed check.
+    levels[1]['weight'] = 'share'
+    ws.set_rules(scheme='S', allocation=levels)
+    assert ws._flow().current('approved:S')
+    assert ws.compile_formulas()['status'] == 'PASS'
+    ws.trial_run('S')
+    assert {row['name']: Decimal(row['final']) for row in ws.results['S']['R0'].people} == {
+        '甲': Decimal(20), '乙': Decimal(10),
+    }
+
+
+def test_distribution_checks_person_report_column_before_calculation(tmp_path):
+    ws = make_workspace(tmp_path)
+    ws.datasets['people'].fields['recipient_code'] = ws.datasets['people'].fields['person'].model_copy(
+        update={'if_empty': '未标识'},
+    )
+    ws.set_rules(scheme='S', report={**ws.drafts['S']['report'], 'people': 'recipient_code'})
+    reviewed(ws)
+    digest = fingerprint(ws.workflow['basis']['S'])
+    ws._flow().approve('S', '测试确认人', digest)
+
+    result = ws.compile_formulas()
+    assert result['status'] == 'FAIL'
+    assert any('field_unmapped' in problem and 'recipient_code' in problem and '(people)' in problem
+               for problem in result['issues'])
+    assert not ws.results
+
+
 def test_equal_total_changed_object_invalidates_confirmation_after_restore(tmp_path):
     ws=reviewed(make_workspace(tmp_path));ws._flow().approve('S','财务',fingerprint(ws.workflow['basis']['S']))
     snap=case.snapshot(ws)
@@ -101,6 +196,36 @@ def test_equal_total_changed_object_invalidates_confirmation_after_restore(tmp_p
     clone.drafts['S']['pool']['expr']='30 - amount * 0.1'
     assert not clone._flow().current('approved:S')
     with pytest.raises(ToolError):clone.trial_run('S')
+
+
+@pytest.mark.parametrize('changed_answer', [False, True])
+def test_reuse_confirmation_after_fresh_review_only_with_identical_scope(tmp_path, changed_answer):
+    from bonus_agent.extract_rules import Question
+
+    ws = make_workspace(tmp_path)
+    ws.llm.checker_llm._responder *= 2
+    question = Question(id='q1', text='本批角色如何分配？', answer='按名单')
+    ws.questions = [question]
+    reviewed(ws)
+    flow = ws._flow()
+    digest = fingerprint(ws.workflow['basis']['S'])
+    flow.approve('S', '财务', digest)
+    ws.done = False
+    ws.workflow['plan']['summary'] += '。补齐报表说明。'
+    if changed_answer:
+        question.answer = '按本期名单，单列待分配'
+    assert not flow.current('approved:S')
+    assert ws.compile_formulas()['status'] == 'PASS'
+    assert ws.calculate_basis('S')['digest'] == digest
+    assert not flow.current('approved:S')
+    report = ws.review_basis('S')
+    assert report['status'] == 'PASS'
+    assert bool(report.get('confirmation_reused')) is not changed_answer
+    assert flow.current('approved:S') is not changed_answer
+    assert ws.done is changed_answer
+    if not changed_answer:
+        assert flow.state['receipts']['approved:S']['payload']['by'] == '财务'
+        assert 'waiting' not in flow.state
 
 
 def test_raw_query_survives_broken_unrelated_parent_and_uses_decimal(tmp_path):
@@ -147,6 +272,92 @@ def test_same_version_resume_waits_without_calling_primary_or_exporting_people(t
     assert (out/'总额预核算.xlsx').is_file()
 
 
+@pytest.mark.parametrize('change_upstream', [False, True])
+def test_restart_preserves_only_the_current_dependent_basis(tmp_path, monkeypatch, change_upstream):
+    payout_quote = '暂缓发放比例为50%。'
+    ws = make_workspace(tmp_path, policy_tail='\n' + payout_quote if change_upstream else '')
+    plan = ws.workflow['plan']
+    ws.plan_calculation(plan['summary'], plan['outputs'], plan['files'], ['S', '人员'])
+    allocation = copy.deepcopy(ws.drafts['S']['allocation'])
+    ws.set_rules(scheme='S', allocation=allocation[:1], report={**ws.drafts['S']['report'], 'people': None})
+    ws.set_rules(scheme='人员', pool={'scope': '项目', 'expr': 'scheme_paid("S", "R0")',
+                                   'sources': ws.drafts['S']['pool']['sources']},
+                 allocation=allocation, report={'people': 'person'})
+    prepared(ws)
+    funding = ws.calculate_basis('S')
+    assert ws.review_basis('S')['status'] == 'PASS'
+    out = tmp_path/'out'
+    save_staged_case(ws, out)
+    case.confirm_totals(out, 'S', funding['digest'], '隔离测试确认人')
+
+    response = {'pool': 'scheme_paid("S", "R0")', 'populations': {'项目': population_spec()['项目']}}
+    primary = FakeLLM([{'tool': 'trial_run', 'args': {'scheme': 'S'}},
+                       {'tool': 'calculate_basis', 'args': {'scheme': '人员'}},
+                       {'tool': 'review_basis', 'args': {'scheme': '人员'}}])
+    primary.workflow_mode = 'staged'
+    primary.checker_required = True
+    primary.checker_llm = FakeLLM([json.dumps(response, ensure_ascii=False)])
+    pending = run_agent(primary, ws.inv.files, out, max_steps=3)
+    assert pending.status == 'AWAITING_TOTAL_CONFIRMATION', [(s.tool, s.result) for s in pending.steps if not s.ok]
+    assert pending.ws._flow().stage() == (6, '人员')
+    assert not pending.results and len(primary.checker_llm.calls) == 1
+    if change_upstream:
+        old_digest = fingerprint(pending.ws.workflow['basis']['人员'])
+        pending.ws.set_rules(scheme='S', payout=[{'id': '保留一半', 'scope': '项目', 'hold_ratio': '0.5',
+                                                'sources': [{'doc': 'policy.md', 'quote': payout_quote}]}])
+        assert pending.ws._flow().current('approved:S')
+        assert not pending.ws._flow().current('review:人员')
+        assert not pending.ws._flow().current('basis:人员')
+        assert pending.ws._flow().stage() != (6, '人员')
+        pending.ws.record_facts([{'name': '暂缓发放比例', 'file': 'policy.md', 'quote': payout_quote, 'value': '50%'}])
+        pending.ws.bind_facts([{'name': '暂缓发放比例', 'targets': ['S::/payout/0/hold_ratio']}])
+        assert pending.ws.compile_formulas()['phase'] == 'all'
+        payout_task, = (task['id'] for task in pending.ws.workflow['construction']['tasks'].values()
+                        if task['scheme'] == 'S' and task['target'] == '/payout')
+        assert pending.ws.check_formula_task(payout_task)['status'] == 'PASS'
+        basis = pending.ws.calculate_basis('人员')
+        assert basis['pool'] == '15.00' and basis['digest'] != old_digest
+        assert not pending.ws._flow().current('review:人员')
+        return
+
+    monkeypatch.setattr(primary, 'context_window', lambda: pytest.fail('restoring the same wait must not call the service'))
+    resumed = run_agent(primary, ws.inv.files, out, max_steps=1)
+    assert resumed.status == 'AWAITING_TOTAL_CONFIRMATION' and resumed.ws._flow().stage() == (6, '人员')
+    assert not resumed.results and len(primary.checker_llm.calls) == 1
+    assert not list(out.glob('result*.xlsx'))
+    digest = fingerprint(resumed.ws.workflow['basis']['人员'])
+    case.confirm_totals(out, '人员', digest, '隔离测试确认人')
+    saved = case.load_case(out)
+    assert [r['scheme'] for r in saved['total_confirmations']] == ['S', '人员']
+    settle = FakeLLM([{'tool': 'trial_run', 'args': {'scheme': '人员'}}])
+    settle.workflow_mode = 'staged'
+    settle.checker_required = True
+    settle.checker_llm = primary.checker_llm
+    calculated = run_agent(settle, ws.inv.files, out, max_steps=1)
+    assert not calculated.results and not list(out.glob('result*.xlsx'))
+    recipients = calculated.ws.results['人员']['R0'].people
+    assert {r['name']: r['final'] for r in recipients} == {'甲': '20.00', '乙': '10.00'}
+
+
+def test_existing_unresolved_basis_review_waits_without_new_requests(tmp_path, monkeypatch):
+    ws = prepared(make_workspace(tmp_path))
+    ws.calculate_basis('S')
+    ws.llm.checker_llm = FakeLLM([json.dumps({'unclear': ['区域预算缺少空白行口径。']}, ensure_ascii=False)])
+    with pytest.raises(ToolError, match='区域预算'):
+        ws.review_basis('S')
+    out = tmp_path / 'out'
+    save_staged_case(ws, out)
+
+    llm = _staged_llm(ws, lambda *args: pytest.fail('same unresolved evidence must stop before a new model call'))
+    monkeypatch.setattr(llm, 'context_window', lambda: pytest.fail('no service discovery while waiting'))
+    result = run_agent(llm, ws.inv.files, out, max_steps=1)
+
+    assert result.status == 'AWAITING_REVIEW'
+    assert not result.results and not (out / 'result.xlsx').exists()
+    assert '区域预算' in result.ws.workflow['review_error']['error']
+    assert not case.load_case(out).get('total_confirmations')
+
+
 def test_bounded_context_has_indices_not_full_original_documents(tmp_path):
     ws=make_workspace(tmp_path)
     text=task_card(ws)
@@ -189,10 +400,52 @@ def test_case_confirmation_recomputes_and_rejects_changed_input(tmp_path):
     basis=ws.workflow['basis']['S']
     rec=case.confirm_totals(out,'S',fingerprint(basis),'财务')
     assert rec['status']=='PASS'
+    same=case.confirm_totals(out,'S',fingerprint(basis),'第二次提交')
+    assert same['already_confirmed'] and same['by']=='财务'
+    assert len(case.load_case(out)['total_confirmations'])==1
     clone=Workspace(FakeLLM([]),ws.inv);case.restore(clone,case.load_case(out)['workspace'])
     assert clone._flow().current('approved:S')
     (tmp_path/'policy.md').write_text('原始规则已修改',encoding='utf8')
     with pytest.raises(case.ConfirmError,match='变化'):case.confirm_totals(out,'S',fingerprint(basis),'财务')
+
+
+def test_offline_confirmation_preserves_source_reviewed_withdrawal(tmp_path):
+    from bonus_agent.extract_rules import Question
+
+    ws = make_workspace(tmp_path)
+    evidence = [{'file': 'policy.md', 'quote': '每个项目按销售金额的10%计算奖金'}]
+    ws.questions = [Question(id='q1', text='材料没有定义项目奖金比例，是否需要补充比例？')]
+    ws.llm.checker_llm._responder.insert(0, json.dumps({
+        'decision': 'withdraw', 'kind': 'false_premise', 'reason': '制度原文明确规定了适用比例。',
+        'evidence': evidence,
+    }, ensure_ascii=False))
+    assert ws.review_question('q1', '请核对比例是否已经写在制度中。', evidence)['status'] == 'WITHDRAWN'
+    reviewed(ws)
+    out = tmp_path / 'out'
+    save_staged_case(ws, out)
+    prior = case.sha256(out / 'case.json')
+    with pytest.raises(case.ConfirmError, match='总额版本已变化'):
+        case.confirm_totals(out, 'S', 'wrong-digest', '测试案卷财务')
+    assert case.sha256(out / 'case.json') == prior
+    rec = case.confirm_totals(out, 'S', fingerprint(ws.workflow['basis']['S']), '测试案卷财务')
+    assert rec['status'] == 'PASS'
+    saved = case.load_case(out)
+    assert saved['workspace']['questions'][0]['withdrawn'] == ws.questions[0].withdrawn
+    assert saved['workspace']['questions'][0]['answer'] is None
+    assert len(saved['total_confirmations']) == 1
+
+
+def test_case_writer_lock_blocks_run_and_confirmation_before_side_effects(tmp_path):
+    out=tmp_path/'out'
+    llm=FakeLLM([])
+    with case.case_lock(out):
+        with pytest.raises(ToolError,match='案卷正在计算'):
+            run_agent(llm, [], out)
+        with pytest.raises(case.ConfirmError,match='案卷正在计算'):
+            case.confirm_totals(out, 'S', 'digest', '财务')
+    assert not llm.calls and not (out/case.CASE_FILE).exists()
+    with case.case_lock(out):
+        assert not (out/case.PROCESSING_NOTICE).exists()
 
 
 def test_modified_basis_cannot_be_approved_even_if_browser_digest_matches(tmp_path):
@@ -204,14 +457,40 @@ def test_modified_basis_cannot_be_approved_even_if_browser_digest_matches(tmp_pa
 
 
 def test_approved_resume_runs_allocation_but_never_skips_final_validation(tmp_path):
-    ws=reviewed(make_workspace(tmp_path));out=tmp_path/'out';save_staged_case(ws,out)
+    ws=make_workspace(tmp_path)
+    ws.said='示例案卷已有的书面核算说明。\n同一版继续使用这份说明。'
+    ws.report_required=True
+    reviewed(ws)
+    out=tmp_path/'out';save_staged_case(ws,out)
     case.confirm_totals(out,'S',fingerprint(ws.workflow['basis']['S']),'财务')
     llm=FakeLLM([{'tool':'trial_run','args':{'scheme':'S'}}]);llm.workflow_mode='staged'
     ar=run_agent(llm,ws.inv.files,out,max_steps=1)
     assert not ar.ok and not ar.results and not (out/'result.xlsx').exists()
+    assert ar.ws.said==ws.said and ar.ws._flow().current('approved:S')
+    assert ar.ws.report_required
     assert 'S' in ar.ws.results, [(s.tool, s.result[:1200]) for s in ar.steps]
     assert ar.ws.results['S']['R0'].pool=='30.00'
     assert ar.status=='FAILED' and '最大步数' in ar.error
+
+
+def test_export_rechecks_person_view_before_publishing_any_results(tmp_path, monkeypatch):
+    from bonus_agent.agent import AgentResult, write_agent_outputs
+
+    ws = reviewed(make_workspace(tmp_path))
+    ws._flow().approve('S', '测试案卷财务', fingerprint(ws.workflow['basis']['S']))
+    ws.trial_run('S')
+    rs = ws._ruleset('S')
+    result = ws.results['S']['R0']
+    replay = copy.deepcopy(result)
+    replay.people[0]['final'] = '99.00'
+    monkeypatch.setattr('bonus_agent.agent.compute', lambda *args, **kwargs: replay)
+    ws.done = True
+    out = tmp_path / 'out'
+    ar = AgentResult(ws, [], rs, result, rulesets={'S': rs}, results=ws.results)
+
+    with pytest.raises(ToolError, match='复算.*人员'):
+        write_agent_outputs(ar, out)
+    assert not any((out / name).exists() for name in ('result.xlsx', 'results.json', 'engine_results.json'))
 
 
 def test_recipient_sum_rounding_is_preserved_in_basis_and_final_engine():
@@ -248,6 +527,110 @@ def test_full_staged_financial_validation_without_skipping_checker_or_samples(tm
         ws.verify(node,expr,'每个项目按销售金额的10%计算奖金，按名单比例分配。',scheme='S',amount=kind)
     assert ws.validation_report()['status']=='PASS'
     assert ws.finish('项目按10%核算，按名单比例分配',review=False)=='已完成'
+
+
+@pytest.mark.reread
+@pytest.mark.verify
+@pytest.mark.parametrize(
+    'mode_text, threshold, rates, amounts, share, amount_column, expected_projects, expected_people',
+    [
+        ('整额分档', 100, (10, 20), (100, 140), '0.25', '到账金额', ('20.00', '28.00'), ('27.00', '21.00')),
+        ('超额累进', 150, (8, 15), (120, 190), '0.60', '本期业绩', ('9.60', '18.00'), ('20.40', '7.20')),
+    ],
+)
+def test_changed_rules_and_inputs_reach_verified_people_export(
+    tmp_path, mode_text, threshold, rates, amounts, share, amount_column, expected_projects, expected_people,
+):
+    from bonus_agent.agent import AgentResult, write_agent_outputs
+
+    low, high = rates
+    quote = f'项目奖励按{mode_text}计算'
+    policy = tmp_path / '新制度.md'
+    cutoff = f'档位为{threshold}元，等于档位时归高档'
+    policy.write_text(f'{quote}。低档费率为{low}%，高档费率为{high}%，{cutoff}。按名单份额分配。', encoding='utf-8')
+    workbook = tmp_path / '新台账.xlsx'
+    wb = openpyxl.Workbook()
+    projects = wb.active
+    projects.title = '业绩'
+    projects.append(['立项号', amount_column])
+    projects.append(['A', amounts[0]])
+    projects.append(['B', amounts[1]])
+    people = wb.create_sheet('名单')
+    people.append(['行号', '立项号', '工号', '份额'])
+    people.append(['A1', 'A', 'E01', '1'])
+    people.append(['B1', 'B', 'E01', share])
+    people.append(['B2', 'B', 'E02', str(1 - Decimal(share))])
+    wb.save(workbook)
+    wb.close()
+
+    low_ratio, high_ratio = (Decimal(r) / 100 for r in rates)
+    independent = (f'if(amount < {threshold}, amount * {low_ratio}, amount * {high_ratio})'
+                   if mode_text == '整额分档' else
+                   f'min(amount, {threshold}) * {low_ratio} + max(amount - {threshold}, 0) * {high_ratio}')
+    source = [{'doc': policy.name, 'quote': quote}]
+    populations = {k: {**v, 'sources': source} for k, v in population_spec().items()}
+    llm = FakeLLM([])
+    llm.checker_required = True
+    llm.checker_llm = FakeLLM([json.dumps({
+        'pool': independent, 'helpers': {}, 'tables': {}, 'details': {'项目奖': independent},
+        'totals': {'项目奖合计': f'sum({independent}, of: "projects")'},
+        'populations': populations, 'unclear': [],
+    })])
+    ws = Workspace(llm, build_inventory([policy, workbook]))
+    ws.workflow['enabled'] = True
+    ws.plan_calculation('按新制度核算并按名单分配', ['项目底稿', '总额', '人员金额'],
+                        {policy.name: 'rule', workbook.name: 'data'}, ['S'])
+    ws.record_clauses([{'file': policy.name, 'quote': quote, 'point': quote}])
+    ws.record_facts([{'name': name, 'file': policy.name, 'quote': text, 'value': value}
+                     for name, text, value in [('rate_low', f'低档费率为{low}%', f'{low}%'),
+                                               ('rate_high', f'高档费率为{high}%', f'{high}%'),
+                                               ('cutoff', cutoff, f'{threshold}元')]])
+    ws.define_dataset('projects', workbook.name, '业绩', {
+        'pid': {'column': '立项号', 'type': 'id'}, 'amount': {'column': amount_column, 'type': 'money'},
+    }, key='pid')
+    ws.define_dataset('people', workbook.name, '名单', {
+        'rid': {'column': '行号', 'type': 'id'}, 'pid': {'column': '立项号', 'type': 'id'},
+        'person': {'column': '工号', 'type': 'text'}, 'share': {'column': '份额', 'type': 'ratio'},
+    }, key='rid')
+    ws.compile_table('rate', [{'value': 'rate_low'}, {'lower': 'cutoff', 'value': 'rate_high'}],
+                     scheme='S', algorithm_basis={'file': policy.name, 'quote': quote}, lower_inclusive=True)
+    formula = 'tier(rate, amount)'
+    ws.set_rules('S', pool={'scope': '项目', 'expr': formula, 'sources': source},
+                 allocation=[{'level': '项目', 'key': 'pid'},
+                             {'level': '参与', 'key': 'rid', 'parent_key': 'pid', 'weight': 'share'}],
+                 report={'people': 'person', 'details': [{'name': '项目奖', 'level': '项目', 'expr': formula, 'sources': source}],
+                         'distributions': [{'name': '项目分配去向', 'level': '项目', 'total': formula, 'sources': source}],
+                         'totals': [{'name': '项目奖合计', 'level': 'global', 'expr': f'sum({formula}, of: "projects")',
+                                     'sources': source}]})
+    ws.cover_clauses({'C1': 'pool'})
+    reviewed(ws)
+    basis = ws.workflow['basis']['S']
+    assert [basis['objects'][f'项目:{key}']['amount'] for key in 'AB'] == list(expected_projects)
+    assert not ws.results
+    ws._flow().approve('S', '测试确认人', fingerprint(basis))
+    ws.trial_run('S')
+    llm.checker_llm.reread = json.dumps({'items': [{'name': '项目奖', 'columns': [f'projects/{amount_column}'],
+        'constants': [{'value': r, 'unit': '%'} for r in rates] + [{'value': threshold, 'unit': '元'}]}]})
+    llm.checker_llm.calc = json.dumps({'schemes': {'S': {'pool': independent, 'helpers': {}, 'tables': {},
+        'details': {'项目奖': independent}, 'people': {'key': 'person', 'mode': 'allocation', 'weights': {'参与': 'share'}}}}})
+    assert ws.review_calculation()['status'] == 'PASS'
+    for node, kind, _ in ws._verify_targets('S'):
+        expr = (f'sum({independent}, of: "projects")' if node == '全部' else
+                independent if node.startswith('项目:') else f'({independent}) * share')
+        ws.verify(node, expr, quote, scheme='S', amount=kind)
+    assert ws.validation_report()['status'] == 'PASS'
+    result = ws.results['S']['R0']
+    assert {p['name']: p['final'] for p in result.people} == dict(zip(('E01', 'E02'), expected_people))
+    assert ws.finish('已按当期制度与名单核算', review=False) == '已完成'
+    rules = ws._ruleset('S')
+    paths = write_agent_outputs(AgentResult(ws, [], rules, result, rulesets={'S': rules}, results=ws.results), tmp_path / 'out')
+    output = openpyxl.load_workbook(paths['excel'], read_only=True, data_only=True)
+    try:
+        actual = {row[0]: Decimal(str(row[2])).quantize(Decimal('0.01')) for row in output['汇总核算'].values
+                  if row[0] in ('E01', 'E02')}
+        assert actual == dict(zip(('E01', 'E02'), map(Decimal, expected_people)))
+    finally:
+        output.close()
 
 
 def test_rewording_production_formula_cannot_resample_a_disagreeing_reference(tmp_path):

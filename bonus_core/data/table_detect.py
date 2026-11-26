@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import re
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import openpyxl
+
+from bonus_core.data.period import Period
 
 TOTAL_WORDS = ("合计", "小计", "总计", "总额")
 SCAN_ROWS = 20
@@ -214,11 +217,13 @@ def _is_segment_header(row: list, header: list[str]) -> bool:
 
 
 _NAME_SHARE = re.compile(r"^(?P<name>.*?)\s*[(（]?\s*(?P<pct>\d+(?:\.\d+)?)\s*[%％]\s*[)）]?$")
+_SHARE_PARTS = re.compile(r"[,，、;；\r\n]+")
+_PERCENT_SIGN = re.compile(r"[%％]")
+_EXPLICIT_SHARE = re.compile(r"([(（])?\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*[%％]\s*([)）])?$")
 
 
 def split_name_share(text) -> tuple[str, "Decimal | None"]:
     """“张三50%”“张三(50%)”拆成 (张三, 0.5)；没有百分比（或前面没有名字）原样返回、比例是 None。"""
-    from decimal import Decimal
     if not isinstance(text, str):
         return text, None
     m = _NAME_SHARE.match(text.strip())
@@ -232,30 +237,130 @@ def parse_shares(text) -> dict:
     if not isinstance(text, str):
         return {}
     out = {}
-    for part in re.split(r"[,，、;；\n]+", text):
+    for part in _SHARE_PARTS.split(text):
         name, pct = split_name_share(part)
         if pct is not None:
             out[str(name)] = pct
     return out
 
 
+def _explicit_recipient_shares(value, location: str) -> list[tuple[str, Decimal]]:
+    """Parse every entry from a cell explicitly designated as the recipient source."""
+    parts = [p.strip() for p in _SHARE_PARTS.split(value) if p.strip()] if isinstance(value, str) else []
+    if not parts:
+        raise ValueError(f'{location}需要可拆分的姓名和百分比，如「甲60%，乙40%」')
+    shares = []
+    for part in parts:
+        match = _EXPLICIT_SHARE.search(part)
+        if not match or len(_PERCENT_SIGN.findall(part)) != 1:
+            raise ValueError(f'{location}无法解析「{part}」，每项须填写姓名和明确百分比')
+        opening, percent, closing = match.groups()
+        name = part[:match.start()].strip()
+        if (not re.search(r'[^\d\s.()（）+-]', name) or name.endswith(('+', '-', '.', '(', '（'))
+                or {'(': ')', '（': '）', None: None}[opening] != closing):
+            raise ValueError(f'{location}无法解析「{part}」，请核查姓名和百分比的写法')
+        pct = Decimal(percent) / 100
+        if not 0 <= pct <= 1:
+            raise ValueError(f'{location}「{part}」中的比例超出 0% 到 100%')
+        shares.append((name, pct))
+    return shares
+
+
+def normalize_unpivot_split_columns(value, *, columns: list[str], share: str) -> list[str]:
+    """Validate which original columns directly supply names and percentages."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or any(not isinstance(col, str) or col.strip() not in columns for col in value):
+        raise ValueError('unpivot.split_shares_columns：须列出 columns 中作为人员和比例来源的原始列名')
+    if value and not share:
+        raise ValueError('unpivot.split_shares_columns：须同时写 share，才能输出各人的比例')
+    return [col.strip() for col in value]
+
+
+def rename_unpivot_columns(spec: dict, rename) -> dict:
+    """Apply the same physical-column names to every reference in an unpivot spec."""
+    out = dict(spec)
+    for key in ('columns', 'share_from_columns', 'blank_except', 'split_shares_columns'):
+        if isinstance(out.get(key), list):
+            out[key] = [rename(c) for c in out[key]]
+    if out.get('share_from'):
+        out['share_from'] = rename(out['share_from'])
+    if isinstance(out.get('share_columns'), dict):
+        out['share_columns'] = {rename(person): rename(ratio) for person, ratio in out['share_columns'].items()}
+    return out
+
+
+def normalize_unpivot_share_columns(value, *, columns, headers, share, split_columns=(), text_columns=()):
+    """Resolve the per-role mapping from a name column to a separate ratio column."""
+    if value is None:
+        return {}
+    if not share or not isinstance(value, dict):
+        raise ValueError('unpivot.share_columns：须同时写 share，并按 {姓名列: 比例列} 声明')
+    separate = {}
+    for person, ratio in value.items():
+        if (not isinstance(person, str) or person.strip() not in columns or not isinstance(ratio, str)
+                or not ratio.strip() or ratio.strip() in columns or headers.count(ratio.strip()) != 1):
+            raise ValueError(f'unpivot.share_columns：「{person}」须对应表中唯一的独立比例列，当前为「{ratio}」')
+        person = person.strip()
+        if person in split_columns or person in text_columns or person in separate:
+            raise ValueError(f'unpivot.share_columns：「{person}」的比例来源已另行指定')
+        separate[person] = ratio.strip()
+    return separate
+
+
+def scope_unpivot_source(st: SheetTable, spec: dict, period_column: str | None, window: Period | None) -> SheetTable:
+    """Exclude rows known to be outside the period before parsing their allocation text."""
+    if (window is None or not spec.get('share') or not period_column or st.headers.count(period_column) != 1
+            or not isinstance(spec.get('columns'), list) or period_column in spec['columns']
+            or period_column in (spec.get('value'), spec.get('label'), spec.get('share'))):
+        return st
+    idx = st.headers.index(period_column)
+    return replace(st, rows=[(row, vals) for row, vals in st.rows
+                             if window.contains(vals[idx] if idx < len(vals) else None) is not False])
+
+
 _UNSET_SHARE = object()
 
 
-def normalize_unpivot_default_share(value, *, share: str, remainder: str = ""):
-    """Validate the declared executable fallback; absence is handled by the caller."""
-    from decimal import Decimal, InvalidOperation
-    if not share:
-        raise ValueError('unpivot.default_share：须同时写 share，默认比例才有实际输出列')
+def _unit_ratio(value):
     if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
-        raise ValueError('unpivot.default_share：须为0到1的有限比例（也可写百分数字符串），不能是空值或布尔值')
+        raise ValueError('须为0到1的有限比例（也可写百分数字符串），不能是空值或布尔值')
     text = str(value).strip()
     try:
         ratio = Decimal(text[:-1]) / 100 if text.endswith(('%', '％')) else Decimal(text)
     except InvalidOperation:
-        raise ValueError('unpivot.default_share：无法解析比例，须为0到1或明确百分数') from None
+        raise ValueError('无法解析比例，须为0到1或明确百分数') from None
     if not ratio.is_finite() or not 0 <= ratio <= 1:
-        raise ValueError('unpivot.default_share：比例须为0到1的有限数，不能猜测裸数的单位')
+        raise ValueError('比例须为0到1的有限数，不能猜测裸数的单位')
+    return ratio
+
+
+def unpivot_cell_shape(value) -> str:
+    """Classify source cells using the same parsers as the unpivot operation."""
+    if value is None or isinstance(value, str) and not value.strip():
+        return '空白'
+    try:
+        _unit_ratio(value)
+        return '纯比例'
+    except ValueError:
+        pass
+    if isinstance(value, str) and _PERCENT_SIGN.search(value):
+        try:
+            _explicit_recipient_shares(value, '')
+            return '姓名及比例'
+        except ValueError:
+            return '含百分号但格式无效'
+    return '其他非空值'
+
+
+def normalize_unpivot_default_share(value, *, share: str, remainder: str = ""):
+    """Validate the declared executable fallback; absence is handled by the caller."""
+    if not share:
+        raise ValueError('unpivot.default_share：须同时写 share，默认比例才有实际输出列')
+    try:
+        ratio = _unit_ratio(value)
+    except ValueError as exc:
+        raise ValueError(f'unpivot.default_share：{exc}') from None
     if remainder and ratio < 1:
         raise ValueError('unpivot.default_share：小于1的默认比例与 remainder 暂不支持组合；'
                          '默认份额余项和多人共用比例的口径须另行明确，不能静默丢掉余下份额')
@@ -264,7 +369,8 @@ def normalize_unpivot_default_share(value, *, share: str, remainder: str = ""):
 
 def unpivot_sheet(st: SheetTable, columns: list[str], value: str, label: str = "", share: str = "", remainder: str = "",
                   blank: str = "", share_from: str = "", blank_except: list | None = None,
-                  share_from_columns: list | None = None, default_share=_UNSET_SHARE) -> SheetTable:
+                  share_from_columns: list | None = None, default_share=_UNSET_SHARE,
+                  split_shares_columns: list[str] | None = None, share_columns: dict | None = None) -> SheetTable:
     """把几列同一类的值（如销售负责人、执行人、客户经理各一列人名）展开成每个值一行：其余列照抄，
     展开的值放在 value 列，label 列记它原来在哪一列（如 角色）。空格子不展开；合计行不要。
     share 非空时：格子里“名字+百分比”（如 张三50%）拆开，名字放 value、比例放 share 列；
@@ -274,8 +380,14 @@ def unpivot_sheet(st: SheetTable, columns: list[str], value: str, label: str = "
     share_from 非空时：各人的比例写在表里另一列的文字中（如“吴晨晨80%，张荣20%”），格子里只有名字：按名字到这一列的文字里取比例，
     文字是空的时使用 default_share（省略兼容1）；格子里自己写了百分比的，用格子里的。
     share_from_columns：只有这几列的比例写在 share_from 那一列里（不写是全部列）；其余列只认格子里自己写的百分比。
+    split_shares_columns：格子本身提供这个角色的所有姓名和百分比，每项记一行，余项按合计比例算一次。
+    share_columns：角色的比例在各自原始列中。比例为空时，有姓名的角色须有明确的份额或 default_share。
     blank_except：这几列的空格子不记（如“第二个人”那一列空着就是没有第二个人）。"""
-    from decimal import Decimal
+    split_columns = set(normalize_unpivot_split_columns(split_shares_columns, columns=columns, share=share))
+    separate = normalize_unpivot_share_columns(share_columns, columns=columns, headers=st.headers, share=share,
+                                               split_columns=split_columns,
+                                               text_columns=(share_from_columns or columns) if share_from else ())
+    share_indexes = {c: st.headers.index(ratio) for c, ratio in separate.items()}
     declared_default = default_share is not _UNSET_SHARE
     fallback = (normalize_unpivot_default_share(default_share, share=share, remainder=remainder)
                 if declared_default else Decimal(1))
@@ -287,10 +399,28 @@ def unpivot_sheet(st: SheetTable, columns: list[str], value: str, label: str = "
     for j, vals in st.rows:
         base = [vals[i] for i in keep]
         for c, i in zip(columns, idx):
+            location = f'unpivot.share_parse：{st.file}/{st.sheet}!{j}，列「{c}」'
+            separate_value = vals[share_indexes[c]] if c in share_indexes else None
+            explicit_share = separate_value is not None and str(separate_value).strip() != ''
             if vals[i] in (None, "") or (isinstance(vals[i], str) and not vals[i].strip()):
+                if explicit_share:
+                    raise ValueError(f'{location}没有姓名，比例列「{separate[c]}」却有值，请核对原行')
                 if blank and c not in (blank_except or []):
                     rows.append((j, base + [blank.replace("{label}", c)] + ([c] if label else []) + ([Decimal(1)] if share else [])))
                 continue
+            if c in split_columns:
+                shares = _explicit_recipient_shares(vals[i], location)
+                total = sum(pct for _, pct in shares)
+                if total > 1:
+                    raise ValueError(f'{location}的比例合计 {total:.2%}，超过 100%')
+                if total < 1:
+                    if not remainder:
+                        raise ValueError(f'{location}的比例合计 {total:.2%}，不足 100%，请依据规则使用 remainder 记录余项')
+                    shares.append((remainder.replace('{label}', c), Decimal(1) - total))
+                rows.extend((j, base + [name] + ([c] if label else []) + [pct]) for name, pct in shares)
+                continue
+            if share and isinstance(vals[i], str) and len(_PERCENT_SIGN.findall(vals[i])) > 1:
+                raise ValueError(f'{location}有多项比例；如果该列决定人员和份额，请把它写进 split_shares_columns')
             from_text = False                 # 比例是另一列文字里各人分摊的：几个人合起来是 100%，不存在“余下的部分”
             if sf is not None:
                 v, pct = split_name_share(vals[i])
@@ -304,9 +434,23 @@ def unpivot_sheet(st: SheetTable, columns: list[str], value: str, label: str = "
                     from_text = True
             else:
                 v, pct = split_name_share(vals[i]) if share else (vals[i], None)
-            if declared_default and isinstance(vals[i], str) and re.search('[%％]', vals[i]) and split_name_share(vals[i])[1] is None:
-                raise ValueError(f'unpivot.share_parse：{st.file}/{st.sheet}!{j}，列「{c}」含百分号但未解析为姓名和比例；'
+            if (declared_default or c in separate) and isinstance(vals[i], str) and re.search('[%％]', vals[i]) and split_name_share(vals[i])[1] is None:
+                raise ValueError(f'{location}含百分号但未解析为姓名和比例；'
                                  '不能将无法解析的比例当作空值使用 default_share')
+            if c in separate:
+                section = f'{location}的比例列「{separate[c]}」'
+                if explicit_share:
+                    try:
+                        ratio = _unit_ratio(separate_value)
+                    except ValueError as exc:
+                        raise ValueError(f'{section}：{exc}') from None
+                    if pct is not None and pct != ratio:
+                        raise ValueError(f'{section}与姓名格内的比例冲突')
+                    pct = ratio
+                if pct is None and not declared_default:
+                    raise ValueError(f'{section}为空，须按原文声明 default_share')
+                if pct is not None and pct < 1 and not remainder:
+                    raise ValueError(f'{section}的份额不足100%，须按规则声明 remainder')
             rows.append((j, base + [v] + ([c] if label else []) + ([pct if pct is not None else fallback] if share else [])))
             if share and remainder and pct is not None and pct < 1 and not from_text:
                 rows.append((j, base + [remainder.replace("{label}", c)] + ([c] if label else []) + [Decimal(1) - pct]))
@@ -318,7 +462,8 @@ def unpivot_by(st: SheetTable, spec: dict) -> SheetTable:
     """按 define_dataset / 映射里存的 unpivot 说明展开。"""
     return unpivot_sheet(st, spec["columns"], spec["value"], spec.get("label") or "", spec.get("share") or "",
                          spec.get("remainder") or "", spec.get("blank") or "", spec.get("share_from") or "", spec.get("blank_except") or None,
-                         spec.get("share_from_columns") or None, spec.get('default_share', _UNSET_SHARE))
+                         spec.get("share_from_columns") or None, spec.get('default_share', _UNSET_SHARE),
+                         spec.get('split_shares_columns'), spec.get('share_columns'))
 
 
 ROW_ID = "（行号）"      # 虚拟列：每行的 Excel 行号（展开后同一行的几条加 -1、-2），给没有唯一编号列的明细表当编号

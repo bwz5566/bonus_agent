@@ -1,5 +1,6 @@
 """Job limits are checked before transport, shared across roles and never reset by retries."""
 import copy
+import json
 from types import SimpleNamespace as NS
 
 import pytest
@@ -44,6 +45,66 @@ def transport(monkeypatch, responses=None):
     client = Transport(responses)
     monkeypatch.setattr('bonus_agent.llm.openai_client', lambda *args: client)
     return client
+
+
+@pytest.mark.parametrize('error_type, switched', [
+    ('exceeded_current_quota_error', True), ('rate_limit_reached_error', False), ('engine_overloaded_error', False)
+])
+def test_kimi_standby_only_retries_a_confirmed_quota_rejection(monkeypatch, error_type, switched):
+    llm = LLM('repair', 'kimi-test', 'https://api.moonshot.cn/v1', 'primary-test')
+    llm.fallback_api_key = 'standby-test'
+    llm._ctx = None
+    budget = RunBudget(0, 100_000).bind(llm)
+    failure = RuntimeError('rejected')
+    failure.status_code, failure.body = 429, {'error': {'type': error_type}}
+    client = Transport([failure, response()])
+    keys = []
+    def connection(url, key, timeout):
+        keys.append(key)
+        return client
+    monkeypatch.setattr('bonus_agent.llm.openai_client', connection)
+    if switched:
+        assert llm.chat([{'role': 'user', 'content': 'ok'}]) == '{}'
+        assert keys == ['primary-test', 'standby-test']
+        assert len(llm.last_call['request_attempts']) == 2
+        assert llm.last_call['request_attempts'][0]['budget_request_sequence'] != llm.last_call['request_attempts'][1]['budget_request_sequence']
+        assert budget.snapshot()['unconfirmed_reserved_tokens'] > 0 and budget.snapshot()['actual_used_tokens'] == 150
+        assert 'standby-test' not in repr(llm) and 'primary-test' not in str(llm.last_call)
+    else:
+        with pytest.raises(LLMError):
+            llm.chat([{'role': 'user', 'content': 'ok'}])
+        assert keys == ['primary-test']
+
+
+def test_case_budget_recovers_outstanding_reservation_and_actual_usage(tmp_path, monkeypatch):
+    from bonus_agent.case import save_case
+
+    out, ledger = tmp_path / 'out', tmp_path / 'usage.json'
+    save_case(out, {'rounds': [{'usage': {'prompt_tokens': 500, 'completion_tokens': 200,
+                                        'budget': {'unconfirmed_reserved_tokens': 100}}},
+                              {'usage': {'prompt_tokens': 300, 'completion_tokens': 100}}]})
+    llm = model()
+    budget = RunBudget.for_case(ledger, out, 0, 20_000).bind(llm)
+    def checked_response():
+        saved = json.loads(ledger.read_text())
+        assert saved['actual_used_tokens'] == 1100
+        assert saved['inflight_reserved_tokens'] > 0
+        return response(prompt=300, completion=100)
+
+    client = transport(monkeypatch, [checked_response])
+    llm.chat([{'role': 'user', 'content': 'read policy'}], max_tokens=500)
+    assert len(client.requests) == 1
+    budget.reserve(llm, 2_000, 500)  # Process exits before it receives or settles this response.
+    assert json.loads(ledger.read_text())['inflight_reserved_tokens'] == 2_500
+
+    reopened = RunBudget.for_case(ledger, out, 0, 4_100).bind(model())
+    state = reopened.snapshot()
+    assert state['actual_used_tokens'] == 1_500
+    assert state['unconfirmed_reserved_tokens'] == 2_600
+    assert state['inflight_reserved_tokens'] == state['remaining_tokens'] == 0
+    with pytest.raises(RunBudgetError, match='案卷累计.*达到总上限'):
+        reopened.reserve(model(), 10, 10)
+    assert len(client.requests) == 1
 
 
 @pytest.mark.parametrize('kind', ['chat', 'chat_tools'])
@@ -183,6 +244,51 @@ def test_checker_budget_error_cannot_send_fallback_or_retry(monkeypatch, require
     assert budget.error and not client.requests
 
 
+def test_optional_read_timeout_keeps_case_reservation_after_primary_continues_and_restarts(tmp_path, monkeypatch):
+    from httpx import ReadTimeout
+
+    primary, supervisor = model(), model('supervisor')
+    primary.repair_llm = supervisor
+    ledger = tmp_path / 'usage.json'
+    budget = RunBudget.for_case(ledger, tmp_path / 'out', 0, 10000).bind(primary)
+    client = transport(monkeypatch, [ReadTimeout('waiting for result'), response(prompt=100, completion=50)])
+    with budget.optional_request(handoff_model=supervisor), pytest.raises(LLMError):
+        supervisor.chat([], max_tokens=200)
+    held = supervisor.last_call['reserved_input_estimate'] + supervisor.last_call['requested_output_tokens']
+    assert budget.optional_timeout(supervisor)['unconfirmed_reserved_tokens'] == held
+    assert not budget.error and not budget.optional_timeout(primary)
+    assert primary.chat([], max_tokens=200) == '{}'
+    assert len(client.requests) == 2 and supervisor.last_call['request_attempts'][0]['dispatch_status'] == 'unknown'
+    restored = RunBudget.for_case(ledger, tmp_path / 'out', 0, 10000)
+    assert restored.snapshot()['remaining_tokens'] == 10000 - held - 150
+    assert json.loads(ledger.read_text())['unconfirmed_reserved_tokens'] == held
+
+
+@pytest.mark.parametrize('wrong_role,invalid_usage', [(True, False), (False, True)])
+def test_optional_timeout_never_excuses_missing_usage_or_another_role(monkeypatch, wrong_role, invalid_usage):
+    from httpx import ReadTimeout
+
+    primary, reviewer = model(), model('reviewer')
+    budget = RunBudget(0, 10000).bind(primary).bind(reviewer)
+    transport(monkeypatch, [response(reported=False) if invalid_usage else ReadTimeout('unanswered')])
+    with budget.optional_request(handoff_model=primary if wrong_role else reviewer), pytest.raises(LLMError):
+        reviewer.chat([], max_tokens=100)
+    assert budget.error and not budget.optional_timeout(reviewer)
+
+
+def test_held_uncertain_tokens_also_bound_returned_actions(monkeypatch):
+    from httpx import ReadTimeout
+
+    primary, supervisor = model(), model('repair')
+    budget = RunBudget(0, 2000).bind(primary).bind(supervisor)
+    client = transport(monkeypatch, [ReadTimeout('no response'), response(prompt=1800, completion=50)])
+    with budget.optional_request(handoff_model=supervisor), pytest.raises(LLMError):
+        supervisor.chat([], max_tokens=100)
+    with pytest.raises(RunBudgetError, match='未确认预留之和超过'):
+        primary.chat([], max_tokens=100)
+    assert len(client.requests) == 2 and budget.snapshot()['remaining_tokens'] == 0
+
+
 def test_unknown_advisor_usage_cannot_allow_primary_to_continue(monkeypatch):
     from bonus_agent.recovery import local_advice
     client = transport(monkeypatch, [response(reported=False)])
@@ -280,6 +386,61 @@ def test_run_agent_registers_budget_and_does_not_fallback_after_preflight_stop(t
     assert llm.run_budget is budget and not client.requests
 
 
+@pytest.mark.parametrize('expire_before_request', [True, False])
+def test_cli_auto_preserves_case_at_configured_deadline(tmp_path, monkeypatch, expire_before_request):
+    from bonus_agent.cli import main
+
+    clock = [1000.0]
+    monkeypatch.setattr('bonus_agent.recovery.time.monotonic', lambda: clock[0])
+    llm = model()
+    llm.min_request_seconds = 3 if expire_before_request else 0
+    monkeypatch.setattr('bonus_agent.cli.load_config', lambda *args: {'models': {llm.name: {}}})
+    monkeypatch.setattr(LLM, 'from_config', classmethod(lambda cls, *args: llm))
+    monkeypatch.setattr(Workspace, 'triage_all', lambda self: None)
+
+    def late_response():
+        clock[0] += 3
+        return response()
+
+    client = transport(monkeypatch, [late_response])
+    policy = tmp_path / 'policy.md'
+    policy.write_text('按原文计算。', encoding='utf-8')
+    out = tmp_path / 'case'
+    assert main(['auto', '--out', str(out), '--max-seconds', '2', str(policy)]) == 1
+    assert (out / 'case.json').is_file()
+    assert not (out / 'engine_results.json').exists()
+    log = json.loads((out / 'agent_log.json').read_text(encoding='utf-8'))
+    budget = log['usage']['budget']
+    if expire_before_request:
+        assert not client.requests and budget['actual_used_tokens'] == 0
+        assert '未发出请求' in log['error']
+    else:
+        assert len(client.requests) == 1 and budget['actual_used_tokens'] == 150
+        assert client.options == [{'max_retries': 0, 'timeout': 2.0}]
+        assert '未执行返回动作' in log['error']
+
+
+@pytest.mark.parametrize('constraint', ['window', 'tokens'])
+def test_unsent_optional_request_does_not_stop_a_fitting_primary_request(monkeypatch, constraint):
+    from bonus_agent.recovery import local_advice
+
+    monkeypatch.setattr('bonus_agent.recovery.time.monotonic', lambda: 1000.0)
+    client = transport(monkeypatch)
+    primary, advisor = model(), model('advisor')
+    budget = RunBudget(0, 10000 if constraint == 'window' else 3000, 60, started=1000).bind(primary)
+    budget.bind(advisor)
+    if constraint == 'window':
+        advisor.min_request_seconds = 180
+
+    with pytest.raises(RunBudgetError, match='请求时间事前拦截' if constraint == 'window' else '预算事前拦截'):
+        local_advice(advisor, '核对费率', [], [], '核对原文')
+    assert not client.requests and not budget.check(primary)
+    primary.chat([], max_tokens=100)
+    assert len(client.requests) == 1
+    assert budget.snapshot()['actual_used_tokens'] == 150
+    assert budget.snapshot()['unconfirmed_reserved_tokens'] == 0
+
+
 @pytest.mark.parametrize('tool,error', [
     ('plan_formula_tasks', '错误：construction.plan：同一目标只允许一个任务，修改时复用id'),
     ('update_dataset', '错误：unmatched_basis 缺少依据，请先登记来源'),
@@ -288,3 +449,9 @@ def test_explicit_contract_feedback_gets_primary_repair_before_optional_advisor(
     step = Step(tool, {}, error, False)
     assert _deep_reason([step], 0, NS(), {tool: 1}) == ''
     assert _deep_reason([step], 0, NS(), {tool: 2})
+
+
+@pytest.mark.parametrize('code', ['construction.source', 'construction.name_clash'])
+def test_exact_plan_identifier_errors_keep_the_native_repair_path(code):
+    step = Step('plan_formula_tasks', {}, f'错误：{code}：请核对反馈中的原名', False)
+    assert _deep_reason([step], 0, NS(), {'plan_formula_tasks': 2}) == ''

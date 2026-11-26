@@ -39,6 +39,53 @@ def test_compile_table_resolves_cell_coordinates_without_reading_the_ledger(tmp_
         ws.compile_table("T", [{"key": "x", "value": "R2C2"}], scheme="S", kind="lookup", cells_from={"file": FILE})
 
 
+@pytest.mark.parametrize(('first', 'second', 'rates', 'reverse'), [
+    (30, 85, ('2%', '3%', '4%'), True),
+    (60, 140, ('1.5%', '2.5%', '3.5%'), False),
+])
+def test_first_upper_endpoint_compiles_from_the_source_series(tmp_path, first, second, rates, reverse):
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    from bonus_agent.agent import Workspace
+    from bonus_agent.auto import build_inventory
+    from bonus_core.engine.evaluator import tier_amount
+
+    doc = tmp_path / 'schedule.pptx'
+    book = Presentation()
+    slide = book.slides.add_slide(book.slide_layouts[6])
+    slide.shapes.add_textbox(0, 0, Inches(5), Inches(1)).text = '阶段核算制度'
+    table = slide.shapes.add_table(4, 2, 0, Inches(1), Inches(5), Inches(2)).table
+    table.cell(0, 0).text, table.cell(0, 1).text = '金额区间', '阶段费率'
+    bands = list(zip((f'{first}万以下', f'{first}-{second}万', f'{second}万以上'), rates))
+    bands = bands[::-1] if reverse else bands
+    for row, (limit, rate) in enumerate(bands, 1):
+        table.cell(row, 0).text, table.cell(row, 1).text = limit, rate
+    book.save(doc)
+    policy = tmp_path / 'policy.md'
+    quote = '核算金额采用超额累进。'
+    policy.write_text(quote, encoding='utf-8')
+    ws = Workspace(FakeLLM([]), build_inventory([doc, policy]))
+    source = {'file': doc.name, 'page': 1, 'table': 1}
+    numbers = [4, 3, 2] if reverse else [2, 3, 4]
+    cells = [{'row': row, 'column': 2} for row in numbers] + [{'row': row, 'column': 1} for row in numbers[1:]]
+    assert ws.record_parameter_cells(**source, cells=cells, applies_to='阶段核算制度')['status'] == 'PASS'
+    rows = [{'lower': f'R{row}C1', 'value': f'R{row}C2'} for row in numbers]
+    basis = {'file': policy.name, 'quote': quote}
+    ws.compile_table('schedule', rows, scheme='S', cells_from=source, algorithm_basis=basis, lower_inclusive=False)
+    compiled = ws._ruleset('S').tables['schedule']
+    assert [lower for lower, _ in compiled.steps] == [0, first * 10_000, second * 10_000]
+    entered = Decimal(second * 10_000 + 20_000)
+    expected = sum(Decimal(rate[:-1]) / 100 * amount
+                   for rate, amount in zip(rates, (first * 10_000, (second - first) * 10_000, 20_000)))
+    assert tier_amount(compiled, entered) == expected
+    before = ws.drafts['S']['tables']['schedule'].copy()
+    with pytest.raises(ToolError, match='parameter.applicability'):
+        ws.compile_table('schedule', rows, scheme='S', cells_from=source, algorithm_basis=basis,
+                         applies_when='阶段 费率说明')
+    assert ws.drafts['S']['tables']['schedule'] == before
+
+
 def _batch(i):
     ok = {"name": f"ok{i}", "file": "policy.md", "quote": "甲组费率3%", "value": "3%"}
     bad = {"name": f"bad{i}", "file": "policy.md", "quote": "甲组费率3%", "value": "7%"}
@@ -170,6 +217,70 @@ def test_update_dataset_can_set_unmatched_but_still_needs_material_basis(tmp_pat
     with pytest.raises(ToolError) as e:
         ws.update_dataset("参考", {"unmatched": "ignore"})
     assert "dataset.patch" not in str(e.value) and "unmatched_basis" in str(e.value)   # 进到依据核对，不是“不允许修改”
+
+
+def test_verified_unmatched_basis_survives_snapshot_and_unrelated_field_patch(tmp_path):
+    import openpyxl
+    from bonus_agent import case
+    from bonus_agent.auto import build_inventory
+    from bonus_agent.agent import Workspace
+
+    source = tmp_path / 'ref.xlsx'
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = '明细'
+    sheet.append(['code', 'alternate', 'amount'])
+    sheet.append(['A', 'B', 0])
+    workbook.save(source)
+    guide = tmp_path / 'guide.md'
+    quote = '销售记录里找不到的参考表记录不参与本次核算。'
+    guide.write_text(quote, encoding='utf-8')
+    inventory = build_inventory([source, guide])
+    ws = Workspace(FakeLLM([]), inventory)
+    basis = {'file': guide.name, 'quote': quote}
+    ws.define_dataset('参考', source.name, sheet.title,
+                      {'code': {'column': 'code', 'type': 'id'},
+                       'amount': {'column': 'amount', 'type': 'number'}},
+                      link='code', unmatched='ignore', unmatched_basis=basis)
+    resumed = Workspace(FakeLLM([]), inventory)
+    case.restore(resumed, case.snapshot(ws))
+    resumed.update_dataset('参考', {'fields': {'amount': {'if_empty': 'skip'}}})
+    assert resumed.mapping['参考'].unmatched_basis == basis
+    assert resumed.datasets['参考'].fields['amount'].if_empty == 'skip'
+    with pytest.raises(ToolError, match='unmatched_basis'):
+        resumed.update_dataset('参考', {'fields': {'code': {'column': 'alternate'}}})
+    assert resumed.mapping['参考'].columns['code'] == 'code'
+
+
+def test_unmatched_quote_rejection_returns_exact_policy_instead_of_finance_question(tmp_path):
+    import openpyxl
+    from bonus_agent import stuck_question
+    from bonus_agent.agent import Workspace
+    from bonus_agent.auto import build_inventory
+
+    source = tmp_path / 'ref.xlsx'
+    workbook = openpyxl.Workbook()
+    workbook.active.append(['code'])
+    workbook.active.append(['A'])
+    workbook.save(source)
+    guide = tmp_path / 'guide.md'
+    matching = '参考表按编号匹配主表。'
+    exclusion = '参考表有、主表里没有的对象，不计入本次核算。'
+    guide.write_text(f'- {matching}\n- {exclusion}\n- 手续费不参与奖金核算。', encoding='utf-8')
+    llm = FakeLLM([])
+    ws = Workspace(llm, build_inventory([source, guide]))
+    args = dict(name='参考', file=source.name, sheet='Sheet',
+                fields={'code': {'column': 'code', 'type': 'id'}}, key='code', unmatched='ignore')
+    for wrong in (matching, '多出来的记录不参与。'):
+        with pytest.raises(ToolError, match=r'unmatched_basis\.source') as error:
+            ws.define_dataset(**args, unmatched_basis={'file': guide.name, 'quote': wrong})
+        reason = f'错误：{error.value}'
+        assert exclusion in reason and '手续费' not in reason
+        assert stuck_question.build(ws, llm, reason, []) is None and not llm.calls
+
+    basis = {'file': guide.name, 'quote': exclusion}
+    ws.define_dataset(**args, unmatched_basis=basis)
+    assert ws.mapping['参考'].unmatched_basis == basis
 
 
 def _tier_ppt(tmp_path):

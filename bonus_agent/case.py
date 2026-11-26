@@ -11,8 +11,11 @@ from __future__ import annotations
 
 import hashlib
 import copy
+import errno
 import json
+import os
 import shutil
+from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -25,6 +28,33 @@ from bonus_core.dsl.models import DatasetDef
 from bonus_core.engine.run import Result
 
 CASE_FILE = "case.json"
+
+
+class CaseBusyError(RuntimeError):
+    pass
+
+
+@contextmanager
+def case_lock(out: Path | None):
+    """Hold one OS-owned writer lock for a case, released on close or process exit."""
+    if out is None:
+        yield
+        return
+    out.mkdir(parents=True, exist_ok=True)
+    with (out / '.case.lock').open('a+b') as stream:
+        stream.seek(0)
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                raise
+            raise CaseBusyError('案卷正在计算或确认，完成当前操作后再提交。') from exc
+        yield
 
 
 def fingerprint(files: list[Path]) -> dict[str, str]:
@@ -85,7 +115,7 @@ def _checkpoint(out: Path, case: dict) -> None:
 def snapshot(ws) -> dict:
     flow = copy.deepcopy(ws.workflow)
     if ws.staged:
-        flow['view_version'] = ws._flow().version()
+        flow['view_basis_version'] = ws._flow().version('basis')
     return {
         "datasets": {k: v.model_dump(mode="json", exclude_defaults=True) for k, v in ws.datasets.items()},
         "mapping": {k: v.model_dump(mode="json", exclude_defaults=True) for k, v in ws.mapping.items()},
@@ -106,11 +136,20 @@ def snapshot(ws) -> dict:
         "repair_attempts": ws.repair_attempts,
         "workflow": flow,
         "said": ws.said,
+        "report_required": ws.report_required,
     }
 
 
 def confirm_totals(out: Path, scheme: str, digest: str, by: str) -> dict:
     """Human-only boundary: recompute the exact pending basis before storing approval."""
+    try:
+        with case_lock(out):
+            return _confirm_totals(out, scheme, digest, by)
+    except CaseBusyError as exc:
+        raise ConfirmError(str(exc)) from exc
+
+
+def _confirm_totals(out: Path, scheme: str, digest: str, by: str) -> dict:
     from bonus_agent.agent import Workspace, ToolError
     from bonus_agent.auto import build_inventory
     from bonus_agent.llm import FakeLLM
@@ -121,6 +160,9 @@ def confirm_totals(out: Path, scheme: str, digest: str, by: str) -> dict:
     obj = load_case(out)
     if not obj or not obj.get('rounds'):
         raise ConfirmError('没有待确认的案卷')
+    if obj.get('workspace',{}).get('workflow',{}).get('fixed_commission'):
+        from bonus_agent.commission_chain import approve_fixed
+        return approve_fixed(out,obj,scheme,digest,by)
     rnd = obj['rounds'][-1]
     paths = [Path(x['path']) for x in rnd.get('source_inputs', [])]
     if not paths or any(not p.is_file() for p in paths):
@@ -133,9 +175,11 @@ def confirm_totals(out: Path, scheme: str, digest: str, by: str) -> dict:
     if not ws.staged:
         raise ConfirmError('该案卷不是分阶段核算')
     try:
-        record = Workflow(ws).approve(scheme, by, digest)
+        record = Workflow(ws).approve(scheme, by, digest, reviewed_snapshot=True)
     except (ToolError, EngineError, ValueError, KeyError) as exc:
         raise ConfirmError(str(exc)) from None
+    if record.get('already_confirmed'):
+        return record
     obj['workspace'] = snapshot(ws)
     obj.setdefault('total_confirmations', []).append(
         {**record, 'at': datetime.now().isoformat(timespec='seconds'), 'round': rnd['n']}
@@ -163,6 +207,7 @@ def restore(ws, snap: dict) -> None:
     ws.repair_attempts = snap.get("repair_attempts", {})
     ws.workflow = snap.get('workflow',{})
     ws.said = snap.get('said','')
+    ws.report_required = ws.report_required or snap.get('report_required') is True
     from bonus_agent.agent import _verify_key
     ws.verified = {}
     for key, record in snap.get("verified", {}).items():
@@ -184,6 +229,62 @@ def restore(ws, snap: dict) -> None:
             node = node.removesuffix('|实发')
         ws.verified[_verify_key(name, node, amount)] = record
     ws.untested = set(ws.schemes)            # 数据或答复可能变了，每个方案都要重新试算
+
+
+def restore_confirmed_basis(out: Path, case: dict, ws) -> None:
+    """Recover older human confirmations using the reviewed round's saved inputs."""
+    from bonus_agent.recovery import fingerprint as digest_of
+    from bonus_agent.workflow import Workflow
+    from bonus_core.data.period import Period
+
+    if not case.get('total_confirmations') or not ws.staged:
+        return
+    archived = ws.workflow.setdefault('confirmed_basis', {})
+    pending = set(ws.schemes) - archived.keys()
+    snapshots = {}
+    for record in reversed(case['total_confirmations']):
+        if not isinstance(record, dict):
+            continue
+        name = record.get('scheme')
+        if not isinstance(name, str) or name not in pending:
+            continue
+        pending.remove(name)
+        n, digest, by = record.get('round'), record.get('digest'), record.get('by')
+        if record.get('status') != 'PASS' or type(n) is not int or n < 1 or not digest or not by or not record.get('at'):
+            continue
+        if n not in snapshots:
+            path = out / 'history' / f'第{n}轮' / CASE_FILE
+            try:
+                snapshots[n] = json.loads(path.read_text(encoding='utf-8'))
+            except (OSError, ValueError):
+                snapshots[n] = {}
+        previous = snapshots[n]
+        if not isinstance(previous, dict):
+            continue
+        rows = previous.get('rounds') or []
+        if not rows or rows[-1].get('n') != n:
+            continue
+        inputs = rows[-1]
+        try:
+            period = Period.parse(inputs.get('period'))
+        except ValueError:
+            continue
+        if inputs.get('files') != ws._source_version or period != ws.period:
+            continue
+        workspace = previous.get('workspace', {})
+        flow = workspace.get('workflow', {})
+        review = (flow.get('receipts', {}).get('review:' + name) or {}).get('payload', {})
+        if (review.get('status') != 'PASS' or review.get('basis_digest') != digest
+                or digest_of(flow.get('basis', {}).get(name)) != digest):
+            continue
+        try:
+            questions = [Question.model_validate(q) for q in workspace.get('questions', [])]
+        except ValueError:
+            continue
+        archived[name] = {
+            'scope': Workflow.confirmation_scope(digest, ws._source_version, ws.period, questions),
+            'by': by, 'at': record['at'],
+        }
 
 
 def apply_answers(questions: list[Question], answers: list[dict] | None) -> list[Question]:
@@ -378,36 +479,151 @@ def confirm_options(out: Path) -> dict:
     }
 
 
-def confirm(out: Path, by: str, note: str = "", data: list[Path] | None = None, review: bool = True, *,
-            save_template: bool = True, revisions: list[str] | None = None) -> Path | None:
-    """财务确认最新一轮：核对口径单已逐条确认、输出文件没被改过、按这些文件复算与该轮结果逐分一致，然后冻结成 template/。
-
-    只能确认最新的一轮，且该轮已出结果（状态 OK）。返回模板目录。属于某个场景的案卷，确认后可以发布成场景的规则版本
-    （scenarios.releases.publish），以后每期换数据直接按版本算。
-    review=False：口径单已在线下核对（命令行确认时用 --no-review 明确说明）。
-    save_template=False：只确认本轮结果，不录入模板（原模板不动），返回 None。
-    revisions：录入模板的人工调整修订（"方案/修订名"，见 confirm_options）。本轮有修订时必须明确给出，空列表表示都不录入；
-    录入的调整以后每期按模板计算都会自动带上，所以不默认带。
-    """
-    out = Path(out)
-    import yaml
-
-    from bonus_core.dsl.models import RuleSet
-    from bonus_core.template import MANIFEST, Template, order_schemes
+def _checked_round(out: Path) -> tuple[dict, dict, dict]:
     case = load_case(out)
     if not case or not case.get("rounds"):
         raise ConfirmError(f"{out} 不是案卷（没有 {CASE_FILE}），先用 bonus-agent auto --out {out} 计算")
-    if not by.strip():
-        raise ConfirmError("要写明确认人")
     rnd = case["rounds"][-1]
     if rnd.get("status") != "OK":
         raise ConfirmError(f"第 {rnd['n']} 轮状态是 {rnd.get('status')}，没有正式结果，不能确认"
                            + ("（还有问题等财务答复）" if rnd.get("pending") else ""))
+    if case.get('workspace',{}).get('workflow',{}).get('fixed_commission'):
+        from bonus_agent.commission_revision import validate_current
+        validate_current(out,case,final=True)
     outs = rnd.get("outputs") or {}
-    changed = [name for name, h in outs.values() if not (out / name).exists() or sha256(out / name) != h]
+    changed = [name for name, h in outs.values() if not (out / name).is_file() or sha256(out / name) != h]
     if changed:
         raise ConfirmError(f"这些文件在第 {rnd['n']} 轮输出之后被改过或删除：{'、'.join(changed)}。"
                            "改规则请走一轮智能体处理，不要直接改文件")
+    return case, rnd, outs
+
+
+def _template_plan(out: Path, rnd: dict, outs: dict, data: list[Path] | None,
+                   revisions: list[str] | None) -> tuple[dict, list[Path], dict]:
+    from bonus_core.dsl.models import RuleSet
+    from bonus_core.template import order_schemes
+
+    available = _revision_keys(outs)
+    required = _required_revisions(out, outs)
+    optional = [k for k in available if k not in required]
+    if revisions is None and optional:
+        raise ConfirmError("本轮有人工调整修订：" + "、".join(optional) + "。录入模板后，以后每期按模板计算都会自动带上这些调整，"
+                           "请逐个选择是否录入（都不录入也要明确选择），或只确认结果、不录入模板")
+    unknown = sorted(set(revisions or []) - set(available))
+    if unknown:
+        raise ConfirmError(f"没有这些修订：{'、'.join(unknown)}；本轮可选：{'、'.join(optional) or '无'}")
+    selected = sorted(set(revisions or []) | set(required))
+    kept = {available[k] for k in selected}
+    outs = {k: v for k, v in outs.items() if not k.startswith("adjust:") or k in kept}
+    names = {("默认" if k == "rules" else k.split(":", 1)[1]): v[0]
+             for k, v in outs.items() if k == "rules" or k.startswith("rules:")}
+    if not names or "mapping" not in outs:
+        raise ConfirmError("本轮缺少计算规则或数据映射，无法按模板复算")
+    revs = {n: [{"name": k.split(":")[2], "adjust": v[0]} for k, v in outs.items()
+                if k.startswith(f"adjust:{n}:")] for n in names}
+    inputs = [Path(p) for p in (data or rnd.get("inputs") or [])]
+    missing = [str(p) for p in inputs if not p.is_file()]
+    if missing or not inputs:
+        raise ConfirmError("找不到确认时要复算用的数据文件：" + ("、".join(missing) or "无") + "，请在命令后面给出数据文件")
+    original_names = {Path(p).name for p in rnd.get("inputs") or []}
+    input_names = {p.name for p in inputs}
+    if original_names and input_names != original_names:
+        raise ConfirmError("复算用的数据文件必须与原轮文件名一致：" + "、".join(sorted(input_names ^ original_names)))
+    try:
+        hashes = fingerprint(inputs)
+        ordered = order_schemes({n: RuleSet.load(out / f) for n, f in names.items()})
+    except ValueError as exc:
+        raise ConfirmError(f"模板准备失败：{exc}") from exc
+    expected = rnd.get("files") or {}
+    changed_inputs = [name for name, h in hashes.items() if expected.get(name) != h]
+    changed_inputs += [item["name"] for item in rnd.get("source_inputs", [])
+                       if not Path(item["path"]).is_file() or sha256(Path(item["path"])) != item["hash"]]
+    if changed_inputs:
+        raise ConfirmError("确认输入版本已变化或缺少原轮指纹，请重新核算：" + "、".join(sorted(set(changed_inputs))))
+    manifest = {
+        "period": rnd.get("period"),
+        "mapping": outs["mapping"][0],
+        "schemes": [{"name": n, "rules": names[n], "revisions": revs[n]} for n in ordered],
+        "files": {name: h for name, h in outs.values()},
+        "data": hashes,
+    }
+    selection = {"revisions": selected, "revisions_required": dict(sorted(required.items())),
+                 "revisions_not_saved": sorted(set(available) - set(selected))}
+    return manifest, inputs, selection
+
+
+def _verify_template_replay(template, rnd: dict, inputs: list[Path]) -> list:
+    chosen = {s["name"]: {"R0", *(r["name"] for r in s["revisions"])} for s in template.manifest["schemes"]}
+
+    def only(values):
+        return {s: {r: v for r, v in (rs or {}).items() if r in chosen.get(s, {"R0"})}
+                for s, rs in (values or {}).items()}
+
+    try:
+        template.verify()
+        results, warnings = template.run(inputs)
+    except Exception as exc:
+        raise ConfirmError(f"按模板复算失败：{exc}") from exc
+    differences = []
+    if digest(results) != only(rnd.get("digest")):
+        differences.append("对象集合或应得/实发改变")
+    frozen = rnd.get("financial_digest")
+    if frozen is None:
+        differences.append("缺少完整金额基线，旧案卷须重新核算")
+    elif financial_digest(results) != only(frozen):
+        differences.append("完整金额及报告对账与原轮不一致")
+    if differences:
+        raise ConfirmError(f"按模板复算与第 {rnd['n']} 轮结果不一致：{'、'.join(differences)}")
+    return warnings
+
+
+def check_template(out: Path, data: list[Path] | None = None, *, revisions: list[str] | None = None) -> dict:
+    """复算最新完成轮次并核对原始指纹及完整金额基线。"""
+    from collections import Counter
+
+    from bonus_core.template import Template
+
+    out = Path(out)
+    if not out.is_dir():
+        raise ConfirmError(f"案卷目录不存在：{out}")
+    with case_lock(out):
+        _, rnd, outs = _checked_round(out)
+        manifest, inputs, selection = _template_plan(out, rnd, outs, data, revisions)
+        warnings = _verify_template_replay(Template(out, manifest), rnd, inputs)
+        sources = sorted((x["name"], x["hash"]) for x in rnd.get("source_inputs", []))
+        encoded = json.dumps({"manifest": manifest, "source": sources}, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return {"status": "PASS", "round": rnd["n"], "period": manifest["period"],
+                "fingerprint": hashlib.sha256(encoded).hexdigest(),
+                "schemes": [s["name"] for s in manifest["schemes"]], "revisions": selection["revisions"],
+                "data_files": len(inputs), "source_files": len(sources),
+                "warnings": dict(sorted(Counter(w.code for w in warnings).items()))}
+
+
+def confirm(out: Path, by: str, note: str = "", data: list[Path] | None = None, review: bool = True, *,
+            save_template: bool = True, revisions: list[str] | None = None) -> Path | None:
+    """财务确认最新一轮。按需用选定修订复算并冻结模板，供场景发布后每期使用。
+
+    review=False 表示口径单已在线下核对。save_template=False 表示只确认本轮结果。
+    有可选人工调整修订时，必须明确指定 revisions。空列表表示只录入必选修订。
+    """
+    out = Path(out)
+    if not out.is_dir():
+        raise ConfirmError(f"案卷目录不存在：{out}")
+    with case_lock(out):
+        return _confirm(out, by, note, data, review, save_template, revisions)
+
+
+def _confirm(out: Path, by: str, note: str, data: list[Path] | None, review: bool,
+             save_template: bool, revisions: list[str] | None) -> Path | None:
+    import yaml
+
+    from bonus_core.template import MANIFEST, Template
+
+    if not by.strip():
+        raise ConfirmError("要写明确认人")
+    case, rnd, outs = _checked_round(out)
+    if case.get('workspace',{}).get('workflow',{}).get('fixed_commission') and save_template:
+        raise ConfirmError('固定提成链路每期直接重新绑定材料；当前结果可单独确认，不录入旧版通用DSL模板')
     if review and "review" in outs:
         from bonus_agent import review as rv
         st = rv.status(out)
@@ -419,40 +635,21 @@ def confirm(out: Path, by: str, note: str = "", data: list[Path] | None = None, 
                                f"（{'、'.join(r['id'] for r in st['pending'][:10])}{'……' if len(st['pending']) > 10 else ''}），"
                                "逐条确认后才能确认结果")
     at = datetime.now().isoformat(timespec="seconds")
-    if not save_template:     # 只确认结果：不建模板、不动已有模板，以后每期不会按本轮规则自动计算
-        rec = {"by": by, "at": at, "round": rnd["n"], "note": note, "summary": rnd.get("summary", ""), "template": None}
-        case.setdefault("confirmations", []).append(rec)
-        case["confirmed"] = rec
-        rnd["confirmed"] = rec
+    record = {"by": by, "at": at, "round": rnd["n"], "note": note, "summary": rnd.get("summary", ""), "template": None}
+    if not save_template:
+        case.setdefault("confirmations", []).append(record)
+        case["confirmed"] = record
+        rnd["confirmed"] = record
         save_case(out, case)
         return None
-    available = _revision_keys(outs)
-    required = _required_revisions(out, outs)
-    optional = [k for k in available if k not in required]
-    if revisions is None and optional:
-        raise ConfirmError("本轮有人工调整修订：" + "、".join(optional) + "。录入模板后，以后每期按模板计算都会自动带上这些调整，"
-                           "请逐个选择是否录入（都不录入也要明确选择），或只确认结果、不录入模板")
-    unknown = sorted(set(revisions or []) - set(available))
-    if unknown:
-        raise ConfirmError(f"没有这些修订：{'、'.join(unknown)}；本轮可选：{'、'.join(optional) or '无'}")
-    revisions = sorted(set(revisions or []) | set(required))   # 被引用的修订必须录入，否则引用它的方案算不出来
-    kept = {available[k] for k in revisions}
-    outs = {k: v for k, v in outs.items() if not k.startswith("adjust:") or k in kept}
-    # 方案、规则文件和修订
-    rules = {k: v[0] for k, v in outs.items() if k == "rules" or k.startswith("rules:")}
-    names = {("默认" if k == "rules" else k.split(":", 1)[1]): f for k, f in rules.items()}
-    rss = {n: RuleSet.load(out / f) for n, f in names.items()}
-    revs = {n: [{"name": k.split(":")[2], "adjust": v[0]} for k, v in outs.items()
-                if k.startswith(f"adjust:{n}:")] for n in names}
-    chosen = {n: {"R0", *(r["name"] for r in rs)} for n, rs in revs.items()}
-    only = lambda d: {s: {r: v for r, v in (x or {}).items() if r in chosen.get(s, {"R0"})} for s, x in (d or {}).items()}
+    manifest, inputs, selection = _template_plan(out, rnd, outs, data, revisions)
+    manifest["confirmed"] = {k: v for k, v in record.items() if k != "template"} | selection
     final = out / "template"
-    tpl = out / "template.new"          # 先在临时目录里做好并全部核对通过，才替换已确认的模板；失败时原模板不动
+    tpl = out / "template.new"
     if tpl.exists():
         shutil.rmtree(tpl)
     tpl.mkdir(parents=True)
-    files = [v[0] for v in outs.values()]
-    # 模板文件的指纹记在同目录的 manifest 里，挡得住误改、挡不住有意连指纹一起改的人：每个文件开头和目录里写明不要改
+    files = list(manifest["files"])
     banner = (f"# 已确认冻结的计算模板：第 {rnd['n']} 轮，{by} 于 {at} 确认。\n"
               "# 请勿直接修改本目录里的任何文件。改动后按模板计算会被拒绝；需要改规则，请走一轮智能体处理并重新确认。\n")
     for f in files:
@@ -467,59 +664,29 @@ def confirm(out: Path, by: str, note: str = "", data: list[Path] | None = None, 
         "- 需要修改规则、参数或人工调整，请在案卷里走一轮智能体处理，由财务重新确认后生成新模板；\n"
         "- 手工改文件并同步改指纹可以绕过检查，但这样算出的结果没有经过确认，不能作为正式结果。\n",
         encoding="utf-8")
-    inputs = [Path(p) for p in (data or rnd.get("inputs") or [])]
-    missing = [str(p) for p in inputs if not p.exists()]
-    if missing or not inputs:
-        shutil.rmtree(tpl)
-        raise ConfirmError("找不到确认时要复算用的数据文件：" + ("、".join(missing) or "无") + "，请在命令后面给出数据文件")
-    expected_files = rnd.get('files') or {}
-    changed_inputs = [p.name for p in inputs if expected_files.get(p.name) != sha256(p)]
-    changed_inputs += [item['name'] for item in rnd.get('source_inputs',[])
-                       if not Path(item['path']).exists() or sha256(Path(item['path'])) != item['hash']]
-    if changed_inputs:
-        shutil.rmtree(tpl)
-        raise ConfirmError('确认输入版本已变化或缺少原轮指纹，请重新核算：'+'、'.join(sorted(set(changed_inputs))))
-    manifest = {
-        "confirmed": {"by": by, "at": at, "round": rnd["n"], "note": note, "summary": rnd.get("summary", ""),
-                      "revisions": sorted(revisions or []),
-                      "revisions_required": {k: v for k, v in sorted(required.items())},
-                      "revisions_not_saved": sorted(set(available) - set(revisions or []))},
-        "period": rnd.get("period"),        # 确认时的核算期间；以后换期间计算时另选
-        "mapping": outs["mapping"][0],
-        "schemes": [{"name": n, "rules": names[n], "revisions": revs[n]} for n in order_schemes(rss)],
-        "files": {f: sha256(tpl / f) for f in files},
-        "data": {p.name: sha256(p) for p in inputs},
-    }
+    manifest["files"] = {f: sha256(tpl / f) for f in files}
     (tpl / MANIFEST).write_text(banner + yaml.safe_dump(manifest, allow_unicode=True, sort_keys=False), encoding="utf-8")
-    # 复算：按模板算出的每个对象金额必须与该轮结果一致（没录入的修订不在模板里，只比录入的部分）
     try:
-        results, _ = Template.load(tpl).run(inputs)
-    except Exception as e:
+        _verify_template_replay(Template.load(tpl, verify=False), rnd, inputs)
+    except ConfirmError:
         shutil.rmtree(tpl)
-        raise ConfirmError(f"按模板复算失败：{e}") from None
-    want = only(rnd.get("digest") or {})
-    got = digest(results)
-    diff = ['对象集合或应得/实发改变'] if got != want else []
-    frozen = rnd.get('financial_digest')
-    if frozen is None:
-        diff.append('缺少完整金额基线，旧案卷须重新核算后确认')
-    elif financial_digest(results) != only(frozen):
-        diff.append('完整金额及报告对账与原轮不一致')
-    if diff:
-        shutil.rmtree(tpl)
-        raise ConfirmError(f"按模板复算与第 {rnd['n']} 轮结果不一致：{diff[:10]}（数据文件是否换过？）")
+        raise
     old = out / "template.old"
     if old.exists():
         shutil.rmtree(old)
     if final.exists():
         final.rename(old)
-    tpl.rename(final)
+    try:
+        tpl.rename(final)
+    except OSError:
+        if old.exists():
+            old.rename(final)
+        raise
     if old.exists():
         shutil.rmtree(old)
-    tpl = final
-    rec = {**manifest["confirmed"], "template": str(tpl)}
-    case.setdefault("confirmations", []).append(rec)
-    case["confirmed"] = rec
-    rnd["confirmed"] = rec
+    record = {**manifest["confirmed"], "template": str(final)}
+    case.setdefault("confirmations", []).append(record)
+    case["confirmed"] = record
+    rnd["confirmed"] = record
     save_case(out, case)
-    return tpl
+    return final

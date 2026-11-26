@@ -62,6 +62,33 @@ def test_wrong_page_and_value_still_rejected_and_alias_fields_forbidden(tmp_path
     assert not ws.facts
 
 
+def test_approved_unit_evidence_reaches_literal_and_coordinate_registration(tmp_path):
+    path = tmp_path / 'policy.pptx'
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    table = slide.shapes.add_table(2, 2, Inches(0), Inches(0), Inches(7), Inches(2)).table
+    table.cell(0, 0).text, table.cell(0, 1).text = '角色', '比例'
+    table.cell(1, 0).text, table.cell(1, 1).text = '负责人', '25'
+    scope = '西区本期销售分配表'
+    slide.shapes.add_textbox(Inches(0), Inches(3), Inches(7), Inches(1)).text_frame.text = scope
+    prs.save(path)
+    finance = tmp_path / 'finance.md'
+    correct = f'{scope}的裸数单位为百分数（%）。'
+    wrong = '东区本期销售分配表的裸数单位为百分数（%）。'
+    finance.write_text(f'{correct}\n{wrong}', encoding='utf-8')
+    ws = Workspace(FakeLLM([]), build_inventory([finance, path]))
+    cell = {'row': 2, 'column': 2, 'unit': '%'}
+    with pytest.raises(ToolError, match='parameter.unit'):
+        ws.record_parameter_cells(path.name, 1, 1, [cell], scope, unit_basis={'file': finance.name, 'quote': wrong})
+    assert not ws.facts
+    ws.record_facts([{'name': '负责人分配比例', 'file': path.name, 'page': 1, 'context': scope,
+                      'quote': '负责人 25', 'value': '25', 'unit': '%'}])
+    assert ws.facts[0].unit_basis == {'file': finance.name, 'quote': correct}
+    result = ws.record_parameter_cells(path.name, 1, 1, [cell], scope,
+                                       unit_basis={'file': finance.name, 'quote': correct})
+    assert result['facts'][0]['numeric'] == '0.25'
+
+
 def test_native_tools_work_through_agent_dispatch(tmp_path):
     ws=workspace(tmp_path)
     name='policy.pptx::P2.T1.R2.C2.L1'
@@ -73,6 +100,67 @@ def test_native_tools_work_through_agent_dispatch(tmp_path):
     ]),ws.inv.files,tmp_path/'out',max_steps=4)
     assert all(s.ok for s in result.steps if not s.tool.startswith('（'))
     assert result.ws.facts[0].targets==['S::/tables/R/steps/0/1']
+
+
+def test_scenario_default_uses_physical_title_row_column_and_keeps_unit_evidence(tmp_path):
+    from bonus_agent.scenarios import Registry
+    from bonus_agent.scenarios.context import prepare
+    from bonus_agent.facts import numeric
+
+    pack = tmp_path / 'scenarios' / 'regional'
+    pack.mkdir(parents=True)
+    (pack / 'scenario.yaml').write_text('id: regional\nname: 示例', encoding='utf-8')
+    declaration = '| 北区方案 | 经理 | 常规、调整、明示、原文 | % |'
+    (pack / 'guide.md').write_text(
+        '| 制度表标题 | 适用行 | 适用列 | 裸数默认单位 |\n| --- | --- | --- | --- |\n' + declaration,
+        encoding='utf-8')
+    book = Presentation()
+    for title in ('北区方案', '南区方案'):
+        slide = book.slides.add_slide(book.slide_layouts[6])
+        slide.shapes.add_textbox(0, 0, Inches(4), Inches(1)).text = title
+        table = slide.shapes.add_table(3, 6, 0, Inches(1), Inches(7), Inches(3)).table
+        for i, row in enumerate([['岗位', '常规', '调整', '数量', '明示（‰）', '原文'],
+                                 ['经理', '20', '10 外埠\n32.5 本地', '20', '20', '20%'],
+                                 ['人数', '20', '20', '20', '20', '20']]):
+            for j, value in enumerate(row):
+                table.cell(i, j).text = value
+    path = tmp_path / '政策.pptx'
+    book.save(path)
+    scene = prepare(Registry([pack.parent]), 'regional', [path])
+    def fact(name, value, quote, row, col, page=1, **extra):
+        return {'name': name, 'file': path.name, 'page': page, 'quote': quote, 'value': value,
+                'source_cell': {'table': 1, 'row': row, 'column': col}, **extra}
+    batch = [
+        fact('甲', '20', '经理 20', 2, 2, unit='%', unit_basis={'file': path.name, 'quote': '北区方案'}),
+        fact('乙', '32.5', '经理 10 外埠 32.5 本地', 2, 3,
+             source_cell={'table': 1, 'row': 2, 'column': 3, 'line': 2}),
+        fact('另一行', '20', '人数 20', 3, 2), fact('另一列', '20', '20', 2, 4),
+        fact('另一页', '20', '经理 20', 2, 2, page=2),
+        fact('表头单位', '20', '20', 2, 5), fact('自带单位', '20%', '20%', 2, 6),
+    ]
+    native = {'tool': 'record_parameter_cells', 'args': {'file': path.name, 'page': 1, 'table': 1,
+              'cells': [{'row': 2, 'column': 2}], 'applies_to': '北区方案'}}
+    result = run_agent(FakeLLM([{'tool': 'record_facts', 'args': {'facts': batch}}, native]), [path],
+                       tmp_path / 'out', scenario=scene, max_steps=2)
+    assert all(s.ok for s in result.steps if s.tool in ('record_facts', 'record_parameter_cells'))
+    saved = {f.name: f for f in result.ws.facts}
+    assert [numeric(saved[n]) for n in ('甲', '乙', '另一行', '另一列', '另一页')] == [
+        Decimal('0.2'), Decimal('0.325'), Decimal(20), Decimal(20), Decimal(20)]
+    assert saved['乙'].context == '北区方案' and saved['乙'].value == '32.5'
+    assert saved['乙'].unit_basis == {'file': scene.files[0].name, 'quote': declaration,
+                                      'source_hash': case.sha256(scene.files[0])}
+    assert numeric(saved['甲']) == Decimal('0.2') and not result.ws.questions
+    assert numeric(saved['表头单位']) == Decimal('0.020') and not saved['表头单位'].unit_basis
+    assert numeric(saved['自带单位']) == Decimal('0.20') and not saved['自带单位'].unit_basis
+    native_result = result.ws.record_parameter_cells(**native['args'])
+    assert native_result['facts'][0]['reused'] and native_result['facts'][0]['numeric'] == '0.20'
+    for altered in [dict(batch[0], value='21'), dict(batch[0], quote='我编的证据 20'),
+                    dict(batch[1], source_cell={'table': 1, 'row': 2, 'column': 3, 'line': 1}),
+                    dict(batch[2], unit='%', unit_basis=saved['乙'].unit_basis),
+                    dict(batch[0], source_cell=None, unit=None, unit_basis=None),
+                    dict(batch[0], source_cell=None, unit=None, unit_basis=None, page=None)]:
+        with pytest.raises(ToolError):
+            result.ws.record_facts([altered])
 
 
 def test_multiline_requires_explicit_line_and_does_not_guess_units(tmp_path):

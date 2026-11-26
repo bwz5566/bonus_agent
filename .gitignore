@@ -10,3 +10,8 @@ result.xlsx
 *.questions.json
 config/secrets.yaml
 .env
+# Local finance reconciliation, case snapshots, reports and test-run outputs.
+# These may contain real business/customer/personnel data; never commit them.
+/analysis/
+# Third-party skill installed locally; project-authored skills remain tracked.
+/.agents/skills/property-based-testing/

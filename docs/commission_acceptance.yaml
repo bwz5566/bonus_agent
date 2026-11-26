@@ -1,0 +1,213 @@
+version: 1
+current_delivery_plan: docs/commission_delivery_plan.yaml
+goal: 财务从正式入口提交当期材料，经规则澄清和本版总额确认，取得项目应分、每人应分、暂扣、待分配和与原底稿的逐项差异说明。
+start: S0
+environment: 在仓库根目录使用 PowerShell 和项目的 Python 环境执行。业务工作簿、案卷、账目和报告留在本地业务目录。
+
+inputs:
+  september:
+    business_materials: 'D:\hy_project\202609data_验证\01_输入材料'
+    scenario: 'analysis/acceptance_rebuild_t18_resume/materials/场景说明（提成奖金计算）.md'
+    saved_review: analysis/deliver_202609/segmented_project_scope_confirmed_review.json
+    saved_workspace: analysis/deliver_202609/segmented_project_scope_confirmed_workspace.json
+    original_reference: 'D:\hy_project\1-9月提成奖核算底稿-结果参考1112.xlsx'
+    historical_comparison: analysis/deliver_202609/acceptance_plan_check
+    use: 失败诊断可读旧案卷。正式冷启动只收清单内业务材料、场景说明及真实财务答复；已有草稿、规则包、输出及底稿保存在输入目录之外。
+  holdout:
+    select: 选择未用于此次修复的另一真实月份，登记期间、规则版本、输入清单、财务底稿或独立核算人及其覆盖范围。
+    unavailable: 缺材料、合法可用的历史明细或独立基准时记录具体缺项。S0 至 S4 仍可单独完成。
+  run_record:
+    create: 为每批建本地 run.json；给 PowerShell 变量 $RunFile 赋该文件的绝对路径。案卷目录和核对目录须分开。
+    fields:
+      run_id: 本批运行标识
+      code_version: 提交 SHA；工作区有修改时另记相关 diff 及未跟踪实现文件的 SHA-256
+      period: CLI 接受的期间字符串，同时用于核对行
+      materials: 只装本批模型可读材料的目录，封存清单含相对路径、用途和 SHA-256
+      case_dir: 本批全新正式案卷目录，恢复时沿用
+      scenario: 可选的本批场景 ID，使用场景输出要求检查正式报表
+      scenario_dir: 使用本地场景时填写其目录
+      evidence_dir: 每个候选版本和基准版本组合使用新的本地核对目录，存放冻结输出、原底稿指纹、差异和本批回执
+      unit: 本批按规则结算的最小货币单位，十进制字符串
+      raw_role_atol: 独立基准中角色原值的记录精度所需绝对容差，默认零，先登记依据
+      required_levels: 按该批适用规则和独立来源登记有数据的核对层级；无人员或待分配行时须能从来源解释
+      model: 本次获准的执行模型
+      checker: 本次获准的独立复核模型
+      remaining_tokens: 从本次获准额度扣除已用和发送状态未知的预留，续跑前更新
+      remaining_seconds: 有约定时限时填写剩余秒数，同时记录绝对截止时间
+      max_steps: 本次运行的剩余步数上限
+
+execution:
+  order: [S0, S1, S2, S3, S4, S5]
+  resume: 先按 case、期间、代码、材料与规则指纹读取最近证据。复用依赖仍有效的步骤，从首个未通过的步骤继续。
+  stage_record: 每步保存 run_id、步骤、状态、实际命令及返回码、输入输出指纹、证据路径、未解决事项和下一动作。
+  states:
+    PASS: 本步每条通过条件均有对应工件且属于当前版本
+    FAIL: 有可复现反例，保存最小输入、实际值、期望及两方来源，回到负责该项的步骤
+    WAIT_FINANCE: 材料之间存在影响金额的歧义或到达真实总额确认点，给财务材料位置、具体案例、选项和金额影响
+    BLOCKED: 缺必要材料、授权额度、接口可用性或可验证工件，保存已有进度及恢复条件
+    NOT_RUN: 本步尚未实测
+  isolation: 执行和独立复核只读获准材料；财务答案底稿和核对账目在候选结果冻结后由本地核对程序读取。历史明细与答案同源时单列来源及独立性限制。
+  models: 常规阅读、映射和工具调用可用已批准的 Flash；独立范围或复杂规则交给独立 Pro 会话，沿用已配置的思考策略。金额、对象集合和差额由程序计算。
+  retries: 对同一输入指纹、同一失败分段沿用现有两次尝试上限。只补有诊断的未通过目标；重复读取、换说法、重启或换模型均不算进展。有效反例冻结，修生产侧再复核。
+  budget: 网络未发出的请求与已发送但用量不明的请求分开记账。跨轮沿用剩余额度；到达任一有效上限即存档停下。CLI 的 --max-seconds 将剩余时间交给同一个作业预算对象，覆盖所有模型请求。
+  questions: 先查原件、补充规则及同批已确认答复。按业务问题合并重复提问。确实无法判断才提问；例如同一销售行用两个编码会落在哪两个项目，连同对应行和影响一并展示。
+
+commands:
+  inspect_scope: |
+    $dir = 'analysis/deliver_202609'
+    $review = Get-Content -LiteralPath (Join-Path $dir 'segmented_project_scope_confirmed_review.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    $work = Get-Content -LiteralPath (Join-Path $dir 'segmented_project_scope_confirmed_workspace.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    $review | Select-Object review,ready_for_confirmation,approval_recorded | ConvertTo-Json -Depth 6
+    foreach ($scheme in $work.workflow.basis_review_parts.PSObject.Properties) {
+      foreach ($segment in $scheme.Value.PSObject.Properties) {
+        if ($segment.Value.contract_errors) {
+          $segment.Value | Select-Object targets,state,contract_errors | ConvertTo-Json -Depth 6
+        }
+      }
+    }
+  scope_checks: >-
+    python -m pytest -q tests/test_segmented_basis_review.py tests/test_basis_review_recovery.py
+  approval_checks: >-
+    python -m pytest -q
+    tests/test_staged_workflow.py::test_confirmed_basis_allocation_matches_exact_people_and_reports
+    tests/test_staged_workflow.py::test_equal_total_changed_object_invalidates_confirmation_after_restore
+    tests/test_staged_workflow.py::test_same_version_resume_waits_without_calling_primary_or_exporting_people
+    tests/test_staged_workflow.py::test_approved_resume_runs_allocation_but_never_skips_final_validation
+  comparison_checks: python -m pytest -q tests/test_commission_fact_comparison.py
+  historical_comparison: |
+    $d = 'analysis/deliver_202609/acceptance_plan_check'
+    python -X utf8 tools/compare_commission_facts.py --period 2026-09 --unit 0.01 --raw-role-atol 0.000001 --require total project person role_raw pending rounding --candidate (Join-Path $d 'candidate.jsonl') --reference (Join-Path $d 'reference.jsonl')
+  start_or_resume: |
+    $r = Get-Content -LiteralPath $RunFile -Raw -Encoding utf8 | ConvertFrom-Json
+    if ($r.remaining_tokens -le 0 -or $r.max_steps -le 0) { throw '本轮可用预算已用尽' }
+    $options = @('auto', '--no-memory', '--period', $r.period, '--model', $r.model, '--checker', $r.checker, '--max-steps', $r.max_steps, '--max-tokens', $r.remaining_tokens, '--out', $r.case_dir)
+    if ($r.scenario) { $options += @('--scenario', $r.scenario) }
+    if ($r.scenario_dir) { $options += @('--scenario-dir', $r.scenario_dir) }
+    if ($null -ne $r.remaining_seconds) {
+      if ($r.remaining_seconds -le 0) { throw '本轮时间已用尽' }
+      $options += @('--max-seconds', $r.remaining_seconds)
+    }
+    python -m bonus_agent.cli @options $r.materials
+  reconcile: |
+    $r = Get-Content -LiteralPath $RunFile -Raw -Encoding utf8 | ConvertFrom-Json
+    $levels = @($r.required_levels)
+    $candidate = Join-Path $r.evidence_dir 'candidate.jsonl'
+    $reference = Join-Path $r.evidence_dir 'reference.jsonl'
+    $report = Join-Path $r.evidence_dir 'comparison.json'
+    $atol = if ($null -eq $r.raw_role_atol) { '0' } else { $r.raw_role_atol }
+    python -X utf8 tools/compare_commission_facts.py --period $r.period --unit $r.unit --raw-role-atol $atol --require @levels --candidate $candidate --reference $reference --out $report
+
+tasks:
+  - id: S0
+    name: 定位项目范围复核的真实断点
+    needs: []
+    run: [inspect_scope]
+    actions:
+      - 从保存的请求状态、分段记录和当前代码还原失败路径，保留已接受的分段和最近失败指纹。原始声明若未保存，应明确标为未知。
+      - 对照 source_catalog、_validate_populations、check_populations 和 check_quote，检查原文是否可见、ID 是否可解析、文档或页码是否对应，以及原文是否支持所选范围。
+    pass:
+      - 能在离线副本重现已报的错误类别并区分推断与实测；已有记录停在 populations 的项目范围，三个物理行范围已有通过记录，复核请求收到响应。
+      - 保存最小脱敏复现，记录复现是否用原始模型输出；缺少输出时用同类反例覆盖，并在下一次真实请求补留允许的诊断。案卷、已确认答复、业务材料的原始哈希一致。
+    evidence: diagnostic.json，含失败标签、代码、已接受标签、已知与未知、复现位置
+    on_failure: 缺私有案卷时用仓库中的测试夹具先完成同类复现；精确现场状态留为 BLOCKED，补存档后继续。
+
+  - id: S1
+    name: 修复来源绑定、独立复核和恢复
+    needs: [S0]
+    run: [scope_checks]
+    code: [bonus_agent/basis_review_parts.py, bonus_agent/review_population.py, bonus_agent/clauses.py, bonus_agent/workflow.py]
+    actions:
+      - 复用现有来源目录和材料索引，为本次范围给出可核对的来源及具体失败反馈。对证据缺失、无效 ID、引文不在所报页和真实范围不符分别处理；保留原文复核。
+      - 区分当期项目集合与历史统计行。用原始文件重取对象键集合、物理行及其重复次数。已有经确认的本批排除规则绑定来源指纹。
+      - 只在已有覆盖缺失处补定向回归，使用不同字段名或不同月份的最小数据。把改动落到正式路径。
+    pass:
+      - 有效 ID 或原文能回查；伪造 ID、错页、其他材料的同名列和仅相关却不支持选择的引文不能使错误范围通过。实际漏一项或多一行时输出对应差异。
+      - 同一未通过标签只修该标签，恢复后保留其余标签和尝试次数；持久化的真实反例仍有效；达到尝试上限后同指纹新增模型请求数为零。
+      - 最新案例的剩余范围在离线现场证据上可解释。需要财务解释时应能带真实行例进入 WAIT_FINANCE 并保留已回答的问题。
+    evidence: 脱敏回归、失败前后分段报告、请求次数和范围集合差异
+    on_failure: 回到对应的取证、合同解析或数据映射代码；未出现新证据之前停止重复复核。
+
+  - id: S2
+    name: 固定核对口径，准备两条独立取数路径
+    needs: []
+    run: [comparison_checks, historical_comparison]
+    actions:
+      - 依据业务定义事先登记项目键、人员键、角色键、指标来源、币种、结算单位、舍入层级、负数、暂扣和待分配规则。底稿字段的含义按标题及公式确定。
+      - 在核对侧为本批实现或复用两个只读数的适配器。候选侧从正式 engine_results.json 的 scheme/revision 及导出 Excel 取数；参考侧按独立财务底稿或独立原始凭据取数。分别输出 facts_format 定义的文件。
+      - 锁定每个适配器的源文件、表名、字段、键构造、预期覆盖清单及哈希。实际候选金额冻结后才运行参考侧金额比对；适配器不得按金额相似度选择列、方案或人员。
+      - 本机已有九月冻结工作簿的提取样例与来源清单，可用 historical_comparison 验证核对器。在新案卷重新提取事实；旧数字仅作为历史核对证据。
+    pass:
+      - 开始对账前已从独立来源得到应覆盖的项目、人员、适用角色和去向。依赖相同历史明细的字段已标注。缺少参考人员或角色明细时仅报告可核范围。
+      - 用相同合计交换两人的金额、删除一个零金额项目、额外增加角色、复制同键行和改动一分钱分别验证核对失败；正确的行顺序变化通过。
+      - 对数字零、空白、缺行和显式零预算保持区分。采用的默认系数与实测比例各有来源。NPD 等无人名项可按本批依据登记待分配原因及金额。
+    evidence: 本批字段映射、覆盖清单、适配器版本及来源、基准指纹
+    on_failure: 缺独立明细则登记缺项及影响；已有部分可以比较，完整验收保持 BLOCKED。
+
+  - id: S3
+    name: 九月从正式入口冷启动直至人员导出
+    needs: [S1, S2]
+    run: [approval_checks, start_or_resume]
+    actions:
+      - 有作业时限时用 --max-seconds 传入本轮剩余秒数，或用支持同等限额的正式入口。验证请求前停止、在途超时以及案卷保存。
+      - 从空案卷提交材料。按盘点、规则依据、字段映射、数据准备、公式编译、基础金额、独立复核的顺序跟踪实际阶段及回执。
+      - 抽取参数时登记数值、单位、适用条件及原文。用实际行验证绑定的公式目标；错误反馈定位到该参数、行和表达式。修复后重算受影响的上下游，检查至少一个会改变结果的边界案例。
+      - 出现 NEEDS_CONFIRMATION 时先查材料；只录入真实业务答复。出现 AWAITING_REVIEW 时看复核诊断。两者和 AWAITING_TOTAL_CONFIRMATION 在 CLI 都可能返回 3，应读取阶段状态。
+      - 总额通过独立复核后将总额预核算.xlsx、方案和 digest 给财务。财务在页面确认当前版本，或由真实确认人使用 confirm-totals。适用多个有依赖方案时逐方案确认。
+      - 从同一案卷执行 start_or_resume，完成分配、独立核算检查及正式导出。冻结材料、规则映射、确认回执、engine_results.json 和财务实际看到的 Excel。
+    pass:
+      - 全程从业务材料和本批真实答复创建规则与映射；每个纳入或排除范围均有可定位依据；人工确认前无本轮正式个人结果，确认后 case.json 可追溯本版回执。
+      - 抽取、绑定、实际求值和纠错记录能串回同一个参数。用本批规则验证百分数单位、舍入时点和同时触发两项暂扣的样例，并对照预期去向。
+      - 材料或对象发生变化即使总额相同也须使对应回执失效；中途恢复不会重新提出已回答的问题或重复生成发放记录。
+      - 正式状态为 OK，后续独立核算及导出复算通过；重读 Excel 的项目及人员金额与同版本结构化输出一致，冻结结果能定位到原始行及规则。
+    evidence: case.json、workflow.json、总额预核算.xlsx、engine_results.json、result*.xlsx、阶段和请求记录
+    on_failure: 回到首个失败的范围、公式、绑定、审批或导出步骤，保留原运行记录。等待真实确认时存档为 WAIT_FINANCE。
+
+  - id: S4
+    name: 逐项核对金额并归因
+    needs: [S3]
+    run: [reconcile]
+    actions:
+      - 从冻结的正式结果和原始参考按 S2 映射分别生成 candidate.jsonl 和 reference.jsonl。先核对范围和唯一性，再核对数值，最后检查去向守恒。
+      - 正式对账同时从主工作簿回读项目、汇总、人员应得与实发、待分配和舍入，逐键与结构化结果核对。结果保存到 excel_readback.json，任一路存在差异都不能通过。
+      - 九月检查原底稿的四项项目金额、四项总额、实名人员和待分配、全部角色原值及舍入尾差。覆盖数量从独立底稿原始行求得。其他月份按本批定义取数。
+      - 核对原底稿中间过程，包括项目键、分母及期间、同客户多笔记录、系数和舍入时点。有差异即使最终金额相同也说明原因及本期金额影响。
+    pass:
+      - 人员及项目按本批精度逐项相等；角色原值只使用事先登记的原始记录误差。把工作簿和结构化结果分别读回。所有适用键均已覆盖，任何漏项、重复或未解释差异数为零。
+      - 在同一口径和层级验证两笔平衡。提成总额等于可分配加各类暂扣及其他已列明去向；可分配等于实名人员合计加待分配和已解释的舍入尾差。负数和暂扣各按规则列示。
+      - 原底稿有错时保留原始 DIFFERENT 和原文件，列出凭据、影响和财务认可的修订依据，以独立修订基准重跑取得 MATCH。只因结果相同无法关闭中间规则冲突。
+    evidence: 原始 comparison.json、差异台账、平衡及 Excel 读回记录，有修订时附独立修订基准和第二份核对报告
+    on_failure: 按 difference_record 分类。程序错误回 S1 或 S3，底稿或材料问题回 S2，业务口径歧义交真实财务确认。新候选重新冻结并保留原差异。
+
+  - id: S5
+    name: 在未参与修复的月份验证可日常使用
+    needs: [S4]
+    actions:
+      - 固定 S4 的通用代码版本，选择独立月份，在新案卷按 S2、S3、S4 原样执行。另行登记该月来源、应覆盖数量、精度及实际规则。
+      - 若此月暴露程序错误，先记录反例及原因，修复后该月作为回归批，再用一批未参与修复的数据验证通用性。
+    pass:
+      - 冷启动、真实总额确认、正式人员导出、所有适用金额项和来源核对均通过。原始底稿差异有处置，未解释差异数为零。
+      - 同一版本和输入从冻结规则重新计算，逐键金额及去向一致；记录首次运行、恢复的请求数、耗时、用量和停止原因。
+      - 交付版本可从干净检出按正式入口复现，运行只依赖版本内的通用代码和明确列出的本批材料；验收专用脚本仅用于事后核对。
+    evidence: 两批独立运行编号、提交及材料哈希、两批结果表及对账报告、按条件逐项对应的验收摘要
+    on_failure: 标明是通用代码反例、业务澄清、底稿差异还是缺少独立月份。九月已通过的部分单独报告，跨月状态保持未通过。
+
+facts_format:
+  encoding: UTF-8 JSON Lines，每行一个对象；两边分别从自己的来源生成，保留原始定位。一个文件只装一个期间、币种及已选方案版本，多个版本分文件。
+  fields: [period, level, key, metric, amount, source]
+  key: 使用有序字符串数组保留复合键、前导零及角色维度。用事先核实的身份字段，同名人员不能默认合并。
+  levels: [total, project, person, role_raw, pending, rounding]
+  amount: 十进制字符串。结算项由适配器按本批业务规则在正确层级取正式数；原值保留源精度。空白留在数据状态记录，只有能给出规则依据时才能导出零金额。
+  example: {period: '2026-10', level: person, key: ['员工示例A'], metric: 应分, amount: '125.00', source: '人员汇总!D11'}
+  exit_codes: {'0': MATCH 仅表示所给两份账目匹配, '1': DIFFERENT 含键或金额差异及缺少必需层级, '2': INVALID 输入或命令错误}
+
+difference_record:
+  fields: [period, key, metric, candidate, reference, delta, source_locations, rule_evidence, category, owner, resolution, remaining_impact]
+  categories: [程序实现错误, 底稿公式或取数错误, 材料缺失或冲突, 业务口径或舍入不同, 尚未定位]
+  examples:
+    - 同一客户的两笔应收只被底稿取到首笔，列出两条原始行和公式，分别记录指标变化及当期是否跨档。
+    - 总额相同但两位人员对调，逐人差异都须列出；从名单、角色比例和舍入时点追溯到发生分歧的第一步。
+    - 待分项目缺姓名，按本批书面规则区分已获准列为待分配、需要补名单两种结果。
+
+release:
+  condition: S0 至 S5 的通过证据齐全，九月和独立月份均具有正式运行链、财务总额回执、逐项核对和差异处置。
+  report: 先列提成总额、暂扣、可分配、每人应分及待分配，再列差异归因、未决项、版本和工件路径。日常可用与本批可供复核分开给出结论。

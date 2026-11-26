@@ -23,6 +23,7 @@ GENERIC = {
     "员工", "部门", "项目", "小组", "月份", "负责人", "部门名称", "填表说明",
     # 规则语言自己的关键字
     "parent_key", "hold_ratio", "pay_ratio", "lower_inclusive", "upper_inclusive",
+    "target_type",  # parameter.binding.target_type 是通用的参数绑定诊断代码
     "数据表", "字段名", "人工调整",
 }
 

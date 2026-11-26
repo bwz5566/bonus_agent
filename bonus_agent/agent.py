@@ -9,6 +9,7 @@
 （私有化部署的 vLLM 自动缓存；百炼部分模型可在配置里开启显式缓存）。
 """
 from __future__ import annotations
+from contextlib import closing
 
 import itertools
 import json
@@ -18,6 +19,7 @@ import unicodedata
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Callable
 
 import yaml
@@ -31,7 +33,9 @@ from bonus_agent.extract_rules import Extraction, Question, check_quotes, prompt
 from bonus_agent.llm import LLM, LLMError, RunBudgetError, image_part, parse_json
 from bonus_core.data.mapping import DatasetMapping, apply_mapping
 from bonus_core.data.population import prepare as apply_patches
-from bonus_core.data.table_detect import ROW_ID, add_row_ids, combine_columns, table_at, unpivot_by
+from bonus_core.data.table_detect import (ROW_ID, add_row_ids, combine_columns, normalize_unpivot_share_columns,
+                                          normalize_unpivot_split_columns, rename_unpivot_columns,
+                                          scope_unpivot_source, table_at, unpivot_by)
 from bonus_core.dsl.functions import describe as describe_functions
 from bonus_core.dsl.models import DatasetDef, RuleSet, Variable
 from bonus_core.dsl.parser import SELF_COMPARE_HINT, Call, ExprError, Num, parse, self_compares, walk
@@ -41,7 +45,7 @@ from bonus_core.dsl.validator import validate
 from bonus_core.engine.allocation import AdjustConflict
 from bonus_core.engine.evaluator import EvalError, Evaluator, fmt
 from bonus_core.engine.issues import EngineError, Issue
-from bonus_core.engine.run import Adjustment, Engine, Result, compute
+from bonus_core.engine.run import Adjustment, Engine, Result, compute, detail_trace_id
 from bonus_core.engine.tree import ROOT_LEVEL, build_tree
 from bonus_core.report.excel import write_excel
 
@@ -100,7 +104,8 @@ WRITE_TOOLS = {"define_dataset", "remove_dataset", "set_rules", "record_facts", 
                "record_clauses", "cover_clauses",
                "answer_question", "review_question", "update_dataset"}
 WRITE_TOOLS |= {'plan_calculation','prepare_data','compile_formulas','calculate_basis','review_basis'}
-WRITE_TOOLS |= {'plan_formula_tasks', 'check_formula_task', 'compile_coefficient_table', 'submit_formula_task'}
+WRITE_TOOLS |= {'plan_formula_tasks', 'set_scheme_datasets', 'check_formula_task', 'compile_coefficient_table',
+                'submit_formula_task', 'submit_construction_repair'}
 RULE_SUFFIXES = {".docx", ".pptx", ".pdf", ".png", ".jpg", ".jpeg", ".txt", ".md"}   # 规则文档：要登记参数
 CHAT_SOURCE = "财务对话"       # 财务在对话里贴的规则原文、口径说明：和材料一样可以引用核对
 ANSWER_NOTE = "回答财务"       # 财务的说明里带了提问：智能体把回答记在这条笔记里，网页放在本轮回复的开头（没算完也显示）
@@ -115,6 +120,12 @@ PIN_SHEET_ROWS = 30            # 不超过这么多行的工作表整表附上�
 
 class ToolError(Exception):
     """工具参数或执行出错，错误信息原样返回给模型。"""
+
+
+class DistinctFieldError(ToolError):
+    def __init__(self, message, fields):
+        super().__init__(message)
+        self.fields = dict(fields)
 
 
 # 工具定义（发给模型的 schema）在 tool_specs.py；这里按原名导出，其他模块和测试照常从 agent 导入
@@ -563,6 +574,9 @@ class Workspace:
     repair_attempts: dict = field(default_factory=dict)
     repair_regressions: list[dict] = field(default_factory=list, repr=False)
     _source_version: dict = field(default_factory=dict)
+    _unit_defaults: dict = field(default_factory=dict, repr=False)
+    _unit_pages: dict = field(default_factory=dict, repr=False)
+    _unit_rejections: list | None = field(default=None, repr=False)
     _fact_rejections: list[str] = field(default_factory=list)
     workflow: dict = field(default_factory=dict)
 
@@ -584,9 +598,9 @@ class Workspace:
         from bonus_agent.context import workspace_view
         return workspace_view(self,section,scheme,offset,limit,name,query,file,page,detail_offset,bool(detail))
 
-    def query_dataset(self, dataset: str, expr: str):
+    def query_dataset(self, dataset: str, expr: str | None = None, values_of: str | None = None, offset: int = 0):
         try:
-            return self._flow().query_dataset(dataset, expr)
+            return self._flow().query_dataset(dataset, expr, values_of=values_of, offset=offset)
         except EvalError as exc:
             raise ToolError('原表统计失败：' + str(exc)) from None
 
@@ -598,7 +612,24 @@ class Workspace:
 
     def plan_formula_tasks(self, tasks: list[dict], replace: bool = False):
         from bonus_agent.construction import TaskBoard
-        return TaskBoard(self).plan(tasks, replace)
+        board = TaskBoard(self)
+        if tasks == [] and replace is False:
+            if report := board.register_required_roots():
+                return report
+        return board.plan(tasks, replace)
+
+    def set_scheme_datasets(self, scheme: str, datasets: list[str]):
+        name = self._scheme(scheme, for_write=True)
+        if name == SHARED or not isinstance(datasets, list) or not datasets or any(
+                not isinstance(dataset, str) or dataset not in self.datasets for dataset in datasets):
+            raise ToolError('scheme.datasets：须指定一个实际方案和该方案用到的已有数据集名称')
+        selected = sorted(set(datasets))
+        scopes = self.workflow.setdefault('scheme_datasets', {})
+        if scopes.get(name) == selected:
+            return {'status': 'PASS', 'scheme': name, 'datasets': selected, 'changed': False}
+        scopes[name] = selected
+        self.untested.add(name)
+        return {'status': 'PASS', 'scheme': name, 'datasets': selected, 'changed': True}
 
     def check_formula_task(self, task: str):
         from bonus_agent.construction import TaskBoard
@@ -608,6 +639,11 @@ class Workspace:
                             facts: list[dict] | None = None, changes: dict | None = None):
         from bonus_agent.rule_package import submit
         return submit(self, task, value, bindings, facts, changes=changes)
+
+    def submit_construction_repair(self, scheme: str, task: str, formulas: list[dict],
+                                   datasets: list[dict] | None = None, tiers: list[dict] | None = None):
+        from bonus_agent.rule_package import submit_repair
+        return submit_repair(self, scheme, task, formulas, datasets or (), tiers or ())
 
     def calculate_basis(self, scheme: str | None = None):
         try:
@@ -625,8 +661,49 @@ class Workspace:
             self.workflow['review_error']={'version':self._flow().version(),'error':reason}
             self.done=True
             return {'status':'ERROR','error':reason,'next':'必要独立复核未完成，保留工作区等待复核恢复；不出正式金额'}
+        except ToolError:
+            self._pause_unresolved_review()
+            raise
         except (EngineError, EvalError) as exc:
             raise ToolError('独立金额公式执行失败：' + str(exc)) from None
+
+    def _pause_unresolved_review(self):
+        if not self.staged:
+            return False
+        flow = self._flow()
+        if flow.evidence_wait():
+            self.done = True
+            return True
+        if not any(ref.get('spec_state') == 'unresolved' for ref in self.workflow.get('references', {}).values()):
+            return False
+        blocked = flow.unresolved_review()
+        if not blocked:
+            return False
+        from bonus_agent.review_population import BLANK_SCOPE_OPTIONS, blank_scope_question
+
+        scheme, review = blocked
+        if not review.get('scope_questions') and flow.record_independent_settlement_question(scheme, review):
+            return True
+        flow.record_applicability_questions(scheme, review)
+        for label, rows in review.get('scope_questions', {}).items():
+            evidence, bad = self._evidence([{'file': row['file'], 'sheet': row['sheet'], 'row': row['row'],
+                                             'columns': row['empty_columns']} for row in rows])
+            if bad or len(evidence) != len(rows):
+                continue
+            question = blank_scope_question(rows)
+            if not any(q.text == question and not q.withdrawn for q in self.questions):
+                # The independent check already examined the materials. Preserve the
+                # verified coordinates directly instead of calling a second source checker.
+                self.questions.append(Question(
+                    id=_next_qid(self.questions), text=question, round=self.round,
+                    related=f'{scheme} / {label}', evidence=evidence,
+                    options=list(BLANK_SCOPE_OPTIONS),
+                ))
+        self.workflow['review_error'] = {'kind': 'evidence', 'version': flow.version(), 'scheme': scheme,
+                                         'execution_profile': review.get('execution_profile'),
+                                         'reviewer_policy': flow.reviewer_policy(), 'error': review['diagnostic']}
+        self.done = True
+        return True
 
     def __post_init__(self):
         self._source_version = cs.fingerprint(self.inv.files)
@@ -877,16 +954,16 @@ class Workspace:
             sheets = [r.split("/", 1)[1] for r in self.inv.sheet_text if r.startswith(f.name + "/")]
             raise ToolError(f"{f.name} 中没有工作表「{sheet}」，可选：{sheets}")
         import openpyxl
-        ws = openpyxl.load_workbook(f, data_only=True, read_only=True)[sheet]
         start_row, rows = max(1, start_row), max(1, min(rows, 80))
         out, total = [], 0
-        for i, r in enumerate(ws.iter_rows(values_only=True), start=1):
-            total = i
-            if start_row <= i < start_row + rows:
-                cells = [_cell(v) for v in r]
-                while cells and cells[-1] == "":
-                    cells.pop()
-                out.append(f"第{i}行 | " + " | ".join(cells))
+        with closing(openpyxl.load_workbook(f, data_only=True, read_only=True)) as wb:
+            for i, r in enumerate(wb[sheet].iter_rows(values_only=True), start=1):
+                total = i
+                if start_row <= i < start_row + rows:
+                    cells = [_cell(v) for v in r]
+                    while cells and cells[-1] == "":
+                        cells.pop()
+                    out.append(f"第{i}行 | " + " | ".join(cells))
         st = self.inv.sheet(f"{f.name}/{sheet}")
         head = (f"工作表共 {total} 行" + (f"，自动识别表头在第 {st.header_row} 行、{len(st.rows)} 行数据" if st else "，未自动识别出表格")
                 + f"；以下为第 {start_row}~{min(start_row + rows - 1, total)} 行")
@@ -956,12 +1033,21 @@ class Workspace:
         return f"已记录「{topic}」（共 {len(self.notes)} 条笔记，每轮都会附在工作区状态里）"
 
     # ---- 参数台账 ----
-    def _chat_text(self) -> str:
+    def _chat_text(self, *, omit_answers=()) -> str:
         """来源「财务对话」的全文：财务在对话里发的文字，加上问题的答复（问题表里答的和对话里答的都算），
         这样按答复登记参数时也能引用原话核对。"""
         answered = [f"{q.id} {q.text} → {q.answer}" for q in self.questions     # 和任务里列答复的写法一样，照抄就能核对
-                    if q.answer not in (None, "") and not getattr(q, "withdrawn", "")]
+                    if q.answer not in (None, "") and not getattr(q, "withdrawn", "") and q.id not in omit_answers]
         return "\n\n".join([t for t in [self.said] if t] + answered)
+
+    def _unit_chat_sources(self):
+        from bonus_agent.review_population import confirmed_blank_scope_rows
+
+        # Fixed blank-row choices have verified, local meaning. Every other
+        # message and answer remains part of the unit-evidence source version.
+        scoped = {q.id for q in self.questions if confirmed_blank_scope_rows(self, q)}
+        full = self._chat_text()
+        return (self._chat_text(omit_answers=scoped), full) if scoped else (full,)
 
     def _lines(self, name: str) -> list[str]:
         """文件的原文，按行：文档文字、图片转写、Excel 每行单元格。"""
@@ -971,10 +1057,10 @@ class Workspace:
         if f.suffix.lower() in DATA_SUFFIXES:
             if f.name not in self._sheet_corpus:
                 import openpyxl
-                wb = openpyxl.load_workbook(f, data_only=True, read_only=True)
-                self._sheet_corpus[f.name] = "\n".join(
-                    " | ".join("" if v is None else str(v) for v in r) for w in wb.worksheets
-                    for r in w.iter_rows(values_only=True))
+                with closing(openpyxl.load_workbook(f, data_only=True, read_only=True)) as wb:
+                    self._sheet_corpus[f.name] = "\n".join(
+                        " | ".join("" if v is None else str(v) for v in r) for w in wb.worksheets
+                        for r in w.iter_rows(values_only=True))
             return self._sheet_corpus[f.name].splitlines()
         d = next(d for d in self.inv.docs if d.name == f.name)
         return (d.full_text() + "\n" + "\n".join(t for k, t in self.transcripts.items()
@@ -1093,7 +1179,7 @@ class Workspace:
             raise ToolError(str(exc)) from exc
 
     def record_parameter_cells(self, file: str, page: int, table: int, cells: list[dict],
-                               applies_to: str | None = None) -> dict:
+                               applies_to: str | None = None, unit_basis: dict | None = None) -> dict:
         from bonus_agent.source_cells import parameter_cell,ppt_page_index
         self._check_source_version()
         path = self._file(file)
@@ -1126,25 +1212,31 @@ class Workspace:
             except (ValueError, KeyError, TypeError) as exc:
                 failed.append(f"R{cell.get('row')}C{cell.get('column')}：{exc}")      # 逐格说明，其余格照常登记
                 continue
+            args={'name':record['name'],'file':file,'page':page,'context':scope,
+                  'value':record['value'],'quote':record['quote'],'source_cell':record['locator'],
+                  'unit':cell.get('unit'),'component':'literal'}
+            if cell.get('unit') and unit_basis:
+                args['unit_basis'] = unit_basis
+            try:
+                expected = self._declared_cell_unit(fx.Fact.model_validate(args), self._corpus())
+            except ValueError as exc:
+                failed.append(f"R{cell['row']}C{cell['column']}：{exc}")
+                continue
             prior=[f for f in self.facts if f.file==file and f.page==page and f.source_cell and
                 all(f.source_cell.get(k,1)==record['locator'].get(k,1) for k in ('table','row','column','line')) and
-                f.source_hash==source_hash and f.unit==cell.get('unit') and fx.norm(f.value)==fx.norm(record['value']) and
+                f.source_hash==source_hash and f.unit==expected.unit and fx.norm(f.value)==fx.norm(record['value']) and
+                (not expected.unit_basis or all((f.unit_basis or {}).get(k)==v for k,v in expected.unit_basis.items())) and
                 not fx.check_fact(f,self._corpus()) and not self._wrong_page(f)]
             if prior:
                 fact=prior[0]
             else:
-                context=scope       # 已核对在本页原文里
-                quote=record['quote']
-                args={'name':record['name'],'file':file,'page':page,'context':context,
-                      'value':record['value'],'quote':quote,'source_cell':record['locator'],
-                      'unit':cell.get('unit'),'component':'literal'}
                 try:
                     self.record_facts([args])
                 except ToolError as exc:
                     if 'parameter.unit' in str(exc):
                         failed.append(f"R{cell['row']}C{cell['column']}：parameter.unit：当前单元格或行列标题没有支持所填单位的原文。"
                                       f"选中原文={record['selected']!r}，行列标题={record['labels']!r}。"
-                                      '补充原文单位依据，或向财务确认；不能省略unit把比例当作普通系数绕过。')
+                                      + str(exc).removeprefix('错误：'))
                         continue
                     failed.append(f"R{cell['row']}C{cell['column']}：{str(exc).removeprefix('错误：')}")
                     continue
@@ -1224,10 +1316,95 @@ class Workspace:
         self._source_corpus_cache = (key, out)
         return out
 
+    def _unit_proof_options(self, fact, corpus, quotes):
+        contexts = [fact.context]
+        if not fact.context and fact.page is not None and Path(fact.file).suffix.lower() == '.pptx':
+            from bonus_agent.source_cells import ppt_page_index
+            pages = ppt_page_index(self._file(fact.file))
+            if 1 <= fact.page <= len(pages):
+                contexts += [title for title in pages[fact.page - 1]['context']
+                             if title and not self._generic_only(title)]
+        found = []
+        for context in dict.fromkeys(contexts):
+            for source in quotes:
+                candidate = fact.model_copy(update={'context': context, 'unit_basis': source})
+                if fx.unit_basis_matches(candidate, corpus):
+                    found.append({'context': context, 'unit_basis': source})
+                    if len(found) >= 4:
+                        return found
+            if found and context == fact.context:
+                break
+        return found
+
+    def _unit_evidence_quotes(self):
+        from bonus_agent.stuck_question import UNIT_RELATED
+        roles = (self.workflow.get('plan') or {}).get('files', {})
+        files = [doc.name for doc in self.inv.docs]
+        files.extend(f.name for f in self.data_files if roles.get(f.name) == 'rule')
+        # Default-unit table rows are evidence only for their declared physical coordinates.
+        scoped = {(b['file'], fx.norm(b['quote'])) for _, b in self._unit_defaults.values()}
+        sources = [{'file': name, 'quote': line.strip()} for name in files for line in self._lines(name)
+                   if 0 < len(line.strip()) <= fx.MAX_QUOTE and (name, fx.norm(line)) not in scoped]
+        sources += [{'file': CHAT_SOURCE, 'quote': line.strip()} for line in self.said.splitlines()
+                    if 0 < len(line.strip()) <= fx.MAX_QUOTE]
+        sources += [{'file': CHAT_SOURCE, 'quote': str(q.answer)} for q in self.questions
+                    if q.answer not in (None, '') and not q.withdrawn and not q.related.startswith(UNIT_RELATED)]
+        return sources
+
+    def _declared_cell_unit(self, fact, corpus):
+        from bonus_agent.stuck_question import UNIT_RELATED, cell_unit_key
+
+        if any(q.related.startswith(UNIT_RELATED) for q in self.questions):
+            key = cell_unit_key(self, fact) if fact.source_cell else None
+            for q in self.questions:
+                if not q.related.startswith(UNIT_RELATED) or not q.answer or not q.evidence or len(q.options) < 2:
+                    continue
+                cited = fact.unit_basis or {}
+                if q.related != key or q.withdrawn:
+                    if cited.get('file') == CHAT_SOURCE and fx.norm(cited.get('quote', '')) == fx.norm(q.answer):
+                        raise ValueError('parameter.unit：这条财务答复属于其他单元格或原表版本')
+                    continue
+                evidence = q.evidence[0]
+                if (evidence.get('source_hash') != self._source_version.get(fact.file)
+                        or evidence.get('raw_value') != fact.value):
+                    continue
+                if q.answer == q.options[1]:
+                    return fact.model_copy(update={'unit': None, 'unit_basis': None})
+                if q.answer == q.options[0]:
+                    import hashlib
+                    basis = {'file': CHAT_SOURCE, 'quote': q.answer,
+                             'source_hash': hashlib.sha256(self._chat_text().encode()).hexdigest()}
+                    verified = fact.model_copy(update={'unit': evidence['requested_unit'], 'unit_basis': basis})
+                    if fx.unit_basis_matches(verified, corpus):
+                        return verified
+        if not self._unit_defaults:
+            return fact
+        from bonus_agent.source_cells import apply_cell_unit
+        supplied = fact.unit_basis or {}
+        declaration = any(b['file'] == supplied.get('file') and fx.norm(b['quote']) == fx.norm(supplied.get('quote', ''))
+                          for _, b in self._unit_defaults.values()) if supplied else False
+        if declaration:
+            fact = fact.model_copy(update={'unit_basis': None})  # reselect by native labels
+        if fact.file not in self._source_version or Path(fact.file).suffix.lower() != '.pptx':
+            resolved = fact
+        elif fact.page is None:
+            # A missing coordinate on a declared table still needs to be identified,
+            # even if the model also omitted the page. Never select a cell by value.
+            for page in self._quote_pages(fact.quote, self._page_texts(fact.file)):
+                apply_cell_unit(fact.model_copy(update={'page': page, 'source_cell': None}), self._file(fact.file),
+                                self._unit_defaults, self._unit_pages, corpus)
+            resolved = fact
+        else:
+            resolved = apply_cell_unit(fact, self._file(fact.file), self._unit_defaults, self._unit_pages, corpus)
+        if declaration and (resolved.unit_basis or {}).get('quote') != supplied.get('quote'):
+            raise ValueError('parameter.unit：所引默认单位声明不对应此单元格的表标题、行和列')
+        return resolved
+
     def record_facts(self, facts: list[dict]) -> str:
         self._check_source_version()
         corpus, lines, added, dup = self._corpus(), [], 0, 0
         self._fact_rejections=lines
+        unit_quotes = None
         for i, a in enumerate(facts, start=1):
             try:
                 f = fx.Fact.model_validate({**a, "round": self.round}) if isinstance(a, dict) else None
@@ -1243,7 +1420,22 @@ class Workspace:
                 values = {getattr(g,attr) for g in previous}
                 if attr not in a and len(values) == 1:
                     setattr(f,attr,next(iter(values)))
+            try:
+                f = self._declared_cell_unit(f, corpus)
+            except ValueError as exc:
+                lines.append(f'第 {i} 条「{f.name}」未登记：{exc}')
+                continue
             bad = fx.check_fact(f, corpus)
+            if bad and bad.startswith('parameter.unit：quote'):
+                if unit_quotes is None:
+                    unit_quotes = self._unit_evidence_quotes()
+                options = self._unit_proof_options(f, corpus, unit_quotes)
+                if (len(options) == 1 and options[0]['context'] == f.context
+                        and (not f.unit_basis or f.unit_basis.get('file') == f.file)):
+                    f = f.model_copy(update=options[0])
+                    bad = fx.check_fact(f, corpus)
+                elif options:
+                    bad += '。有原文可选。核对后补传对应 context 和 unit_basis：' + json.dumps(options, ensure_ascii=False)
             if bad:
                 near = fx.nearest(f, self._lines(f.file)) if f.file in corpus and "找不到" in bad else ""
                 lines.append(f"第 {i} 条「{f.name}」未登记：{bad}" + (f"。原文里最接近的一句：{near}（照这句改 quote，不必重读文件）"
@@ -1262,8 +1454,10 @@ class Workspace:
                     ):
                         raise ValueError(f'source.cell：source_cell 指的格是「{selected}」（{" / ".join(labels)}），value「{f.value}」不在这一格里；不能从其他区域或新老项目列取值' + self._cell_hint(f))
                     native='\n'.join([*labels,selected])
-                    if f.unit and fx.check_fact(f.model_copy(update={'quote': native}), {f.file: fx.norm(native)}):
-                        raise ValueError(f'source.cell：这一格「{selected}」和它的行列标题（{" / ".join(labels)}）里都没有单位「{f.unit}」，不能借用其他位置的单位；原文没写单位就不写 unit')
+                    if (f.unit and fx.check_fact(f.model_copy(update={'quote': native}), {f.file: fx.norm(native)})
+                            and not fx.unit_basis_matches(f, corpus)):
+                        raise ValueError(f'source.cell：这一格「{selected}」和它的行列标题（{" / ".join(labels)}）里都没有单位「{f.unit}」。'
+                                         '须引用同一参数或已核对适用标题的单位依据')
                     f.meaning = ' | '.join([*labels, selected])
                 except (ValueError, ArithmeticError) as exc:
                     lines.append(f'第 {i} 条「{f.name}」未登记：{exc}')
@@ -1299,16 +1493,21 @@ class Workspace:
             # 同名、同一单元格、同值、同原文版本的参数已经有了：引文写成单元格还是整行只是写法不同，不再登记第二条。
             # 否则重读后换一种引文重录，台账里每个单元格出现两次（实测 144 条里多出 16 条），后续每次通读都更长
             cell = lambda g: tuple(int((g.source_cell or {}).get(k, 1)) for k in ('table', 'row', 'column', 'line'))
-            if f.source_cell and any(g.name == f.name and g.file == f.file and g.page == f.page and g.source_cell
-                                     and cell(g) == cell(f) and fx.same_value(g) == fx.same_value(f)
-                                     and g.source_hash == f.source_hash and not fx.check_fact(g, corpus)
-                                     for g in self.facts):
+            located = [g for g in self.facts if f.source_cell and g.source_cell and g.name == f.name
+                       and g.file == f.file and g.page == f.page and cell(g) == cell(f)
+                       and fx.norm(g.value) == fx.norm(f.value)]
+            def same_unit(g):
+                return g.unit == f.unit and all((g.unit_basis or {}).get(k) == v
+                                                for k, v in (f.unit_basis or {}).items())
+            if any(same_unit(g) and fx.same_value(g) == fx.same_value(f) and g.source_hash == f.source_hash
+                   and not fx.check_fact(g, corpus) for g in located):
                 dup += 1
                 continue
-            same = [g for g in self.facts if (g.name,g.file,fx.norm(g.quote)) == (f.name,f.file,fx.norm(f.quote))]
+            same = [g for g in self.facts if g in located or
+                    (g.name,g.file,fx.norm(g.quote)) == (f.name,f.file,fx.norm(f.quote))]
             if same and all((fx.same_value(g),g.override,fx.norm(g.meaning),g.source_hash) ==
                             (fx.same_value(f),f.override,fx.norm(f.meaning),f.source_hash)
-                            and not fx.check_fact(g,corpus)
+                            and same_unit(g) and not fx.check_fact(g,corpus)
                             and all(attr not in a or getattr(g,attr)==getattr(f,attr) for attr in ('component','unit','page','context'))
                             for g in same):
                 dup += 1
@@ -1322,6 +1521,13 @@ class Workspace:
                 self.facts = [g for g in self.facts if g not in same]
             self.facts.append(f)
             added += 1
+            if f.source_cell and f.unit_basis and self.questions:
+                from bonus_agent.stuck_question import cell_unit_key
+                for q in self.questions:
+                    if not q.answer and not q.withdrawn and q.related == cell_unit_key(self, f):
+                        q.withdrawn = '已从本轮材料核实这个单元格的单位'
+        if self._unit_rejections is not None and any('parameter.unit：quote须有明确单位表头' in x for x in lines):
+            self._unit_rejections.append((facts, '\n'.join(lines)))
         if not added:       # 一条也没登记上：作为失败返回，避免模型以为成功、反复提交同样的内容
             raise ToolError("没有登记任何新参数。" + (f"{dup} 条之前已登记过，不要重复登记。" if dup else "") + "\n".join(lines)
                             + f"\n下一步（程序判断）：{self.next_hint()}")
@@ -1379,6 +1585,7 @@ class Workspace:
         self._check_source_version()
         updates = []
         scopes = self._binding_scopes()
+        unit_chat = None
         for spec in bindings:
             found = [f for f in self.facts if f.name == spec.get("name")]
             if not found or not spec.get("targets"):
@@ -1407,10 +1614,20 @@ class Workspace:
                     raise ToolError(f"{f.name} 的适用条件 context 不在指定原文位置")
                 candidate = fx.binding_candidate(f, list(spec["targets"]), spec.get("component"), spec.get("unit"), spec.get('unit_basis'))
                 candidate.page, candidate.context = page, context
+                try:
+                    candidate = self._declared_cell_unit(candidate, self._corpus())
+                except ValueError as exc:
+                    raise ToolError(str(exc)) from None
                 if candidate.unit_basis:
                     basis = dict(candidate.unit_basis)
-                    body = (self._chat_text().encode() if basis.get('file') == CHAT_SOURCE else
-                            self._file(basis.get('file', '')).read_bytes())
+                    if basis.get('file') == CHAT_SOURCE:
+                        if unit_chat is None:
+                            unit_chat = self._unit_chat_sources()
+                        quote = fx.norm(str(basis.get('quote') or ''))
+                        text = next((text for text in unit_chat if quote in fx.norm(text)), unit_chat[-1])
+                        body = text.encode()
+                    else:
+                        body = self._file(basis.get('file', '')).read_bytes()
                     basis['source_hash'] = hashlib.sha256(body).hexdigest()
                     candidate.unit_basis = basis
                 error = fx.check_fact(candidate, self._corpus())
@@ -1448,7 +1665,7 @@ class Workspace:
                 if changed else "no-op：绑定已一致，已复验类型、数值、目标、出处；没有状态变化，无需重新试算。")
 
     def validate_parameters(self, repair: bool = True) -> dict:
-        """Deterministic local recovery only for targets already explicitly declared."""
+        """Repair declared, grounded evidence without changing calculation formulas."""
         self._check_source_version()
         repaired, errors = [], []
         if repair:
@@ -1461,6 +1678,13 @@ class Workspace:
                         repaired.append(f.name)
                     except ToolError as e:
                         errors.append(str(e))
+            from bonus_agent.parameter_repair import declared_parameter_repairs
+            for spec in declared_parameter_repairs(self):
+                try:
+                    self.bind_facts([spec])
+                except ToolError:
+                    continue  # The normal report retains any unsupported binding.
+                repaired.append(spec['name'])
         gaps = self._binding_gaps()
         return {"status": "FAIL" if gaps or errors else "PASS", "repaired": repaired, "gaps": gaps,
                 "errors": errors, "next": "修正所列参数类型、单位或目标；证据问题不需要重跑金额" if gaps or errors else "参数检查通过；继续其他未完成检查"}
@@ -1599,13 +1823,26 @@ class Workspace:
                 raise ToolError(f'algorithm.mode：所选{mode}与引用原文要求{expected}不一致；本次未保存。按原文重编')
             mode = expected
         mode = mode if mode is not None else prior.get('mode', 'whole')
+        guard = applies_when if applies_when is not None else prior.get('applies_when', '')
+        if guard:
+            try:
+                parse(guard)
+            except ExprError as exc:
+                raise ToolError(f'parameter.applicability：参数表「{name}」的适用条件不是有效公式。{exc}。'
+                                '原表范围用来源记录说明，适用条件须使用实际字段和取值；本次未保存') from None
         escape = lambda s: str(s).replace('~', '~0').replace('/', '~1')
         bindings, sources = [], copy.deepcopy(prior.get('sources', []))
         if cells_from is not None:
             if not isinstance(cells_from, dict) or {"file", "page", "table"} - set(cells_from):
                 raise ToolError("parameter.ref：cells_from 要写 {file, page, table}")
+            if kind == 'tier' and mode == 'excess' and algorithm_basis:
+                from bonus_agent.coefficient import amount_tier_origin
+
+                rows = amount_tier_origin(self, rows, cells_from)
             rows = [{k: (self._cell_ref(v, cells_from) if k in ("value", "lower") else v) for k, v in row.items()}
                     for row in rows]
+        from bonus_agent.construction import guard_table_target
+        guard_table_target(self, owner, name, (row['value'] for row in rows))
 
         def take(ref, path):
             originals = [f for f in self.facts if f.name == ref]
@@ -1627,7 +1864,7 @@ class Workspace:
         # Rebuilding row values must not reset an existing table's independently
         # confirmed policy. Explicit False/empty arguments still override it.
         table = {k: copy.deepcopy(v) for k, v in prior.items() if k not in ('steps', 'mapping', 'sources')}
-        table.update(kind=kind, applies_when=applies_when if applies_when is not None else prior.get('applies_when', ''))
+        table.update(kind=kind, applies_when=guard)
         prefix = '/tables/' + escape(name)
         if kind == "tier":
             table.update(mode=mode,
@@ -1700,15 +1937,35 @@ class Workspace:
             f.component, f.unit = candidate.component, candidate.unit
             if path not in f.targets:
                 f.targets.append(path)
+        if self.staged:
+            from bonus_agent.construction import TaskBoard
+            board = TaskBoard(self)
+            tasks = [task for task, spec in board.state['tasks'].items()
+                     if spec['scheme'] == owner and spec['target'] == prefix]
+            if len(tasks) == 1:
+                checked = board.check(tasks[0], include_next=False, link_clauses=False)
+                out += f"\n参数表任务 {tasks[0]} 局部检查 {checked['status']}。"
+                if checked['issues']:
+                    self.last_blocking = list(dict.fromkeys([*(self.last_blocking or []), *checked['issues']]))
+                    out += ' ' + '。'.join(checked['issues'][:3])
         return out + "\n参数表由原文参数直接编译，已自动建立单元格绑定。"
 
     def _binding_gaps(self) -> list[str]:
         import hashlib
         gaps = list(getattr(self, '_phase_binding_gaps', []))
         hashes = {}
+        unit_hashes = {}
         ignored = {i.get("ref") for i in self.ignored if i.get("rules") == self._rules_print()}
         used = [f for f in self.facts if f.targets]
         for f in used:
+            if self._unit_defaults:
+                try:
+                    required = self._declared_cell_unit(f, self._corpus())
+                except ValueError as exc:
+                    gaps.append(f'{f.name}：{exc}')
+                    continue
+                if required.unit != f.unit or required.unit_basis != f.unit_basis:
+                    gaps.append(f'{f.name}：parameter.unit，现有登记与本期单位依据不一致，须重新登记并复核绑定')
             if f.file not in hashes:
                 hashes[f.file] = hashlib.sha256(self._file(f.file).read_bytes()).hexdigest() if f.file != CHAT_SOURCE else hashlib.sha256(self._chat_text().encode()).hexdigest()
             current = hashes[f.file]
@@ -1716,9 +1973,12 @@ class Workspace:
                 gaps.append(f"{f.name}：原文版本变化或缺少指纹，需要重新登记")
             if f.unit_basis:
                 basis = f.unit_basis
-                body = (self._chat_text().encode() if basis.get('file') == CHAT_SOURCE else
-                        self._file(basis.get('file', '')).read_bytes())
-                if basis.get('source_hash') != hashlib.sha256(body).hexdigest() or fx.check_fact(f, self._corpus()):
+                source = basis.get('file', '')
+                if source not in unit_hashes:
+                    bodies = (text.encode() for text in self._unit_chat_sources()) if source == CHAT_SOURCE else (
+                        self._file(source).read_bytes(),)
+                    unit_hashes[source] = {hashlib.sha256(body).hexdigest() for body in bodies}
+                if basis.get('source_hash') not in unit_hashes[source] or fx.check_fact(f, self._corpus()):
                     gaps.append(f'{f.name}：parameter.unit，单位确认来源已变化或无效，须重新bind_facts核对unit_basis')
         # Numeric parameters read directly from data tables retain their data-source binding.
         read = set().union(*(self.read_nums.get(s, set()) for s in self.schemes))
@@ -1744,46 +2004,38 @@ class Workspace:
                 continue
             active.append(f)
         scopes = self._binding_scopes()
+        from bonus_agent.parameter_repair import covered_range_labels
+        supporting = {row[:3] for row in covered_range_labels(self, active, scopes)}
+        active = [f for f in active if (f.name, f.file, f.quote) not in supporting]
         gaps += fx.binding_errors(active, scopes)
+        from bonus_agent.source_diagnostics import explicit_sources, source_reference_error, report_source_issue
+        corpus = self._corpus()
         for scheme in self.schemes:
             draft = self._merged(scheme)
-            for name, variable in self._ruleset(scheme).variables.items():
-                if variable.ratio_default:
-                    if not variable.sources:
-                        gaps.append(f"variables.{name} 的 ratio_default 缺少明确原文依据")
-                    for source in variable.sources:
-                        bad = cl.check_quote(source.doc, source.quote, self._corpus())
-                        if bad:
-                            gaps.append(f"variables.{name} 默认行为依据：{bad}")
-            for path, value in fx.table_cells(draft.get("tables") or {}):
-                bound = []
-                for f in active:
-                    for target in f.targets:
-                        qualifier, local = fx.split_target(target)
-                        if qualifier is not None and qualifier not in (scheme, SHARED):
-                            continue
-                        try:
-                            if fx.target_parts(local) == fx.target_parts(path):
-                                bound.append(f)
-                        except (KeyError, IndexError, TypeError, ValueError):
-                            pass
-                if not any(fx.numeric(f) == value for f in bound):
-                    gaps.append(f"方案「{scheme}」{path}={value} 缺少精确参数绑定")
-            report = self._ruleset(scheme).report
+            rs = self._ruleset(scheme)
+            for name, variable in rs.variables.items():
+                if variable.ratio_default and not variable.sources:
+                    gaps.append(f"variables.{name} 的 ratio_default 缺少明确原文依据")
+            for path, source in explicit_sources(rs.model_dump(mode='json', exclude={'report'})):
+                if bad := source_reference_error(self, source, corpus):
+                    location = '/' + '/'.join(str(p).replace('~', '~0').replace('/', '~1') for p in path)
+                    gaps.append(f"source.quote：{scheme}::{location}：{bad}")
+            for path, value in fx.unbound_table_cells(draft.get("tables") or {}, active, scheme):
+                gaps.append(f"方案「{scheme}」{path}={value} 缺少精确参数绑定")
+            report = rs.report
             if report:
                 if self.report_required and len(report.totals) > 1 and not report.balances:
                     gaps.append(f"方案「{scheme}」有多项汇总但未声明 report.balances 对账关系")
                 if (self.report_required and report.people and report.totals and
                         self._ruleset(scheme).pool.scope != "global" and not report.distributions):
                     gaps.append(f"方案「{scheme}」缺少 report.distributions：在奖金池层用原文应分配总额，对账分配池与已列示 pending；不能只对账总额=正常+暂扣")
-                from bonus_agent.source_diagnostics import report_source_issue
-                for section in ('balances', 'pending', 'distributions', 'details'):
+                for section in ('balances', 'pending', 'distributions', 'details', 'totals'):
                     for index, item in enumerate(getattr(report, section)):
-                        if not item.sources:
+                        if not item.sources and section != 'totals':
                             gaps.append(report_source_issue(self, scheme, section, index, item,
                                                             'source.required', '缺少原文依据'))
                         for source_index, source in enumerate(item.sources):
-                            bad = cl.check_quote(source.doc, source.quote, self._corpus())
+                            bad = source_reference_error(self, source.model_dump(mode='json'), corpus)
                             if bad:
                                 gaps.append(report_source_issue(self, scheme, section, index, item,
                                                                 'source.quote', bad, source_index=source_index))
@@ -1924,9 +2176,18 @@ class Workspace:
             if not fields:
                 raise ToolError(f"缺少 fields（字段名 -> {{column, type}}）。「{name}」之前没有定义成功过，要写全字段")
             reuse = f"没写 fields，沿用上一次定义「{name}」时的 {len(fields)} 个字段"
-        out = self._define_dataset(name, file, sheet, fields, key, link, desc, header_rows, filter, distinct, unpivot, unmatched,
-                                   period, window, combine, unmatched_basis)
-        self._prev_fields[name] = fields
+        args = dict(name=name, file=file, sheet=sheet, fields=fields, key=key, link=link, desc=desc,
+                    header_rows=header_rows, filter=filter, distinct=distinct, unpivot=unpivot, unmatched=unmatched,
+                    period=period, window=window, combine=combine, unmatched_basis=unmatched_basis)
+        try:
+            out = self._define_dataset(**args)
+        except ToolError:
+            from bonus_agent.dataset_projection import recover_entity
+            repaired = recover_entity(self, args, population_from)
+            if repaired is None:
+                raise
+            out = repaired
+        self._prev_fields[name] = {field: spec for field, spec in fields.items() if field in self.datasets[name].fields}
         self.datasets[name].population_from = population_from
         if self._rules_print() == before:
             self.untested = untested
@@ -1960,34 +2221,40 @@ class Workspace:
                     f"和 scope=「{name}」的变量；再提交同样的定义不会有变化")
         return ""
 
-    def update_dataset(self, name: str, changes: dict) -> str:
-        """Patch a saved definition without rewriting its successful identity mapping."""
-        import copy
+    def _dataset_definition(self, name):
+        """Reconstruct tool arguments with unambiguous physical column labels."""
         if name not in self.datasets or name not in self.mapping:
             raise ToolError('dataset.patch：没有已保存的数据定义')
-        # unmatched/unmatched_basis：实测模型 5 次用局部修改设“对不上的行不参与”都被拒（只能整表重定义），白白打转；
-        # 允许局部修改，依据核对仍由 define_dataset 做（ignore 必须引用写明不参与的原文）
-        if not changes or set(changes)-{'key','link','period','window','filter','population_from','fields','combine','unpivot',
-                                          'unmatched','unmatched_basis'}:
-            raise ToolError('dataset.patch：只允许局部修改关联、期间、筛选、fields、combine、unpivot和unmatched（须带unmatched_basis原文依据）')
         d, m = self.datasets[name], self.mapping[name]
-        st = self.inv.sheet(f'{Path(m.file).name}/{m.sheet}')
+        try:
+            st = (table_at(self._file(Path(m.file).name), m.sheet, m.header_rows) if m.header_rows
+                  else self.inv.sheet(f'{Path(m.file).name}/{m.sheet}'))
+        except (KeyError, ValueError) as exc:
+            raise ToolError(str(exc)) from None
+        if st:
+            from bonus_core.data.mapping import rebind_dup_columns
+            m, _ = rebind_dup_columns(m, st.headers)
         dup = _dup_names(st.headers) if st else {}
         alias = lambda c: f'{c}({dup[c]}列)' if c in dup else c
         fields = {key:{**value.model_dump(exclude_defaults=True), 'column':alias(m.columns[key])}
                   for key,value in d.fields.items() if key in m.columns}
         combine = {key:[alias(c) for c in cols] for key,cols in (m.combine or {}).items()}
-        unpivot = copy.deepcopy(m.unpivot)
-        if unpivot:
-            unpivot['columns'] = [alias(c) for c in unpivot['columns']]
-            if unpivot.get('share_from'):
-                unpivot['share_from'] = alias(unpivot['share_from'])
-            if unpivot.get('share_from_columns'):
-                unpivot['share_from_columns'] = [alias(c) for c in unpivot['share_from_columns']]
-        args = dict(name=name,file=Path(m.file).name,sheet=m.sheet,fields=fields,key=d.key,link=d.link,
+        unpivot = rename_unpivot_columns(m.unpivot, alias) if m.unpivot else None
+        return dict(name=name,file=Path(m.file).name,sheet=m.sheet,fields=fields,key=d.key,link=d.link,
                     desc=d.desc,header_rows=m.header_rows,filter={alias(k):v for k,v in m.filter.items()},
                     distinct=d.distinct,unpivot=unpivot,unmatched=d.unmatched,period=d.period,window=d.window,
                     combine=combine or None,population_from=d.population_from)
+
+    def update_dataset(self, name: str, changes: dict) -> str:
+        """Patch a saved definition without rewriting its successful identity mapping."""
+        import copy
+        if not changes or set(changes)-{'key','link','period','window','filter','population_from','fields','combine','unpivot',
+                                          'unmatched','unmatched_basis'}:
+            raise ToolError('dataset.patch：只允许局部修改关联、期间、筛选、fields、combine、unpivot和unmatched（须带unmatched_basis原文依据）')
+        args = self._dataset_definition(name)
+        d, m = self.datasets[name], self.mapping[name]
+        fields, combine = args['fields'], args['combine']
+        identity = {field: copy.deepcopy(fields.get(field)) for field in (d.key, d.link) if field}
         patch=copy.deepcopy(changes)
         if not isinstance(patch.get('fields',{}),dict) or not isinstance(patch.get('combine',{}),dict):
             raise ToolError('dataset.patch：fields和combine须为对象')
@@ -2009,7 +2276,18 @@ class Workspace:
                 raise ToolError('dataset.patch：unpivot须为对象')
             args['unpivot']={**(args['unpivot'] or {}),**patch.pop('unpivot')}
         args.update(patch)
-        return self.define_dataset(**args)
+        if ('unmatched_basis' not in patch and args['unmatched'] == d.unmatched == 'ignore'
+                and args['key'] == d.key and args['link'] == d.link and args['combine'] == (combine or None)
+                and all(fields.get(field) == original for field, original in identity.items())):
+            args['unmatched_basis'] = m.unmatched_basis
+        try:
+            return self.define_dataset(**args)
+        except ToolError:
+            from bonus_agent.dataset_projection import component_rebind
+            result = component_rebind(self, args, changes)
+            if result is None:
+                raise
+            return result
 
     def diagnose_datasets(self) -> dict:
         """Source-level diagnostics remain available even when allocation cannot build a tree."""
@@ -2020,6 +2298,8 @@ class Workspace:
         def values(name,field,path=()):
             if name in path:
                 raise ToolError('dataset.population：对象范围循环引用')
+            if name not in self.datasets or name not in self.mapping:
+                raise ToolError(f'dataset.population：对象范围引用的数据表「{name}」尚未定义或映射')
             own=set(self._values(name,field))
             d=self.datasets[name]
             if d.population_from and field==d.key:
@@ -2147,16 +2427,36 @@ class Workspace:
         raw = st
         fields, combine, unpivot, filter = _resolve_dup_columns(st, fields, combine, unpivot, filter)
         self._dup_choice_check(st, fields, combine, unpivot, filter)
+        period = str(period or '').strip() or None
+        window = str(window or 'period').strip() or 'period'
+        if window not in ('period', 'year_to_date', 'to_date'):
+            raise ToolError('未保存：window 只能写 period、year_to_date 或 to_date')
+        if window != 'period' and not period:
+            raise ToolError('未保存：写 window 时要同时写 period（记日期或月份的字段）')
+        if self.period and period and isinstance(unpivot, dict) and isinstance(fields, dict):
+            columns = {field: fd.get('column') for field, fd in fields.items() if isinstance(fd, dict)}
+            period_column = columns.get(period)
+            if period not in fields and list(columns.values()).count(period) == 1:
+                period_column = period
+            st = scope_unpivot_source(st, unpivot, period_column, self.period.window(window))
         spec = _unpivot_spec(unpivot, st) if unpivot else None
         if spec:
-            st = unpivot_by(st, spec)
-        comb = _combine_spec(combine, st) if combine else None
+            try:
+                st = unpivot_by(st, spec)
+            except ValueError as exc:
+                if not str(exc).startswith('unpivot.share_parse：'):
+                    raise ToolError(str(exc)) from None
+                from bonus_agent.data_profile import unpivot_column_shapes
+                raise ToolError(f'{exc}。{unpivot_column_shapes(st, spec)}。按原文核对各列提供姓名、纯比例，'
+                                '还是姓名及比例；按已确认口径修改当前 unpivot，先验证这条配置。') from None
+        comb = _combine_spec(combine, st, fields) if combine else None
         if comb:
             st = combine_columns(st, comb)
         if isinstance(fields, dict) and any(isinstance(d, dict) and d.get("column") == ROW_ID for d in fields.values()):
             st = add_row_ids(st)
         if getattr(raw, "unsure", None):      # 另一段表头对不上第一段、又没法按列名对回：用到这些列就不能保存
             want = {d.get("column") for d in (fields or {}).values() if isinstance(d, dict)} | set((spec or {}).get("columns") or [])
+            want.update(col for columns in (comb or {}).values() for col in columns)
             used = {raw.headers.index(c) for c in want if c in raw.headers}
             unsure = sorted({raw.headers[i] for _, ix in raw.unsure for i in ix if i in used})
             if unsure:
@@ -2182,6 +2482,7 @@ class Workspace:
                     fixed.append(f"{which} 写的是列名 {val}，已改成对应的字段名 {hit[0]}（key / link 要写字段名）")
                     key, link = (hit[0], link) if which == "key" else (key, hit[0])
         unmatched = str(unmatched or "block").strip().lower()
+        basis = None
         if unmatched == "ignore":
             if not link and not key:
                 raise ToolError("unmatched: ignore 只用于写了 link 的明细表，或作为下一层分配对象的实体表（写了 key，"
@@ -2189,16 +2490,22 @@ class Workspace:
             # 财务说过的话，或财务答复过的问题（问题里写了表名、答复说怎么处理）：问题原文这里也算，表名多半只出现在问题里
             told = "\n".join([self.said] + [f"{q.text} {q.answer}" for q in self.questions if str(q.answer or "").strip()])
             sh = "" if re.fullmatch(r"(?i)sheet\s*\d*|工作表\s*\d*", str(sheet or "").strip()) else sheet   # Sheet1 这类名字到处都有，不算
-            if not any(x and x in told for x in (name, sh, Path(str(file)).stem)):
+            if unmatched_basis is not None or not any(x and x in told for x in (name, sh, Path(str(file)).stem)):
                 # 材料原文已经写明“对不上的不参与”时，逐字引用原文也算依据（T3：场景说明里写了，仍被要求再问一遍，
                 # 提问又因“原文已有答案”被退回，两头卡住）
                 why = self._quote_basis(unmatched_basis)
                 if why:
+                    source = str(unmatched_basis.get('file') or '') if isinstance(unmatched_basis, dict) else ''
+                    if candidates := self._unmatched_source_quotes(source):
+                        raise ToolError(f"未保存：unmatched_basis.source：unmatched: ignore 要有依据。{why}"
+                                        "已在所引材料定位到关于未匹配记录的原文。"
+                                        "核对适用表和匹配方向后，复制正确的原文作为 unmatched_basis 再提交：\n"
+                                        + json.dumps(candidates, ensure_ascii=False))
                     raise ToolError(f"未保存：unmatched: ignore 要有依据。{why}两种依据都可以："
                                     "① 材料原文写明了对不上的记录不参与：加参数 unmatched_basis，写 {\"file\": 材料文件名, \"quote\": 逐字复制的那句原文}；"
                                     f"② 材料没写：先用 ask_question 问财务「{name}」里在上级找不到的记录怎么处理（问题里写上表名、编号例子），"
                                     "财务答复“不参与 / 按默认值”后再写 ignore")
-                desc = (desc + "；" if desc else "") + f"对不上的记录不参与，依据《{unmatched_basis['file']}》：{str(unmatched_basis['quote']).strip()[:120]}"
+                basis = {'file': unmatched_basis['file'], 'quote': unmatched_basis['quote'].strip()}
         try:
             pd = PlanDataset(sheet=sheet, key=key or None, link=link or None, desc=desc, fields=fields,
                              distinct=bool(distinct), unmatched=unmatched)
@@ -2220,19 +2527,19 @@ class Workspace:
         if held:
             raise ToolError("未保存：filter 排除了还在等财务答复的问题里问到的记录（" + "；".join(held) + "）。"
                             "财务答复前不要自己排除，答复后按答复处理；先做不受影响的部分，然后 finish 等答复")
-        d, m, warnings, errors = check_dataset(name, pd, st, types, header_rows, flt)
+        period_window = self.period.window(window) if period and self.period else None
+        distinct_conflicts = {}
+        d, m, warnings, errors = check_dataset(name, pd, st, types, header_rows, flt, period_field=period,
+                                               period_window=period_window, distinct_conflicts=distinct_conflicts)
         if errors:
             owner = next((n for n, o in self.datasets.items() if n != name and key and o.key == key), None)
             if owner and any("重复值" in e for e in errors):
                 errors.append(f"{key} 是「{owner}」的主键，这张表应写 link={key}（不写 key），每行挂到对应的{owner}上")
-            raise ToolError("未保存，请修正：\n" + "\n".join(f"- {e}" for e in fixed + errors))
+            message = "未保存，请修正：\n" + "\n".join(f"- {e}" for e in fixed + errors)
+            if len(distinct_conflicts) == len(errors):
+                raise DistinctFieldError(message, distinct_conflicts)
+            raise ToolError(message)
         warnings = fixed + warnings
-        period = str(period or "").strip() or None
-        window = str(window or "period").strip() or "period"
-        if window not in ("period", "year_to_date", "to_date"):
-            raise ToolError("未保存：window 只能写 period、year_to_date 或 to_date")
-        if window != "period" and not period:
-            raise ToolError("未保存：写 window 时要同时写 period（记日期或月份的字段）")
         if period:
             if period not in d.fields:
                 hit=[field for field,column in m.columns.items() if column==period]
@@ -2250,7 +2557,8 @@ class Workspace:
                                 "写法要像 年-月、六位年月、年-月-日 或 Excel 日期；空值或其他写法先问财务")
             d.period, d.window = period, window
             spans = sorted({probe.span_of(v) for v in vals})
-            warnings.append(f"按 {period} 筛选核算期间：数据覆盖 {spans[0][0]} ~ {spans[-1][1]}"
+            coverage = f'数据覆盖 {spans[0][0]} ~ {max(end for _, end in spans)}' if spans else '筛选后无记录'
+            warnings.append(f"按 {period} 筛选核算期间：{coverage}"
                             + (f"；本次核算期间 {self.period}，计算时只取" + {"period": "期间里的行", "year_to_date": f"{self.period.window(window)} 年初累计的行",
                                "to_date": f"{self.period.end} 及以前的行"}[window] if self.period else "；本次没有指定核算期间，全部行都参与"))
         if window == "period":
@@ -2259,6 +2567,7 @@ class Workspace:
             m.unpivot = spec
         if comb:
             m.combine = comb
+        m.unmatched_basis = basis
         prev = (self.datasets.get(name), self.mapping.get(name))
         self.datasets[name], self.mapping[name] = d, m
         bad, loose = self._link_mismatch(name)
@@ -2281,6 +2590,7 @@ class Workspace:
                     if getattr(st, "repeats", None) else "")]
         if getattr(raw, "segments", None):
             cols = set(m.columns.values()) | set((spec or {}).get("columns") or [])
+            cols.update((spec or {}).get('share_columns', {}).values())
             used = {raw.headers.index(c) for c in cols if c in raw.headers}
             moved = [(j, {i: k for i, k in mp.items() if k in used or i in used}) for j, mp in getattr(raw, "remaps", [])]
             if any(mp for _, mp in moved):
@@ -2295,8 +2605,14 @@ class Workspace:
             else:
                 lines.append(_segments_text(raw))
         if spec:
-            lines.append(f"已把 {len(spec['columns'])} 列（{'、'.join(spec['columns'])}）展开成每个值一行（空格子不展开），"
+            lines.append(f"已展开 {len(spec['columns'])} 列（{'、'.join(spec['columns'])}），展开成每个值一行，"
                          f"值在「{spec['value']}」列" + (f"，原列名在「{spec['label']}」列" if spec.get("label") else ""))
+            if spec.get('split_shares_columns'):
+                lines.append(f"「{'、'.join(spec['split_shares_columns'])}」按单元格内的姓名和比例逐项展开")
+            if spec.get('share_columns'):
+                lines.append('已绑定独立比例列：' + '、'.join(f'{name} → {ratio}' for name, ratio in spec['share_columns'].items()))
+            if spec.get('blank'):
+                lines.append(f"按 blank 配置记录空白人员去向「{spec['blank']}」")
         lines += [f"注意：{w}" for w in warnings]
         lines += [f"关联提示：{h}" for h in self._relation_hints(name)]
         lines.append("前 3 行（金额已换算为元）：" + json.dumps(sample, ensure_ascii=False))
@@ -2419,24 +2735,29 @@ class Workspace:
 
     def _values(self, name: str, fld: str, combine: dict | None = None, *, period_field: str | None = None) -> list[str]:
         """数据表某个字段的全部取值（文字），用来判断表之间的关联。combine 给了就按它合成（试换一列时用）。"""
-        from bonus_core.data.mapping import cell_text
+        from bonus_core.data.mapping import cell_text, rebind_dup_columns
         m = self.mapping[name]
         st = table_at(Path(m.file) if Path(m.file).exists() else self._file(Path(m.file).name), m.sheet, m.header_rows) \
             if m.header_rows else self.inv.sheet(f"{Path(m.file).name}/{m.sheet}")
         if st is None or fld not in m.columns:
             return []
+        m, _ = rebind_dup_columns(m, st.headers)
+        ds = self.datasets[name]
+        period_field = period_field or ds.period
+        win = self.period.window(ds.window) if self.period else None
         if m.unpivot:
-            st = unpivot_by(st, m.unpivot)
+            st = scope_unpivot_source(st, m.unpivot, m.columns.get(period_field), win)
+            try:
+                st = unpivot_by(st, m.unpivot)
+            except ValueError as exc:
+                raise ToolError(str(exc)) from None
         if combine or m.combine:
             st = combine_columns(st, combine or m.combine)
         if ROW_ID in m.columns.values():
             st = add_row_ids(st)
         st, _ = filter_sheet(st, m.filter or None)
-        ds = self.datasets[name]
-        period_field=period_field or ds.period
-        if self.period and period_field and period_field in m.columns:
+        if win and period_field and period_field in m.columns:
             period_col = st.headers.index(m.columns[period_field])
-            win = self.period.window(ds.window)
             st = replace(st, rows=[(n,v) for n,v in st.rows if win.contains(v[period_col])])
         i = st.headers.index(m.columns[fld])
         return [cell_text(v[i]) for _, v in st.rows if v[i] not in (None, "")]
@@ -2611,6 +2932,14 @@ class Workspace:
     def remove_dataset(self, name: str) -> str:
         if name not in self.datasets:
             raise ToolError(f"没有数据表「{name}」")
+        for review in self.workflow.get('references', {}).values():
+            if review.get('spec_state') != 'population_difference':
+                continue
+            checks = review.get('report', {}).get('population', {}).get('checks', [])
+            if (any(c.get('scope') == 'rows:' + name and c.get('status') == 'FAIL' for c in checks)
+                    and review.get('version') == self._flow().version('basis')):
+                raise ToolError(f'「{name}」正在核对原表取数差异，删除整表会使已编译的核算中断。'
+                                '先运行 review_basis 核对独立声明和差异原行；原文证实生产映射有误时用 update_dataset 原子更正。')
         del self.datasets[name], self.mapping[name]
         self.untested |= set(self.schemes)
         return f"已删除「{name}」"
@@ -2650,6 +2979,12 @@ class Workspace:
         name = self._scheme(scheme, for_write=True)
         if name == SHARED and parts.get("pool") is not None:
             raise ToolError("pool 是每个方案自己的，不能写在共用部分")
+        if self.staged and parts.get('pool') is not None:
+            from bonus_agent.construction import TaskBoard
+            from bonus_agent.funding_plan import pool_input_gap
+
+            if gap := pool_input_gap(TaskBoard(self), name):
+                raise ToolError(gap['message'])
         temp = _temp_wording(parts, self._corpus)
         if temp:      # 为了让试算通过写的临时口径：算出来的数没有意义，还会被当成结果
             raise ToolError(f"未保存：规则里写了「{temp}」。规则只能按材料和财务答复写，不能用临时、假设的口径凑出试算结果。"
@@ -2782,12 +3117,19 @@ class Workspace:
         out.update({k: v for k, v in own.items() if k not in ("tables", "variables")})
         return out
 
+    def _scheme_datasets(self, scheme):
+        """A confirmed funding scheme may keep its original input membership."""
+        assigned = self.workflow.get('scheme_datasets', {}).get(scheme)
+        if assigned is None:
+            return self.datasets
+        return {name: dataset for name, dataset in self.datasets.items() if name in assigned}
+
     def _ruleset(self, scheme: str | None = None, drafts: dict | None = None) -> RuleSet:
         scheme = scheme or self._scheme(None)
         draft = {k: v for k, v in self._merged(scheme, drafts).items() if k != "revisions"}
         ext = Extraction.model_validate({"pool": {"expr": "0"}, "allocation": [], **draft})
         return RuleSet(name=scheme if scheme != DEFAULT_SCHEME else (self.summary[:30] or "智能体草稿"),
-                       version="agent-draft", datasets=self.datasets, **ext.model_dump(exclude={"questions"}))
+                       version="agent-draft", datasets=self._scheme_datasets(scheme), **ext.model_dump(exclude={"questions"}))
 
     def _data(self, rs: RuleSet):
         self._check_source_version()
@@ -2802,6 +3144,8 @@ class Workspace:
         return data, issues
 
     def trial_run(self, scheme: str | None = None) -> str:
+        from bonus_core.dsl.phases import funding_only
+
         if not self.datasets:
             raise ToolError("还没有定义数据表")
         names = [self._scheme(scheme)] if scheme or len(self.schemes) <= 1 else self._order(self.schemes)
@@ -2811,7 +3155,8 @@ class Workspace:
             out.append("【草稿试算：参数预检未通过，不推进验收阶段】先修复来源、类型和绑定缺口："
                        + json.dumps(parameters, ensure_ascii=False))
         for name in names:
-            if "pool" not in self._merged(name) or not self._merged(name).get("allocation"):
+            draft = self._merged(name)
+            if "pool" not in draft or (not draft.get("allocation") and not funding_only(self._ruleset(name))):
                 raise ToolError(f"方案「{name}」的规则还缺 pool 或 allocation")
             out.append(self._trial(name))
         return "\n\n".join(out)
@@ -2912,20 +3257,12 @@ class Workspace:
         self.untested |= {s for s in self.schemes if s != name and name in {d for d, _ in self._deps(s)}}  # 引用本方案的要重算
         base = res["R0"]
         if self.staged:
-            basis=self.workflow['basis'][name]
-            basis_details = {item.name for item in rs.report.details if item.stage == 'basis'} if rs.report else set()
-            basis_totals = {item.name for item in rs.report.totals if item.stage == 'basis'} if rs.report else set()
-            details = {key: value for key, value in base.details.items() if key in basis_details}
-            totals = {key: value for key, value in base.totals if key in basis_totals}
-            if Decimal(base.pool)!=Decimal(basis['pool']) or details!=basis['details'] or totals!=basis['totals']:
+            try:
+                self._flow().check_basis_result(name, rs, base)
+            except ToolError:
                 self.results.pop(name, None)
                 self.untested.add(name)
-                diff = [k for k, a, b in (('奖金池', Decimal(base.pool), Decimal(basis['pool'])),
-                                           ('对象明细', details, basis['details']),
-                                           ('合计', totals, basis['totals'])) if a != b]
-                raise ToolError(f'workflow.gate：这次算出的{"、".join(diff)}和「核对计算基础」阶段确认的不一样'
-                                f'（确认时奖金池 {basis["pool"]}，这次 {base.pool}）。确认之后改过规则或数据：'
-                                '回到 calculate_basis 重新核对计算基础，再试算；不能直接发布')
+                raise
         lines = [f"方案「{name}」金额试算执行完成（尚未验收）。奖金池 {fmt(Decimal(base.pool))} 元（精确值 {base.pool_exact}）"]
         if prev is not None and Decimal(prev.pool) != 0 and Decimal(base.pool) != 0:
             k = abs(Decimal(base.pool) / Decimal(prev.pool))
@@ -2998,10 +3335,39 @@ class Workspace:
                     elsewhere |= lint.reached(self._ruleset(s))
                 except Exception:
                     pass
+        tables = self._merged(name).get('tables') or {}
+        tier_quotes = {}
+        corpus = self._corpus()
+        for table, definition in tables.items():
+            if definition.get('kind') != 'tier':
+                continue
+            for source in definition.get('sources', ()):
+                doc, quote, page = source['doc'], source['quote'], source.get('page')
+                if (not cl.check_quote(doc, quote, corpus)
+                        and (page is None or page in self._quote_pages(quote, self._page_texts(doc)))):
+                    tier_quotes.setdefault(table, []).append(quote)
+        for clause in self.clauses:
+            linked = [ref.removeprefix('tables.') for ref in cl.refs(clause.where) if ref.startswith('tables.')]
+            linked = [table for table in linked if table in tables and tables[table].get('kind') == 'tier']
+            if linked and not cl.check_quote(clause.file, clause.quote, corpus):
+                for table in linked:
+                    tier_quotes.setdefault(table, []).append(clause.quote)
+        generated_values = {}
+        for dataset_name, dataset in rs.datasets.items():
+            mapping = self.mapping.get(dataset_name)
+            transform = (mapping.unpivot or {}) if mapping else {}
+            generated = {pattern.replace('{label}', label) for pattern in (transform.get('blank'), transform.get('remainder'))
+                         if pattern for label in transform.get('columns', [])}
+            for fld in dataset.fields or {}:
+                current = generated if mapping and mapping.columns.get(fld) == transform.get('value') else set()
+                # A field shared by two data sources only has their common generated values.
+                generated_values[fld] = generated_values.get(fld, current) & current
         rep = self.lint[name] = lint.check(rs, data, self._rule_text(), base.traces, sourced=self._sources_readable(),
                                            headers=heads, tiers=base.tier_stats, used_elsewhere=others,
                                            coverage=base.coverage, reached_elsewhere=elsewhere,
-                                           said=self._finance_said())
+                                           said=self._finance_said(), tier_quotes=tier_quotes,
+                                           table_percentages=fx.table_percentage_evidence(tables, self.facts, name),
+                                           generated_values=generated_values)
         from bonus_agent.contracts import ratio_default_gaps
         for path, message in ratio_default_gaps(rs):
             rep.gates.append(message)
@@ -3225,8 +3591,13 @@ class Workspace:
         return "\n".join(out)
 
     def evaluate(self, expr: str, node: str = ROOT_LEVEL, scheme: str | None = None) -> str:
+        from bonus_core.dsl.phases import funding_only
+
         name = self._scheme(scheme) if self.schemes else self._scheme(None, for_write=True)
-        if not self._merged(name).get("allocation"):
+        # Pre-allocation review must be able to inspect the already calculated
+        # project/region/customer indicators without fabricating a recipient tree.
+        basis_probe = bool(self.staged and not self._merged(name).get("allocation"))
+        if not basis_probe and not self._merged(name).get("allocation") and not funding_only(self._ruleset(name)):
             raise ToolError("需要先用 set_rules 设定 allocation（pool 可以先写 0）")
         # 验算时定义过的辅助变量在 evaluate 里也能用（规则里同名的变量优先），按正式规则的语义计算
         rule_vars = set((self._merged(name).get("variables") or {}))
@@ -3237,22 +3608,24 @@ class Workspace:
             same_field = []
         if same_field:
             raise ToolError(f"{'、'.join(dict.fromkeys(same_field))} {SELF_COMPARE_HINT}")
-        v, rendered = self._probe(name, expr, node, extra=extra or None)
+        v, rendered = self._probe(name, expr, node, extra=extra or None, basis=basis_probe)
         return f"{expr} = {rendered} = {fmt(v)}"
 
-    def _probe(self, name: str, expr: str, node: str, helpers: dict | None = None, extra: dict | None = None):
+    def _probe(self, name: str, expr: str, node: str, helpers: dict | None = None, extra: dict | None = None,
+               *, basis: bool = False):
         """在方案的数据上（已应用数据修订、带上引用的其他方案结果）对某个节点计算表达式，和正式计算用同样的数据。
         helpers：独立验算自己定义的辅助变量 {名字: {scope, expr}}，给出时只认这些变量，不带规则里的变量。
         extra：evaluate 用到的已保存辅助变量，加在规则变量旁边，语义和正式计算一样。"""
         key = id(self.results.get(name))           # 试算结果没变时规则和数据也没变，不必重读文件
         hit = self._probe_cache.get(name)
-        if hit and hit[0] == key and name in self.results and name not in self.untested:
+        if not basis and hit and hit[0] == key and name in self.results and name not in self.untested:
             rs, data, patched = hit[1:]
         else:
             rs = self._ruleset(name)
-            data, _ = self._data(rs)
-            data, patched = apply_patches(rs, data)
-            self._probe_cache[name] = (key, rs, data, patched)
+            if not basis:
+                data, _ = self._data(rs)
+                data, patched = apply_patches(rs, data)
+                self._probe_cache[name] = (key, rs, data, patched)
         if helpers is not None:
             try:
                 hv = {k: Variable.model_validate(v) for k, v in helpers.items()}
@@ -3267,6 +3640,11 @@ class Workspace:
             except (ValueError, ToolError):
                 ev_ = {}
             rs = rs.model_copy(update={"variables": {**rs.variables, **ev_}})
+        if basis:
+            from bonus_core.dsl.phases import basis_rules
+            rs = basis_rules(rs, additional_inputs=(expr,))
+            data, _ = self._data(rs)
+            data, patched = apply_patches(rs, data)
         root, by_level, issues = build_tree(rs, data)
         blocking = [i for i in patched + issues if i.severity == "blocking"]
         if blocking:
@@ -3283,6 +3661,15 @@ class Workspace:
             raise ToolError(f"计算失败：{e}") from None
         return v, ev.traces["probe"].rendered
 
+    @staticmethod
+    def _independent_declarations(rs: RuleSet, spec: dict) -> RuleSet:
+        tables = Extraction.model_validate({"pool": {"expr": "0"}, "allocation": [],
+                                            "tables": spec.get("tables") or {}}).tables
+        helpers = {key: Variable.model_validate(value) for key, value in (spec.get("helpers") or {}).items()}
+        helpers = {key: var.model_copy(update={"scope": _helper_scope(rs, key, var.scope)})
+                   for key, var in helpers.items()}
+        return rs.model_copy(update={"variables": helpers, "tables": tables})
+
     def _independent_env(self, name: str, spec: dict, *, basis: bool = False):
         """独立复读写的算式的计算环境：只用它自己的辅助变量和参数表（不带规则的变量和参数表）。写法不对抛 ToolError。"""
         rs = self._ruleset(name)
@@ -3292,16 +3679,12 @@ class Workspace:
         data, _ = self._data(rs)
         data, patched = apply_patches(rs, data)
         try:
-            tables = Extraction.model_validate({"pool": {"expr": "0"}, "allocation": [],
-                                                "tables": spec.get("tables") or {}}).tables
-            hv = {k: Variable.model_validate(v) for k, v in (spec.get("helpers") or {}).items()}
-            for e in [spec.get("pool"), spec.get("pay_ratio")] + [v.expr for v in hv.values()]:
+            rs = self._independent_declarations(rs, spec)
+            for e in [spec.get("pool"), spec.get("pay_ratio")] + [v.expr for v in rs.variables.values()]:
                 if e not in (None, ""):
                     parse(str(e))
         except (ValueError, ExprError) as e:
             raise ToolError(f"写法不对：{str(e)[:400]}") from None
-        hv = {k: v.model_copy(update={"scope": _helper_scope(rs, k, v.scope)}) for k, v in hv.items()}
-        rs = rs.model_copy(update={"variables": hv, "tables": tables})
         root, by_level, issues = build_tree(rs, data)
         blocking = [i for i in patched + issues if i.severity == "blocking"]
         if blocking:
@@ -3363,7 +3746,7 @@ class Workspace:
             nodes = self._independent_report_nodes(root, by_level, pending.level)
             if not nodes or pending.name in out:
                 raise ToolError(f'待分配项「{pending.name}」' + ('和某个人员同名，换一个名字' if pending.name in out else f'所在层级「{pending.level}」没有对象，请核对分配层级、辅助实体和数据范围'))
-            out[pending.name] = sum(self._independent_eval(ev, expr, nodes, '待分配').values(), Decimal(0))
+            out[pending.name] = sum(self._independent_eval(ev, expr, nodes, f'待分配/{pending.name}').values(), Decimal(0))
         return out
 
     @staticmethod
@@ -3372,7 +3755,7 @@ class Workspace:
             return [root]
         return by_level.get(level) or list((root.index or {}).get(level, {}).values())
 
-    def _independent_details(self, name: str, spec: dict, *, basis: bool = False) -> dict[str, Decimal]:
+    def _independent_details(self, name: str, spec: dict, *, basis: bool = False, raw: bool = False) -> dict[str, Decimal]:
         base=self._ruleset(name)
         if basis:
             from bonus_core.dsl.validator import basis_rules
@@ -3388,8 +3771,8 @@ class Workspace:
             nodes=self._independent_report_nodes(root, by_level, item.level)
             if not nodes:
                 raise ToolError(f'对象金额报告「{item.name}」所在层级「{item.level}」没有对象，请核对分配层级、辅助实体和数据范围')
-            values=self._independent_eval(ev,expr,nodes,'对象金额')
-            out.update({json.dumps([item.name,nid],ensure_ascii=False):value.quantize(Decimal('.01'),ROUND_HALF_UP)
+            values=self._independent_eval(ev,expr,nodes,f'对象金额/{item.name}')
+            out.update({json.dumps([item.name,nid],ensure_ascii=False):(value if raw else value.quantize(Decimal('.01'),ROUND_HALF_UP))
                         for nid,value in values.items()})
         return out
 
@@ -3400,7 +3783,12 @@ class Workspace:
             try:
                 v = ev.evaluate(expr, n, f"{n.id}/复读{label}", "复读")
             except (EvalError, ValueError) as e:
-                raise ToolError(f"{label}在 {n.id} 上算不出来：{str(e)[:300]}") from None
+                error = ToolError(f"{label}在 {n.id} 上算不出来：{str(e)[:300]}")
+                if isinstance(e, EvalError) and e.detail_field_binding:
+                    helper = next((f['rule_item'] for f in e.frames if f['rule_item'] in ev.rs.variables), None)
+                    error.review_binding = {**e.detail_field_binding, 'helper': helper,
+                                            'scope': ev.rs.variables[helper].scope if helper else n.level}
+                raise error from None
             if isinstance(v, bool) or not isinstance(v, Decimal):
                 raise ToolError(f"{label}在 {n.id} 上算出的不是数：{v}")
             out[n.id] = v
@@ -3410,7 +3798,9 @@ class Workspace:
         """独立复读按材料写的奖金池算式，在奖金池所在层的每个对象上计算。返回 {对象: 金额}；写法不对、算不出来抛 ToolError。
         strict：复读写算式时用，分档表有传入值不在任何一档里（比例悄悄成了 0）也算写法不对，交还复读改。"""
         rs, root, by_level, ev = self._independent_env(name, spec)
-        targets = [root] if rs.pool.scope == "global" else by_level.get(rs.pool.scope, [])
+        targets = self._independent_report_nodes(root, by_level, rs.pool.scope)
+        if not targets:
+            raise ToolError('独立奖金池没有核算对象，请核对作用域与原始数据')
         out = self._independent_eval(ev, str(spec["pool"]), targets, "奖金池")
         if strict:
             self._independent_holes(rs, ev)
@@ -3540,9 +3930,60 @@ class Workspace:
         return {r.node_id: (Decimal(r.paid), any(tail(m) for m in getattr(r, "members", [r.node_id])))
                 for r in res.payout_rows()}
 
+    def _terminal_samples(self, name):
+        """Re-evaluate signed full-review expressions at the requested sample scope."""
+        from bonus_agent.recovery import fingerprint
+        from bonus_core.dsl.phases import funding_only
+        from bonus_core.engine.allocation import round_pool
+
+        rr = self.reread or {}
+        version = rr.get('terminal_version')
+        result = self.results.get(name, {}).get('R0')
+        spec = (rr.get('calc') or {}).get('schemes', {}).get(name)
+        if (not self.staged or not version or version != self._flow().version() or not result
+                or name in self.untested or not spec):
+            return {}
+        rs = self._ruleset(name)
+        direct = len(rs.allocation) == 1 and rs.allocation[0].level == rs.pool.scope
+        if not (funding_only(rs) or (direct and not rs.payout and not rs.offsets)):
+            return {}
+        targets = self._verify_targets(name)
+        key = (name, version, result.input_hash, fingerprint(spec), tuple((n, k) for n, k, _ in targets))
+        cache = getattr(self, '_terminal_samples_cache', {})
+        if key not in cache:
+            expected = {nid: value for nid, (value, _) in self._amounts(name, '应得').items()}
+            values = self._independent_pool(name, spec, strict=True)
+            cache[key] = {(nid, kind): round_pool(values[nid]) for nid, kind, _ in targets
+                          if kind == '应得' and nid in values and round_pool(values[nid]) == expected.get(nid)}
+            self._terminal_samples_cache = cache
+        return cache[key]
+
+    def _record_terminal_samples(self):
+        count = 0
+        rr = self.reread or {}
+        if not rr.get('terminal_version'):
+            return count
+        for name, spec in rr['calc']['schemes'].items():
+            for nid, kind in self._terminal_samples(name):
+                self.verified[_verify_key(name, nid, kind)] = {
+                    'expr': spec['pool'], 'at': nid, 'amount': kind, 'basis': '同版原文独立复核逐对象算式',
+                    'terminal_signature': rr['sig'],
+                }
+                count += 1
+        return count
+
     def _verify_mismatch(self, name: str, node: str, rec: dict, explain: bool = False) -> str:
         """按当前规则和数据重新比对一条验算记录；一致返回空串，并把比对说明放在 _verify_note。
         explain：这次是智能体调用 verify（不是事后重新比对），对不上时再逐步找分岔处、记对不上的次数。"""
+        if "terminal_signature" in rec:
+            rr = self.reread or {}
+            kind = rec.get("amount", "应得")
+            if rr.get('sig') == rec['terminal_signature']:
+                value = self._terminal_samples(name).get((node, kind))
+                expected = self._amounts(name, kind).get(node)
+                if expected is not None and value == expected[0]:
+                    return ""
+            return "独立复核的来源或样本金额已变化，须重新验算"
         helpers = rec.get("helpers") or {}
         srcs = [rec["expr"]] + [str(h.get("expr", "")) for h in helpers.values()]
         try:
@@ -3735,14 +4176,27 @@ class Workspace:
 
     # ---- 问题与完成 ----
     def ask_question(self, text: str, options: list[str] | None = None, suggested: int | None = None, related: str = "",
-                     blocking: bool = True, evidence: list[dict] | None = None) -> str:
+                     blocking: bool = True, evidence: list[dict] | None = None, diagnosis: dict | None = None) -> str:
         from bonus_agent.question_match import same_pending
+        from bonus_agent.question_review import invalidate_changed_reviews, review_disputed_question
+        if self.workflow.get('question_reviews'):
+            invalidate_changed_reviews(self)
+            for prior in self.questions:
+                audit = self.workflow['question_reviews'].get(prior.id, {})
+                if (prior.withdrawn and audit.get('result', {}).get('status') == 'WITHDRAWN'
+                        and prior.related == related and prior.text.strip() == text.strip()
+                        and list(prior.options) == list(options or [])):
+                    return f'{prior.id} 已经独立核对原文：{prior.withdrawn}。请继续对应规则核验。'
         same = next((q for q in self.questions if not q.withdrawn and
                      (q.text.strip() == text.strip() or same_pending(q,text,related))), None)
         if same is not None:
             if same.answer:
                 return f"这个问题（{same.id}）财务已答复：{same.answer}。请按答复处理"
             return f"这个问题已经问过（{same.id}），还在等财务答复"
+        details = failure.question_diagnosis(diagnosis)
+        if (diagnosis is not None and details is None) or (details is None and failure.vague(text)):
+            raise ToolError('问题缺少可核查的原因。请写清项目或指标、已识别的原文或实际数据、具体缺失的口径或字段，以及影响的计算。'
+                            '例如已找到同一项目的两个客户编码，但规则只写“按客户编码”，需确认列名才能关联预算。')
         ev, bad = self._evidence(evidence)
         if suggested is not None and bad:
             raise ToolError("建议尚未保存：依据引用未核对通过。请用 read_sheet 复制真实原文，不要用省略号拼接；"
@@ -3760,10 +4214,13 @@ class Workspace:
             text = (text + f"\n（程序提示：问题里的 {'、'.join(own)} 是智能体在规则里自己写的数，材料和数据里都找不到；"
                     "请按材料原文判断，不要只看推荐答案）")
         q = Question(id=_next_qid(self.questions), text=text, options=options or [], suggested=suggested,
-                     related=related, blocking=blocking, round=self.round, evidence=ev)
+                     related=related, blocking=blocking, round=self.round, evidence=ev, diagnosis=details or {})
         self.questions.append(q)
         note = (f"（依据里有 {len(bad)} 条在原文里找不到，答复页上会标出“没核对上”：{'；'.join(bad[:3])}）" if bad else "")
         if blocking:
+            audit = review_disputed_question(self, q)
+            if audit and audit['status'] == 'WITHDRAWN':
+                return f"问题 {q.id} 经独立核对原文已撤回：{audit['reason']}。请继续对应规则核验。"
             return (f"已记录问题 {q.id}，等财务答复{note}。不要自行选择口径或补出算法；"
                     "继续做不受影响的部分，全部问完后调用 finish 结束本轮")
         return f"已记录提示 {q.id}（不影响金额，不必等答复）{note}"
@@ -3827,6 +4284,20 @@ class Workspace:
         if len(fx.norm(ev[0]["quote"])) < 8 or not _EXCLUDE.search(ev[0]["quote"]) and "不影响" not in ev[0]["quote"]:
             return "unmatched_basis 引用的原文没有说明对不上的记录不参与（要引用写明“不参与 / 不计算 / 不影响”的那一句）。"
         return ""
+
+    def _unmatched_source_quotes(self, file: str) -> list[dict[str, str]]:
+        """Suggest literal exclusion clauses from the cited source, without changing the join."""
+        if not file or file not in self._corpus():
+            return []
+        quotes = []
+        for line in self._lines(file):
+            for sentence in re.split(r'(?<=[。；！？])', line):
+                quote = re.sub(r'^[-*]\s+', '', sentence.strip())
+                absent = _REFERENCE_ABSENT.search(quote)
+                if (absent and 8 <= len(quote) <= fx.MAX_QUOTE and not quote.endswith(('?', '？'))
+                        and (_EXCLUDE.search(quote, absent.end()) or '不影响' in quote[absent.end():])):
+                    quotes.append(quote)
+        return [{'file': file, 'quote': quote} for quote in list(dict.fromkeys(quotes))[:4]]
 
     def _evidence(self, evidence) -> tuple[list[dict], list[str]]:
         """逐字核对或从真实单元格生成提问依据；带建议的问题不能提交未通过的引用。"""
@@ -3913,7 +4384,17 @@ class Workspace:
         """还在等财务答复的问题。"""
         from bonus_agent.question_review import invalidate_changed_reviews
         invalidate_changed_reviews(self)
-        return [q for q in self.questions if q.blocking and not q.answer and not q.withdrawn]
+        return self._unanswered_questions()
+
+    def _unanswered_questions(self) -> list[Question]:
+        pending = [q for q in self.questions if q.blocking and not q.answer and not q.withdrawn]
+        effects = self.workflow.get('batch_question_effects', {})
+        if not any(q.id in effects for q in pending):
+            return pending
+        flow = self._flow()
+        version = flow.version('basis')
+        return [q for q in pending if effects.get(q.id, {}).get('version') != version
+                or effects[q.id].get('question') != flow._question_identity(q)]
 
     def _report_output_gaps(self) -> list[str]:
         """A calculation basis can feed a recipient scheme without impersonating people."""
@@ -3959,7 +4440,7 @@ class Workspace:
             for upstream, revision in self._deps(name):
                 source = self.results.get(upstream, {}).get(revision)
                 if source:
-                    used = {node for node in {*source.payouts, *source.rollups}
+                    used = {node for node in {*source.payouts, *source.rollups, *source.funding}
                             if f'{upstream}/{revision}:{node}' in inputs}
                     if used:
                         referenced.setdefault(upstream, set()).update(used)
@@ -4138,7 +4619,7 @@ class Workspace:
         return {"status": "FAIL" if gaps else "PASS", "gaps": gaps,
                 "by": self.reread.get("by", ""), "validation": self.validation_report()}
 
-    def blocker_frontier(self) -> set[str]:
+    def blocker_frontier(self, *, construction_receipts=None) -> set[str]:
         """No model calls and no full recalculation; stable unresolved work survives history pruning."""
         if not self.results:
             if self.staged:
@@ -4150,9 +4631,22 @@ class Workspace:
                         return set()  # first-time data construction is not a failed repair check
                     return {'data:' + str(x).split('next',1)[0] for x in saved.get('report', {}).get('issues', [])}
                 if stage == 3:
-                    summary = TaskBoard(self).summary()
+                    board = TaskBoard(self)
+                    statuses = board.refresh()
+                    summary = board.summary(statuses=statuses)
                     active = summary['active']
-                    out = {f'construction:{active["id"]}:{active["target"]}'} if active else {summary['next']}
+                    if gap := summary.get('planning_gap'):
+                        out = {f'construction.plan:{gap["scheme"]}:{gap["target"]}'}
+                    else:
+                        out = {f'construction:{active["id"]}:{active["target"]}'} if active else {summary['next']}
+                    if construction_receipts is not None:
+                        phase = board.phase()
+                        for task in board.required(phase):
+                            spec = board.state['tasks'][task]
+                            if spec['target'] == '/pool' and not (gap and gap.get('kind') == 'pool_inputs' and gap.get('task') == task):
+                                construction_receipts.add(json.dumps(['planned', phase, spec['scheme'], '/pool'], ensure_ascii=False))
+                            if statuses[task]['status'] == 'PASS':
+                                construction_receipts.add(json.dumps([phase, spec['scheme'], spec['target']], ensure_ascii=False))
                     from bonus_agent.progress import compile_objects
                     saved = self.workflow.get('formula_report', {}).get('report', {})
                     report = self._flow().compile_feedback(saved.get('phase', 'basis'))
@@ -4216,13 +4710,16 @@ class Workspace:
         """规则草稿和数据表定义的指纹：用来判断某个时点之后有没有改过。"""
         import hashlib
         body = json.dumps({"drafts": self.drafts, "datasets": {n: d.model_dump(mode="json") for n, d in self.datasets.items()},
-                           "mapping": {n: m.model_dump(mode="json") for n, m in self.mapping.items()}},
+                           "mapping": {n: m.model_dump(mode="json") for n, m in self.mapping.items()},
+                           "scheme_inputs": {s: sorted(self._scheme_datasets(s)) for s in self.schemes}},
                           ensure_ascii=False, sort_keys=True, default=str)
         return hashlib.sha1(body.encode("utf-8")).hexdigest()
 
     def reply(self, text: str, ignored: list[dict] | None = None) -> str:
         if not self.chat_by:
             raise ToolError("现在不是对话，请用 finish 结束")
+        if failure.vague(text):
+            raise ToolError('回复缺少具体原因。请说明涉及的项目或指标、已经核对并识别的事实、具体缺少的证据及影响。')
         refs = {str(i.get("ref", "")) for i in [*self.ignored, *(ignored or [])] if isinstance(i, dict)}
         now = self._rules_print()
         stale = [(qid, a, b) for qid, a, b, fp in self._corrections if fp == now and f"更正 {qid}" not in refs]
@@ -4326,11 +4823,11 @@ class Workspace:
             step = "核对后调用 finish"
         return step + (f"；还没登记参数的规则文档：{'、'.join(bare)}" if bare and "record_facts" not in step else "")
 
-    def state(self) -> str:
+    def state(self, *, card=None) -> str:
         """每轮附在请求末尾的工作区摘要。"""
         if self.staged:
             from bonus_agent.context import task_card
-            return '【当前任务卡】'+task_card(self)
+            return '【当前任务卡】'+task_card(self, data=card)
         lines = ["【当前工作区状态】" + (f"（{self.budget}）" if self.budget else "")]
         k = self.phase()
         lines.append(f"- 当前阶段 {k + 1}/{len(PHASES)}：{PHASES[k][0]}。要做：{PHASES[k][1]}。完成标准：{PHASES[k][2]}")
@@ -4548,6 +5045,98 @@ JSON_PROTOCOL = """
 可用工具（JSON Schema）：
 """
 
+FORMULA_FOCUS_TOOLS = {'submit_formula_task', 'submit_construction_repair', 'check_formula_task', 'plan_formula_tasks', 'update_dataset',
+                       'define_dataset', 'record_facts', 'record_clauses', 'record_parameter_cells', 'bind_facts',
+                       'compile_coefficient_table', 'compile_table',
+                       'read_workspace', 'query_dataset', 'read_sheet', 'read_document',
+                       'read_parameter_table', 'diagnose_datasets', 'view_image', 'ask_question'}
+FORMULA_PLAN_TOOLS = {'plan_formula_tasks', 'read_workspace', 'read_document', 'read_sheet', 'read_parameter_table',
+                      'record_facts', 'record_parameter_cells', 'record_clauses', 'query_dataset', 'view_image', 'ask_question'}
+PARAMETER_TABLE_TOOLS = FORMULA_PLAN_TOOLS | {'compile_table', 'compile_coefficient_table', 'check_formula_task',
+                                              'submit_formula_task', 'bind_facts', 'validate_parameters'}
+PERSONNEL_FOCUS_TOOLS = FORMULA_FOCUS_TOOLS | {'plan_calculation', 'set_scheme_datasets', 'set_rules',
+                                             'cover_clauses'}
+
+
+def formula_plan_focus_prompt():
+    return ('按当前的财务答复、材料、数据映射和交付要求规划公式任务。'
+            '按参数表、基础指标、金额、奖金池、分配和报表确定依赖，每项提供现有方案、唯一任务 ID 和目标。'
+            '奖金池依赖金额及适用规则，分配和报表使用各自的上游。'
+            'facts 填 planning_facts 中逐字匹配的参数名，clauses 填已登记的条款 ID。'
+            '没有对应参数时省略 facts；确需补查再按 read_call 读取。'
+            '已有数据字段可直接引用，变量和表的名称须与字段及其他构件名称互不冲突。'
+            '根据材料给变量填 expected_scope 和已证明的数据前置条件；金额计算在各任务通过后进行。'
+            '任务已存在时复用其 ID。收到参数名反例，核对原名、原文和单位后按原任务修正。')
+
+
+def parameter_table_focus_prompt():
+    return ('按当前任务卡、表标题和原文坐标编译当前参数表。'
+            'PPT 先读本页表格，用 record_parameter_cells 登记原格，然后用 compile_table 引用这些格或台账原名。'
+            '按原文确定金额累进算法、单位、边界和适用对象。区间取系数时使用 compile_coefficient_table。'
+            '保留已核原文与原边界，先修本次反馈指定的档位或参数。'
+            '适用条件用实际字段和公式表达式。已有表只改条件时用 submit_formula_task 的 changes。'
+            '同一表的不同适用列分别登记任务。核对原件后提交下一项可验证的操作。')
+
+
+def formula_focus_prompt():
+    return ('你在编译当前核算方案中的一个公式。财务答复和材料原文决定口径。'
+            '任务卡 checked_inputs 中 definition 是已通过局部检查的上游可执行定义，包含适用条件、'
+            '档位边界与系数。若任务卡有 runtime_repair，先用其中的 task 修复引起反例的上游构件，再复验奖金池。'
+            '先复现有原始行的直接反例，再沿该金额的依赖优先核查证据薄弱的指标，'
+            '对照其可信度缺口、规则原文和实际分组。只有得到可复验的差异才能修改规则；保留其他分支。'
+            '涉及同一口径的关联键、累计数据及公式一起变更时，用 submit_construction_repair 原子提交，'
+            '按 scope_repair 中的原文、已绑定的表列和真实覆盖修复。scope_repair 内 REVIEW 是待核线索。'
+            'aggregate_evidence 区分参与聚合的行和实际取值的源表，并给出已建立实体到核算对象的关联数。'
+            'field_conflict 给出同名字段实际关联到的源表及原始行，按条款选定来源并显式绑定。'
+            'table_applicability 给出费率表条件及失败对象的实际取值，结合原文和原表分类修正分支。'
+            '按原文选择分组及字段，依据未匹配数核对缺失口径。'
+            'global 只计算一次。按对象分组的公式应使用材料支持的主键、实体和明细关联。'
+            '直接按已给的表名引用这些定义。确需补查缺失证据时，'
+            '一次读取具体条款、字段或用 read_call 读取完整构件。'
+            '任务卡的 input_failures 或 input_preflight 指向取数缺口时，先补声明的表、字段、期间和关联。'
+            '累计要求须按对应期间的原始行验证。'
+            '公式引用不存在的表时，先按原格编制该表。区间取系数用 compile_coefficient_table，金额档位用 compile_table。'
+            '证据齐全时调用 submit_formula_task(task,value,bindings,facts) 原子提交。变量 value 使用 scope、expr、'
+            'sources=[{doc,quote}]。原表空值政策须由原文或财务答复支持，按证据修正字段映射后再提交。'
+            '问题影响金额且材料无法裁决时用 ask_question 并提供例子。局部公式通过后仍有独立核验和总额确认。'
+            '\n可用 DSL 函数\n' + describe_functions())
+
+
+def basis_report_focus_prompt():
+    return ('按当前任务卡构建本期基础金额报表。按 report_task.outputs 的报表位置和指定名称逐项填写。'
+            'checked_inputs 给出已核过的金额公式，report_task.scope_keys 给出可用的对象层。'
+            '按 current_task_evidence 的原文决定每行金额及对账关系。基础报表在人员分配前提交。'
+            '调用 submit_formula_task，task 填当前任务 ID。新报表用 value，已有报表用 changes 更新具体字段。'
+            'details 和 totals 的每行填写 name、level、expr、sources=[{doc,quote}]，stage 使用 basis。'
+            'details 按对象逐行输出。totals 逐对象求值再合计，level 为 global 时只在全局求值一次。'
+            '材料规定总额与多个组成项必须闭合时，balances 每行填写 name、level、total、parts、sources，按原文选舍入时点。'
+            '更新列表字段时提交该字段的完整列表，保留仍有效的行。人员及待分配去向在财务确认总额后构建。'
+            '证据齐全就直接提交，报错按失败对象和报表位置修正。确需补查时，按 read_call 或原文位置读取具体证据。'
+            '\n可用 DSL 函数\n' + describe_functions())
+
+
+def personnel_focus_prompt():
+    return (
+        '构建已确认总额后的人员分配。任务卡 personnel_task 给出原文、财务答复、已核对的角色参数表、'
+        '已确认资金的对象层和已有项目报表。保留已确认项目范围、公式和汇总，提交下一个有原文支持的配置。'
+        '从完整项目键关联名单，按原文选择姓名与比例列。同格多条姓名比例须展开，姓名比例分列时用 unpivot.share_columns。'
+        '按原文明确姓名缺失、比例为空和无人领取的去向，计算项目金额乘角色比例和个人份额的原值。'
+        '要求逐人汇总后才舍入时，若确认的资金对象不是人员，计划独立的人员方案。'
+        '资金方案保留项目键和核算报表，用 scheme_paid 引用精确到分的项目资金，由人员方案对关联份额先求和再舍入。'
+        '人员方案以人员为奖金池及末层，逐项目核对角色原值、待分配及资金闭合，'
+        '用 report.distributions 的 after_sum 记录舍入尾差。'
+        '资金方案可以保留实体奖金池与完整项目报表，无须把项目转成人员分配层。'
+        '跨方案对账用 source_funding={scheme,level,allocated}。level 为来源实体表，'
+        'allocated 在该实体计算实名份额原值，所列 pending 也按同样的来源实体逐个计算。'
+        '项目分配树逐记录分摊到分会改变该舍入规则。'
+        '每个实名或待分配去向都要有名单或规则依据，项目键不能用作人名。'
+        '如果具备合适的方案和名单映射，直接为当前任务提交公式。'
+        '若须新增有依赖方案，先用 plan_calculation 保留当前文件用途和输出、增补方案与实际报表位置。'
+        '新增人员数据宜另定义，已有资金方案继续读取确认时的数据集。必要时 set_scheme_datasets 声明各方案的完整输入。'
+        '如原件有影响金额或人员的歧义，提供原件实例后提问。'
+        '\n可用 DSL 函数\n' + describe_functions()
+    )
+
 
 @dataclass
 class AgentResult:
@@ -4572,6 +5161,7 @@ class AgentResult:
     reply: str = ""                                                      # 对话时给财务的回复
     deep_steps: int = 0                                                  # 本轮用了几步深度思考
     usage: dict = field(default_factory=dict)                            # 本轮用时、步数、模型调用次数和 tokens（含预筛、复读等额外调用）
+    failure_context: dict = field(default_factory=dict)
 
     @property
     def single(self) -> bool:
@@ -4589,6 +5179,8 @@ class AgentResult:
     @property
     def status(self) -> str:
         """OK：已算出，可交财务复核；NEEDS_CONFIRMATION：有问题等财务答复，本轮不出结果；FAILED：未完成。"""
+        if fixed := self.ws.workflow.get('fixed_commission'):
+            return fixed.get('status','FAILED')
         if self.ws.done and self.pending:
             return "NEEDS_CONFIRMATION"
         if self.ws.staged and self.ws.done and self.ws._flow().stage()[0]==6:
@@ -4616,12 +5208,18 @@ def _shrink(history: list[dict], max_chars: int, keep: int = KEEP_FULL_RESULTS) 
     if _size(history) <= max_chars:
         return False
     results = [i for i, m in enumerate(history) if _is_result(m)]
+    signed_turns = [m for m in history if m.get('extra_content') or any(c.get('extra_content') for c in m.get('tool_calls') or [])]
+    signed_ids = {c['id'] for m in signed_turns for c in m.get('tool_calls') or []}
     cut = results[-keep] if len(results) >= keep else 0
     for i in results[:-keep] if len(results) > keep else []:
+        if history[i].get('tool_call_id') in signed_ids:
+            continue
         c = history[i]["content"]
         if len(c) > BRIEF_CHARS + 60:
             history[i] = {**history[i], "content": c[:BRIEF_CHARS] + "\n……（较早的结果已省略。关键信息应已记在笔记里，确需原文可重新调用）"}
     for i, m in enumerate(history[:cut]):
+        if any(tc.get('id') in signed_ids for tc in m.get('tool_calls') or []):
+            continue
         for tc in m.get("tool_calls") or []:
             if len(tc["function"]["arguments"]) > 600:
                 tc["function"]["arguments"] = json.dumps({"省略": "较早的参数已省略，当前规则见工作区状态"}, ensure_ascii=False)
@@ -4655,7 +5253,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
               should_stop: Callable[[], bool] | None = None, instruction: str | None = None,
               message: str | None = None, by: str = "", chat: list[dict] | None = None,
               reflect: int = MAX_REFLECT, deep: int = DEEP_LIMIT, scenario=None, period: str | None = None,
-              run_budget=None) -> AgentResult:
+              run_budget=None, settlement_source_amendment=None) -> AgentResult:
     """max_steps 和 max_tokens 都是安全上限：模型调用 finish 就结束，正常不会用满。
     run_budget：自动接续须传同一对象；max_tokens 只会进一步收紧作业总额，续轮不重置用量或时限。
     reflect：卡住时在本轮内反思、换做法的次数上限（清掉打转的对话历史，带上卡在哪、试过什么，工作区保留），用完再停下。
@@ -4667,7 +5265,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
     scenario：场景（scenarios.context.AgentScenario）。场景说明作为材料一起读，场景信息（输入模板检查、场景记忆）放进任务说明。
     period：核算期间（如 "2026-09"、"2026Q3"、"2026-07~2026-09"）。不写时沿用上一轮的期间；都没有就不按期间筛选。"""
     from bonus_core.data.period import Period, PeriodError
-    from bonus_agent.context import ContextBudgetError, guard_messages
+    from bonus_agent.context import ContextBudgetError, guard_messages, task_card_data
     try:
         period_obj = Period.parse(period)
     except PeriodError as e:
@@ -4681,18 +5279,10 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
     if not files:
         raise ToolError("没有找到可处理的文件（支持 .docx .pptx .pdf .xlsx .xlsm .png .jpg .txt .md .json .csv）")
     used0 = llm.usage.prompt_tokens + llm.usage.completion_tokens
-    from bonus_agent.recovery import RecoveryJournal, RunBudget, local_advice
+    from bonus_agent.recovery import RecoveryJournal, RunBudget, dataset_patch_envelope, local_advice
     run_budget = run_budget or RunBudget(used0, max_tokens)
     run_budget.tighten(max_tokens)
     run_budget.bind(llm)
-    try:
-        ctx = None if run_budget.check(llm) else llm.context_window()
-    except RunBudgetError:
-        ctx = None  # Save the stopped job through the ordinary case/result path below.
-    if getattr(llm,'workflow_mode','legacy')!='staged' and ctx is not None and ctx < MIN_CONTEXT:
-        raise ToolError(f"模型服务的上下文长度只有 {ctx} tokens（max_model_len），智能体每一步的输入就有约 4～5 万 tokens，"
-                        f"至少要 {MIN_CONTEXT}，建议 131072。请管理员调大模型服务的上下文长度（vLLM 启动参数 --max-model-len；"
-                        "超过模型原生长度的要同时开 YaRN），再重试")
     u0, t0 = (llm.usage.calls, llm.usage.prompt_tokens, llm.usage.completion_tokens, getattr(llm.usage, "cached_tokens", 0)), time.time()
     ws = Workspace(llm, build_inventory(files))
     out = Path(out_dir) if out_dir is not None else None
@@ -4725,32 +5315,159 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             rnd['recovery']=restored
             ws.notes['案卷恢复']=f'当前工作区从{restored["source"]}恢复；原快照损坏位置：{restored["damaged_path"]}。本轮重新核算后才能确认结果。'
         changes = cs.file_changes(last["files"] if last else {}, prints)
+        ws._review_archive_unchanged = bool(case.get('rounds')) and all(
+            entry.get('files') == prints and entry.get('period') == rnd.get('period') for entry in case['rounds'])
         gone = set(changes["修改"]) | set(changes["删除"])
-        ws.facts = [f for f in ws.facts if f.file not in gone]       # 这些文件的参数要按新内容重新登记
+        ws.facts = [f for f in ws.facts if f.file not in gone and (f.unit_basis or {}).get('file') not in gone]
         ws.clauses = [c for c in ws.clauses if c.file not in gone]   # 条款也按新内容重新摘
-        withdrawn = fx.withdraw_stale(ws.facts, ws.conflicts, ws.questions)
+        withdrawn = fx.withdraw_stale(ws.facts, ws.conflicts, ws.questions, answers)
+        if ws.workflow.get('material_scope_reviews'):
+            from bonus_agent.review_population import withdraw_stale_material_scope_answers
+
+            answers = withdraw_stale_material_scope_answers(ws, answers)
+        if ws.workflow.get('settlement_questions') or ws.workflow.get('applicability_questions'):
+            answers = ws._flow().withdraw_stale_settlement_answers(answers)
+        if (last and last.get('status') in ('AWAITING_REVIEW', 'NEEDS_CONFIRMATION') and not any(changes.values())
+                and last.get('period') == rnd.get('period')):
+            for scheme, review in ws.workflow.get('references', {}).items():
+                ws._flow().record_applicability_questions(scheme, review)
     else:   # 首轮就带了答复（如上一次单轮运行的 questions.yaml）：作为已答复的问题放进工作区
         ws.questions = [Question(id=a.get("id") or f"q{i + 1}", text=a["text"], options=a.get("options") or [])
                         for i, a in enumerate(answers or []) if a.get("text") and a.get("answer") not in (None, "")]
-    fresh = cs.apply_answers(ws.questions, answers)
+    unanswered = {q.id for q in ws._unanswered_questions()}
+    fresh = [q for q in cs.apply_answers(ws.questions, answers) if not q.withdrawn]
+    if scenario is not None:
+        from bonus_agent.source_cells import scenario_unit_defaults
+        ws._unit_defaults = scenario_unit_defaults(map(Path, scenario.files), ws._source_version)
     ws.workflow['enabled']=getattr(llm,'workflow_mode','legacy')=='staged'
-    ws.said = _said(chat, message, instruction)
-    recovery = RecoveryJournal(out / 'recovery.json' if out else None,
-                               {'files': prints, 'period': period_obj.label if period_obj else None,
-                                'answers': [(q.id, q.answer) for q in ws.questions if q.answer is not None],
-                                'code': rnd['code'], 'financial_context': ws.said})
+    if resumed:
+        cs.restore_confirmed_basis(out, case, ws)
+    if ws.staged and scenario is not None:
+        from bonus_agent.source_coverage import scenario_contract
+        previous_contract = ws.workflow.get('source_contract', {})
+        contract = scenario_contract(scenario)
+        ws.workflow['source_contract'] = contract
+        # A newly materialized authoritative supplement has a known role.
+        # Preserve an existing plan only if every prior input is unchanged
+        # and its output contract is unchanged. The new sources still require
+        # clause registration and construction/data receipts are revalidated.
+        added = set((changes or {}).get('新增', ()))
+        plan = ws.workflow.get('plan', {})
+        if (resumed and last and added and not changes['修改'] and not changes['删除']
+                and last.get('period') == rnd.get('period')
+                and added <= set(contract.get('supplement_sources', ()))
+                and set(plan.get('files', {})) == set(last['files'])
+                and {k: v for k, v in previous_contract.items() if k != 'supplement_sources'}
+                    == {k: v for k, v in contract.items() if k != 'supplement_sources'}):
+            ws.plan_calculation(plan['summary'], plan['outputs'],
+                                {**plan['files'], **{n: 'rule' for n in sorted(added)}},
+                                plan['schemes'], plan['ignored'], plan.get('output_targets'))
+            ws.notes['本批新增确认依据'] = '已按实际材料版本加入：' + '、'.join(sorted(added)) + '；须登记条款并复验受影响任务。'
+    ws.said = _said(chat, message, instruction, previous=ws.said)
+    resumed_question_reviews = []
+    if (ws.staged and resumed and last and not fresh
+            and not any((changes or {}).values()) and last.get('period') == rnd.get('period')
+            and not (should_stop and should_stop()) and not run_budget.check(llm)):
+        from bonus_agent.question_review import review_disputed_question
+        for question in ws.pending:
+            pending_review = ws.workflow.get('question_reviews', {}).get(question.id, {})
+            if last.get('status') != 'NEEDS_CONFIRMATION' and not pending_review.get('initial_request_pending'):
+                continue
+            result = review_disputed_question(ws, question)
+            if result and result.get('outcome') == 'COMPLETED':
+                resumed_question_reviews.append((question.id, result['status']))
+                if result['status'] == 'KEEP' and pending_review.get('initial_request_pending'):
+                    ws.done = True
+    from bonus_agent.stuck_question import UNIT_RELATED
+    for q in ws.questions:
+        if q.related.startswith(UNIT_RELATED) and not q.answer and not q.withdrawn and q.evidence:
+            source = q.evidence[0]
+            if source.get('source_hash') != prints.get(source.get('file')):
+                q.withdrawn = '原表版本已变化，需要重新核对单元格'
+    if (resumed and not message and not instruction and not fresh and not any((changes or {}).values())
+            and any(q.related.startswith(UNIT_RELATED) for q in ws.pending)):
+        ws.done = True
+    if ws.staged and resumed and fresh and all(q.id in unanswered for q in fresh):
+        from bonus_agent.question_review import retain_unaffected_withdrawals
+
+        retain_unaffected_withdrawals(ws, fresh)
+    if settlement_source_amendment:
+        if (not resumed or out is None or not ws.staged
+                or cs.sha256(out / cs.CASE_FILE) != settlement_source_amendment.get('case_sha256')):
+            raise ToolError('定向更正必须对应精确的案卷续跑检查点')
+        ws._settlement_source_amendment = settlement_source_amendment
+    if ws.staged and ((not settlement_source_amendment and ws._pause_unresolved_review()) or ws._flow().stage()[0] == 6):
+        ws.done = True
+    try:
+        ctx = None if ws.done or run_budget.check(llm) else llm.context_window()
+    except RunBudgetError:
+        ctx = None  # Save the stopped job through the ordinary case/result path below.
+    if not ws.staged and ctx is not None and ctx < MIN_CONTEXT:
+        raise ToolError(f"模型服务的上下文长度只有 {ctx} tokens（max_model_len），智能体每一步的输入就有约 4～5 万 tokens，"
+                        f"至少要 {MIN_CONTEXT}，建议 131072。请管理员调大模型服务的上下文长度（vLLM 启动参数 --max-model-len；"
+                        "超过模型原生长度的要同时开 YaRN），再重试")
+    recovery_context = {'files': prints, 'period': period_obj.label if period_obj else None,
+                        'answers': [(q.id, q.answer) for q in ws.questions if q.answer is not None],
+                        'code': rnd['code'], 'financial_context': ws.said}
+    if ws.staged:
+        from bonus_agent.workflow import _EXECUTION_PROFILE
+        # A local deployment can change the compiler without changing git HEAD.
+        # Use the same executable fingerprint as the staged verification receipts.
+        rnd['execution_profile'] = recovery_context['execution_profile'] = _EXECUTION_PROFILE
+    previous_build = ({k: last.get(k) for k in ('code', 'execution_profile')}
+                      if ws.staged and resumed and last and last.get('execution_profile') else None)
+    recovery = RecoveryJournal(out / 'recovery.json' if out else None, recovery_context, previous_build=previous_build)
+    if ws.staged and recovery.path:
+        recovery.restore_basis_parts(ws.workflow, ws.round, resume=resume)
+        ws._save_basis_part = recovery.save_basis_part
+    if ws.staged and resumed and not ws.pending and ws._flow().stage()[0] == 2 and not recovery.state.get('native_repairs'):
+        from bonus_agent.data_profile import archived_unpivot_failure
+        if previous_unpivot := archived_unpivot_failure(ws, out, last):
+            recovery.observe_native_feedback(*previous_unpivot, False)
     from bonus_agent.progress import ConstructionReadBudget, RepairReadBudget, repair_scope
     repair_reads = RepairReadBudget(recovery.state.setdefault('repair_reads', {}))
     construction_reads = ConstructionReadBudget(recovery.state.setdefault('construction_reads', {}))
 
     def construction_focus(**observation):
         from bonus_agent.construction import TaskBoard
-        if not ws.staged or ws.pending or repair_reads.active:
+        from bonus_agent.funding_plan import pool_input_gap
+        if not ws.staged or ws.pending:
             return None
         stage, scheme = ws._flow().stage()
         if stage != 3:
             return None
-        obligations = TaskBoard(ws).output_obligations('all' if scheme else 'basis')
+        board = TaskBoard(ws)
+        if gap := pool_input_gap(board):
+            return {**construction_reads.observe([gap], **observation), 'planning_gap': True}
+        if repair_reads.active:
+            return None
+        obligations = board.output_obligations('all' if scheme else 'basis')
+        if board.state['tasks'] and (missing := board.pool_plan_gap()):
+            pool = [row for row in obligations if row['scheme'] == missing and row['target'] == '/pool']
+            if pool:
+                focus = construction_reads.observe(pool, **observation)
+                return {**focus, 'planning_gap': True}
+        summary = board.summary()
+        if (gap := summary.get('planning_gap')) and gap.get('kind') in ('clause_owners', 'parameter_owners'):
+            return {**construction_reads.observe([gap], **observation), 'planning_gap': True}
+        active = summary['active']
+        blocked = summary.get('runtime_repair')
+        if not blocked and active and (active.get('confidence_level') == 'CONFLICT'
+                or any(issue.startswith('construction.coefficient_input') for issue in active.get('last_issues', ()))):
+            blocked = {**active, 'task': active['id']}
+        if blocked:
+            focus = {'kind': 'blocked_formula', 'scheme': blocked['scheme'], 'target': blocked['target'],
+                     'task': blocked['task']}
+            return construction_reads.observe([focus], **observation)
+        if any(row['kind'] == 'missing_component' for row in obligations):
+            if active is not None:
+                ready = [row for row in obligations if row['kind'] == 'missing_task'
+                         or (row['scheme'], row['task_target']) == (active['scheme'], active['target'])]
+                # The report still has to be built, but reads for an unrelated
+                # prerequisite cannot spend its repair allowance.
+                if not ready:
+                    return None
+                obligations = ready
         return construction_reads.observe(obligations, **observation)
 
     def construction_stop(focus):
@@ -4759,15 +5476,34 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         return ''
 
     recovery.set_repair_scope(repair_scope(ws))
+    same_inputs = resumed and not fresh and not message and not instruction and not any((changes or {}).values())
+    same_period = bool(same_inputs and last and last.get('period') == rnd.get('period'))
+    resumed_entity = None
+    if (same_period and ws.staged and not ws.pending and not ws.done and not run_budget.check(llm)
+            and not (should_stop and should_stop())):
+        resumed_entity = recovery.resume_entity_definition(ws, out, last)
+    resumed_dataset_patch = (recovery.revalidate_saved_dataset_patches(ws, out, last)
+                             if ws.staged and resumed and not ws.pending and not ws.done else None)
+    if same_period and not ws.done:
+        recovery.restore_table_origins(ws, out, last)
+    table_stop = recovery.error
+    resumed_table_checks = recovery.revalidate_saved_tables(ws) if resumed and not ws.done else []
+    resolved_table_stop = bool(table_stop and last and table_stop == last.get('error')
+                               and resumed_table_checks and not recovery.error)
+    if recovery.resume_after_construction(ws):
+        ws.notes.pop('纠错进度', None)
     resumed_read_budget = repair_reads.observe([], recovery.state.get('native_repairs', {}), None, READ_ONLY,
                                              scope=recovery.state['repair_scope'])
     if resumed_read_budget['halt']:
         recovery.halt(resumed_read_budget['message'], repair_read=resumed_read_budget)
-    previous_construction_stop = (construction_stop(construction_focus())
-                                  if construction_reads.state.get('reads', 0) >= construction_reads.LIMIT else '')
+    previous_construction_focus = (construction_focus()
+                                   if (construction_reads.state.get('reads', 0) >= construction_reads.LIMIT
+                                       or construction_reads.state.get('joint_rejections', 0) >= construction_reads.REPAIR_LIMIT)
+                                   else None)
+    previous_construction_stop = construction_stop(previous_construction_focus)
     ws.notes.pop(ANSWER_NOTE, None)          # 上一轮的回答不带到这一轮
     handlers = {t["name"]: getattr(ws, t["name"]) for t in TOOLS}
-    if not run_budget.check(llm) and not recovery.error and not previous_construction_stop:
+    if not ws.done and not run_budget.check(llm) and not recovery.error and not previous_construction_stop:
         ws.transcribe_all()
         ws.triage_all()
     pack = '' if ws.staged else ("\n\n【材料包】以下是本批次材料的内容（程序读取，图片已转写），每轮都附在这里、不会被裁剪。"
@@ -4781,7 +5517,8 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                 pass
         task = _chat_task(ws, message, chat, fresh, (changes if resumed else None))
     elif resumed:
-        task = _resume_task(ws, last, changes, fresh, withdrawn)
+        task = _resume_task(ws, last, changes, fresh, withdrawn, data_repair=resumed_entity,
+                            question_reviews=resumed_question_reviews, resolved_table_stop=resolved_table_stop)
     else:
         task = ("请完成本批次的奖金计算。文件清单：\n" + ws.list_files() + _answers_text(answers)
                 + "\n\n完成后调用 finish。")
@@ -4803,14 +5540,36 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
     sys = system_prompt()
     if ws.staged:
         sys += '\n\n'+prompt('workflow')
-        if ws._flow().stage()[0] == 6:
-            ws.done = True
     if not max_history_chars:      # 没指定就按模型配置（网页入口不传）；长上下文模型配得大，台账、条款读一遍就能留住
         configured = getattr(llm, "max_history_chars", None)
         max_history_chars = configured if isinstance(configured, int) and configured > 0 else DEFAULT_HISTORY_CHARS
     carry_chars = max(CARRY_CHARS, max_history_chars // 4)
     history: list[dict] = []
     steps: list[Step] = []
+
+    def record_table_checks(checks):
+        for report in checks:
+            note = ('已按原任务、原文费率格和区间复验更名后的表，归档旧表的对应错误。'
+                    if report.get('verified_replacements') else '同一参数表复验通过，已归档对应原文参数错误。')
+            text = json.dumps({**report, 'message': note},
+                              ensure_ascii=False, default=str)
+            steps.append(Step('（自动复核）', {'tool': 'check_formula_task', 'task': report['task'], 'automatic': True}, text, True))
+            if on_step:
+                on_step(len(steps), steps[-1])
+
+    if resumed_entity:
+        steps.append(Step('（数据修复）', {'tool': resumed_entity['tool'], 'name': resumed_entity['target'],
+                                      'automatic': True}, json.dumps(resumed_entity, ensure_ascii=False), True))
+        if on_step:
+            on_step(len(steps), steps[-1])
+    if resumed_dataset_patch:
+        text = json.dumps({**resumed_dataset_patch, 'message': '已复验之前保存的更新，原参数错误已归档。'},
+                          ensure_ascii=False)
+        steps.append(Step('（自动复核）', {'tool': 'update_dataset', 'automatic': True,
+                                        'name': resumed_dataset_patch['dataset']}, text, True))
+        if on_step:
+            on_step(len(steps), steps[-1])
+    record_table_checks(resumed_table_checks)
     error = run_budget.check(llm) or recovery.error or previous_construction_stop
     nudges = 0
     seen: dict[str, int] = {}          # 只读工具的调用 -> 第几步，用来发现原地打转
@@ -4860,43 +5619,292 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             history.clear()
         return _size(history)<before
 
-    def automatic_recheck():
-        """Run ready deterministic checks before paying a model to choose the next action."""
+    settlement_reviews, terminal_reviews = set(), set()
+    supervisor = getattr(llm, 'repair_llm', None) if ws.staged and not message and llm.recovery_mode == 'supervisor' else None
+    primary_plan_handoff = None
+
+    def apply_supervision(reason, recent=(), *, focus=None):
+        nonlocal deep_used, primary_plan_handoff
+        if (not supervisor or not reason or not max_steps or deep_used >= deep or ws.done or ws.pending
+                or recovery.error or run_budget.check(llm) or (should_stop and should_stop())):
+            return None
+        if (focus and primary_plan_handoff and focus['scheme'] == primary_plan_handoff['scheme']
+                and focus.get('task_target', focus['target']) == primary_plan_handoff['target']):
+            return None
+        from bonus_agent.supervision import run as supervise
+
+        started = time.monotonic()
+        before = llm.usage.prompt_tokens, llm.usage.completion_tokens
+        result = supervise(ws, recovery, supervisor, recent, reason, focus=focus, should_stop=should_stop)
+        if result is None:
+            return None
+        if not result.get('replayed'):
+            deep_used += 1
+        if result['saved']:
+            summary = {'status': 'PASS', 'focus': result['focus'],
+                       'validated_targets': result['report']['validated_targets']}
+            history.append({'role': 'user', 'content': '【监督计划已由程序校验保存】'
+                            + json.dumps(summary, ensure_ascii=False)})
+        elif result['status'] == 'DEFERRED':
+            history.append({'role': 'user', 'content': '监督请求读取超时，候选未返回。程序已保留预估用量。'
+                            '执行模型根据当前阶段的证据和任务缺口继续。'})
+            if result.get('next_tool') == 'plan_formula_tasks':
+                scheme, target = result['focus']
+                primary_plan_handoff = {'scheme': scheme, 'target': target}
+        elif (focus or {}).get('kind') in ('pool_inputs', 'clause_owners', 'parameter_owners') and result['status'] == 'FAIL':
+            history.append({'role': 'user', 'content': '【程序拒绝的依赖候选】'
+                            + json.dumps(result.get('issues', ()), ensure_ascii=False)})
+        args = {'tool': 'model_supervision', 'model': result['model'], 'stage': result['stage'],
+                'scheme': result['scheme'], 'saved': bool(result.get('saved')),
+                **({'replayed': True} if result.get('replayed') else {})}
+        step = Step('（案卷监督）', args, json.dumps(result, ensure_ascii=False, default=str),
+                    result['status'] in ('PASS', 'GUIDED'), deep=True,
+                    model_secs=round(time.monotonic() - started, 2),
+                    tokens_in=llm.usage.prompt_tokens - before[0], tokens_out=llm.usage.completion_tokens - before[1],
+                    request=dict(supervisor.last_call))
+        steps.append(step)
+        if on_step:
+            on_step(len(steps), step)
+        return result
+
+    def apply_model_repair(reason, failed_steps=()):
+        alternate = getattr(llm, 'repair_llm', None)
+        if alternate is None or not max_steps or ws.pending or ws.done or (should_stop and should_stop()):
+            return None
+        if run_budget.check(llm):
+            return None
+        from bonus_agent.model_repair import run as run_model_repair
+
+        started = time.monotonic()
+        before = llm.usage.prompt_tokens, llm.usage.completion_tokens
+        stopped_on = recovery.error
+        result = run_model_repair(ws, recovery, alternate, failed_steps, reason)
+        if result is None:
+            return None
+        saved = bool(result.get('saved') and result['status'] == 'PASS')
+        content = json.dumps(result, ensure_ascii=False, default=str)
+        args = {'tool': 'model_repair', 'model': result['model'], 'executor': result['executor'],
+                'task': result['task'], 'scheme': result['scheme']}
+        if saved:
+            repair_args = {key: args[key] for key in ('task', 'scheme')}
+            recovery.observe_native_feedback('submit_construction_repair', repair_args, content, True)
+            if stopped_on and recovery.error == stopped_on and not recovery.resume_after_construction(ws):
+                feedback = failure._recorded_feedback(stopped_on)
+                if feedback.get('task') == result['task'] and feedback.get('target') == result['target']:
+                    recovery.state.setdefault('resolved_model_halts', {})[fingerprint(stopped_on)] = {
+                        'model': result['model'], 'task': result['task'], 'target': result['target'],
+                        'checks': result.get('checked', []),
+                    }
+                    recovery.state['halted'] = ''
+                    recovery.save()
+            ws.notes.pop('纠错进度', None)
+        note = (f'{result["model"]} 已通过程序校验，交回 {llm.model} 继续。' if saved
+                else f'修复请求读取超时，候选未返回，交回 {llm.model} 处理原反例。' if result.get('status') == 'DEFERRED'
+                else f'{result["model"]} 的修复未通过程序校验。')
+        history.append({'role': 'user', 'content': '【修复模型】' + note + content})
+        st = Step('（修复模型）', args, note + '\n' + content, saved,
+                  model_secs=round(time.monotonic() - started, 2), tokens_in=llm.usage.prompt_tokens - before[0],
+                  tokens_out=llm.usage.completion_tokens - before[1], request=dict(alternate.last_call))
+        steps.append(st)
+        if on_step:
+            on_step(len(steps), st)
+        return result
+
+    def automatic_recheck(*, replay_budget=False, local_only=False):
+        """Run ready checks before paying the main model to select a tool."""
         if not ws.staged or ws.done:
             return []
         flow = ws._flow()
         focus = flow.stage()
         regressed = bool(reached_focus and focus[0] < reached_focus[0])
-        checked = flow.recheck(initial_compile=not regressed)
-        for name, ok, issues in checked:
-            if name == 'compile_formulas':
-                report = flow.compile_summary(flow.state['formula_report']['report'])
-            else:
-                report = flow.state.get('auto_checks', {}).get(name + ':data', {}).get('report', {})
+
+        def record(name, phase, scheme, ok, issues, report, *, checker=False):
+            if name in ('calculate_basis', 'review_basis'):
+                report = {'scheme': scheme, 'phase': phase,
+                          **{key: report[key] for key in ('basis_digest', 'digest', 'objects', 'checked_objects',
+                                                        'confirmation_reused', 'revalidated_from_profile',
+                                                        'confirmed_funding', 'reused_settlement_scopes',
+                                                        'source_binding') if key in report}}
             payload = {**report, 'status': 'PASS' if ok else 'FAIL', 'issues': issues[:6],
                        'message': f"{name} {'通过' if ok else '未通过'}",
                        'next': flow.hint()}
             text = json.dumps(payload, ensure_ascii=False, default=str)
             recovery.observe_native_feedback(name, {}, text, ok)
-            steps.append(Step('（自动复核）', {'tool': name, 'automatic': True, 'phase': report.get('phase')}, text, ok))
-            history.append({'role': 'user', 'content': '【程序自动检查，未调用模型】' + text})
+            label = '自动独立复核' if checker else '自动复核'
+            args = {'tool': name, 'automatic': True, 'phase': report.get('phase')}
+            if ok and report.get('saved') is True:
+                args['saved'] = True
+            if checker:
+                args['scheme'] = scheme
+            steps.append(Step(f'（{label}）', args, text, ok))
+            prefix = '【程序调度独立复核】' if checker else '【程序自动检查，未调用模型】'
+            history.append({'role': 'user', 'content': prefix + text})
             if on_step:
                 on_step(len(steps), steps[-1])
+
+        linked = (flow.answered_settlement_schemes() if resumed and getattr(llm, 'checker_llm', None)
+                  and getattr(llm, 'checker_required', False) else {})
+        options = {'resumed_settlements': linked} if linked else {}
+        checked = [] if local_only else flow.recheck(initial_compile=not regressed, on_result=record, **options)
+        if not ws.pending and not ws.done and flow.stage()[0] == 3:
+            from bonus_agent.funding_plan import prepare_pool_inputs
+
+            if pool_report := prepare_pool_inputs(ws):
+                flow = ws._flow()
+                ok = pool_report['status'] == 'PASS' and pool_report['saved']
+                issues = pool_report.get('issues', [])
+                record('prepare_pool_inputs', 'basis', pool_report['scheme'], ok, issues, pool_report)
+                checked.append(('prepare_pool_inputs', ok, issues))
+        if not ws.pending and not ws.done and flow.stage()[0] == 3:
+            from bonus_agent.funding_components import prepare_funding_components
+
+            if component_report := prepare_funding_components(ws):
+                flow = ws._flow()
+                ok = component_report['status'] == 'PASS' and component_report['saved']
+                issues = component_report.get('issues', [])
+                record('prepare_funding_components', 'basis', component_report['scheme'], ok, issues, component_report)
+                checked.append(('prepare_funding_components', ok, issues))
+                if ok:
+                    recovery.resume_after_funding_plan(ws, component_report)
+        if replay_budget and not local_only and not ws.pending and not ws.done and flow.stage()[0] == 3:
+            from bonus_agent.rule_package import resume_grouped_budget
+
+            if repaired := resume_grouped_budget(ws, out, last):
+                flow = ws._flow()
+                ok = repaired['status'] == 'PASS'
+                issues = repaired.get('issues', [])
+                record('submit_construction_repair', 'basis', repaired['scheme'], ok, issues,
+                       {**repaired, 'source_round': last['n']})
+                checked.append(('submit_construction_repair', ok, issues))
+        if not ws.pending and not ws.done and flow.stage()[0] == 3:
+            from bonus_agent.rule_package import prepare_formula_inputs
+
+            while flow.stage()[0] == 3 and not ws.pending and not ws.done and not (should_stop and should_stop()):
+                if not (input_report := prepare_formula_inputs(ws)):
+                    break
+                flow = ws._flow()
+                ok = input_report['status'] == 'PASS'
+                issues = input_report.get('issues', [])
+                record('prepare_formula_inputs', 'basis', input_report['scheme'], ok, issues, input_report)
+                checked.append(('prepare_formula_inputs', ok, issues))
+                if not ok or not input_report.get('saved'):
+                    break
+                record_table_checks(recovery.revalidate_saved_tables(ws))
+        if local_only:
+            recovery.resume_after_construction(ws)
+            return checked
+        stage, scheme = flow.stage()
+        if (not ws.done and stage == 5 and scheme in linked and flow.current('approved:' + linked[scheme])
+                and flow.current('allocation_formulas') and not run_budget.check(llm)
+                and not (should_stop and should_stop())):
+            key = (scheme, flow.version('basis'))
+            if key not in settlement_reviews:
+                settlement_reviews.add(key)
+                try:
+                    result = ws.review_basis(scheme)
+                    ok = result.get('status') == 'PASS'
+                    issues = result.get('issues') or ([result['error']] if result.get('error') else [])
+                except ToolError as exc:
+                    result, ok, issues = {}, False, [str(exc)]
+                record('review_basis', 'basis', scheme, ok, issues, result, checker=True)
+                checked.append(('review_basis', ok, issues))
+                if ok:
+                    checked.extend(flow.recheck(on_result=record, **options))
+        if linked and not ws.done and flow.stage()[0] == 8 and not (should_stop and should_stop()):
+            from bonus_agent import reread
+            terminal = reread.bound_settlement_review(ws)
+            if terminal and terminal['sig'] not in terminal_reviews:
+                terminal_reviews.add(terminal['sig'])
+                ws.reread = terminal
+                result = ws.review_calculation()
+                ok = result['status'] == 'PASS'
+                issues = [text for _, text in result.get('gaps', [])]
+                record('review_calculation', 'terminal', None, ok, issues, {'phase': 'terminal'})
+                checked.append(('review_calculation', ok, issues))
+                if ok:
+                    count = ws._record_terminal_samples()
+                    try:
+                        ws.finish('已完成已确认资金的人员分配、逐人金额和角色原值独立核对')
+                    except ToolError as exc:
+                        ok, issues = False, [str(exc)]
+                    else:
+                        ok, issues = True, []
+                    record('finish', 'terminal', None, ok, issues, {'phase': 'terminal', 'samples': count})
+                    checked.append(('finish', ok, issues))
         return checked
 
-    if not error and not ws.done and not (should_stop and should_stop()):
-        initial_checks = automatic_recheck()
-        if initial_checks:
-            discovery = False
-            for st in steps:
-                discovery = discover(st, discovered_reads) or discovery
-            progress_watch.observe(ws.blocker_frontier(), discovery=discovery,
-                                   compile_report=current_compile_report(), fact_names=(f.name for f in ws.facts))
-            recovery.state['progress'] = {'previous': sorted(progress_watch.previous), 'stagnant': progress_watch.stagnant,
-                                          'reads': sorted(discovered_reads), 'compile': progress_watch.compile_state}
-            recovery.save()
-            reached, reached_focus = ws.phase(), ws._flow().stage()
-            highest_stage = max(highest_stage, reached_focus[0])
+    initial_checks = []
+    stopped_pool = bool(error and error == previous_construction_stop and not recovery.error and not run_budget.error
+                        and previous_construction_focus['obligation']['kind'] == 'pool_inputs')
+    stopped_construction = bool(error and error == recovery.error and not run_budget.error
+                                and recovery.stopped_construction_targets())
+    local_recovery = stopped_pool or stopped_construction
+    if ws.staged and (not error or local_recovery) and not ws.done and not (should_stop and should_stop()):
+        initial_checks = automatic_recheck(replay_budget=same_period, local_only=local_recovery)
+    planning_repaired = any(name in ('prepare_pool_inputs', 'prepare_funding_components') and ok
+                            for name, ok, _ in initial_checks)
+    recovered_locally = local_recovery and not recovery.error and (
+        stopped_construction or planning_repaired)
+    if recovered_locally:
+        error = run_budget.check(llm) or recovery.error or construction_stop(construction_focus())
+        if not error:
+            initial_checks.extend(automatic_recheck())
+    inherited_repair = None
+    if (same_period and last.get('status') == 'FAILED' and not ws.done and not ws.pending and not recovery.error
+            and not run_budget.check(llm) and (not error or error == previous_construction_stop)
+            and not (should_stop and should_stop())):
+        from bonus_agent.supervision import archived_empty_plan
+        if archived_empty_plan(ws, last, out, construction_focus()):
+            try:
+                registered = ws.plan_formula_tasks([])
+            except ToolError:
+                registered = None
+            if registered and registered.get('saved'):
+                planning_repaired = True
+                step = Step('（自动规划）', {'tool': 'plan_formula_tasks', 'automatic': True, 'saved': True},
+                            json.dumps(registered, ensure_ascii=False, default=str), True)
+                steps.append(step)
+                if on_step:
+                    on_step(len(steps), step)
+                error = run_budget.check(llm) or recovery.error or construction_stop(construction_focus())
+                if not error:
+                    initial_checks.extend(automatic_recheck())
+    if same_period and supervisor and not error and not ws.done and not ws.pending and last.get('status') == 'FAILED':
+        from bonus_agent.supervision import archived_planning_timeout
+        primary_plan_handoff = archived_planning_timeout(ws, last, out, supervisor, construction_focus())
+        if primary_plan_handoff:
+            step = Step('（接续规划）', {'tool': 'plan_formula_tasks', 'automatic': True, 'saved': False},
+                        '已核对上轮监督超时请求，原有预留继续计入额度。由执行模型提交当前计划。'
+                        + json.dumps(primary_plan_handoff, ensure_ascii=False), True)
+            steps.append(step)
+            if on_step:
+                on_step(len(steps), step)
+    if (same_period and last.get('status') == 'FAILED' and not ws.done
+            and not (primary_plan_handoff or resumed_entity or resumed_question_reviews or planning_repaired
+                     or recovered_locally or resolved_table_stop)):
+        inherited_repair = apply_model_repair(error or last.get('error', ''))
+        if inherited_repair is None and supervisor:
+            from bonus_agent.supervision import planning_focus
+
+            if gap := planning_focus(ws, construction_focus(), archived_error=last.get('error', '')):
+                inherited_repair = apply_supervision(last.get('error', ''), focus=gap)
+                if (gap['kind'] == 'missing_task' and not primary_plan_handoff
+                        and not (inherited_repair and inherited_repair.get('saved'))):
+                    error = error or last.get('error', '')
+        if inherited_repair and inherited_repair.get('saved'):
+            error = run_budget.check(llm) or recovery.error or construction_stop(construction_focus())
+            if not error:
+                initial_checks.extend(automatic_recheck())
+    if resumed_entity or initial_checks or (inherited_repair and inherited_repair.get('saved')):
+        discovery = bool(resumed_entity or (inherited_repair and inherited_repair.get('saved')))
+        for st in steps:
+            discovery = discover(st, discovered_reads) or discovery
+        progress_watch.observe_workspace(ws, discovery=discovery, compile_report=current_compile_report())
+        recovery.state['progress'] = {'previous': sorted(progress_watch.previous), 'stagnant': progress_watch.stagnant,
+                                      'reads': sorted(discovered_reads), 'compile': progress_watch.compile_state}
+        recovery.save()
+        reached, reached_focus = ws.phase(), ws._flow().stage()
+        highest_stage = max(highest_stage, reached_focus[0])
     recovery.set_repair_scope(repair_scope(ws))
     initial_read_budget = repair_reads.observe([], recovery.state.get('native_repairs', {}), current_compile_report(), READ_ONLY,
                                              scope=recovery.state['repair_scope'])
@@ -4904,6 +5912,15 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         recovery.halt(initial_read_budget['message'], repair_read=initial_read_budget)
         error = recovery.error  # enforce a persisted exhausted allowance before a new request
     recovery.save()
+    from bonus_agent.data_profile import archived_category_probe, repeated_category_probe, category_handoff
+    resumed_probe = (archived_category_probe(out, last) if ws.staged and resumed and not error and not ws.done
+                     and not fresh and not message and not instruction and not any((changes or {}).values())
+                     and last and last.get('period') == rnd.get('period') else None)
+    if ws.staged and resumed and not error and not ws.done and not fresh and not message and not instruction \
+            and not any((changes or {}).values()) and last and last.get('period') == rnd.get('period'):
+        from bonus_agent.rule_package import archived_tier_candidate
+        ws._resume_tier_candidate = archived_tier_candidate(out, last)
+    category_focus = None
     for turn in range(max_steps if not error else 0):
         if ws.done:
             break
@@ -4923,15 +5940,53 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         ws.budget = f"已用 {len(steps)} 步，上限 {max_steps} 步" + (f"；tokens 已用 {used}，上限 {max_tokens}" if max_tokens else "")
         if _shrink(history, max_history_chars):
             seen.clear()       # 较早的结果已省略，重新读取是合理的
+        prior_focus, category_focus = category_focus, None
+        if ws.staged and not repair_reads.active and not recovery.native_guidance:
+            probe = resumed_probe if turn == 0 and resumed_probe else repeated_category_probe(
+                [s.args if s.tool == 'query_dataset' and s.ok else None for s in steps[-2:]])
+            category_focus = prior_focus
+            if probe and (not prior_focus or probe != (prior_focus['dataset'], prior_focus['field_evidence']['field'])):
+                category_focus = category_handoff(ws, probe, prior_error=last['error'] if turn == 0 and resumed_probe else None)
         think = bool(deep_why) and deep_used < deep
-        if construction and construction['warn']:
+        if category_focus or (construction and (construction['warn'] or construction.get('planning_gap'))):
             think, deep_why = False, ''
         if recovery.native_guidance:
             ws.notes['程序修复指引'] = recovery.native_guidance
             think, deep_why = False, ''
         else:
             ws.notes.pop('程序修复指引', None)
-        if think and llm.recovery_mode == 'advisor' and llm.think_llm is not None:
+        guidance = None
+        if supervisor:
+            # The primary model keeps the tool session. The supervisor sees a small
+            # case checkpoint when the program detects an unresolved issue.
+            think = False
+            reason = deep_why or (stuck if repeats >= MAX_STUCK else '')
+            obligation = (construction or {}).get('obligation')
+            if obligation and construction['warn']:
+                reason = construction['message']
+            if not reason and quiet >= QUIET_WARN:
+                reason = f'连续 {quiet} 次只读，当前阶段尚未取得新的写入回执'
+            if not reason and nudges >= 2:
+                reason = '连续两次没有收到可执行工具，当前阶段未推进'
+            if obligation and obligation['kind'] in ('pool_inputs', 'clause_owners', 'parameter_owners'):
+                planned = apply_supervision(construction['message'], steps[-6:], focus=obligation)
+                if planned and planned.get('saved'):
+                    automatic_recheck()
+                    progress_watch.observe_workspace(ws, discovery=True, compile_report=current_compile_report())
+                    recovery.state['progress'] = {'previous': sorted(progress_watch.previous),
+                                                  'stagnant': progress_watch.stagnant, 'reads': sorted(discovered_reads),
+                                                  'compile': progress_watch.compile_state}
+                    recovery.save()
+                    construction = construction_focus()
+            elif not obligation or obligation['kind'] != 'missing_task':
+                guidance = apply_supervision(reason, steps[-6:], focus=obligation)
+            deep_why = ''
+            if error := run_budget.check(llm):
+                break
+            if should_stop and should_stop():
+                error = f'已手动停止（第 {len(steps)} 步）'
+                break
+        if think and llm.recovery_mode in ('advisor', 'supervisor') and llm.think_llm is not None:
             # Counter changes and reworded stagnation notices are not new problems.
             blockers = sorted(ws.blocker_frontier())
             advice_issue = {'blockers': blockers} if blockers else deep_why
@@ -4975,11 +6030,17 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             deep_used += 1
         request_think = think or bool(getattr(llm, 'tools_thinking', False))
         request_output = max(8192, llm.think_max_tokens) if request_think else 8192
-        tail = [{"role": "user", "content": ws.state() + (_deep_note(deep_why, steps) if think else "")}]
+        card = task_card_data(ws) if ws.staged else {}
+        state_text = ws.state(card=card)
+        tail = [{"role": "user", "content": state_text + (_deep_note(deep_why, steps) if think else "")}]
         if construction and construction['warn']:
             tail[0]['content'] += '\n【当前缺失的构建任务】' + construction['message']
+        if category_focus:
+            tail.append({'role': 'user', 'content': '【已核实的字段取值与当前公式】' +
+                         json.dumps(category_focus, ensure_ascii=False)})
         focus_report = current_compile_report()
-        if focus_report or runtime_focus_text:
+        work = (card.get('workflow') or {}).get('construction') or {}
+        if focus_report or runtime_focus_text or category_focus or work.get('runtime_repair'):
             try:
                 ws._check_source_version()
             except ToolError as exc:
@@ -5009,8 +6070,159 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         flow=ws._flow() if ws.staged else None
         stage=flow.stage()[0] if flow else None
         available_tools=[t for t in TOOLS if flow is None or flow.allowed(t['name'],stage)]
+        request_system = sys
+        active_task = {}
+        if (stage == 3 and (focus_report or {}).get('status') != 'FAIL'
+                and not recovery.native_guidance and not repair_reads.active):
+            # Use the same task card that the model receives, including its phase and validated inputs.
+            active_task = work.get('runtime_repair') or work.get('active') or {}
+        target = active_task.get('target', '')
+        focus_prompt = None
+        focus_tools = FORMULA_FOCUS_TOOLS
+        if not ws.pending:
+            if stage == 3 and (construction or {}).get('obligation', {}).get('kind') == 'pool_inputs':
+                focus_prompt = formula_plan_focus_prompt
+                focus_tools = FORMULA_PLAN_TOOLS
+            elif stage == 3 and work.get('planning_facts') and not recovery.native_guidance and not repair_reads.active:
+                focus_prompt = formula_plan_focus_prompt
+                focus_tools = FORMULA_PLAN_TOOLS
+            elif target.startswith('/tables/'):
+                focus_prompt = parameter_table_focus_prompt
+                focus_tools = PARAMETER_TABLE_TOOLS
+            elif target.startswith('/variables/'):
+                focus_prompt = formula_focus_prompt
+            elif target == '/report' and work.get('report_task', {}).get('phase') == 'basis':
+                focus_prompt = basis_report_focus_prompt
+            elif card.get('personnel_task') and target in ('/allocation', '/report'):
+                focus_prompt = personnel_focus_prompt
+                focus_tools = PERSONNEL_FOCUS_TOOLS
+        if focus_prompt:
+            request_system = focus_prompt()
+            available_tools = [t for t in available_tools if t['name'] in focus_tools]
+            proposal = card.get('personnel_task', {}).get('scheme_proposal')
+            if focus_prompt is personnel_focus_prompt and proposal:
+                request_system = ('当前只确定资金方案与人员方案的归属。已确认资金按对象计算，'
+                                  '原文明确先汇总每个人的份额，再四舍五入。现场给出这条原文及完整 plan_calculation 候选。'
+                                  '核对后直接提交该候选，保留文件用途、确认的资金来源和原输出。'
+                                  '此动作只规划报表归属，分配名单和公式会在下一步继续。'
+                                  '若原文或财务答复确有矛盾并影响金额，才提出一个含例子的业务问题。')
+                available_tools = [t for t in available_tools if t['name'] in ('plan_calculation', 'ask_question')]
+                body = [{'role': 'user', 'content': '本批已有独立复核总额和真实财务确认，继续规划人员分配。'}]
+                tail = [{'role': 'user', 'content': json.dumps(
+                    {'proposal': proposal, 'confirmed_scope': card['personnel_task']['basis_scope']},
+                    ensure_ascii=False)}]
+            if active_task.get('scope_reference', {}).get('candidate_call'):
+                request_system += ('\n程序已按原文核对相同的缺行系数，并量测当前对象的实际命中。'
+                                   'scope_reference.candidate_call 是一条可执行的局部修复，保留其余计算项。'
+                                   '按当前原文确认后直接提交或局部修正该候选。首次请求先验证这个写入。')
+                available_tools = [t for t in available_tools if t['name'] in ('submit_formula_task', 'ask_question', 'update_dataset')]
+        data_preflight = work.get('input_failures') or work.get('input_preflight', {}).get('stage') == 'data'
+        if data_preflight and not ws.pending and stage == 3:
+            request_system = formula_focus_prompt() + (
+                '\n先修当前任务的数据及原文前置条件。input_preflight.input_failures 中的 evidence_candidates '
+                '给出实际材料中可核对的条款。缺少登记时用 record_clauses，'
+                '用 plan_formula_tasks 补充当前任务的条款 ID，随后等待程序复验。'
+                '按报错中的窗口和关联键定位原表，'
+                '使用 define_dataset、update_dataset 或 submit_construction_repair 补齐；'
+                '只有原始证据仍无法区分影响金额的口径时才提问。')
+            data_tools = {'define_dataset', 'update_dataset', 'submit_construction_repair', 'plan_formula_tasks',
+                          'record_clauses', 'submit_formula_task', 'check_formula_task',
+                          'read_workspace', 'read_sheet', 'read_document', 'query_dataset', 'diagnose_datasets', 'ask_question'}
+            available_tools = [t for t in available_tools if t['name'] in data_tools]
+        elif work.get('scope_repair') and not ws.pending and stage == 3:
+            # A real grouped counterexample already supplies the source clauses,
+            # mapped fields and historical candidates. This request must propose
+            # a testable write so it cannot spend the repair allowance rereading.
+            request_system = formula_focus_prompt() + (
+                '\n针对 scope_repair 提交一次联合候选。方案用 scheme，直接反例用 anchor。'
+                '用原文确定应该按哪个现有或新建实体计算。'
+                '本期群体从业务主表分组，跨期累计从符合口径的历史原表关联，避免以当前项目编号筛掉往期。'
+                '已有项目仍按原项目键计算。相关系数更换作用域时，同步更新引用它的守卫和分母。'
+                '用 changes 保留已核原文和其他条件。尽量同时修复证据充分的相关范围问题。'
+                '程序会全量试算；直接提交候选即可。原件确实矛盾且影响金额才提出业务问题。')
+            if work['scope_repair'].get('candidate_call'):
+                request_system += ('\nscope_repair.candidate_call 已定位前置输入的原文、分组键和实际源表。'
+                                   '先按其完整 args 提交一次，再按返回的反例推进。')
+            available_tools = [t for t in available_tools if t['name'] in ('submit_construction_repair', 'ask_question')]
+            # A complete structured packet can be submitted by the normal
+            # executor. Independent review keeps its configured thinking route.
+            request_think = bool(getattr(llm, 'tools_thinking', False))
+            request_output = max(8192, llm.think_max_tokens) if request_think else 8192
+        elif work.get('tier_repair') and not ws.pending and stage == 3:
+            request_system = formula_focus_prompt() + (
+                '\n当前是区域阶梯选表修复。tier_repair 给出当前使用的表、原件页码及完整行列。'
+                '先根据新旧列及实际分组补齐缺少的档位表任务，复用原格坐标 compile_table。'
+                '再用 submit_construction_repair 一次提交选表公式和相关适用条件，保留已有参数及边界。'
+                '修复单的 task 必须填写 tier_repair.task 指向的公式任务，勿改写奖金池。'
+                '单改选表公式无法改变三张旧表的适用条件，须一并提交表的 applies_when。'
+                'variant_candidates 提供按原格登记及编译的缺失列。可复制到 tiers，同时修正 compile.applies_when。'
+                '已有同目标的计划任务可直接用 tiers 编译。修改选表分支和适用条件时省略 bindings，原参数绑定沿用。'
+                '新旧项目使用各自栏，制度明确始终按新项目的场景沿用新项目栏。'
+                '同时执行 tier_repair.routing_clauses 明示的二次归类，别漏掉同一物理区域里的不同费率政策。'
+                '实际数据的区域名称在 runtime_repair.table_applicability.field_evidence。'
+                '若原件确实支持不同口径才问财务。')
+            available_tools = [t for t in TOOLS if t['name'] in (
+                'plan_formula_tasks', 'compile_table', 'record_parameter_cells', 'submit_construction_repair',
+                'read_parameter_table', 'ask_question')
+                and flow.allowed(t['name'], stage)]
+            if work['tier_repair']['source_pages']:
+                available_tools = [t for t in available_tools if t['name'] != 'read_parameter_table']
+            if work['tier_repair'].get('candidate_call'):
+                request_system += ('\ntier_repair.candidate_call 补齐了上一轮已提出的分支及对应的原文档位输入。'
+                                   '先原样提交，再看程序的逐对象执行结果。')
+                available_tools = [t for t in available_tools if t['name'] in ('submit_construction_repair', 'ask_question')]
+        elif work.get('runtime_repair', {}).get('policy_candidate') and not ws.pending and stage == 3:
+            request_system = ('程序在实际项目发现负值，且 policy_sources 已逐字核对明确的负数计算口径。'
+                              '先提交 runtime_repair.policy_candidate，保持原公式并对全部项目复验。')
+            available_tools = [t for t in available_tools if t['name'] in ('submit_formula_task', 'ask_question')]
+        guided_tool = (guidance or {}).get('next_tool') if stage != 3 else None
+        if guidance and guidance.get('next_tool'):
+            if guided_tool:
+                available_tools = [t for t in TOOLS if t['name'] == guided_tool and flow.allowed(guided_tool, stage)]
+                request_system += '\n本次监督已定位下一项工具。核对当前案卷证据，按标准工具协议提交一次。'
+            else:
+                request_system += '\n核对当前依赖和监督建议。需要先登记、编译或修复前置构件时，使用本阶段提供的对应工具。'
+            tail.append({'role': 'user', 'content': '【案卷监督引导】' + json.dumps(
+                guidance, ensure_ascii=False, default=str)})
+        evidence_focus = (work.get('planning_gap') or {}) if stage == 3 and not ws.pending else {}
+        evidence_planning = evidence_focus.get('kind') in ('clause_owners', 'parameter_owners')
+        if evidence_planning:
+            key = 'clauses' if evidence_focus['kind'] == 'clause_owners' else 'facts'
+            request_system = ('依据本次所列原文选择负责实现的任务。直接调用 plan_formula_tasks。'
+                              f'已有任务仅提交 id、scheme、target 和 {key}。' + evidence_focus['message'])
+            evidence_tools = {'plan_formula_tasks', 'ask_question'}
+            # Always offer a source read, including paging for large task boards.
+            # Once the supplied packet and two more lookups are available, a
+            # further read must resolve genuinely incomplete or truncated input.
+            needs_lookup = (evidence_focus['task_count'] > len(evidence_focus['tasks'])
+                            or any(row.get('truncated') for row in evidence_focus[key]))
+            if needs_lookup or construction_reads.state.get('reads', 0) < 2:
+                evidence_tools.update(('read_workspace', 'read_document', 'read_sheet', 'read_parameter_table'))
+            available_tools = [t for t in TOOLS if t['name'] in evidence_tools and flow.allowed(t['name'], stage)]
+            feedback = []
+            for step in steps[-5:]:
+                if not step.ok and step.args.get('tool') == 'model_supervision':
+                    rejected = json.loads(step.result)
+                    if rejected.get('focus') == [evidence_focus['scheme'], evidence_focus['target']]:
+                        feedback.append({k: rejected[k] for k in ('issues', 'proposed_owners') if k in rejected})
+                elif not step.ok and step.tool == 'plan_formula_tasks':
+                    feedback.append(step.result[:1000])
+            tail = [{'role': 'user', 'content': json.dumps({'focus': evidence_focus, 'recent_rejections': feedback}, ensure_ascii=False)}]
+            # Other phases' instructions in the old history can point to a
+            # previously closed fact group. Retain recent evidence for this decision.
+            body = [{'role': 'user', 'content': '继续处理当前归属缺项。'}] + [
+                {'role': 'user', 'content': st.result[:1600]} for st in steps[-2:] if st.tool in READ_ONLY and st.ok]
+        live_gap = (construction or {}).get('obligation') or {}
+        if (stage == 3 and not ws.pending and primary_plan_handoff
+                and live_gap.get('scheme') == primary_plan_handoff['scheme']
+                and live_gap.get('task_target', live_gap.get('target')) == primary_plan_handoff['target']
+                and any(t['name'] == 'plan_formula_tasks' for t in available_tools)):
+            tail.append({'role': 'user', 'content': '上一次监督没有返回计划。根据本案数据和已登记条款，'
+                         '用 plan_formula_tasks 提交覆盖此缺口的任务、依赖与原文归属；回执通过后继续编译。'
+                         + json.dumps(live_gap, ensure_ascii=False, default=str)})
+            available_tools = [t for t in available_tools if t['name'] in ('plan_formula_tasks', 'ask_question')]
         if mode == "json":
-            msgs = [{"role": "system", "content": sys + JSON_PROTOCOL + json.dumps(available_tools, ensure_ascii=False)}] + body + tail
+            msgs = [{"role": "system", "content": request_system + JSON_PROTOCOL + json.dumps(available_tools, ensure_ascii=False)}] + body + tail
             try:
                 if ws.staged:
                     guard_messages(msgs,llm,output_tokens=request_output)
@@ -5062,7 +6274,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                     on_step(len(steps), steps[-1])
                 continue
         else:
-            msgs = [{"role": "system", "content": sys}] + body + tail
+            msgs = [{"role": "system", "content": request_system}] + body + tail
             try:
                 if ws.staged:
                     guard_messages(msgs,llm,tools=openai_tools(available_tools),output_tokens=request_output)
@@ -5106,7 +6318,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             context_retries=0
             calls = [{**c, "raw": c["arguments"], "arguments": _fix_arguments(c["arguments"])} for c in reply["tool_calls"]]
             reasoning = (reply.get("reasoning") or "") if request_think else ""
-            history.append({"role": "assistant", "content": reply["content"],
+            history.append(reply.get('signed_message') or {"role": "assistant", "content": reply["content"],
                             **({"reasoning_content": reasoning} if reasoning else {}),
                             **({"tool_calls": [{"id": c["id"], "type": "function",
                                                 "function": {"name": c["name"], "arguments": _short_thought(c["arguments"])}}
@@ -5114,7 +6326,8 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             if not calls and think and (reply.get("content") or reasoning).strip():
                 # 深度思考的那一步（可能换了更强的模型）只写了分析、没动手：分析留在历史里，下一步回到平时的模型按分析调用工具，
                 # 不算“没调用工具”（否则换模型思考反而让整轮失败）
-                history[-1] = {"role": "assistant", "content": (reply.get("content") or "").strip() or reasoning.strip()[:6000]}
+                if not reply.get('signed_message'):
+                    history[-1] = {"role": "assistant", "content": (reply.get("content") or "").strip() or reasoning.strip()[:6000]}
                 history.append({"role": "user", "content": "上面是深度思考得出的分析。现在按这个分析调用工具动手改；全部完成后调用 finish。"})
                 deep_why = ""
                 continue
@@ -5133,9 +6346,16 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         said = "" if mode == "json" else (reply.get("content") or "").strip()     # 原生工具调用时模型写在正文里的思考
         # 上一批参数的拒绝原因已经在工具结果里、并在刚才这一步的任务卡里给过一次：不再每步重发（会引着模型反复重试）
         ws._fact_rejections = []
-        for c in calls:
+        for call_index, c in enumerate(calls):
+            if call_index and should_stop and should_stop():
+                error = f'已手动停止（第 {len(steps)} 步）'
+                break
             if recovery.error or ws.done:
                 break  # no later write in the same model response may bypass the stop
+            tool_response = ({'role': 'tool', 'tool_call_id': c['id'],
+                              **({'name': c['name']} if reply.get('signed_message') else {})}
+                             if mode != 'json' else None)
+            ws._unit_rejections = [] if c['name'] in ('record_facts', 'record_parameter_cells') else None
             args, note, dup = {}, "", False
             thought, bare = _split_thought(c["arguments"])
             thought = thought or said
@@ -5160,7 +6380,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                 history.append(
                     {"role": "user", "content": f"【{c['name']} 的结果】\n{result}"}
                     if mode == "json"
-                    else {"role": "tool", "tool_call_id": c["id"], "content": result}
+                    else {**tool_response, "content": result}
                 )
                 skipped += 1
                 continue
@@ -5168,22 +6388,48 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             saved_draft = False
             try:
                 args = json.loads(c["arguments"] or "{}")
-                fn = handlers.get(c["name"])
                 if not isinstance(args, dict):
                     raise ToolError("参数必须是 JSON 对象")
                 if "_invalid_json" in args:
                     raise ToolError(args["_invalid_json"])
                 args.pop("thought", None)
                 note = args.pop("_note", "")
+                if (c['name'] == 'define_dataset' and dataset_patch_envelope(args)
+                        and args['name'] in ws.datasets):
+                    renamed = ('update_dataset', '已按 name + changes 的更新参数调用 update_dataset。')
+                    c = {**c, 'name': renamed[0]}
+                    sig = f"{c['name']}:{bare}"
+                fn = handlers.get(c["name"])
                 args = _coerce_args(c["name"], args)
                 note = "\n".join(x for x in (note, args.pop("_fixed", ""), renamed[1] if renamed else "") if x)
                 if fn is None:
                     raise ToolError(("thought 不是工具，是每个工具都有的参数：直接调用要用的工具，把思考写在它的 thought 参数里。"
                                      if c["name"] == "thought" else f"没有工具 {c['name']}。")
                                     + f"可用：{list(handlers)}")
+                if category_focus and c['name'] == 'query_dataset':
+                    from bonus_agent.data_profile import category_probe
+                    field = category_focus['field_evidence']['field']
+                    if category_probe(args) == (category_focus['dataset'], field):
+                        raise ToolError(f'query.category_complete：{category_focus["dataset"]}.{field}的完整取值、'
+                                        f'数量和源行已给出。{category_focus["next"]} 当前任务 {category_focus["task"]}')
+                if c['name'] not in READ_ONLY:
+                    category_focus = None  # A later call in this batch may see new rules or a different mapping.
                 if ws.staged and not ws._flow().allowed(c['name']):
                     raise ToolError('workflow.gate：该操作的前置阶段尚未通过。下一步：'+ws._flow().hint())
-                value = fn(**args)
+                if guided_tool and (c['name'] != guided_tool or call_index):
+                    raise ToolError(f'监督引导的本次操作限一次 {guided_tool}，按当前证据核对后继续。')
+                if evidence_planning:
+                    if c['name'] not in evidence_tools:
+                        raise ToolError('construction.phase：' + evidence_focus['message'])
+                    if c['name'] == 'plan_formula_tasks':
+                        from bonus_agent.rule_package import plan_evidence_owners
+                        value = plan_evidence_owners(ws, evidence_focus, **args)
+                    else:
+                        value = fn(**args)
+                else:
+                    value = fn(**args)
+                if c['name'] == 'submit_construction_repair':
+                    ws._resume_tier_candidate = None
                 if isinstance(value, (dict, list)):
                     from bonus_agent.context import tool_result
                     result = (json.dumps(value, ensure_ascii=False, default=str) if c['name'] == 'read_workspace'
@@ -5230,6 +6476,18 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             except (AttributeError, KeyError, IndexError, ValueError) as e:     # 参数结构和工具说明不一致（如对象写成了列表）
                 result, ok = (f"错误：参数结构不对（{type(e).__name__}: {e}）。请按工具说明的格式重写："
                               "要求对象 {...} 的地方不要写成列表 [...]，反之亦然"), False
+            if ws._unit_rejections and not ws.pending:
+                from bonus_agent.stuck_question import cell_unit_question
+                for rejected, reasons in ws._unit_rejections:
+                    question = cell_unit_question(ws, rejected, reasons)
+                    if question:
+                        q = Question(id=_next_qid(ws.questions), round=ws.round, blocking=True, **question)
+                        ws.questions.append(q)
+                        ws.summary = f'原表单位待财务确认，答复 {q.id} 后继续核算'
+                        ws.done = ws.changed = True
+                        result += '\n' + ws.summary
+                        break
+            ws._unit_rejections = None
             if len(result) > MAX_RESULT_CHARS:
                 result = result[:MAX_RESULT_CHARS] + "……（已截断）"
             if not thought:
@@ -5396,7 +6654,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             if mode == "json":
                 history.append({"role": "user", "content": f"【{c['name']} 的结果】\n{result}"})
             else:
-                history.append({"role": "tool", "tool_call_id": c["id"], "content": result})
+                history.append({**tool_response, "content": result})
         if request_think:
             for st in steps[turn_steps:]:
                 st.deep = True
@@ -5410,14 +6668,23 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         native_changed = False
         read_budget_warned = False
         for step_index, st in enumerate(model_steps):
+            if st.tool == 'submit_construction_repair' and not st.ok:
+                construction_reads.reject_joint(construction)
             recovery.set_repair_scope(st._repair_scope if hasattr(st, '_repair_scope') else repair_scope(ws))
-            native_changed = recovery.observe_native_feedback(st.tool, st.args, st.result, st.ok) or native_changed
+            task_specs = ws.workflow.get('construction', {}).get('tasks', {}).values()
+            table_tasks = task_specs if st.tool == 'compile_table' else ()
+            native_changed = recovery.observe_native_feedback(st.tool, st.args, st.result, st.ok,
+                                                               table_tasks=table_tasks, task_specs=task_specs) or native_changed
             # Native feedback and reads are observed in execution order: reads
             # before the first failed attempt must not spend its new allowance.
             observed_budget = repair_reads.observe([st], recovery.state.get('native_repairs', {}),
                                                    getattr(st, '_repair_compile_report', None), READ_ONLY,
                                                     attempts=model_steps[:step_index + 1], scope=recovery.state['repair_scope'])
             read_budget_warned = read_budget_warned or observed_budget['warn']
+        if any(s.tool in ('set_rules', 'compile_table', 'record_parameter_cells', 'bind_facts', 'submit_formula_task',
+                          'plan_formula_tasks', 'check_formula_task', 'submit_construction_repair')
+               and s.ok for s in model_steps):
+            record_table_checks(recovery.revalidate_saved_tables(ws))
         rechecked = automatic_recheck()
         recovery.set_repair_scope(repair_scope(ws))
         read_budget = repair_reads.observe([], recovery.state.get('native_repairs', {}),
@@ -5445,15 +6712,15 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             # Required independent monetary review still uses its configured reviewer.
             deep_why = ''
         discovery = False
+        stalled_construction = ''
         if ws.staged:
             for st in steps[turn_steps:]:
                 discovery = discover(st, discovered_reads) or discovery
         if (ws.staged and ws.drafts) or any(
                 st.tool in {"bind_facts", "compile_table", "validate_parameters", "trial_run", "finish", "set_rules", "apply_repair"}
                 for st in steps[turn_steps:]):
-            frontier = ws.blocker_frontier()
-            stagnant = progress_watch.observe(frontier, discovery=discovery and not read_budget['active'],
-                                               compile_report=current_compile_report(), fact_names=(f.name for f in ws.facts))
+            stagnant = progress_watch.observe_workspace(ws, discovery=discovery and not read_budget['active'],
+                                                        compile_report=current_compile_report())
             frontier = progress_watch.previous  # includes unresolved objects masked by incomplete checks
             if discovery and not read_budget['active']:
                 quiet = 0
@@ -5462,6 +6729,7 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
             recovery.save()
             if stagnant >= 2 and frontier:
                 progress_reason = f"连续 {stagnant + 1} 次检查没有消除既有问题；工具返回成功不代表有进展。" + "；".join(sorted(frontier)[:3])
+                stalled_construction = progress_reason
                 deep_why = '' if recovery.native_guidance or read_budget['active'] else progress_reason
                 ws.notes["纠错进度"] = (progress_reason + ('。当前明确动作：' + ws._flow().hint() if ws.staged and not ws.results else
                                       "。先做局部参数预检；金额问题用 review_calculation 定位，"
@@ -5481,6 +6749,27 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         if read_budget['active']:
             deep_why = ''  # the existing program counterexample needs a bounded repair, not another advisor
         recovery.save()
+        repair = apply_model_repair(recovery.error or construction_stop(construction) or stalled_construction, steps[turn_steps:])
+        if repair is None and supervisor:
+            from bonus_agent.supervision import planning_focus
+
+            rejected_plan = bool(stalled_construction and any(st.tool == 'plan_formula_tasks' and not st.ok for st in model_steps))
+            if gap := planning_focus(ws, construction, rejected=rejected_plan):
+                repair = apply_supervision(construction['message'], steps[turn_steps:], focus=gap)
+        if repair:
+            deep_why = ''
+            if repair.get('saved'):
+                if error := run_budget.check(llm) or recovery.error:
+                    break
+                automatic_recheck()
+                progress_watch.observe_workspace(ws, discovery=True, compile_report=current_compile_report())
+                recovery.state['progress'] = {'previous': sorted(progress_watch.previous), 'stagnant': progress_watch.stagnant,
+                                              'reads': sorted(discovered_reads), 'compile': progress_watch.compile_state}
+                recovery.save()
+                repeats, stuck, last_write = 0, '', None
+                for tracker in (fails, fail_why, fail_issues, seen, again, rereads):
+                    tracker.clear()
+                continue
         if skipped and skipped == len(calls) and not rechecked:
             # 整轮都是被拦下的重复调用：不把它留在历史里，否则小模型会照着历史接着重复；只留一句说明
             del history[turn_start:]
@@ -5564,15 +6853,29 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                      + "。请把这条信息反馈给开发，或在对话里告诉智能体怎么处理")
             break
     else:
-        if not error and not any(st.ok and st.tool in WRITE_TOOLS for st in steps):
-            # 整轮只读、没有任何写入：自动接续只会把同样的读取再做一遍（不以“达到最大步数”开头，retryable 不接续）
-            error = f"本轮没有进展（只读取，没有任何写入），不自动接续；达到最大步数 {max_steps} 仍未完成"
-        if not error and ws.staged and progress_watch.previous and progress_watch.stagnant >= 2:
-            error = '本轮结束时仍未消除既有校验问题，不自动接续；先修复：' + '；'.join(sorted(progress_watch.previous)[:3])
-        error = error or f"达到最大步数 {max_steps} 仍未完成"
+        if not ws.done:
+            if not error and max_steps == 0 and steps:
+                error = '程序接续已保存；其他阶段尚未完成：' + (steps[-1].result if not steps[-1].ok else ws.next_hint())
+            if not error and not any(st.ok and (st.tool in WRITE_TOOLS or st.args.get('tool') == 'model_repair'
+                                               or st.args.get('saved') and (st.args.get('automatic')
+                                                                            or st.args.get('tool') == 'model_supervision'))
+                                     for st in steps):
+                # 整轮只读、没有任何写入：同一任务不自动重试。
+                error = f"本轮没有进展（只读取，没有任何写入），不自动接续；达到最大步数 {max_steps} 仍未完成"
+            if not error and ws.staged and progress_watch.previous and progress_watch.stagnant >= 2:
+                error = '本轮结束时仍未消除既有校验问题，不自动接续；先修复：' + '；'.join(sorted(progress_watch.previous)[:3])
+            error = error or f"达到最大步数 {max_steps} 仍未完成"
 
     if run_budget.error:
         error, ws.done = run_budget.error, False
+    elif error and error == recovery.error and recovery.state.get('read_budget_halt') and ws.pending:
+        ids = '、'.join(q.id for q in ws.pending)
+        message_wait = f'等待财务答复 {ids}。本轮已停止纠错：{error}'
+        ws.summary = message_wait
+        steps.append(Step("（等答复）", {}, message_wait, True))
+        if on_step:
+            on_step(len(steps), steps[-1])
+        ws.done, error = True, ""
     if error and error.startswith(("纠错预算耗尽", "智能体卡住了")) and not ws.pending:
         # 卡住了不能只说“需要补充材料、明确答复”：把卡点变成一个具体问题（问什么、选项、怎么答）交给财务，
         # 本轮按“等答复”结束。答复会进入纠错记录的上下文，卡住记录随之清除，下一轮接着做。
@@ -5580,8 +6883,10 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         from bonus_agent import stuck_question
         asked = stuck_question.build(ws, llm, error, steps)
         if asked:
-            q = Question(id=_next_qid(ws.questions), text=asked["text"] + (f"\n（为什么问：{asked['why']}）" if asked.get("why") else ""),
-                         options=asked["options"], blocking=True, round=ws.round)
+            details = asked.get('diagnosis', {})
+            text = asked['text'] + (f"\n（为什么问：{asked['why']}）" if asked.get('why') and not details else '')
+            q = Question(id=_next_qid(ws.questions), text=text, options=asked['options'], blocking=True, round=ws.round,
+                         diagnosis=details)
             ws.questions.append(q)
             steps.append(Step("（向财务提问）", {}, f"卡在：{error[:400]}\n已改为向财务提问 {q.id}：{q.text}", True))
             if on_step:
@@ -5627,7 +6932,8 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
         rnd["inputs"] = [str(f) for f in ws.data_files]
         rnd['source_inputs'] = [{'name':f.name,'path':str(f),'hash':cs.sha256(f)} for f in ws.inv.files]
         rnd["outputs"] = {k: [p.name, cs.sha256(p)] for k, p in ar.outputs.items()
-                          if k in ("mapping", "rules", "review") or k.startswith(("rules:", "adjust:"))}
+                          if k in ("mapping", "rules", "review", "excel", "results", "engine_results")
+                          or k.startswith(("rules:", "adjust:", "excel:"))}
         if message:
             rnd["message"] = {"by": ws.chat_by, "text": message}
         rnd.update(status=ar.status, error=error, usage=ar.usage, pending=[q.id for q in ws.pending], summary=ws.summary,
@@ -5637,40 +6943,59 @@ def _run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = N
                    digest=cs.digest(tested) if tested else (last or {}).get("digest"))
         case = case or {"created": rnd["at"], "rounds": []}
         case["rounds"].append(rnd)
-        case["workspace"] = cs.snapshot(ws)
+        focus = None
+        if error and ws.staged and ws._flow().stage()[0] == 3:
+            from bonus_agent.construction import TaskBoard
+
+            try:
+                board = TaskBoard(ws)
+                focus = board.summary(statuses=board.statuses(with_confidence=False)).get('active')
+            except (ToolError, ValueError, KeyError):
+                pass
+        case['workspace'] = cs.snapshot(ws)
+        if error:
+            ar.failure_context = failure.stop_diagnosis(error, case['workspace'], focus)
+            rnd['failure_context'] = ar.failure_context
         ar.outputs["case"] = cs.save_case(out, case)
         cs.archive(out, rnd["n"], ar.outputs)
     return ar
 
 
 def run_agent(llm: LLM, paths: list[str | Path], out_dir: str | Path | None = None, **kw) -> AgentResult:
-    """处理一轮（参数见 _run_agent）。处理期间在输出目录放一份“正在处理中，请勿修改”的提示，结束或出错后删除。"""
-    notice = Path(out_dir) / cs.PROCESSING_NOTICE if out_dir is not None else None
-    if notice is not None:
-        notice.parent.mkdir(parents=True, exist_ok=True)
-        notice.write_text(
-            f"智能体正在处理本案卷（开始于 {time.strftime('%Y-%m-%d %H:%M:%S')}）。\n\n"
-            "处理结束前请勿修改、替换或删除：\n"
-            "- 本目录里的任何文件（规则、映射、结果、案卷记录）；\n"
-            "- 本次使用的材料文件。\n"
-            "需要补充或更正材料，请等本轮结束（本文件消失）后再上传，下一轮会自动比对变化。\n",
-            encoding="utf-8")
+    """Serialize writers to the same case across Web workers and CLI processes."""
+    out = Path(out_dir) if out_dir is not None else None
     try:
-        return _run_agent(llm, paths, out_dir, **kw)
-    finally:
-        if notice is not None:
-            notice.unlink(missing_ok=True)
+        with cs.case_lock(out):
+            notice = out / cs.PROCESSING_NOTICE if out is not None else None
+            if notice is not None:
+                notice.write_text(
+                    f"智能体正在处理本案卷（开始于 {time.strftime('%Y-%m-%d %H:%M:%S')}）。\n\n"
+                    "处理结束前请勿修改、替换或删除：\n"
+                    "- 本目录里的任何文件（规则、映射、结果、案卷记录）；\n"
+                    "- 本次使用的材料文件。\n"
+                    "需要补充或更正材料，请等本轮结束（本文件消失）后再上传，下一轮会自动比对变化。\n",
+                    encoding="utf-8")
+            try:
+                from bonus_agent.commission_chain import uses_fixed,run_chain
+                if uses_fixed(kw.get('scenario'),out,kw.get('resume',True)):
+                    return run_chain(llm,paths,out,**kw)
+                return _run_agent(llm, paths, out, **kw)
+            finally:
+                if notice is not None:
+                    notice.unlink(missing_ok=True)
+    except cs.CaseBusyError as exc:
+        raise ToolError(str(exc)) from exc
 
 
-def _said(chat: list[dict] | None, message: str | None, instruction: str | None) -> str:
-    """财务在对话里发过的全部文字（去重，按时间），作为可引用的来源「财务对话」。"""
-    out: list[str] = []
+def _said(chat: list[dict] | None, message: str | None, instruction: str | None, *, previous: str = '') -> str:
+    """Extend the saved source with financial messages in arrival order."""
+    out = previous
     for t in [m.get("text", "") for m in chat or [] if m.get("role") == "user"
                                        and not str(m.get("text", "")).startswith("上传了期望结果")] + [message or "", instruction or ""]:
         t = str(t).strip()
-        if t and t not in out:
-            out.append(t)
-    return "\n\n".join(out)
+        if t and ("\n\n" + t + "\n\n") not in ("\n\n" + out + "\n\n"):
+            out = "\n\n".join(part for part in (out, t) if part)
+    return out
 
 
 def _chat_task(ws: Workspace, message: str, chat: list[dict] | None, fresh: list[Question],
@@ -5697,7 +7022,8 @@ def _chat_task(ws: Workspace, message: str, chat: list[dict] | None, fresh: list
 
 
 def _resume_task(ws: Workspace, last: dict | None, changes: dict | None, fresh: list[Question],
-                 withdrawn: list[Question] = ()) -> str:
+                 withdrawn: list[Question] = (), *, data_repair=None, question_reviews=(), resolved_table_stop=False) -> str:
+    from bonus_agent.recovery import unacknowledged_read_timeout
     n = ws.round
     lines = [f"这是同一笔奖金的第 {n} 轮处理（上一轮状态：{(last or {}).get('status', '未知')}）。上一轮的数据表、列映射、规则、"
              "笔记和问题都已恢复到工作区（见工作区状态），没有变化的材料不必重读。", "", "本轮变化："]
@@ -5711,7 +7037,20 @@ def _resume_task(ws: Workspace, last: dict | None, changes: dict | None, fresh: 
         lines.append("- 程序撤回的问题（冲突所依据的材料已修改，请按新内容重新登记参数）：" + "；".join(q.id for q in withdrawn))
     if not fresh and not any((changes or {}).values()):
         lines.append("- 没有新答复，也没有文件变化")
-    if last and last.get("status") == "FAILED" and last.get("error"):
+    if data_repair:
+        lines.append(f"- 上轮建表阻断已经由程序复验并关闭。当前生效的编号字段 {data_repair['key']} "
+                     f"取合成列 {data_repair['combine']}，{data_repair['entities']} 个「{data_repair['dataset']}」"
+                     f"已完整关联 {data_repair['detail_rows']} 行「{data_repair['source']}」。保持此映射，"
+                     "按材料清单继续建立尚缺的表和来源，然后运行 prepare_data。")
+    elif resolved_table_stop:
+        lines.append('- 上轮的参数表停止记录已通过当前原件和任务复验。按工作区当前的未完成任务继续。')
+    elif question_reviews:
+        lines.append('- 本轮已完成待办的独立问题复核：' + '、'.join(f'{qid} {status}' for qid, status in question_reviews)
+                     + '。以当前工作区的阶段回执和待答问题为准，继续办理下一步。')
+    elif last and unacknowledged_read_timeout(((last.get('usage') or {}).get('budget') or {}).get('request_failure')):
+        lines.append('- 上轮的模型请求等待响应超时。使用已保存的工作区回执继续当前待办；'
+                     '未返回的模型候选仍须提交并验证。')
+    elif last and last.get("status") == "FAILED" and last.get("error"):
         lines += ["", "上一轮没做完，停在这里（这一轮先针对这个原因换做法，不要原样重复上一轮的写法）：",
                   "  " + str(last["error"])[:600]] + [f"  · {t}" for t in _lessons(str(last["error"]))]
     if ws.pending:
@@ -5789,6 +7128,8 @@ def _dup_names(headers: list[str]) -> dict[str, str]:
 
 
 _EXCLUDE = re.compile(r"不参与|不计算|不计入|不纳入|不核算|不计提|不算作|不统计|剔除|排除")
+_REFERENCE_ABSENT = re.compile(r"未(?:能)?匹配|对不上|找不到|未关联|(?:匹配|关联)不到|无法(?:匹配|关联)|"
+                               r"(?:主表|主数据|主名单|销售单|核算范围)(?:里|内|中)?(?:没有|不存在)")
 
 
 def _broken_exprs(rss) -> list[tuple[str, str]]:
@@ -5828,28 +7169,32 @@ def _resolve_dup_columns(st, fields, combine, unpivot, filter):
                   for k, d in fields.items()}
     if isinstance(combine, dict):
         combine = {k: [fix(c) for c in v] if isinstance(v, list) else v for k, v in combine.items()}
-    if isinstance(unpivot, dict) and isinstance(unpivot.get("columns"), list):
-        unpivot = {**unpivot, "columns": [fix(c) for c in unpivot["columns"]]}
+    if isinstance(unpivot, dict):
+        try:
+            unpivot = rename_unpivot_columns(unpivot, fix)
+        except ToolError as exc:
+            raise ToolError(f'unpivot.columns：{exc}') from None
     if isinstance(filter, dict):
         filter = {fix(k): v for k, v in filter.items()}
-    if isinstance(unpivot, dict):
-        if unpivot.get('share_from'):
-            unpivot = {**unpivot, 'share_from':fix(unpivot['share_from'])}
-        if unpivot.get('share_from_columns'):
-            unpivot = {**unpivot, 'share_from_columns':[fix(c) for c in unpivot['share_from_columns']]}
     return fields, combine, unpivot, filter
 
 
-def _combine_spec(spec, st) -> dict[str, list[str]]:
-    """校验 define_dataset 的 combine：{"新列名": ["列1", "列2", ...]}，几列合成一个编号（如项目 = 月份+客户+型号）。"""
+def _combine_spec(spec, st, fields=None) -> dict[str, list[str]]:
+    """Resolve unambiguous field aliases and persist only original source columns."""
     if not isinstance(spec, dict) or not spec or not all(isinstance(v, list) for v in spec.values()):
         raise ToolError('combine 的格式是 {"新列名": ["列1", "列2"]}，几列合成一个编号列，fields 里用新列名')
+    fields = fields if isinstance(fields, dict) else {}
+    source_columns = {
+        field: definition['column'] for field, definition in fields.items()
+        if isinstance(definition, dict) and isinstance(definition.get('column'), str) and definition['column'] in st.headers
+    }
     out = {}
     for name, cols in spec.items():
         name, cols = str(name).strip(), [str(c).strip() for c in cols]
+        cols = [col if col in st.headers else source_columns.get(col, col) for col in cols]
         bad = [c for c in cols if c not in st.headers]
         if len(cols) < 2 or bad:
-            raise ToolError((f"combine 的列「{'、'.join(bad)}」不在表头中，可选：{[h for h in st.headers if h]}" if bad
+            raise ToolError((f"combine 的列「{'、'.join(bad)}」不在表头中，也未通过 fields 绑定到原始单列。可选：{[h for h in st.headers if h]}" if bad
                              else "combine 至少要写 2 列"))
         if not name or name in st.headers:
             raise ToolError(f"combine 的新列名「{name}」和表里已有的列重名，换一个")
@@ -5862,19 +7207,29 @@ def _unpivot_spec(spec, st) -> dict:
     if not isinstance(spec, dict) or not isinstance(spec.get("columns"), list) or not spec.get("value"):
         raise ToolError('unpivot 的格式是 {"columns": ["列1", "列2"], "value": "展开后的列名", "label": "记原列名的列名（可选）"}')
     cols = [str(c).strip() for c in spec["columns"]]
+    share = str(spec.get('share') or '').strip()
+    share_from = str(spec.get("share_from") or "").strip()
+    try:
+        split_columns = normalize_unpivot_split_columns(spec.get('split_shares_columns'), columns=cols, share=share)
+        separate = normalize_unpivot_share_columns(
+            spec.get('share_columns'), columns=cols, headers=st.headers, share=share, split_columns=split_columns,
+            text_columns=(spec.get('share_from_columns') or cols) if share_from else ())
+    except ValueError as exc:
+        raise ToolError(str(exc)) from None
     bad = [c for c in cols if c not in st.headers]
-    if len(cols) < 2 or bad:
+    if bad or (len(cols) < 2 and not (split_columns or separate)):
         raise ToolError((f"unpivot 的列「{'、'.join(bad)}」不在表头中，可选：{[h for h in st.headers if h]}" if bad
                          else "unpivot 至少要写 2 列"))
     if len(set(cols)) != len(cols) or any(st.headers.count(c) > 1 for c in cols):
         raise ToolError("unpivot 的列名重复，或表头里有同名的几列，没法区分；先用 header_rows 指定表头或换列")
     value, label = str(spec["value"]).strip(), str(spec.get("label") or "").strip()
-    share, remainder = str(spec.get("share") or "").strip(), str(spec.get("remainder") or "").strip()
+    remainder = str(spec.get("remainder") or "").strip()
     blank = str(spec.get("blank") or "").strip()
-    share_from = str(spec.get("share_from") or "").strip()
-    unknown = sorted(set(spec) - {"columns", "value", "label", "share", "remainder", "blank", "share_from", "blank_except", "share_from_columns", "default_share"})
+    allowed = {"columns", "value", "label", "share", "remainder", "blank", "share_from", "blank_except",
+               "share_from_columns", "default_share", "split_shares_columns", "share_columns"}
+    unknown = sorted(set(spec) - allowed)
     if unknown:
-        raise ToolError(f"unpivot 不认识 {unknown}，可以写的是 columns、value、label、share、remainder、blank、share_from、blank_except、share_from_columns、default_share")
+        raise ToolError(f"unpivot 不认识 {unknown}，可以写的是 {'、'.join(sorted(allowed))}")
     default = {}
     if 'default_share' in spec:
         from bonus_core.data.table_detect import normalize_unpivot_default_share
@@ -5886,7 +7241,7 @@ def _unpivot_spec(spec, st) -> dict:
     if not share_from:
         # 名单里同一角色几个人、各人比例写在另一列的文字里（如“甲80%，乙20%”），展开时没用上这一列：会按平分或全额算错到人
         from bonus_core.data.table_detect import parse_shares, split_name_share
-        idx = [st.headers.index(c) for c in cols]
+        idx = [st.headers.index(c) for c in cols if c not in split_columns and c not in separate]
         for j, h in enumerate(st.headers):
             if not h or h in cols:
                 continue
@@ -5912,7 +7267,7 @@ def _unpivot_spec(spec, st) -> dict:
         sfc = [str(c) for c in (spec.get("share_from_columns") or cols)]
         if [c for c in sfc if c not in cols]:
             raise ToolError("unpivot 的 share_from_columns 要是 columns 里的列")
-        idx = [st.headers.index(c) for c in sfc]
+        idx = [st.headers.index(c) for c in sfc if c not in split_columns]
         sf = st.headers.index(share_from)
         bad = []
         for _, v in st.rows:
@@ -5933,8 +7288,9 @@ def _unpivot_spec(spec, st) -> dict:
     if share and not remainder:
         # T2：名单里写了比例但不足 100%，余下的部分没单列，奖金池按覆盖比例缩小，这部分钱直接没了
         from bonus_core.data.table_detect import split_name_share
-        idx = [st.headers.index(c) for c in cols]
+        idx = [st.headers.index(c) for c in cols if c not in split_columns]
         short = [str(v[i]) for _, v in st.rows for i in idx if i < len(v) and v[i] not in (None, "")
+                 and str(v[i]).count('%') + str(v[i]).count('％') <= 1
                  for _, pct in [split_name_share(v[i])] if pct is not None and pct < 1]
         if short:
             raise ToolError(f"unpivot 有 {len(short)} 格比例不足 100%（如「{short[0]}」），余下的部分不能丢：写 remainder"
@@ -5949,7 +7305,9 @@ def _unpivot_spec(spec, st) -> dict:
             **({"remainder": remainder} if remainder else {}), **({"blank": blank} if blank else {}),
             **({"share_from": share_from} if share_from else {}),
             **({"blank_except": [str(c) for c in spec["blank_except"]]} if spec.get("blank_except") else {}),
-            **({"share_from_columns": [str(c) for c in spec["share_from_columns"]]} if spec.get("share_from_columns") else {}), **default}
+            **({"share_from_columns": [str(c) for c in spec["share_from_columns"]]} if spec.get("share_from_columns") else {}),
+            **({"split_shares_columns": split_columns} if split_columns else {}),
+            **({"share_columns": separate} if separate else {}), **default}
 
 
 def _code_version() -> str:
@@ -6085,6 +7443,9 @@ def _deep_reason(turn: list[Step], skipped: int, ws: Workspace, fails: dict[str,
             continue  # Partial native batches retain valid cells and identify exact rejections; no paid guessing.
         if not st.ok and st.tool == 'define_dataset' and fails.get(st.tool, 0) < 2:
             continue
+        if (not st.ok and st.tool == 'plan_formula_tasks'
+                and st.result.startswith(('错误：construction.source', '错误：construction.name_clash'))):
+            continue  # Exact identifiers and collisions can be corrected from the program feedback.
         if (not st.ok and fails.get(st.tool, 0) < 2
                 and ((st.tool == 'plan_formula_tasks' and 'construction.plan' in st.result)
                      or (st.tool == 'update_dataset' and 'unmatched_basis' in st.result))):
@@ -6230,7 +7591,8 @@ def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None =
                     detail.append([s, '奖金池', n, v['raw'], v['amount']])
                 for report,rows in b['details'].items():
                     for n, v in rows.items():
-                        detail.append([s, report, n, v['amount'], v['amount']])
+                        trace = b.get('traces', {}).get(detail_trace_id(n, report), {})
+                        detail.append([s, report, n, trace.get('value'), v['amount']])
                 for key, t in b.get('traces', {}).items():
                     trace_sheet.append([s, key, t['expr'], t['rendered'], t['value'], '\n'.join(t['rows'])])
             paths['basis']=out/'总额预核算.xlsx';wb.save(paths['basis']);wb.close()
@@ -6296,28 +7658,40 @@ def write_agent_outputs(ar: AgentResult, out: Path, answers: list[dict] | None =
             paths["pending"] = out / "待确认问题.xlsx"
             wb.save(paths["pending"])
         return paths
-    paths["review"] = rv.write(ws, out, ar.results)  # 口径单：财务逐条确认后才能确认结果（确认记录按内容保留，见 review.py）
-    paths["results"] = out / "results.json"      # 全部金额的明细（应得、暂缓、抵扣、超发、实发），便于程序逐分核对
+    ar.recheck = "；".join(_recheck(ar, paths, name, rev) for name, revs in ar.results.items() for rev in revs)
+    with TemporaryDirectory(prefix='.results-', dir=out) as pending:
+        prepared = _write_amount_files(ar, Path(pending), qrows)
+        paths['review'] = rv.write(ws, out, ar.results)
+        published = {}
+        try:
+            for key, source in prepared.items():
+                published[key] = source.replace(out / source.name)
+        except OSError:
+            for target in published.values():
+                target.unlink(missing_ok=True)
+            raise
+        paths.update(published)
+    return paths
+
+
+def _write_amount_files(ar: AgentResult, out: Path, qrows: list[dict]) -> dict[str, Path]:
+    paths = {'results': out / 'results.json', 'engine_results': out / 'engine_results.json'}
     paths["results"].write_text(json.dumps(_results_json(ar.results), ensure_ascii=False, indent=1), encoding="utf-8")
-    paths["engine_results"] = out / "engine_results.json"
     paths["engine_results"].write_text(json.dumps(
         {name: {rev: result.to_dict() for rev, result in revisions.items()}
          for name, revisions in ar.results.items()}, ensure_ascii=False, indent=1), encoding="utf-8")
-    ar.recheck = "；".join(_recheck(ar, paths, name, rev) for name, revs in ar.results.items() for rev in revs)
-    if ar.single:
-        paths["excel"] = out / "result.xlsx"
-        write_excel(ar.ruleset, ar.result, paths["excel"], extra_sheets=_sheets(ar, qrows))
-        return paths
+    explicit_people_only = ar.ws.report_required
     if len(ar.results) == 1 and list(next(iter(ar.results.values()))) == ["R0"]:     # 一个方案、没有修订：只出一份结果
         name = next(iter(ar.results))
         paths["excel"] = out / "result.xlsx"
-        write_excel(ar.rulesets[name], ar.results[name]["R0"], paths["excel"], extra_sheets=_sheets(ar, qrows))
+        write_excel(ar.rulesets[name], ar.results[name]["R0"], paths["excel"], extra_sheets=_sheets(ar, qrows),
+                    explicit_people_only=explicit_people_only)
         return paths
     for name, revs in ar.results.items():
         for rev, res in revs.items():
             k = f"excel:{name}:{rev}"
             paths[k] = out / (f"result_{_safe(name)}.xlsx" if rev == "R0" else f"result_{_safe(name)}_{_safe(rev)}.xlsx")
-            write_excel(ar.rulesets[name], res, paths[k])
+            write_excel(ar.rulesets[name], res, paths[k], explicit_people_only=explicit_people_only)
     paths["excel"] = out / "result.xlsx"
     _overview(ar, qrows, paths["excel"])
     return paths
@@ -6333,6 +7707,8 @@ def _results_json(results: dict) -> dict:
             for nid, n in r.nodes.items():
                 if n.key:
                     objs[nid] = {"层级": n.level, "名称": n.label, "应得": n.final}
+                    if nid in r.funding:
+                        objs[nid]["可分配资金"] = r.funding[nid]
             for nid, p in {**r.payouts, **r.rollups}.items():
                 objs.setdefault(nid, {"名称": getattr(p, "label", ""), "应得": p.final})
                 objs[nid].update({"暂缓": p.held, "可发上限": p.cap or p.final, "已发抵扣": p.offset,
@@ -6348,9 +7724,10 @@ def _safe(s: str) -> str:
 def _overview(ar: AgentResult, qrows: list[dict], path: Path):
     """多个方案 / 修订时的总览：每个对象一行，每个方案（修订）一列。修订是同一方案的不同版本，不能相加。"""
     import openpyxl
-    from bonus_core.report.excel import MONEY, _sheet
+    from bonus_core.report.excel import MONEY, _sheet, add_consolidated_reports, check_report_sheets
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
+    expected = add_consolidated_reports(wb, ar.results) if ar.ws.report_required else {}
     cols = [(n, r) for n, revs in ar.results.items() for r in revs]
     heads = [n if r == "R0" else f"{n} {r}" for n, r in cols]
     rows, seen = [], set()
@@ -6376,10 +7753,12 @@ def _overview(ar: AgentResult, qrows: list[dict], path: Path):
                 if isinstance(c.value, float):
                     c.number_format = MONEY
     wb.save(path)
+    if expected:
+        check_report_sheets(path, expected)
 
 
 def _recheck(ar: AgentResult, paths: dict[str, Path], name: str, rev: str) -> str:
-    """从写出的规则、映射（和调整）文件重新读入并重算，逐个对象核对金额，证明结果只来自引擎、可复算。"""
+    """Recompute every financial view from the files before publishing results."""
     from bonus_core.data.mapping import load_mapping
     label = "" if ar.single else f"{name}{'' if rev == 'R0' else ' ' + rev}："
     want = ar.results[name][rev]
@@ -6391,13 +7770,21 @@ def _recheck(ar: AgentResult, paths: dict[str, Path], name: str, rev: str) -> st
             adj = [Adjustment(**a) for a in yaml.safe_load(paths[f"adjust:{name}:{rev}"].read_text(encoding="utf-8"))]
         refs = {f"{s}/{r}": res for s, revs in ar.results.items() for r, res in revs.items() if s != name}
         again = compute(rs, data, adj, refs=refs, period=ar.ws.period)
-    except Exception as e:  # 复算失败要如实写进结果，不能当作通过
-        return f"{label}复算失败：{e}"
-    diff = [i for i, n in want.nodes.items() if i not in again.nodes or again.nodes[i].final != n.final]
-    if again.pool != want.pool or diff:
-        return f"{label}复算不一致：奖金池 {again.pool} / {want.pool}，不一致的对象 {diff[:10]}"
+        raw_agrees = again.detail_raw_amounts() == want.detail_raw_amounts()
+    except Exception as e:
+        raise ToolError(f"{label}使用导出的规则、映射和调整复算失败。{e}") from e
+    expected = cs.financial_digest({name: {rev: want}})[name][rev]
+    actual = cs.financial_digest({name: {rev: again}})[name][rev]
+    labels = {'nodes': '对象金额', 'payouts': '发放金额', 'rollups': '汇总发放',
+              'people': '人员及待分配', 'totals': '汇总', 'details': '明细',
+              'rounding': '舍入对账', 'pool': '奖金池', 'pool_exact': '舍入前奖金池'}
+    diff = [labels[key] for key in expected if expected[key] != actual[key]]
+    if not raw_agrees:
+        diff.append('明细原值')
+    if diff:
+        raise ToolError(f"{label}复算未通过，金额有差异的部分为{'、'.join(diff)}")
     files = "rules.yaml + mapping.yaml" if ar.single else f"规则、映射{'和调整' if rev != 'R0' else ''}文件"
-    return f"{label}一致：按 {files} 重新计算，奖金池和 {len(again.nodes)} 个对象的金额逐分相同"
+    return f"{label}一致。按 {files} 复算了奖金池、{len(again.nodes)} 个对象和全部报表金额"
 
 
 def _sheets(ar: AgentResult, qrows: list[dict]):

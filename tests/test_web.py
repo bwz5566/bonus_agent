@@ -16,7 +16,30 @@ from tests.test_conflicts import CLAUSES, DATASET, F5, F6, _materials, rules  # 
 PW = "password-123"
 
 
-def test_staged_total_confirmation_requires_role_csrf_and_current_digest(env,monkeypatch):
+def test_scheme_scoped_confirmation_requires_current_global_opinion_and_matching_receipts():
+    from bonus_agent.recovery import fingerprint
+    from bonus_agent.web import pending_basis_confirmations
+
+    basis = {'pool': '50.00'}
+    digest = fingerprint(basis)
+    opinion = {'status': 'PASS', 'basis_digest': digest}
+    reference = {'version': 'global', 'spec_state': 'valid', 'report': dict(opinion)}
+    flow = {'enabled': True, 'waiting': 'S', 'basis': {'S': basis}, 'view_basis_version': 'global',
+            'references': {'S': reference}, 'receipts': {
+                'basis:S': {'version': 'scheme', 'payload': {'digest': digest}},
+                'review:S': {'version': 'scheme', 'payload': dict(opinion)}}}
+    record = {'rounds': [{'status': 'AWAITING_TOTAL_CONFIRMATION'}], 'workspace': {'workflow': flow}}
+    assert list(pending_basis_confirmations(record)) == [('S', basis, digest)]
+    for obj, field in ((reference, 'version'), (reference, 'spec_state'), (reference['report'], 'basis_digest'),
+                       (flow, 'waiting'), (flow['receipts']['basis:S'], 'version'), (record['rounds'][0], 'status')):
+        original = obj[field]
+        obj[field] = 'stale'
+        assert list(pending_basis_confirmations(record)) == []
+        obj[field] = original
+
+
+@pytest.mark.parametrize('saved_wait', [False, True])
+def test_staged_total_confirmation_requires_role_csrf_and_current_digest(env, monkeypatch, saved_wait):
     from tests.test_staged_workflow import make_workspace,reviewed,save_staged_case
     from bonus_agent.recovery import fingerprint
     from bonus_agent import case
@@ -27,6 +50,19 @@ def test_staged_total_confirmation_requires_role_csrf_and_current_digest(env,mon
     save_staged_case(ws,out)
     url=f'/cases/{cid}/confirm-totals'
     args={'scheme':'S','digest':fingerprint(ws.workflow['basis']['S'])}
+    if saved_wait:
+        record = case.load_case(out)
+        flow = record['workspace']['workflow']
+        flow['view_version'] = ws._flow().version()
+        flow.pop('view_basis_version')
+        flow['waiting'] = 'S'
+        assert flow['view_version'] != flow['receipts']['review:S']['version']
+        payload = flow['receipts']['review:S']['payload']
+        payload['basis_digest'] = 'stale'
+        case.save_case(out, record)
+        assert '确认本版本总额并继续人员分配' not in as_(c, 'bob').get(f'/cases/{cid}').text
+        payload['basis_digest'] = args['digest']
+        case.save_case(out, record)
     assert post(c,store,url,args,user='alice').status_code==403
     as_(c,'bob')
     assert c.post(url,data={**args,'csrf':'invalid'}).status_code==403
@@ -37,8 +73,12 @@ def test_staged_total_confirmation_requires_role_csrf_and_current_digest(env,mon
     starts=[]
     monkeypatch.setattr(app.state.runner,'start',lambda *a,**k:starts.append((a,k)))
     assert post(c,store,url,args,user='bob').status_code==303
+    assert post(c,store,url,args,user='bob').status_code==303
     assert len(starts)==1
-    assert case.load_case(out)['workspace']['workflow']['receipts']['approved:S']['payload']['by']=='李经理'
+    saved = case.load_case(out)
+    assert saved['workspace']['workflow']['receipts']['approved:S']['payload']['by']=='李经理'
+    assert len(saved['total_confirmations']) == 1
+    assert sum(entry['action'] == '确认核算总额' for entry in store.audit_log(cid)) == 1
 
 
 @pytest.fixture
@@ -77,6 +117,101 @@ def post(c, store, url, data=None, files=None, user="alice"):
 def wait(app, cid):
     app.state.runner.jobs[cid].thread.join(30)
     return app.state.runner.jobs[cid]
+
+
+def test_question_display_uses_the_latest_batch_effect(env):
+    from bonus_agent.case import save_case
+
+    _, store, _, client, _ = env
+    cid = store.create('未触发事项', 'alice')
+    out = store.dir(cid) / 'out'
+    out.mkdir(exist_ok=True)
+    (out / 'questions.yaml').write_text(yaml.safe_dump([{'id': 'q1', 'text': '端点归属待定'}]), encoding='utf-8')
+    scope = {'question': 'identity', 'scheme': 'S'}
+    workflow = {'view_basis_version': 'v1', 'applicability_questions': {'q1': scope},
+                'batch_question_effects': {'q1': {**scope, 'version': 'v1', 'evidence': {'reason': '当前没有端点命中'}}}}
+    rnd = {'n': 1, 'status': 'NEEDS_CONFIRMATION', 'pending': []}
+    record = {'rounds': [rnd], 'workspace': {'workflow': workflow}}
+    for version, pending, inactive in [('v1', [], True), ('v2', [], False), ('v1', ['q1'], False)]:
+        workflow['view_basis_version'], rnd['pending'] = version, pending
+        save_case(out, record)
+        page = as_(client, 'alice').get(f'/cases/{cid}').text
+        assert ('本期未触发' in page) == inactive
+        assert ('当前没有端点命中' in page) == inactive
+        assert ('等待答复' in page) != inactive
+
+
+def test_exhausted_model_budget_stays_in_place_after_web_restart(tmp_path, monkeypatch):
+    from bonus_agent.case import load_case, save_case
+    from bonus_agent.llm import LLM
+
+    requests = []
+    monkeypatch.setattr('bonus_agent.llm.openai_client', lambda *args: requests.append(args))
+
+    def llm():
+        return LLM('mock', 'mock', 'https://example.invalid/v1', 'not-a-key')
+
+    app = create_app(tmp_path, llm, max_tokens=150)
+    store = app.state.store
+    store.users.add('alice', PW, ['editor'])
+    cid = store.create('旧案卷', 'alice')
+    d = store.dir(cid)
+    (d / 'materials' / 'policy.txt').write_text('提成奖按核算规则执行。', encoding='utf-8')
+    saved = {'rounds': [{'n': 1, 'status': 'FAILED', 'usage': {'prompt_tokens': 130, 'completion_tokens': 20}}]}
+    save_case(d / 'out', saved)
+
+    for new in (False, True):
+        if new:
+            app = create_app(tmp_path, llm, max_tokens=150)
+        client = TestClient(app)
+        client.sids = {}
+        assert post(client, app.state.store, f'/cases/{cid}/run', {'new': str(int(new))}).status_code == 303
+        job = wait(app, cid)
+        assert job.status == 'failed' and '案卷累计 tokens 用量 150 达到总上限 150' in job.message
+        assert load_case(d / 'out') == saved
+    assert not requests
+
+
+def test_unlimited_case_tokens_preserve_the_ledger_and_other_cases(tmp_path):
+    import json
+
+    from bonus_agent.case import load_case, save_case
+    from bonus_agent.web import Store
+
+    store = Store(tmp_path)
+    store.users.add('alice', PW, ['editor'])
+    selected = store.create('解除上限的案卷', 'alice')
+    ordinary = store.create('普通案卷', 'alice')
+    ledger = {'version': 1, 'actual_used_tokens': 150, 'unconfirmed_reserved_tokens': 19, 'inflight_reserved_tokens': 0}
+    saved = {'rounds': [{'n': 1, 'status': 'FAILED', 'usage': {'prompt_tokens': 130, 'completion_tokens': 20}}]}
+    for cid in (selected, ordinary):
+        d = store.dir(cid)
+        (d / 'materials' / 'policy.txt').write_text('按季度实际金额核算。', encoding='utf-8')
+        (d / '.model_budget').mkdir()
+        (d / '.model_budget' / 'usage.json').write_text(json.dumps(ledger), encoding='utf-8')
+        save_case(d / 'out', saved)
+
+    app = create_app(tmp_path, lambda: FakeLLM([]), max_steps=0, max_tokens=150,
+                     unlimited_case_tokens=[selected])
+    client = TestClient(app)
+    client.sids = {}
+    note = '本案卷当前不设累计 token 上限'
+    assert note in as_(client, 'alice').get(f'/cases/{selected}').text
+    assert note not in client.get(f'/cases/{ordinary}').text
+    for cid in (selected, selected, ordinary):
+        assert post(client, store, f'/cases/{cid}/run').status_code == 303
+        wait(app, cid)
+
+    continued = load_case(store.dir(selected) / 'out')['rounds'][1:]
+    assert len(continued) >= 2
+    for rnd in continued:
+        budget = rnd['usage']['budget']
+        assert budget['max_tokens'] is None and budget['remaining_tokens'] is None
+        assert budget['actual_used_tokens'] == 150 and budget['unconfirmed_reserved_tokens'] == 19
+    other = app.state.runner.jobs[ordinary]
+    assert other.status == 'failed' and '达到总上限 150' in other.message
+    assert load_case(store.dir(ordinary) / 'out') == saved
+    assert json.loads((store.dir(selected) / '.model_budget' / 'usage.json').read_text(encoding='utf-8')) == ledger
 
 
 def test_web_rounds_confirm_and_template(env):

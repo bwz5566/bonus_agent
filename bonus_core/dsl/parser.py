@@ -205,6 +205,38 @@ def _parens(src: str, upto: int) -> tuple[list[tuple[int, bool]], int, int]:
     return stack, extra, depth
 
 
+def repair_unclosed_parenthesis(src: str) -> str | None:
+    """Insert one missing ')' only if all valid placements produce the same AST."""
+    from bonus_core.dsl.functions import FUNCTIONS
+
+    _, extra, depth = _parens(src, len(src))
+    if depth != 1 or extra >= 0:
+        return None
+    try:
+        tokens = list(_parser.lex(src))
+    except LarkError:
+        return None
+    chosen = None
+    chosen_ast = None
+    for pos in (len(src), *(token.end_pos for token in reversed(tokens) if token.end_pos < len(src))):
+        candidate = src[:pos] + ')' + src[pos:]
+        try:
+            ast = parse(candidate)
+        except ExprError:
+            continue
+        if any(node.fn not in FUNCTIONS
+               or not FUNCTIONS[node.fn].min_args <= len(node.args) <= FUNCTIONS[node.fn].max_args
+               or not node.kw().keys() <= FUNCTIONS[node.fn].kwargs
+               or len(node.kwargs) != len(node.kw())
+               for node in walk(ast) if isinstance(node, Call)):
+            continue
+        if chosen is None:
+            chosen, chosen_ast = candidate, ast
+        elif ast != chosen_ast:
+            return None
+    return chosen
+
+
 def _why(src: str, e: Exception) -> str:
     """把语法分析器的报错换成能照着改的话：出错位置（▲）、括号配没配对、常见的不支持写法。
     长表达式不再整段回显，只给出错位置前后一段。"""

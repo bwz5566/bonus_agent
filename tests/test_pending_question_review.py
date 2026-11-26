@@ -28,6 +28,24 @@ def opinion(**changes):
                        'evidence': EVIDENCE, **changes}, ensure_ascii=False)
 
 
+@pytest.mark.parametrize('resolve', [True, False])
+def test_question_raised_from_disputed_amount_gets_one_source_review(tmp_path, resolve):
+    ws = setup(tmp_path, opinion() if resolve else opinion(decision='keep', kind='unresolved'))
+    ws.workflow.update(enabled=True, references={'S': {'spec_state': 'amount_difference'}})
+    ws.questions.clear()
+    ws._source_skip = True
+    receipts = copy.deepcopy(ws.workflow['receipts'])
+    text = '全年项目没有本期日期，是否全部视为新项目？'
+    result = ws.ask_question(text, related='S.variables.当期项目', evidence=EVIDENCE)
+    q = ws.questions[0]
+    assert bool(q.withdrawn) is resolve and bool(ws.pending) is not resolve
+    assert not q.answer and not q.answered_by and ws.workflow['receipts'] == receipts
+    assert len(ws.llm.checker_llm.calls) == 1
+    again = ws.ask_question(text, related=q.related, evidence=EVIDENCE)
+    assert len(ws.questions) == 1 and len(ws.llm.checker_llm.calls) == 1
+    assert q.id in result and q.id in again
+
+
 def test_withdrawal_keeps_original_question_and_never_writes_answer_or_approval(tmp_path):
     ws = setup(tmp_path, opinion())
     receipts = copy.deepcopy(ws.workflow['receipts'])
@@ -124,6 +142,7 @@ def test_formula_or_description_changes_do_not_buy_another_opinion(tmp_path):
 
 def test_complete_rule_tail_is_present_and_overlong_quotes_are_rejected(tmp_path):
     ws = setup(tmp_path, opinion(decision='keep', kind='unresolved', reason='文末有相反条款'))
+    ws.llm.checker_llm.max_input_tokens = 120000
     tail = '重要限定：历史项目是否另行补发尚未确认，须先由财务批准。'
     (tmp_path / '规则.txt').write_text(RULE + '\n' + '说明文字。' * 12500 + '\n' + tail, encoding='utf8')
     # Inventory is refreshed as a normal run would do after source changes.

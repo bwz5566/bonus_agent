@@ -12,6 +12,63 @@ import json
 import re
 
 OTHER = "其他（请直接写明应该怎么处理）"
+UNIT_RELATED = "原表单元格单位/"
+
+
+def cell_unit_key(ws, fact):
+    from bonus_agent.recovery import fingerprint
+    loc = fact.source_cell or {}
+    return UNIT_RELATED + fingerprint([fact.file, ws._source_version.get(fact.file), fact.page,
+                                        *[loc.get(k, 1) for k in ('table', 'row', 'column', 'line')]])
+
+
+def cell_unit_question(ws, facts, result):
+    """Ask about a real bare cell only after checking the other rules and finance answers."""
+    from bonus_agent import facts as fx
+    from bonus_agent.source_cells import parameter_cell
+    from pathlib import Path
+
+    for match in re.finditer(r'第 (\d+) 条「[^\n]*?」未登记：parameter\.unit：quote须有明确单位表头', result):
+        index = int(match[1]) - 1
+        if not 0 <= index < len(facts):
+            continue
+        fact = fx.Fact.model_validate(facts[index])  # this row already passed fact schema validation
+        if (not fact.source_cell or not fact.unit or fact.component != 'literal' or fx.numeric(fact) is None
+                or Path(fact.file).suffix.lower() != '.pptx'):
+            continue
+        try:
+            cell = parameter_cell(ws._file(fact.file), fact.page, **fact.source_cell)
+        except (TypeError, ValueError, KeyError):
+            continue  # wrong coordinates still belong to the program/model
+        if fx.norm(fact.value) != fx.norm(cell['value']) or fx.number(fact.value) is None:
+            continue
+        corpus = ws._corpus()
+        if fact.page not in ws._quote_pages(fact.quote, ws._page_texts(fact.file)):
+            continue
+        quotes = ws._unit_evidence_quotes()
+        for unit in ('%', '‰', '元', '万', '万元', '亿', '亿元'):
+            proposed = fact.model_copy(update={'unit': unit, 'unit_basis': None})
+            native = proposed.model_copy(update={'quote': cell['quote']})
+            if not fx.check_fact(native, corpus) or ws._unit_proof_options(proposed, corpus, quotes):
+                break
+        else:
+            key = cell_unit_key(ws, fact)
+            if any(q.related == key and not q.withdrawn for q in ws.questions):
+                continue
+            number = format(fx.numeric(fact).normalize(), 'f')
+            row, column = cell['labels']
+            quote = cell['selected']
+            return {
+                'related': key,
+                'text': f'《{fact.file}》第 {fact.page} 页表 {fact.source_cell["table"]} 的「{row}」行、「{column}」列'
+                        f'写作「{quote}」。这项数值按什么单位参与计算？',
+                'options': [f'「{fact.name}」的单位为 {fact.unit}，{fact.value} 按 {number} 参与计算',
+                            f'「{fact.name}」直接用原值 {fact.value} 参与计算', OTHER],
+                'evidence': [{'file': fact.file, 'page': fact.page, 'source_cell': dict(fact.source_cell),
+                              'source_hash': ws._source_version[fact.file], 'quote': quote, 'ok': True,
+                              'requested_unit': fact.unit, 'fact_name': fact.name, 'raw_value': fact.value}],
+            }
+    return None
 
 _PROGRAM = re.compile(r"没有工具|thought 不是工具|参数不是合法 JSON|参数结构不对|参数不对|参数必须是 JSON|"
                       r"上下文|tokens 用量|总时间上限|object has no attribute|not subscriptable|NoneType|"
@@ -19,7 +76,9 @@ _PROGRAM = re.compile(r"没有工具|thought 不是工具|参数不是合法 JSO
                       # 智能体自己的流程没走完（没做独立验算、自查没走完、验算式写错），财务回答不了
                       r"独立验算还没|没有独立验算|结束前自查|条款清单还有没落实|验算式算不出来|验算式写错了|辅助变量|"
                       # 步骤顺序不对（前置阶段没过、表还没定义），是智能体自己的流程问题
-                      r"workflow\.gate|前置阶段|还没有定义|尚未定义|dataset\.patch|"
+                      r"workflow\.gate|前置阶段|还没有定义|尚未定义|dataset\.patch|unmatched_basis\.source|construction\.data_dependency|"
+                      r"\b(?:scope_bad|agg_unrelated|fn_arity)\b|"
+                      r"link_unmatched:[^\n]+被推断挂到|"
                       # 原样重复同一个调用（参数相同、定义没变）：是智能体自己在打转，不是材料没写清
                       r"参数相同|no-op|完全相同|反复提交相同|"
                       # 编译公式时自己的登记、绑定、报表声明没做完（参数没绑到规则位置、填的数和原文不一致）
@@ -47,7 +106,8 @@ def build(ws, llm, reason: str, steps) -> dict | None:
     """{text, options, why}；程序或模型自身的问题返回 None。"""
     if program_issue(reason):
         return None
-    return _known(ws, reason, steps) or _from_model(ws, llm, reason, steps) or _generic(reason)
+    return (_known(ws, reason, steps) or _from_model(ws, llm, reason, steps)
+            or (None if getattr(ws, 'staged', False) else _generic(reason)))
 
 
 def _column(ws, dataset: str, field: str, steps=()) -> str:
@@ -74,7 +134,9 @@ def _known(ws, reason: str, steps=()) -> dict | None:
                 "options": [f"合并：同一个「{k}」下的多个「{o}」视为同一个对象，一起计算",
                             f"分开：按「{o}」分别计算；只按「{k}」给的数据（如参考表）再按「{k}」对应过去",
                             OTHER],
-                "why": f"按「{k}」还是按「{o}」区分对象，会改变后面的汇总和金额"}
+                'diagnosis': {'item': f'「{table}」的核算对象', 'identified': f'「{sample}」的「{o}」有 {a} 和 {b}。',
+                              'missing': f'需明确同一「{k}」下不同的「{o}」是合并还是分别计算。',
+                              'impact': '决定后续汇总对象及各对象的金额。'}}
     m = re.search(r"(\S+?) 关联字段 (\S+?) 没有父实体", reason)
     if m:
         table, link = m.groups()
@@ -84,12 +146,16 @@ def _known(ws, reason: str, steps=()) -> dict | None:
         options += [f"对应到「{n}」（按「{_column(ws, n, key)}」），「{table}」的数据换算到这一层再用" for n, key in entities[:2]]
         return {"text": f"「{table}」是按「{col}」给的。计算时它应该对应到哪一层（每个{col}一份，还是对应到其他对象上）？",
                 "options": options + [OTHER],
-                "why": f"程序不知道「{table}」的每一行该用在哪个对象上，没法往下算"}
+                'diagnosis': {'item': f'「{table}」的核算范围', 'identified': f'数据已按「{col}」提供。',
+                              'missing': f'需确定「{col}」对应哪一层核算对象及关联字段。',
+                              'impact': '决定这张表的金额归到哪些对象。'}}
     m = re.search(r"「([^」]+)」[^\n]*?(?:主键|编号)[^\n]*?重复", reason)
     if m:
         return {"text": f"「{m.group(1)}」里有重复的编号。重复的行是录入错误，还是一个编号本来就对应多行（如一人参与多个项目）？",
                 "options": ["录入错误：同一编号只保留一行（请写明保留哪一行）", "本来就对应多行：同一编号的多行要合并计算", OTHER],
-                "why": "编号重复时不知道该按一个对象算还是按多行算"}
+                'diagnosis': {'item': f'「{m.group(1)}」的重复编号', 'identified': '同一编号出现在多行。',
+                              'missing': '需明确重复记录应保留哪些行，或是否按规则合并。',
+                              'impact': '决定哪些记录进入汇总及是否重复计入金额。'}}
     return None
 
 
@@ -97,11 +163,15 @@ PROMPT = """【卡住提问】奖金核算智能体在下面这一步卡住了�
 要求：
 - 只问业务口径（怎么算、按什么对应、哪些计入），用材料和表头里的原文说法；不要出现工具名、英文字段名、程序术语。
 - 给 2~4 个具体选项，每个选项写清选了以后会怎么算；最后一个选项写“{other}”。
+- diagnosis 写涉及的方案、项目编号或指标，已核实的原文或单元格值，仍缺的具体口径或字段，以及对计算的影响。不要只写“无法判断”。
+- 不能从已有检查确认缺的是业务口径时，不向财务提问。不得把取数或公式报错改写成“材料没写”。
 - 如果卡住原因是程序或模型自身的问题（调用格式、内部错误），program_issue 填 true，其余留空。
-只输出 JSON：{{"program_issue": false, "question": "...", "options": ["...", "..."], "why": "一句话：为什么要问这个"}}"""
+只输出 JSON：{{"program_issue": false, "question": "...", "options": ["...", "..."], "diagnosis": {{"item": "...", "identified": "...", "missing": "...", "impact": "..."}}}}"""
 
 
 def _from_model(ws, llm, reason: str, steps) -> dict | None:
+    from bonus_agent.failure import question_diagnosis
+
     recent = [{"tool": s.tool, "ok": s.ok, "thought": (s.thought or "")[:200], "result": (s.result or "")[:300]}
               for s in list(steps)[-8:]]
     data = {n: {"key": d.key, "link": d.link,
@@ -119,9 +189,12 @@ def _from_model(ws, llm, reason: str, steps) -> dict | None:
     text, options = str(out.get("question") or "").strip(), [str(x).strip() for x in out.get("options") or [] if str(x).strip()]
     if len(text) < 8 or not 2 <= len(options) <= 5 or re.search(r"[a-z]+_[a-z]+|\b(?:dataset|update_|define_)", text):
         return None
+    details = question_diagnosis(out.get('diagnosis'))
+    if details is None and getattr(ws, 'staged', False):
+        return None
     if not any(o.startswith("其他") for o in options):
         options.append(OTHER)
-    return {"text": text, "options": options[:5], "why": str(out.get("why") or "").strip()[:200]}
+    return {"text": text, "options": options[:5], "diagnosis": details or {}, "why": str(out.get("why") or "").strip()[:200]}
 
 
 def _generic(reason: str) -> dict:
@@ -129,4 +202,4 @@ def _generic(reason: str) -> dict:
     where = where.strip()[:200]
     return {"text": f"智能体在这一步拿不准该怎么处理：{where}。材料里这一点是怎么规定的？",
             "options": ["按材料原文处理（请在答复里写明是哪份材料、哪一句）", OTHER],
-            "why": "这一步材料没写清，智能体反复尝试都没通过程序检查"}
+            "why": "该项程序校验未通过，需要核对对应材料及计算口径。"}

@@ -65,6 +65,29 @@ def test_existing_pool_task_changes_preserve_formula_and_verified_sources(tmp_pa
     assert not ws.llm.calls
 
 
+def test_local_pool_repair_keeps_negative_policy_and_the_upstream_source(tmp_path):
+    quote = '退货记录为负数时照算，保留负奖金。'
+
+    def refund(book):
+        book['projects']['B2'] = -100
+
+    ws = make_workspace(tmp_path, mutate_workbook=refund, policy_tail='\n' + quote)
+    ws.record_clauses([{'file': 'policy.md', 'quote': quote, 'point': '保留退货负奖金'}])
+    clause = next(c.id for c in ws.clauses if c.quote == quote)
+    assert ws.prepare_data()['status'] == 'PASS'
+    ws.plan_formula_tasks([{'id': 'refund', 'scheme': 'S', 'target': '/variables/refund_amount', 'clauses': [clause]},
+                           {'id': 'pool-task', 'scheme': 'S', 'target': '/pool'}])
+    assert ws.submit_formula_task('refund', value={'scope': '项目', 'expr': 'amount'})['status'] == 'PASS'
+    result = ws.submit_formula_task('pool-task', changes={'expr': 'refund_amount * 0.1'})
+    assert result['status'] == 'FAIL' and not result['saved']
+    repair = result['execution']['repair']
+    assert repair['policy']['target'] == '/pool/negative'
+    assert repair['policy']['actual_policy'] == 'block'
+    assert repair['policy_sources'] == [{'id': clause, 'file': 'policy.md', 'quote': quote}]
+    assert any('submit_formula_task' in instruction for instruction in repair['guidance'])
+    assert ws._ruleset('S').pool.negative == 'block' and not ws.results
+
+
 def test_focus_exposes_negative_policy_but_allow_does_not_approve_a_wrong_amount(tmp_path):
     ws = make_workspace(tmp_path)
     pool = copy.deepcopy(ws.drafts['S']['pool'])

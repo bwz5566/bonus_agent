@@ -6,8 +6,8 @@ import yaml
 
 from bonus_agent import review as rv
 from bonus_agent.agent import run_agent
-from bonus_agent.case import (PROCESSING_NOTICE, TEMPLATE_NOTICE, ConfirmError, confirm, confirm_options, fingerprint,
-                              load_case)
+from bonus_agent.case import (PROCESSING_NOTICE, TEMPLATE_NOTICE, ConfirmError, check_template, confirm,
+                              confirm_options, fingerprint, load_case)
 from bonus_agent.llm import FakeLLM
 from bonus_core.data.files import DuplicateFileName
 from bonus_core.template import Template
@@ -36,6 +36,10 @@ def test_confirm_asks_which_adjustments_to_save_and_template_says_do_not_edit(ca
         confirm(case_dir, "财务甲")                              # 不默认把人工调整带进以后每一期
     with pytest.raises(ConfirmError, match="没有这些修订"):
         confirm(case_dir, "财务甲", revisions=["QUARTER/R9"])
+    saved = load_case(case_dir)
+    checked = check_template(case_dir, revisions=[])
+    assert checked["status"] == "PASS" and checked["revisions"] == ["QUARTER/R2"]
+    assert not (case_dir / "template").exists() and load_case(case_dir) == saved
     tpl = confirm(case_dir, "财务甲", revisions=[])            # 只录入必须的 R2
     m = yaml.safe_load((tpl / "manifest.yaml").read_text(encoding="utf-8"))
     quarter = next(s for s in m["schemes"] if s["name"] == "QUARTER")

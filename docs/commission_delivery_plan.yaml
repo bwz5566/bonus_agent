@@ -1,0 +1,325 @@
+version: 1
+status: IN_PROGRESS
+goal: 财务从正式入口提交本批材料，取得可分配总额、每个人的应分金额及逐项对账依据。材料不足时给出受影响的项目、原因、待补证据和可核定范围。
+start: source_coverage
+acceptance_plan: docs/commission_acceptance.yaml
+workflow: docs/staged_workflow.md
+indicator_architecture: docs/indicator_reliability_plan.md
+current_focus:
+  case: T21
+  checkpoint: T21 第 37 轮正式案卷 OK。沿第 26 轮已确认资金完成分配，导出项目核算、人员核算及案卷汇总三份 Excel，逐项核对后封存。
+  personnel_reconciliation: 62 个项目的金额与 1112 底稿逐项一致。已用项目引擎复核 324 条份额，19 人合计 91905.70 元，待分配 42835.31 元，舍入尾差 0.01 元。28 个项目的 Q 列为空，底稿引用客户经理 1，按本次已确认口径将相应份额列入待分配。
+  personnel_confirmation: 用户已确认 q2「按现有名单分配，无例外」，仅适用于 T21。继续执行原 q1，实名和个人份额只认名单实际 Q 列依据，空角色份额和 NPD 分别记录。已确认项目资金的原审批指纹不变。
+  local_repairs: 已确认资金的人员复核可提交带原文的业务问题，程序逐字核对后登记。材料或期间变更时旧问题和答复须重新核对。新增答复进入人员核算，资金方案按自身输入、期间及审批版本核验。资金承接逐项目验证实名原值与待分配之和。终检按同版已确认资金逐对象复验旧独立声明，模型只重建待核方案。T21 的终检请求正文离线测得由 81547 字节降至 60207 字节。
+  scoped_answer_resume: 真实 T21 的 13 份材料指纹未变，新执行版本在副本第 32 轮仍停在未答复的 q2，原总额确认及用量账本不变，零外部请求，无正式金额文件。模拟财务答复用例走 Web 和 CLI 共用入口，自动分别重验基础与完整分配公式，沿用项目确认，再完成逐人独立复核、样本验算、正式 Excel 导出和回读。149 项相关离线检查通过。
+  settlement_scope_resume: q2 答复后仅可复用同一材料、期间、取数结构和复核路由下已逐项复验的范围声明。独立复核在金额请求中明确确认新答复不改变范围时，少发一次取数请求；否则重查取数。T21 第 32 轮用真实原表预检两路首个请求，164 项相关离线检查通过。
+  metered_settlement_handoff: 已从第 32 轮检查点接收真实 q2，沿第 26 轮原确认、13 份授权原件和既有累计账本继续。真实 Pro 第 36 轮保存独立金额公式。针对实际地域名称和 Q 列名称的定向复核确认同一公式结构和原件，独立结论由程序逐项复算。
+  t21_comparison_ready: 正式 Excel 回读与引擎 705 项对账一致。与 1112 原底稿的 4 项总额及 248 项逐项目金额一致。48 个客户经理角色原值对应人不同但金额一致，28 个有金额，合计 11601.96 元；8 人的全部金额差异均由 Q 列为空的份额归入待分配解释。
+  validation_origin: 项目引擎计算，复用真实 DeepSeek Pro 独立声明，第 37 轮 488 项全量金额、36 项独立样本、397 项数值证据绑定和程序校验全部通过。本地复核了 4 条程序提示并提交依据，重新核对 2 条报表条款，最终结案未新增模型请求。修复条款阅读标记触发复核过期的问题。冻结版本冷启动和独立批次仍待验收。
+  verified_template_replay: 使用 T21 第 37 轮封存的规则、映射和原轮 10 份 Excel 数据调用 Template.verify 和 Template.run，基础金额和完整金额指纹均与原轮一致。62 个项目可分配 134741.02 元，19 人应分 91905.70 元。离线复算零模型请求。当前为可复算候选，T21 口径单仍待最终确认，本地销售提成场景未配置发布验收用例及已发布规则版本。
+  web_authoring_status: 同材料自测案卷 6c956449058c 第 4 轮通过数据准备，停在 T19 阶梯公式，四轮服务日志合计记录 13811787 tokens。第 4 轮副本已验证自动补验阶梯表和拦截漏用新老项目分类及地区误配的公式。按原文补齐后 62 个项目阶梯金额逐项对齐。新案卷从原始材料完成正式导出仍须独立验收。
+  template_check_entry: template-check 已从正式 CLI 复算 T21 第 37 轮。核对 13 份来源材料及两套金额基线，候选指纹 bc92125514b9e694d6c5cab3494261d8c000f2d0535c21d6aaa64d8f589c6f6b。候选检查与确认模板共享复算逻辑。
+  web_case_budget: 网页案卷导入历史轮次已报告用量，发请求前落盘预留额度，返回后结算。并发写入用案卷账本锁串行，服务重启或点击从头开始会恢复原累计用量。历史统计以案卷已记录的用量为准。
+  early_reference_validation: 新数据门禁在无分配层级时也检查实际关联。重放自测案卷第 4 轮后，数据准备识别出 48 个项目和 13 个客户被误挂到客户预算参考表。已封存 T21 的参考表和分组结构通过同一门禁。
+  t22_2_budget_repair: 自测案卷 01d2c565276c 的一次续跑因 Windows 拒绝替换恢复文件而中断，第 2 轮在区域达成任务停止。跨文件同一组合键的旧冲突自动撤回并留存答复。恢复日志使用原子替换和有界重试。真实案卷副本经正式续跑入口零模型调用恢复区域任务，5 个区域的系数与封存结果一致。用实物制度表编译客户档位后，正常公式提交入口修复客户预算的同名关联键，14 个客户的系数逐项一致。T22-2 的后续核算与正式人员导出待验证。
+  t22_2_coefficient_dependency: 第 3 轮的自动修复通过 T10，随后停在 T11。已有 5 个客户系数来源格，公式引用的系数表未生成，公式阶段原先不开放编表工具。恢复时从唯一匹配的完整原格行编制并检查系数表，再联合提交映射和公式。用第 3 轮归档从正式入口离线通过 T11 及前置表，5 个区域和 14 个客户的系数均与封存结果一致。T12 所需本年累计金额已在同指纹历史数据表核实覆盖 1 至 9 月，月平均出货及正式导出待核算。
+  t22_2_formula_data_preflight: 第 4 轮引用了未定义累计表，诊断建议替换为仅含当月的销售单。任务现可先登记数据集、字段、窗口和关联键。正式续跑在模型请求前发现并复核历史候选，用真实当期 14 个分组对账后绑定累计表，再验证公式。第 4 轮副本零模型调用通过 T12，14 个客户月平均及 T10、T11 的系数与封存结果逐项一致。另验证不同期间与表头、拒绝仅当月的来源、历史金额冲突及无证据变化时避免重复处理。T22-2 下一项为 T15 毛利系数，整案总额和人员导出待核算。
+  t22_2_local_formula_handoff: 第 5 轮实跑自动通过 T12，三张毛利系数表编译通过，T15 公式尚未提交时下一模型请求因剩余额度不足而停止。程序现可从已核原格确认各档适用对象，绑定空毛利率口径、已核项目分类及系数表，再联合提交公式。制度明写的条件算式可绑定已核实际销售字段和原文常量后直接编译。第 5 轮副本经正式入口零模型调用连续通过 T15 和 T06，62 个项目两项数值逐项一致。下一项为 T16 库存系数，整案总额和人员导出待核算。
+  evidence: analysis/commission_execution_202609/T21_goal_1000w/settlement-ef5b560b42197f89/formal-case/result.xlsx
+  online_delivery: 按冻结版本和有效预算从本批原材料走正式流程；以该版本的财务确认、人员输出、逐项对账及独立批次记录验收。
+execution_evidence:
+  t21_metered_validation: analysis/commission_execution_202609/T21_goal_1000w/deepseek_usage.json
+  t21_resume: analysis/commission_execution_202609/T21_goal_1000w/resume
+  t21_project_reconciliation: analysis/commission_execution_202609/T21_goal_1000w/第18轮_项目和基础指标逐项对账.json
+  t21_review_scope_replay: analysis/commission_execution_202609/T21_goal_1000w/第18轮_复核声明离线复现.json
+  t21_review_scope_candidates: analysis/commission_execution_202609/T21_goal_1000w/第19轮_复核范围候选对照.json
+  t21_review_final_scope_replay: analysis/commission_execution_202609/T21_goal_1000w/第21轮_独立复核末段完整回放.json
+  t21_review_formula_field_evidence: analysis/commission_execution_202609/T21_goal_1000w/第22轮_独立公式字段证据.json
+  t21_review_independent_formula: analysis/commission_execution_202609/T21_goal_1000w/第24轮_独立公式逐项目验证.json
+  t21_report_binding_replay: analysis/commission_execution_202609/T21_goal_1000w/第25轮_报表绑定修复回放.json
+  t21_reconciled_people: analysis/commission_execution_202609/T21_goal_1000w/T21_人员分配核算及底稿对账.xlsx
+  t21_reconciled_people_receipt: analysis/commission_execution_202609/T21_goal_1000w/T21_人员分配核算及底稿对账.json
+  t21_live_personnel_plan: analysis/commission_execution_202609/T21_goal_1000w/resume-review-27-1a3c1bcfb1595b06/agent_log.json
+  t21_confirmed_personnel_plan_replay: analysis/commission_execution_202609/T21_goal_1000w/resume-reviewed-basis-eupabj55/approved-plan-replay.json
+  t21_scoped_roster_replay: analysis/commission_execution_202609/T21_goal_1000w/resume-reviewed-basis-eupabj55/scoped-roster-acceptance.json
+  t21_confirmed_personnel_plan_checkpoint: analysis/commission_execution_202609/T21_goal_1000w/resume-reviewed-basis-eupabj55/case.json
+  t21_native_personnel_replay: analysis/commission_execution_202609/T21_goal_1000w/checked-personnel-7i_fj3je/native-personnel-0e3fe81f09ac/replay.json
+  t21_native_personnel_draft: analysis/commission_execution_202609/T21_goal_1000w/checked-personnel-7i_fj3je/native-personnel-0e3fe81f09ac/草稿结果（待正式独立复核）.xlsx
+  t21_native_formal_gate: analysis/commission_execution_202609/T21_goal_1000w/native-personnel-reviewed-funding-e1kdkcyy/formal-gate.json
+  t21_personnel_policy_scope: analysis/commission_execution_202609/T21_goal_1000w/personnel-basis-review-7m0i0y75/personnel-policy-scope-audit.json
+  t21_personnel_exception_workbook: analysis/commission_execution_202609/T21_goal_1000w/personnel-basis-review-7m0i0y75/T21_销售负责人直接负责例外核对.xlsx
+  t21_personnel_conditional_pro_arithmetic: analysis/commission_execution_202609/T21_goal_1000w/personnel-independent-draft-arithmetic-bj8px9mi/arithmetic-proof.json
+  t21_personnel_scoped_wait: analysis/commission_execution_202609/T21_goal_1000w/personnel-awaiting-business-decision-d4fvjuv4/scoped-wait-proof.json
+  t21_personnel_automatic_route_and_terminal_review_scope: analysis/commission_execution_202609/T21_goal_1000w/personnel-wait-automatic-route-dbr0fzd3/automatic-route-verification.json
+  t21_recompile_pending_answer_replay: analysis/commission_execution_202609/T21_goal_1000w/recompile-wait-verification-4m90f_eh/wait-verification.json
+  t21_settlement_scope_probe: analysis/commission_execution_202609/T21_goal_1000w/settlement-scope-probe-dn9q1cwc/scope-probe.json
+  t21_metered_settlement_handoff: analysis/commission_execution_202609/T21_goal_1000w/metered-handoff-proof-t2k8ynhq/handoff-verification.json
+  t21_formal_comparison_layout: analysis/commission_execution_202609/T21_goal_1000w/reconciliation-layout.json
+  t21_comparison_reference: analysis/commission_execution_202609/T21_goal_1000w/reconciliation-reference.json
+  t21_draft_comparison_proof: analysis/commission_execution_202609/T21_goal_1000w/official-adapter-proof-4oo875zt/draft-adapter-proof.json
+  t21_comparison_readback_proof: analysis/commission_execution_202609/T21_goal_1000w/official-adapter-proof-4oo875zt/readback-validation.json
+  t21_customer_manager_comparison_attribution: analysis/commission_execution_202609/T21_goal_1000w/official-adapter-proof-4oo875zt/q_blank_attribution.json
+  t21_roster_confirmation: analysis/commission_execution_202609/T21_goal_1000w/q2-user-confirmation.json
+  t21_pro_binding_confirmation: analysis/commission_execution_202609/T21_goal_1000w/settlement-ef5b560b42197f89/narrow-review/response.json
+  t21_round_37_validation: analysis/commission_execution_202609/T21_goal_1000w/settlement-ef5b560b42197f89/case/validation.json
+  t21_formal_validation: analysis/commission_execution_202609/T21_goal_1000w/settlement-ef5b560b42197f89/formal-case/validation.json
+  t21_manual_finish_evidence: analysis/commission_execution_202609/T21_goal_1000w/settlement-ef5b560b42197f89/formal-case/manual-finish-evidence.json
+  t21_formal_excel_readback: analysis/commission_execution_202609/T21_goal_1000w/settlement-ef5b560b42197f89/formal-case/reconciliation-1112/excel_readback.json
+  t21_formal_reference_comparison: analysis/commission_execution_202609/T21_goal_1000w/settlement-ef5b560b42197f89/formal-case/reconciliation-1112/comparison.json
+  t21_validation_package: analysis/commission_execution_202609/T21_goal_1000w/validation-package/f28d5e2b879a/package-verification.json
+  source_coverage: analysis/commission_execution_202609/delivery/t20_source_coverage.json
+  september_first_resume: analysis/commission_execution_202609/delivery/t20_live
+  september_formula_replay: analysis/commission_execution_202609/delivery/t20_1_scope_replay.json
+  september_delivery:
+    online_resume: analysis/commission_execution_202609/delivery/t20_1_live
+    question_review: analysis/commission_execution_202609/delivery/t20_1_question_review_admitted/exit.json
+    project_comparison: analysis/commission_execution_202609/delivery/t20_1_amounts_corrected/candidate_project_comparison.json
+    basis_amounts: analysis/commission_execution_202609/delivery/t20_1_formal_basis/official_amounts.json
+    basis_review: analysis/commission_execution_202609/delivery/t20_1_basis_review_live
+    basis_review_retry: analysis/commission_execution_202609/delivery/t20_1_basis_review_retry
+    scope_citation_replay: analysis/commission_execution_202609/delivery/t20_1_scope_citation_fix/replay.json
+    basis_review_after_citation_fix: analysis/commission_execution_202609/delivery/t20_1_review_after_citation_fix
+    blank_value_replay: analysis/commission_execution_202609/delivery/t20_1_review_after_citation_fix/margin_scope_diagnostic.json
+    targeted_scope_preflight: analysis/commission_execution_202609/delivery/t20_1_targeted_scope_resume/preflight.json
+    targeted_scope_declaration: analysis/commission_execution_202609/delivery/t20_1_targeted_scope_resume/live_retry/scope_declaration.json
+    amount_review_preflight: analysis/commission_execution_202609/delivery/t20_1_amount_review_with_source_observations/preflight.json
+    truncated_amount_resume_preflight: analysis/commission_execution_202609/delivery/t20_1_amount_length_resume/preflight.json
+    tier_source_amount_preflight: analysis/commission_execution_202609/delivery/t20_1_amount_source_series/preflight.json
+    distribution_replay: analysis/commission_execution_202609/delivery/t20_1_distribution_probe.json
+    distribution_workflow_preflight: analysis/commission_execution_202609/delivery/t20_1_distribution_workflow_probe.json
+    independent_formula_replay: analysis/commission_execution_202609/delivery/t20_1_independent_technical_preflight.json
+    independent_review_pass: analysis/commission_execution_202609/delivery/t20_1_report_document_metadata/live/exit.json
+    finance_confirmation_ready: analysis/commission_execution_202609/delivery/t20_1_report_document_metadata/live/finance_review_ready.json
+    finance_resume_revalidation: analysis/commission_execution_202609/delivery/t20_1_ready_after_restart/resume_ready.json
+    finance_ready_on_current_export: analysis/commission_execution_202609/delivery/t20_1_ready_after_export_checks/revalidation.json
+    finance_ready_on_current_mapping: analysis/commission_execution_202609/delivery/t20_1_ready_after_stage_mapping/revalidation.json
+    finance_ready_on_current_workbook_checks: analysis/commission_execution_202609/delivery/t20_1_ready_after_excel_readback/revalidation.json
+    distribution_draft_complete: analysis/commission_execution_202609/delivery/t20_1_distribution_draft_report_complete/preflight.json
+    distribution_draft_reconciliation: analysis/commission_execution_202609/delivery/t20_1_distribution_draft_report_complete/reconciliation_layout_check.json
+    distribution_draft_live_review: analysis/commission_execution_202609/delivery/t20_1_complete_draft_independent_review/exit.json
+    distribution_draft_live_resume: analysis/commission_execution_202609/delivery/t20_1_complete_draft_independent_review/resume_after_invalid_shape/exit.json
+    distribution_draft_resume_after_protocol_fix: analysis/commission_execution_202609/delivery/t20_1_complete_draft_independent_review/ready_after_shape_resume/preflight.json
+    finance_ready_after_protocol_fix: analysis/commission_execution_202609/delivery/t20_1_ready_after_review_shape/revalidation.json
+    distribution_draft_scope_replay: analysis/commission_execution_202609/delivery/t20_1_complete_draft_independent_review/live_after_protocol_fix/regional_budget_scope_resume/clarification_ready.json
+    distribution_draft_regional_blank_reply: analysis/commission_execution_202609/delivery/t20_1_complete_draft_independent_review/live_after_protocol_fix/regional_budget_scope_resume/exit.json
+    distribution_draft_scope_decision: analysis/commission_execution_202609/delivery/t20_1_complete_draft_independent_review/live_after_protocol_fix/regional_budget_scope_resume/retry_structured_columns/regional_budget_scope_decision_ready.json
+    finance_ready_after_blank_amendment: analysis/commission_execution_202609/delivery/t20_1_ready_after_blank_amendment/revalidation.json
+    regional_budget_question_app: analysis/commission_execution_202609/delivery/t20_1_regional_budget_question_app/revalidation.json
+    finance_ready_after_evidence_wait: analysis/commission_execution_202609/delivery/t20_1_ready_after_evidence_wait/revalidation.json
+    regional_budget_answer_revalidation: analysis/commission_execution_202609/delivery/t20_1_wait_and_answer_resume/revalidation.json
+    finance_ready_after_scope_resume: analysis/commission_execution_202609/delivery/t20_1_ready_after_scope_resume/revalidation.json
+    current_distribution_draft_comparison: analysis/commission_execution_202609/delivery/t20_1_current_draft_reconciliation/comparison.json
+    current_distribution_draft_process_check: analysis/commission_execution_202609/delivery/t20_1_current_draft_reconciliation/process_check.json
+    finance_ready_after_dependent_restart: analysis/commission_execution_202609/delivery/t20_1_checked_after_dependent_restart/revalidation.json
+    regional_budget_scope_counterfactual: analysis/commission_execution_202609/delivery/t20_1_regional_budget_match_check/scope_check.json
+    regional_budget_scope_from_material: analysis/commission_execution_202609/delivery/t20_1_regional_budget_match_check/independent_scope_review/scope_resolution.json
+    regional_budget_resolved_case: analysis/commission_execution_202609/delivery/t20_1_regional_budget_match_check/source_resolved/preflight.json
+    regional_budget_continued_independent_review: analysis/commission_execution_202609/delivery/t20_1_regional_budget_match_check/continued_basis_review/exit.json
+    t20_1_project_population_replay: analysis/commission_execution_202609/delivery/t20_1_regional_budget_match_check/replayed_after_entity_population_fix/preflight.json
+    t20_1_all_population_scopes_verified: analysis/commission_execution_202609/delivery/t20_1_regional_budget_match_check/all_population_scopes_verified/preflight.json
+  independent_batch:
+    status: PAUSED
+    inventory: analysis/commission_execution_202609/delivery/holdout_202608_evidence.json
+baseline:
+  evidence: analysis/commission_execution_202609/t20_diagnostic.json
+  case: T20
+  period: '2026-09'
+  observed: 正式案卷停在第 4/9 阶段。四张已声明的数据表都来自销售文件。62 个项目已识别，36 个公式任务通过 0 个。
+  replay: 离线副本显式修正表名后取得 7 处原文绑定，任务转向新老项目和区域判定。真实模型的自主修复及后续人员导出仍待验证。
+  t20_1: 第 1 轮被后续报表读取预算提前终止，第 2 轮被区域预算的聚合范围阻断。正式工具的隔离复现已逐项查验 62 个项目的区域分类、5 个销售区域及 14 个客户的预算达成系数。
+  t20_1_basis: 修正原文绑定、期间和 ODM 毛利系数后，62 个项目的 248 项金额与 1112 原底稿逐项一致。正式引擎已计算本版基础金额。
+  t20_1_review: 已复核历史销售、分配名单和区域预算范围。项目范围两次引用了其他表的表头作为依据，达到本段尝试上限。总额确认和本案人员导出仍待完成。
+  t20_1_citation_replay: 使用真实销售表的表头及月份字段重放。错表引用返回所选表与被引表的位置；正确范围与 1,719 条销售明细和 62 个项目一致。旧回执重新验证时保留已纠正的条款归属，正式编译和可分配总额重算通过。
+  t20_1_blank_value_review: 新一轮独立复核通过了项目取数范围，随后发现毛利率参考表的 10 行空值差异，其中 4 个属于九月。原文规定空毛利率视同查不到，不能当作 0%。本地按原文重放的行集合已核对，独立意见和人员分配回执仍待完成。
+  t20_1_scope_resolution: 局部续跑保留四组独立范围声明。Pro 根据原始单元格核对空毛利率的处理，程序比较行集合通过。金额复核进一步附上真实挂接覆盖和 PPT 单元格证据。
+  t20_1_amount_transport: 上一次金额复核响应达到输出上限，服务报告实际用量 51,131 tokens。已复验五段范围记录，截断段的续试按服务上限提高输出额度，并继续保留真实用量。
+  t20_1_tier_source: 扩容后已取得完整模型声明。它对已排除的空毛利率仍有疑问，且合并了原表分列的客户和地区预算系数。已验证原表 17 条横向或纵向费率系列可由程序编译，独立复核可按原行列选用。奖金池先逐项目比较，再请求其余报表声明。
+  t20_1_formula_clarification: 独立稿已选中原表 17 条费率系列。程序核对端点归属、两处横表取列、年累计窗口及真实简称。两项 BIU 项目均为新项目，老项目读法差异对本期金额无影响。隔离重放逐项核对 62 笔奖金池，尚须记录独立复核回执。
+  t20_1_report_cache: 正式复算逐项目复用了模型的金额修订，经原文和源字段绑定客户简称的右括号。发现不同报表行共用计算追踪键，对象相同会误读前一项；改为按报表项、类型求值并通过差异回归。已保存九条独立报表式，可独立重验其技术与金额部分。
+  t20_1_finance_confirmation: 62 个项目、四项汇总和五项明细全部通过真正的独立复核。工作表标题以输出模块元数据解释。正式预核算表已回读核对，可分配总额 134741.02 元。案卷状态为 AWAITING_TOTAL_CONFIRMATION，待财务确认本版后进入正式人员分配和导出。
+  t20_1_resume_and_confirmation: 修复财务说明和完整报表要求在重启后丢失、离线确认重开已撤回问题，以及整轮存档前中断时丢失已完成复核分段。真实九月案卷用原复核配置重启，模型调用为零，金额和摘要一致。确认入口拒绝故意错误的摘要并保持原回执。隔离测试案卷经正常入口完成中断恢复、人员终检及 Excel 回读。
+  t20_1_export_preparation: 使用隔离数据走通项目资金、人员方案、两次测试确认和终检。主工作簿回读核对逐项目金额、按人舍入、待分配和负尾差。加入落盘后全金额视图比对，代表性反例在总奖金池保持一致时改动人员金额，正式发布应被拦截。
+  t20_1_stage_mapping: 在隔离用例复现分配比例缺列提前阻断总额、缺映射被误报为空单元格，以及人员列缺映射却编译通过。数据准备和总额计算统一按基础规则取数，分配编译检查人员列和权重映射。仅修正权重公式后可沿用同一基础金额确认。
+  t20_1_workbook_checks: 项目资金方案的汇总页保留本方案金额，人员汇总使用实际声明的人员。两个同总额、逐人金额对调的导出反例在主工作簿和分方案工作簿中均被回读核对拦截。隔离两阶段验收确认正式文件指纹写入案卷，修改主工作簿中的人员金额会被对账入口拒绝。
+  t20_1_distribution_draft: 用同一批 13 份材料在隔离草稿补齐逐项目暂扣明细，将各交付模块关联到报表位置。数据、基础编译和人员编译均通过，62 个项目四项金额逐笔与已复核预核算一致。草稿有不同的规则与取数版本，正式使用前需独立复核本版。
+  t20_1_distribution_draft_online: 核对当期 62 个销售项目均有首发日期。独立复核以原文撤回将历史项目计入本期的旧问题。随后第一个项目范围声明返回可解析的 JSON，但顶层字段协议未通过。两次实际请求 65495 tokens，续试因剩余时间低于配置下限在发出前停止。相同请求的首次失败和稍后续试机会已落盘。
+  t20_1_distribution_scope_replay: 真实第 2 次范围声明有两个数字零筛选，修正类型解析后重验同一回复。项目 62 个、全年原始明细 461 行和分配名单 262 行对齐。区域预算的唯一差异在第 8 行，区域标记为“(空白)”且 12 个月度指标为空。专项模型回复认为该行为占位，但未返回所需结构。补核接口允许仅提交空值列和原文依据，仍要求逐行核对结果。
+  t20_1_regional_budget_decision: 专项结构已通过协议，独立复核明确指出客户预算第 41 行的确认不涵盖区域预算第 8 行。现行案卷的同源独立声明在两方案草稿中重验为 6 行，与实际取数一致。另一个独立判断仍认为第 8 行的范围依据不足，已向用户提出仅针对这一行的业务确认。未写入范围或金额批准。
+  t20_1_evidence_wait: 在真实案卷副本复现，已保存的独立缺证结论会在正常续跑入口再次触发主模型。改为按输入和复核配置恢复等待状态。完整空值取数坐标经程序核对后生成正式待答复问题，新答复进入下一步核对。隔离回归覆盖同版零请求、问题去重和有效答复续跑。
+  t20_1_scope_answer_resume: 在真实副本复现区域答复重开首发日期问题和整段对话指纹使 24 条单位绑定过期。修复后正常入口在无新答复时保持原问题且零请求。仅在内存演练排除选项时，原单位绑定及已撤回旧问题保持有效，62 个项目合计仍为 134741.02 元。程序重新核对 6 条有效区域预算行并继续到下一组独立范围检查。真实案卷保留待答状态。
+  t20_1_distribution_reconciliation: 已登记草稿字段与正式输出位置。用已保存的诊断结构检查六类 601 个对账键及其唯一性，正式候选结果冻结后再运行参考侧取数。正式对账校验所用方案的基线摘要、独立复核和总额确认台账。
+  t20_1_distribution_replay: 使用哈希相同的 13 份材料和本版 62 笔项目金额，在隔离验收中复算 23 位人员。分配合计、NPD 待分配和舍入尾差闭合到项目总额。本案正式确认和发放工件仍须从工作流完成。
+  t20_1_current_draft_comparison: 用当前两套规则和映射直接从 13 份材料执行确定性引擎。冻结试算后读取原版 1112 底稿，六类 601 项金额一致，Excel 中 23 人及待分配项回读一致。实名应分 103507.66 元，NPD 待分配 31233.35 元，尾差 0.01 元。原底稿的应收首条匹配与双暂扣使用乘法分别通过原行和例子核对，本期金额未受影响。试算保留独立来源指纹，正式区域口径和分配基数均未确认。
+  t20_1_reconciliation_export_seal: 正式对账须验证本轮封存的结构化结果、主工作簿及指定分方案文件。隔离用例验证缺封存项或导出后金额被改动时均拒绝正式对账，完整封存可通过。历史回放在对账报告中标明用途。
+  dependent_basis_restart: 隔离两方案通过实际确认入口和正常续跑入口验证。下游已复核待确认时重启，保持原等待状态且不访问模型。修改上游暂缓比例后，原项目总额确认仍有效，下游旧复核失效。上游示例资金 30 元按 50% 暂缓后，下游资金重算为 15 元，须重新复核。正常确认后由原案卷接续人员试算，正式导出继续检查人员终检。
+  t20_1_regional_budget_material_resolution: 实际销售区域和原预算匹配规则说明第 8 行没有本期匹配键。临时写入 12 个数值并核对已读取该行，本期 601 项金额不变。改变可匹配预算行会影响项目和人员。专项 Pro 支持第 8 行不参与，但将第 5 行真实预算一并筛掉，程序拒收该范围声明，并重验此前独立声明保留六条真实预算。经原文复核在案卷副本登记材料出处和请求编号，原 24 条单位绑定保留，62 项项目基线重算保持 134741.02 元。正式金额确认仍待完成。
+  t20_1_project_population_replay: 续接真实独立复核时发现原检查用项目主表的全年 461 行核对本期 62 条实体来源。按引擎已启用的实体键核对原始物理行并保留有效重复，全年出货 461 行保留。接受范围标签完整且唯一的平铺 JSON 后仍执行原范围校验。原回复中的应收 6 行、销售 1719 行、项目 62 行复验通过。毛利复用同批已独立验证的来源声明，保留有效的 451 行。
+  t20_1_all_population_scopes_verified: 同一批原件的首发日期 62 行独立声明逐行复验通过。按当前程序从已保存案卷重验全部取数范围并定位到独立金额复核。专项范围一次和其余范围续跑三次共报告 125958 tokens。随后离线重放无新增用量，正式金额和人员终检仍待完成。
+  historical_result: 已核实规则包产生的九月工件有 601 项底稿核对记录。冷启动时只提供本批原材料和真实财务答复。项目数、人数、费率和历史金额只留在验收侧。
+
+execution:
+  architecture: 沿用 Web 和 CLI 共用的 run_agent、九阶段工作流、TaskBoard 和确定性核算引擎。把检查接入真实的准备、编译、计算、恢复及导出入口。
+  instructions: 按 tasks 的依赖选择第一个没有当前版本通过证据的任务。先用最小反例重现，再修正式入口，再验证反例、相邻正常用例及受影响的下游。已有且仍有效的能力直接复用。
+  journal: 每项记录运行编号、输入与规则版本、实际命令或入口、检查对象、期望、实测、状态、工件路径和下一动作。业务明细、参考底稿和运行记录放在本地案卷或验收目录。
+  runtime_identity: 锁定 Git 版本及工作区实现指纹、模型与提示配置、场景、材料哈希和财务答复。恢复时校验这些依赖。旧案卷缺新检查回执时补做对应检查，保留原始记录。
+  models:
+    program: 本地枚举材料与物理坐标、统计键和行数、验证绑定、按十进制计算、冻结和回读工件。
+    flash: 按当前规则读取原文片段，提交有来源的解释、映射或公式候选。每次提供当前目标、必要上下文和一个具体反例。
+    pro: 用于关键规则的独立语义复核和原文足够但解释仍冲突的判断。需要推理时按已配置策略开启深度思考。独立复核先依据原材料形成判断，再比较两方结论。
+    context: 长材料沿业务条款和原表拆分，保留页标题、多层表头、单位、脚注及跨页引用。响应截断时定位未完成分段并在额度内补取，已核验分段按版本复用。
+  budget: 离线阶段使用本地材料和定向反例。在线阶段沿用实际授权的资料、地址、时间、步数和 token 余额。调用前预留，跨轮累计。用量未知单列，达到有效上限即保存检查点。
+  role_of_reference: 运行及模型复核只读业务材料。验收侧预先登记核对项、精度、独立来源和已知的同源限制，候选输出冻结后再打开参考金额。
+  entrypoints:
+    inspect_t20: |
+      $caseEvidence = Get-Content -LiteralPath 'analysis/commission_execution_202609/t20_diagnostic.json' -Raw -Encoding utf8 | ConvertFrom-Json
+      $caseEvidence.original_case_progress | ConvertTo-Json -Depth 5
+      $caseEvidence.offline_resume | Select-Object task_state, pending_dependencies, next
+    targeted_tests: 从当前任务的 reuse_tests 选择覆盖本次反例的用例，例如 python -m pytest -q tests/test_table_task_alignment.py。新反例应能在修改前触发、修改后通过。
+    formal_run: Web 使用原案卷的运行下一轮或新案卷的正式入口。CLI 使用主验收计划 commands.start_or_resume 和其中的 run.json 约定，记录所选场景、记忆设置及剩余额度。
+    resume_t21_settlement: |
+      $checkpoint = 'analysis/commission_execution_202609/T21_goal_1000w/recompile-wait-verification-4m90f_eh'
+      python -B -X utf8 -m analysis.commission_execution_202609.run_t21_goal_validation --continue-settlement $checkpoint --check
+      # 收到真实 q2 答复后，在独立的 questions.yaml 按原问题填写。先用 --answers 指定该文件预检；确认显示 READY_FOR_SETTLEMENT 后，去掉 --check。
+      # 旧规则和证据只用于续跑验收。正式入口生成并冻结结果后，另在本地和底稿对账。
+    reconcile_t21_result: |
+      # 将 $CaseDir 设为经正式续跑产出 OK 及 engine_results.json 的案卷目录。核对目录必须尚未创建。
+      $base = 'analysis/commission_execution_202609/T21_goal_1000w'
+      python -B -X utf8 -m analysis.commission_execution_202609.reconcile_september --case $CaseDir --engine (Join-Path $CaseDir 'engine_results.json') --layout (Join-Path $base 'reconciliation-layout.json') --run (Join-Path $base 'reconciliation-reference.json') --out $EvidenceDir
+      # DIFFERENT 保留原差异及取数行，不改变正式案卷、不覆盖底稿。根据已核实材料和答复逐项处理。
+    compare_run: 使用主验收计划 commands.reconcile，从本次冻结的引擎与 Excel 提取 candidate.jsonl，从独立来源提取 reference.jsonl。
+
+tasks:
+  - id: source_coverage
+    name: 从输出和条款反推数据需求，修复数据准备的漏检
+    needs: []
+    mode: offline
+    code: [bonus_agent/workflow.py, bonus_agent/agent.py, bonus_agent/review_population.py]
+    reuse_tests: [tests/test_scope_diagnostics.py, tests/test_review_population.py]
+    actions:
+      - 在 T20 副本先取正式数据准备回执。对每个影响金额的条款和承诺输出登记所需字段、业务粒度、期间或历史窗口、来源位置、关联键及缺失处理依据。
+      - 用材料目录、规则原文、本批业务答复和各来源实际键集合交叉检查清单，能发现执行模型整项漏列的需求。纯制度材料可通过条款或参数单元格覆盖。同一文件可供多个数据集使用。
+      - 在 prepare_data 核对本阶段所需的输入，保存匹配、无匹配、多匹配、冲突及按原文允许排除或默认的数量和例子。后续阶段另有来源要求时，明确登记使用阶段和检查点。
+    pass:
+      - T20 只映射销售文件的旧快照能指出未覆盖的实际需求和受影响的业务键。新老项目能够追到首发日期、核算时点和期限原文。区域能够追到销售区域及制度归类。
+      - 对从原材料独立列出的本阶段必需项，逐项提供可回查的来源、经核实的默认或排除依据。进入对应金额计算前，未解释缺口为零。删掉任务或把所需文件改标为参考，仍能检出缺口。
+      - 拿掉一个无替代来源的必需字段会阻断对应金额，给出具体项目和缺项。重复键按本批规则聚合或报告冲突。恢复映射后重新取数通过，真正无关的附件仍可附理由排除。
+      - 正式续跑会重新校验旧的数据准备回执，并保留本案已回答的问题。
+    evidence: 本批需求与来源清单、原始四表反例、逐键覆盖报告、修复前后的正式数据准备回执。
+    on_failure: 缺映射时返回可执行的取数动作。原材料确实缺失或互相冲突时记录影响范围，查完现有资料后提出一个带实例的业务问题。
+
+  - id: rule_binding
+    name: 将已理解的业务规则编译为可验证的公式和依赖
+    needs: [source_coverage]
+    mode: offline
+    code: [bonus_agent/construction.py, bonus_agent/facts.py, bonus_agent/coefficient.py, bonus_agent/semantics.py, bonus_agent/workflow.py]
+    reuse_tests: [tests/test_table_task_alignment.py, tests/test_coefficient_compiler.py, tests/test_construction_flow.py]
+    actions:
+      - 每条规则记录适用对象、取值来源、单位、有效期间、档位及等号归属、扣减顺序、舍入层级和输出目标。仅填写适用项，有分歧的项保留两种解释和原文。
+      - 从来源行列绑定到本方案的确切公式位置，把适用条件和跨表取数加入依赖图。从基础字段向项目金额和人员分配逐层求值，分别记录选中的规则分支。
+      - 用批次外的简化材料验证理解。交换同名列的位置或重排无顺序含义的行，金额应相同。将制度从逐行舍入改成人员汇总后舍入，能够检出规定差额。
+      - 先在验收侧独立标注关键规则的预期适用范围、来源位置、边界和应答或应澄清的情形。在线验收时仅给执行模型原件，逐条核对它提交的解释及由此驱动的规则分支。
+    pass:
+      - 新老项目各用本批对应列，原文相同数值出现在另一格也无法冒领绑定。存在未定义的区域或新老判定时，任务板指向缺少的依赖。
+      - 单位示例中，项目 1000 元、角色裸数 25、个人份额 50%，按百分数得 125 元，按千分数得 12.50 元。测试要求能定位单位依据，证据不足时停在澄清，收到本批答复后再绑定。
+      - 在合成舍入样例中，同一人两笔各 0.014 元，逐笔到分再合计为 0.02 元，先合计再到分为 0.03 元。选择的结果由输入规则决定。阶梯边界、负数和两项暂扣同时适用也须有改变结果的反例。
+    evidence: 规则与任务清单、原文坐标到公式位置的映射、各适用分支的正反例和试算回执。
+    on_failure: 反馈到具体条款、参数或依赖。技术错误由程序或模型修正，剩余且影响金额的业务歧义进入财务澄清。
+
+  - id: repair_and_resume
+    name: 让纠错有范围、有验证、有停止条件
+    needs: [rule_binding, indicator_evidence]
+    mode: offline
+    code: [bonus_agent/recovery.py, bonus_agent/progress.py, bonus_agent/rule_package.py, bonus_agent/agent.py, bonus_agent/case.py]
+    reuse_tests: [tests/test_native_repair_routing.py, tests/test_verified_repair_halt_closure.py, tests/test_request_budget.py, tests/test_staged_workflow.py]
+    actions:
+      - 按目标、原始反例、输入版本和失败原因保存问题。每个修复候选记录修改前后、原文依据、影响的公式与输出。只有证据唯一且程序可以验证时才自动采用。
+      - 在隔离副本提交最小修改。先复跑最初失败的检查，再复跑受影响的下游。通过后原子保存新版本，同时使依赖旧版本的计算、复核或总额确认回执失效。失败保留上一个可用版本与反例。
+      - 将有效修复归档为失败原因、适用前提、修复动作和能推翻该修复的反例。技术问题沉淀为可重复的检查。复用业务口径时重新确认本批来源与适用范围。
+      - 同一失败和同一候选直接复用诊断。不同候选在已有的局部及作业额度内尝试。换模型、换说法、重启或工具返回成功均不重置额度。能确定尚未发送的请求有限重试，已发送而用量不明时保留预留并暂停。
+    pass:
+      - 错表写入、缺单位、适用条件未就绪、答复后恢复、连接中断与用量未知分别走正确分支。有真正待答复问题时能回到原问题，已确认口径沿用其本批依据。
+      - 对同一未变错误耗尽纠错次数后再次进入，新增付费请求为零。业务阻断须有新证据或可验证的不同修复。单纯费用或时间上限耗尽按已授权的剩余或新增额度恢复，保留未知用量与旧反例。
+      - 在保存边界中断及重复点击时，已验证任务和真实答复可恢复。对同一版本最多产生一套有效交付记录。改动某个项目即使总额巧合相同，也会要求重核受影响的结果。
+    evidence: 首个反例、修复差异、局部及下游回执、故障注入记录、各轮调用和用量台账。
+    on_failure: 材料歧义进入 NEEDS_CONFIRMATION，独立复核服务不可用时按 AWAITING_REVIEW 或实际技术错误保存。程序缺陷携带最小反例交回对应实现。
+
+  - id: indicator_evidence
+    name: 在指标被上层金额引用前验证对象、来源与期间，按证据定位故障
+    needs: [source_coverage, rule_binding]
+    mode: offline
+    code: [bonus_agent/construction.py, bonus_agent/indicator_confidence.py, bonus_agent/indicator_scope.py, bonus_agent/context.py]
+    reuse_tests: [tests/test_indicator_confidence.py, tests/test_indicator_contract.py, tests/test_indicator_scope.py, tests/test_indicator_triage.py]
+    actions:
+      - 为每个指标区分规则原文、对象粒度、来源与期间、实际执行、独立核验的证据，保留理由、当前版本、已证实反例和待查线索。
+      - 在冻结案卷上分别检查多个独立指标，保留原件。核查累计期间、全局与分组聚合和唯一值约束。验证预期分组与实际公式能被分别检查。
+      - 在下游失败时先返回原始反例，再沿受影响依赖排序，优先核查依据不足之处。发现多个真实可行解释时列举业务实例并查原件。
+    pass:
+      - 低可信度不会改写规则或发放金额。其他分支的低可信度不会劫持纠错；同一公式已有局部通过记录时，新发现的实际矛盾能改变排序和通过状态。
+      - T21 副本一次离线排查能区分库存唯一值冲突、月均数据来源待核和从其他作用域引用全局汇总的风险。合法共享的全局值及仅在一个月份有业务的对象不受误拦。
+      - 指标字段、单位、来源、期间、分组等口径能由本批原文填写并核验。有依据的独立金额核验才能使对应指标的独立维度通过。
+    evidence: 逐指标可信度及维度、源表与期间观测、故障上游排序、真实范围反例、合法全局和合法缺月的对照结果。
+    on_failure: 有业务冲突先查原文及实际样本；定义不足或缺材料则注明影响及恢复条件。由程序验证修改，再核对相关下游金额。
+
+  - id: september_delivery
+    name: 从 T20 检查点取得首份正式可核对的结果
+    needs: [repair_and_resume]
+    mode: online_and_reconcile
+    acceptance_tasks: [S3, S4]
+    code: [bonus_agent/workflow.py, bonus_agent/case.py, bonus_agent/validation.py, bonus_core/engine/run.py, tools/compare_commission_facts.py]
+    reuse_tests: [tests/test_staged_workflow.py, tests/test_commission_fact_comparison.py]
+    actions:
+      - 从原始 T20 检查点另取干净副本，保留本案 q1，经正式入口续跑。离线回放中显式改表名及人工补映射的副本留在诊断侧。让模型自主补数据覆盖，按就绪依赖构建新老项目及区域判断，再编译费率和项目金额。记录首个仍需干预的动作。
+      - 使用确定性引擎计算项目应分与暂扣，独立复核对象范围、规则和汇总。由财务确认当前版本的总额后，计算每人应分、待分配及尾差，执行终检并回读正式 Excel。
+      - 冻结结构化结果和导出文件。按主验收计划的 reconcile 命令核对项目、人员、角色原值、总额、待分配及舍入。逐项解释和审计任何差异。
+    pass:
+      - 本次正式状态为 OK，并有本版真实总额确认、engine_results.json、财务看到的 Excel 和逐项对账记录。候选和独立参考预期的业务键一致，重复键和未解释差异均为零。
+      - 在预先登记的关键语义样例中，逐条对照实际模型选择的证据、单位、适用分支和澄清行为。错误引用、漏掉关键条款或无依据采纳一种解释的次数为零。每个应产生金额变化的样例还须通过独立验算。
+      - 本批结算项逐分一致。角色未舍入原值沿用九月已经登记的 0.000001 元绝对容差。验证总额各去向以及可分配金额与实名、待分配、舍入尾差的平衡。
+      - 缺少姓名时按本批书面依据处理。九月允许的 NPD 待分配应单列且参与对账。其他批次遇到缺名单，按该批规定决定可否单列或须等待补件。
+      - 对调两人、漏掉零金额项目、改动一分钱均能定位到具体键。若底稿有错，留存原始差异，并凭独立来源与财务认可的修订基准重新核对。
+    evidence: 正式运行及模型干预记录、本版总额回执、项目及人员结果、Excel 回读、对账报告、差异归因。
+    on_failure: 技术错误回到责任任务。材料致命缺失时输出受影响的项目或人员、可确定部分以及金额影响或无法估算的原因，保留未完成状态。
+
+  - id: repeatability
+    name: 验证同批重复运行及中断恢复
+    needs: [september_delivery]
+    mode: online_and_reconcile
+    acceptance_tasks: [S3, S4]
+    actions:
+      - 锁定版本、材料、场景和已证实的业务口径。两个空案卷使用相同的记忆设置，排除既往规则草稿、技术代修指令及参考金额。记录 T20 续跑实际沿用的工作区和记忆差别。A 连续运行，B 在已保存的阶段中断、重启并继续。两个案卷均经正式入口和各自版本的真实确认。
+      - 将 A、B 和已交付的 T20 结果逐业务键核对，并各自核对独立底稿。记录首次运行和续跑的请求数、用量、耗时、待答复次数及停点。中途修改实现时重新注明验收版本。
+    pass:
+      - 三条路径的项目范围、人员、资金去向和金额逐项一致。有效的历史答复可追溯，重复请求及过期确认均未造成重复发放记录或错误放行。
+      - 两次冷启动均由模型从原材料生成规则和映射，在预算内产出正式结果，每次人工技术代修次数为零。保留财务真实答复和本版总额确认。发生技术代修的运行继续作为诊断证据。
+    evidence: 两个冷启动编号、一次中断位置、三条路径的逐键差异、各自底稿核对和成本记录。
+    on_failure: 定位第一处不同的材料解释、模型动作、状态恢复或金额节点。修复并冻结新版本后重新验证受影响的路径。
+
+  - id: independent_batch
+    name: 检验更换材料与规则后的适用性
+    needs: [repeatability]
+    mode: online_and_reconcile
+    acceptance_tasks: [S5]
+    inputs_evidence: analysis/commission_execution_202609/holdout_inventory.json
+    actions:
+      - 选择未参与修复且有独立项目和人员金额依据的真实批次。优先盘点八月，现有 45 个项目有角色金额，须补该月人员分配依据和月末应收、暂扣口径，或选另一完整月份。
+      - 用冻结版本新建案卷，按该批制度重新解释单位、粒度、分配及舍入，事先登记独立基准。从正式入口走到人员导出，依次回读、对账、解释差异。
+    pass:
+      - 另一真实批次按其实际材料通过与九月同等级别的完整验收。批次专属口径有独立来源。实现中未引入按月份、案例编号、客户、人员或期望金额选择答案的分支。
+      - 若用该批反例修改了实现，将其登记为回归批。修订版本再使用另一未参与修复的批次验收。
+    evidence: 独立批次清单、冻结代码与来源指纹、正式输出、按键对账及差异处置记录。
+    on_failure: 缺独立人员依据时报告已能核对的层级及缺项，跨批验收维持待完成。
+
+delivery_decisions:
+  first_implementation: source_coverage
+  first_paid_run_after: [source_coverage, rule_binding, indicator_evidence, repair_and_resume]
+  single_batch_evidence: [september_delivery]
+  approved_template_use: 沿用已审核规则的批次，走计算模式，先核对本期输入合同、规则版本和适用范围，再由引擎核算。以同一材料的完整金额指纹、实际导出回读和发布验收为证据。字段或规则变动进入编制并生成新版本。此项验收与新材料从零编制的 repeatability、independent_batch 分别记录。
+  daily_use_evidence: [september_delivery, repeatability, independent_batch]
+  operational_metrics: 按版本和批次分别记录正式交付、合理等待业务答复、材料缺失、技术失败、人工技术代修、重复请求、耗时、用量及未解释差异。候选版本有未解释金额差异时暂停该版交付，保留原工件并定位首个差异。
+  reviewed_dimensions:
+    材料理解: [source_coverage, rule_binding, independent_batch]
+    结果准确: [rule_binding, september_delivery, independent_batch]
+    自我修复: [repair_and_resume, september_delivery]
+    全程闭环: [repair_and_resume, september_delivery, repeatability]
+    运行稳定: [repair_and_resume, repeatability]
+    可追溯与成本: [source_coverage, repair_and_resume, september_delivery, repeatability]

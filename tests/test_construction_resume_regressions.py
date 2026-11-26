@@ -4,6 +4,7 @@ import copy
 import pytest
 
 from bonus_agent.construction import TaskBoard
+from bonus_agent.recovery import RecoveryJournal
 from tests.test_staged_workflow import make_workspace, prepared
 
 pytestmark = pytest.mark.evidence
@@ -48,6 +49,41 @@ def test_stale_receipts_are_rechecked_by_program_in_dependency_order(tmp_path):
     assert not ws.llm.calls
 
 
+def test_refresh_keeps_explicitly_corrected_clause_targets(tmp_path, monkeypatch):
+    from bonus_agent import workflow
+
+    ws = prepared(make_workspace(tmp_path))
+    board = TaskBoard(ws)
+    pool = next(n for n, spec in board.state['tasks'].items() if spec['target'] == '/pool')
+    ws.plan_formula_tasks([{'id': 'detail', 'scheme': 'S', 'target': '/variables/source_amount',
+                            'clauses': ['C1']}, {**board.task_spec(pool), 'depends_on': ['detail']}])
+    assert ws.submit_formula_task('detail', value={'scope': '项目', 'expr': 'amount'})['status'] == 'PASS'
+    assert 'variables.source_amount' in ws.clauses[0].where
+    ws.cover_clauses({'C1': 'pool'})
+    monkeypatch.setattr(workflow, '_EXECUTION_PROFILE', 'updated-profile')
+    board = TaskBoard(ws)
+    assert board.statuses()['detail']['status'] == 'PENDING'
+    board.refresh()
+    assert board.statuses()['detail']['status'] == 'PASS'
+    assert ws.clauses[0].where == 'pool'
+
+
+def test_compiled_bound_table_completes_its_task_and_recovers_a_missing_receipt(tmp_path):
+    ws = make_workspace(tmp_path)
+    assert ws.prepare_data()['status'] == 'PASS'
+    ws.plan_formula_tasks([{'id': 'bands', 'scheme': 'S', 'target': '/tables/bands'}])
+    written = ws.compile_table('bands', [{'lower': '0', 'value': '提成率'}], scheme='S', kind='tier')
+    board = TaskBoard(ws)
+    assert '参数表任务 bands 局部检查 PASS' in written
+    assert board.statuses()['bands']['status'] == 'PASS'
+
+    board.state['receipts'].pop('bands')
+    board.state['reports'].pop('bands')
+    assert board.statuses()['bands']['status'] == 'PENDING'
+    assert board.refresh()['bands']['status'] == 'PASS'
+    assert not ws.llm.calls
+
+
 def test_existing_and_new_components_are_enrolled_before_final_compile(tmp_path):
     ws = make_workspace(tmp_path)
     ws.plan_formula_tasks([{'id': 'pool', 'scheme': 'S', 'target': '/pool'}])
@@ -87,3 +123,26 @@ def test_large_component_keeps_its_scope_across_fragment_pages(tmp_path):
     second = ws.read_workspace(**call)
     assert second['item_fragment']['offset'] > 0
     assert second['item_fragment']['text']
+
+
+def test_saved_construction_stop_requires_matching_current_receipt(tmp_path):
+    ws = make_workspace(tmp_path)
+    ws.prepare_data()
+    ws.plan_formula_tasks([{'id': 'pool', 'scheme': 'S', 'target': '/pool', 'facts': ['提成率']}])
+    journal = RecoveryJournal(tmp_path / 'recovery.json', 'same materials')
+    key = 'construction:pool:/pool'
+    journal.state['progress'] = {'previous': [key], 'stagnant': 12}
+    journal.state['failures'] = {'earlier failure': 2}
+    journal.halt('连续 13 次检查没有消除既有问题；工具返回成功不代表有进展。' + key)
+    assert not journal.resume_after_construction(ws)
+
+    assert ws.check_formula_task('pool')['status'] == 'PASS'
+    original = ws.drafts['S']['pool']['expr']
+    ws.drafts['S']['pool']['expr'] = 'amount + 1'
+    assert not journal.resume_after_construction(ws)
+    ws.drafts['S']['pool']['expr'] = original
+    assert journal.resume_after_construction(ws)
+    assert not journal.error and journal.state['failures'] == {'earlier failure': 2}
+    assert journal.state['progress']['stagnant'] == 0
+    record, = journal.state['resolved_construction_halts'].values()
+    assert record['receipts'] == {key: TaskBoard(ws).statuses()['pool']['version']}

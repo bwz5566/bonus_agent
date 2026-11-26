@@ -26,6 +26,7 @@ from bonus_agent.extract_rules import ExtractResult, Question, extract, prompt
 from bonus_agent.llm import LLM, LLMError, parse_json
 from bonus_agent.parsing.docs import PARSERS, Block, ParsedDoc, md_table, parse_any
 from bonus_core.data.mapping import DatasetMapping, Mapping, apply_mapping, cell_text, row_filter
+from bonus_core.data.period import Period
 from bonus_core.data.table import ConvertError, convert
 from bonus_core.data.table_detect import SheetTable, detect
 from bonus_core.dsl.models import DatasetDef, FieldDef, FieldType, RuleSet
@@ -257,7 +258,9 @@ def filter_sheet(st: SheetTable, flt: dict | None) -> tuple[SheetTable, str]:
 
 
 def check_dataset(name: str, pd: PlanDataset, st: SheetTable, field_types: dict[str, tuple[str, str]] | None = None,
-                  header_rows: list[int] | None = None, flt: dict | None = None
+                  header_rows: list[int] | None = None, flt: dict | None = None, *,
+                  period_field: str | None = None, period_window: Period | None = None,
+                  distinct_conflicts: dict[str, tuple[str, FieldDef]] | None = None,
                   ) -> tuple[DatasetDef | None, DatasetMapping | None, list[str], list[str]]:
     """校验一张数据表的定义：列是否存在、字段名是否合法、类型能否转换。返回 (数据表, 映射, 警告, 错误)。"""
     errors, warnings = [], []
@@ -309,6 +312,8 @@ def check_dataset(name: str, pd: PlanDataset, st: SheetTable, field_types: dict[
                           "key 是“每行一个对象”的编号（如人员表的 staff_id）；一行属于某个对象的明细（如合同明细每行属于"
                           "一个人）不写 key，写 link=该对象的编号（如 link=staff_id），行里的其他编号（如 team_id）"
                           "仍能取到对应实体的字段和变量")
+        elif k and k in pd.fields and k not in fields:
+            errors.append(f"数据表「{name}」已声明编号字段 {k}，其来源列尚未通过校验")
         elif k and k not in fields:
             errors.append(f"数据表「{name}」的 {'key' if k == pd.key else 'link'} 字段 {k} 不在它的 fields 里")
     # 试转换全部行，类型判断错了（如把文字当成金额）尽早发现
@@ -324,21 +329,28 @@ def check_dataset(name: str, pd: PlanDataset, st: SheetTable, field_types: dict[
     if pd.key in cols:
         from collections import Counter
         i = st.headers.index(cols[pd.key])
-        dup = [(k, n) for k, n in Counter(cell_text(v[i]) for _, v in st.rows if v[i] not in (None, "")).items() if n > 1]
+        rows = st.rows
+        period_column = cols.get(period_field, period_field)
+        if period_window is not None and period_column in st.headers:
+            date_index = st.headers.index(period_column)
+            rows = [(row, values) for row, values in rows if period_window.contains(values[date_index]) is not False]
+        key_counts = Counter(cell_text(v[i]) for _, v in rows if v[i] not in (None, ""))
+        dup = [(k, n) for k, n in key_counts.items() if n > 1]
         if dup and pd.distinct:
             others = [f for f in fields if f != pd.key]
             for f in others:            # 同一编号下其余字段要一样，否则不是“每个编号一个”的对象
                 j = st.headers.index(cols[f])
                 seen: dict = {}
-                for _, v in st.rows:
+                for _, v in rows:
                     k = cell_text(v[i])
                     if k and seen.setdefault(k, cell_text(v[j])) != cell_text(v[j]):
+                        if distinct_conflicts is not None:
+                            distinct_conflicts[f] = (cols[f], fields[f])
                         errors.append(f"「{name}」distinct 按 {pd.key} 合并时，{f} 在同一编号下取值不同（如 {k}："
                                       f"{seen[k]} / {cell_text(v[j])}）：从 fields 去掉 {f}（update_dataset 写 changes: {{\"fields\": {{\"{f}\": null}}}}），"
                                       f"需要它时在原表上按 link 汇总；若 {f} 本身是该对象应有的编号，改用 {f} 作 key")
                         break
-            warnings.append(f"按 {pd.key} 的不同取值建对象：{len(st.rows)} 行合成 "
-                            f"{len({cell_text(v[i]) for _, v in st.rows if v[i] not in (None, '')})} 个")
+            warnings.append(f"按 {pd.key} 的不同取值建对象：{len(rows)} 行合成 {len(key_counts)} 个")
         elif dup:
             errors.append(f"「{name}」的 key={pd.key} 有重复值（如 {dup[0][0]} 出现 {dup[0][1]} 次），说明不是每行一个对象："
                           f"这是明细表，去掉 key，写 link=它所属对象的编号。"

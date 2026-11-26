@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+from pathlib import Path
 
 from bonus_agent.context import guard_messages
 from bonus_agent.llm import LLMError, parse_json
@@ -18,7 +19,7 @@ def _reviewer(checker):
                                           ('base_url', 'think_body', 'extra_body', 'json_mode')})}
 
 
-def evidence_state(ws):
+def evidence_state(ws, *, omit_answers=()):
     from bonus_agent import case
     definitions = {}
     for name, ds in ws.datasets.items():
@@ -30,20 +31,80 @@ def evidence_state(ws):
                         'datasets': definitions,
                         'mapping': {n: m.model_dump(mode='json') for n, m in ws.mapping.items()},
                         'said': ws.said, 'transcripts': ws.transcripts,
-                        'answers': [(q.id, q.answer) for q in ws.questions if q.answer not in (None, '')],
+                        'answers': [(q.id, q.answer) for q in ws.questions
+                                    if q.answer not in (None, '') and q.id not in omit_answers],
                         'reviewer': _reviewer(getattr(ws.llm, 'checker_llm', None)), 'policy': 1})
+
+
+def _withdrawals(ws):
+    records = ws.workflow.get('question_reviews', {})
+    return [(q, records[q.id]) for q in ws.questions if q.id in records and q.withdrawn
+            and q.answer in (None, '') and records[q.id].get('result', {}).get('status') == 'WITHDRAWN']
+
+
+def _withdrawal_state(record):
+    return record.get('scoped_answer_check', {}).get('evidence_state', record.get('evidence_state'))
+
+
+def _question_datasets(ws, question):
+    from bonus_agent import facts
+    from bonus_agent.agent import ToolError
+    from bonus_agent.construction import TaskBoard
+    from bonus_agent.review_population import requirements
+
+    scheme, target = facts.split_target(question.related)
+    parts = facts.target_parts(target)
+    if scheme not in ws.schemes or len(parts) != 2 or parts[0] != 'variables' or ws._deps(scheme):
+        return set()
+    try:
+        rs = ws._ruleset(scheme)
+        expr = rs.variables[parts[1]].expr
+        needed = requirements(rs.model_copy(update={'pool': rs.pool.model_copy(update={'expr': expr}), 'report': None}))
+        mapped, _ = TaskBoard(ws).data_inputs({'scheme': scheme, 'target': target})
+    except (KeyError, ValueError, ToolError):
+        return set()
+    return set(mapped) | {label[5:] for label in needed if label.startswith('rows:')}
+
+
+def retain_unaffected_withdrawals(ws, answers):
+    """Keep a source-backed withdrawal across fresh, disjoint blank-row choices."""
+    from bonus_agent.review_population import confirmed_blank_scope_rows
+
+    candidates = _withdrawals(ws)
+    if not candidates:
+        return
+    scopes = [confirmed_blank_scope_rows(ws, question) for question in answers]
+    if not scopes or not all(scopes):
+        return
+    sheets = {(r['file'], r['sheet']) for rows in scopes for r in rows}
+    files = {file for file, _ in sheets}
+    affected = {name for name, mapping in ws.mapping.items()
+                if (Path(mapping.file or '').name, mapping.sheet) in sheets or
+                (mapping.sheet is None and Path(mapping.file or '').name in files)}
+    if not affected:
+        return
+    answer_ids = {q.id for q in answers}
+    before = evidence_state(ws, omit_answers=answer_ids)
+    after = evidence_state(ws)
+    for q, record in candidates:
+        proof = record.get('verified_evidence', [])
+        if (_withdrawal_state(record) != before or record.get('review', {}).get('kind') != 'false_premise'
+                or not proof or any(ref.get('file') not in ws._source_version or ref['file'] in files for ref in proof)
+                or any(name in q.text for name in affected | {Path(file).stem for file in files})):
+            continue
+        inputs = _question_datasets(ws, q)
+        if inputs and inputs.isdisjoint(affected):
+            record['scoped_answer_check'] = {'answers': sorted(answer_ids), 'evidence_state': after}
 
 
 def invalidate_changed_reviews(ws):
     """A source-backed withdrawal is not permanent after its evidence changes."""
-    records = ws.workflow.get('question_reviews', {})
-    candidates = [(q, records[q.id]) for q in ws.questions if q.id in records and q.withdrawn
-                  and q.answer in (None, '') and records[q.id].get('result', {}).get('status') == 'WITHDRAWN']
+    candidates = _withdrawals(ws)
     if not candidates:
         return
     current = evidence_state(ws)
     for q, record in candidates:
-        if record.get('evidence_state') != current:
+        if _withdrawal_state(record) != current:
             record['invalidated_withdrawal'] = q.withdrawn
             record['result'] = {'status': 'KEEP', 'id': q.id, 'reason': '原文、数据范围或复核配置已变，旧撤回不再有效'}
             q.withdrawn = ''
@@ -53,6 +114,52 @@ def _quotes_complete(evidence):
     return (isinstance(evidence, list) and 1 <= len(evidence) <= 4
             and all(isinstance(e, dict) and isinstance(e.get('quote'), str)
                     and 8 <= len(e['quote'].strip()) <= 300 for e in evidence))
+
+
+def review_disputed_question(ws, question):
+    """Check a source-cited question raised by the executor after a monetary disagreement."""
+    from bonus_agent.agent import ToolError
+
+    if (not ws.staged or not question.blocking or question.withdrawn or question.answer is not None
+            or question.answered_by or not getattr(ws.llm, 'checker_llm', None) or ws.checker_down):
+        return None
+    prior = ws.workflow.get('question_reviews', {}).get(question.id, {})
+    if (prior.get('initial_request_pending') and not prior.get('attempts') and not prior.get('review')
+            and prior.get('proposed_evidence') and prior.get('proposed_reason')):
+        try:
+            return review_question(ws, question.id, prior['proposed_reason'], prior['proposed_evidence'])
+        except (LLMError, ToolError):
+            return None
+    refs = ws.workflow.get('references', {})
+    if not any(question.related.startswith(scheme + '.') and ref.get('spec_state') == 'amount_difference'
+               for scheme, ref in refs.items()):
+        if (not question.related and question.diagnosis and not ws.schemes
+                and any(n in question.text and d.link and ws.mapping[n].columns.get(d.link, '') in question.text
+                        for n, d in ws.datasets.items() if n in ws.mapping)):
+            from bonus_agent.dataset_projection import question_relation
+
+            try:
+                prepared = ws.prepare_data()
+                proof = question_relation(ws, question)
+                if prepared['status'] == 'PASS' and proof:
+                    reason = (f'程序已按原始来源建立独立的 {proof["column"]} 索引。'
+                              f'「{proof["source"]}」取「{proof["source_column"]}」，有效取值 {proof["keys"]} 个，'
+                              f'与「{proof["reference"]}」匹配 {proof["matched_reference_keys"]} 个，'
+                              f'范围外 {proof["outside_reference_keys"]} 个。请独立判断原文是否已回答该问题。')
+                    return review_question(ws, question.id, reason, proof['evidence'])
+            except (ToolError, LLMError):
+                return None
+        return None
+    proof = [row for row in question.evidence if row.get('ok') is True and _quotes_complete([row])][:4]
+    if not proof:
+        return None
+    try:
+        return review_question(ws, question.id,
+                               '执行端在金额比对失败后提出此问题。请结合各份原文、工作表表头及已定位的记录，'
+                               '判断材料能否界定问题涉及的对象与处理规则。证据不足或有冲突时保留提问。', proof)
+    except (LLMError, ToolError):
+        # An unavailable reviewer or an unverifiable proposal must leave the original question open.
+        return None
 
 
 def _known_length(request):
@@ -147,7 +254,7 @@ def review_question(ws, id: str, reason: str, evidence: list[dict], retry_techni
         if initial_pending and retry_technical:
             raise ToolError('初次独立复核尚未发送，不属于技术续试；在可用作业预算下正常review_question即可')
         initial_ready = (initial_pending and budget is not None and not budget.check(checker)
-                         and (budget.snapshot().get('remaining_tokens') or 0) > 0)
+                         and (budget.max_tokens is None or (budget.snapshot().get('remaining_tokens') or 0) > 0))
         if not retry_technical and not initial_ready:
             result = copy.deepcopy(old['result'])
             result['cached'] = True

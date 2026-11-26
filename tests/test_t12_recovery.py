@@ -33,7 +33,9 @@ def test_explicit_heading_beats_name_heuristic_and_cell_rejects_swapped_value(tm
 def test_informational_notes_do_not_spend_pro_budget():
     ws=Workspace(FakeLLM([]),build_inventory([]))
     assert not _deep_reason([Step('define_dataset',{},'已保存\n注意：当期62个项目，1719条明细',True)],0,ws,{})
-    assert _deep_reason([Step('define_dataset',{},'错误：关联失败',False)],0,ws,{})
+    failed=Step('define_dataset',{},'错误：关联失败',False)
+    assert not _deep_reason([failed],0,ws,{'define_dataset':1})
+    assert _deep_reason([failed],0,ws,{'define_dataset':2})
 
 def test_first_duplicate_alias_resolves_in_share_from():
     from types import SimpleNamespace

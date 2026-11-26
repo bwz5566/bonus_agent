@@ -12,15 +12,18 @@ import difflib
 import re
 import statistics
 from decimal import Decimal, InvalidOperation
+from math import isfinite
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from bonus_core.data.table import ConvertError, Datasets, Row, RowRef, StdTable, convert
-from bonus_core.data.table_detect import ROW_ID, SheetTable, add_row_ids, combine_columns, detect, table_at, unpivot_by
+from bonus_core.data.table_detect import (ROW_ID, SheetTable, add_row_ids, combine_columns, detect,
+                                          rename_unpivot_columns, scope_unpivot_source, table_at, unpivot_by)
 from bonus_core.dsl.models import RuleSet
-from bonus_core.dsl.parser import names, parse
+from bonus_core.dsl.parser import BinOp, BoolOp, Call, Cmp, Name, Neg, Not, parse
+from bonus_core.dsl.scope import Layout, is_aggregate
 from bonus_core.engine.issues import Issue
 
 # 常见同义词，可按业务持续补充
@@ -48,8 +51,28 @@ class DatasetMapping(BaseModel):
     filter: dict[str, list[str] | str | dict[str, list[str]]] = {}  # 只取这些行：列名 -> 允许的取值；{"not": [...]} 为去掉这些取值的行
     unpivot: dict | None = None        # 几列同一类的值展开成每个值一行：{"columns": [...], "value": 列名, "label": 列名}（先展开再筛选）
     combine: dict[str, list[str]] | None = None   # 几列合成一个编号列：{"新列名": ["列1", "列2"]}（如项目 = 月份+客户+型号），展开之后再合成
+    unmatched_basis: dict[str, str] | None = None  # 已核实的本案关联排除原文
     confidence: dict[str, float] = {}  # 推荐时填写
     confirmed_by: str | None = None
+
+    @field_validator('filter', mode='before')
+    @classmethod
+    def canonical_filter_values(cls, value):
+        def literal(item):
+            if type(item) is int or (type(item) is float and isfinite(item)):
+                return cell_text(item)
+            return item
+
+        def condition(item):
+            return [literal(element) for element in item] if isinstance(item, list) else literal(item)
+
+        if not isinstance(value, dict):
+            return value
+        return {
+            column: ({operator: condition(items) for operator, items in rule.items()}
+                     if isinstance(rule, dict) else condition(rule))
+            for column, rule in value.items()
+        }
 
 
 Mapping = dict[str, DatasetMapping]
@@ -105,23 +128,65 @@ def suggest_heuristic(rs: RuleSet, sheets: list[SheetTable], history: Mapping | 
     return out
 
 
-def used_fields(rs: RuleSet) -> set[str]:
-    """规则表达式里实际用到的字段，加上主键和关联键。"""
-    used = set()
-    exprs = [v.expr for v in rs.variables.values()] + [rs.pool.expr] + [lv.weight for lv in rs.allocation if lv.weight.strip()]
-    exprs += [e for p in rs.payout for e in (p.hold_ratio, p.pay_ratio) if e.strip()]
-    exprs += [c.expr for c in rs.checks] + [o.expr for o in rs.offsets]
+def required_fields(rs: RuleSet, period=None) -> dict[str, set[str]]:
+    """Find the source fields required by an expression in its actual row context."""
+    owners = rs.field_owner()
+    required = {name: {field for field in (ds.key, ds.link, ds.period) if field in ds.fields}
+                for name, ds in rs.datasets.items()}
+    layout = Layout(rs)
+
+    def scope_table(scope):
+        if scope in layout.aux:
+            return scope
+        level = rs.level(scope)
+        entity = rs.entity_dataset(level.key) if level else None
+        return entity[0] if entity else None
+
+    def visit(expression, row_table=None):
+        match expression:
+            case Name(id=field):
+                sources = owners.get(field, ())
+                if row_table in sources:
+                    sources = (row_table,)
+                for source in sources:
+                    required[source].add(field)
+            case Call(fn='period_value', args=args) if period is not None and len(args) == 12:
+                visit(args[period.end.month - 1], row_table)
+            case Call(args=args, kwargs=kwargs):
+                if is_aggregate(expression):
+                    row_table, _ = layout.agg_dataset(expression)
+                for child in args:
+                    visit(child, row_table)
+                for key, child in kwargs:
+                    if key != 'of':
+                        visit(child, row_table)
+            case BinOp(left=left, right=right) | Cmp(left=left, right=right) | BoolOp(left=left, right=right):
+                visit(left, row_table)
+                visit(right, row_table)
+            case Not(operand=operand) | Neg(operand=operand):
+                visit(operand, row_table)
+
+    exprs = [(v.expr, v.scope) for v in rs.variables.values()] + [(rs.pool.expr, rs.pool.scope)]
+    exprs += [(lv.weight, lv.level) for lv in rs.allocation if lv.weight.strip()]
+    exprs += [(e, p.scope) for p in rs.payout for e in (p.hold_ratio, p.pay_ratio) if e.strip()]
+    exprs += [(c.expr, c.scope) for c in rs.checks] + [(o.expr, o.scope) for o in rs.offsets]
     if rs.report:
-        exprs += [t.expr for t in [*rs.report.totals, *rs.report.pending]]
-        exprs += [e for b in rs.report.balances for e in [b.total, *b.parts]]
-    for e in exprs:
-        used |= names(parse(e))
-    for d in rs.datasets.values():
-        used |= {k for k in (d.key, d.link) if k}
+        exprs += [(t.expr, t.level) for t in [*rs.report.totals, *rs.report.pending]]
+        exprs += [(e, b.level) for b in rs.report.balances for e in [b.total, *b.parts]]
+        if rs.report.people:
+            leaf = rs.entity_dataset(rs.leaf.key) if rs.allocation else None
+            visit(Name(rs.report.people), leaf[0] if leaf else None)
+    for expression, scope in exprs:
+        visit(parse(expression), scope_table(scope))
     for lv in rs.allocation:
-        if lv.parent_key:
-            used.add(lv.parent_key)
-    return used & set(rs.field_owner())
+        for source in owners.get(lv.parent_key, ()):
+            required[source].add(lv.parent_key)
+    return required
+
+
+def used_fields(rs: RuleSet) -> set[str]:
+    """Name-only view for callers that do not validate a particular source row."""
+    return {field for fields in required_fields(rs).values() for field in fields}
 
 
 def _sheet_names(path) -> list[str]:
@@ -166,8 +231,9 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping, period
     sheets = [s for f in files for s in detect(f)]
     data: Datasets = {}
     issues: list[Issue] = []
-    needed = used_fields(rs)
+    needed_by_table = required_fields(rs, period)
     for ds_name, ds in rs.datasets.items():
+        needed = needed_by_table[ds_name]
         m = mapping.get(ds_name)
         if m is None:
             issues.append(Issue.block("mapping_missing", f"数据表「{ds_name}」没有映射"))
@@ -221,12 +287,23 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping, period
             issues.append(Issue.block("segment_unsure", f"「{ds_name}」的 sheet「{st.sheet}」中间另一段表头的列对不上第一段，"
                                       f"用到的列「{'、'.join(unsure)}」在那一段里不知道该读哪一列", ds_name))
             continue
+        win = period.window(ds.window) if period is not None else None
+        outside_source_rows = 0
         if m.unpivot:
-            bad = [c for c in m.unpivot.get("columns") or [] if c not in st.headers]
+            source_cols = list(m.unpivot.get('columns') or [])
+            if m.unpivot.get('share_from'):
+                source_cols.append(m.unpivot['share_from'])
+            bad = [c for c in source_cols if c not in st.headers]
             if bad:
                 issues.append(Issue.block("column_missing", f"unpivot 的列「{'、'.join(bad)}」不在 sheet「{st.sheet}」中", ds_name))
                 continue
-            st = unpivot_by(st, m.unpivot)
+            scoped = scope_unpivot_source(st, m.unpivot, m.columns.get(ds.period), win)
+            outside_source_rows = len(st.rows) - len(scoped.rows)
+            try:
+                st = unpivot_by(scoped, m.unpivot)
+            except ValueError as exc:
+                issues.append(Issue.block('unpivot_share', str(exc), ds_name))
+                continue
         if m.combine:
             bad = [c for cols in m.combine.values() for c in cols if c not in st.headers]
             if bad:
@@ -250,7 +327,6 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping, period
         if ds.period and period is not None and pcol is None:
             issues.append(Issue.block("period_unmapped", f"「{ds_name}」按期间筛选的字段 {ds.period} 没有对应的列", ds_name))
             continue
-        win = period.window(ds.window) if period is not None else None
         win_text = "" if win is None else {"year_to_date": f"（年初累计 {win.start}~{win.end}）", "to_date": f"（截至 {win.end}）"}.get(ds.window, "")
         out_of, unclear, skipped = 0, [], 0
         for excel_row, vals in st.rows:
@@ -286,8 +362,9 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping, period
             issues.append(Issue.warn("empty_skipped", f"「{ds_name}」有 {skipped} 行按 if_empty: skip 当作没有（空格子所在的行不参与，"
                                      f"按对象取值时和“查不到”一样）", ds_name))
         if ds.period and period is not None:
+            prefiltered = f'，展开前已排除期间外原始记录 {outside_source_rows} 行' if outside_source_rows else ''
             issues.append(Issue.warn("period_filtered", f"「{ds_name}」按核算期间 {period}{win_text} 筛选（{ds.period}）：取 {len(t.rows)} 行，"
-                                     f"期间外 {out_of} 行不参与计算", ds_name))
+                                     f"期间外 {out_of} 行不参与计算{prefiltered}", ds_name))
         if ds.distinct and ds.key:
             t.rows, clash = _distinct(t.rows, ds.key)
             if clash:
@@ -296,7 +373,7 @@ def apply_mapping(rs: RuleSet, files: list[str | Path], mapping: Mapping, period
                                           f"或改在原表上按 link 汇总", ds_name))
         data[ds_name] = t
         issues += _reconcile(st, idx, ds, t)
-        issues += _sanity(ds_name, ds, t, needed)
+        issues += _sanity(ds_name, ds, t, needed & idx.keys())
     return data, issues
 
 
@@ -355,8 +432,7 @@ def rebind_dup_columns(m: "DatasetMapping", headers: list[str]) -> tuple["Datase
         notes[c] = cands[0]
         return cands[0]
     cols = {f: fix(c) for f, c in m.columns.items()}
-    unp = {**m.unpivot, "columns": [fix(c) for c in m.unpivot.get("columns") or []],
-            **({"share_from": fix(m.unpivot["share_from"])} if m.unpivot.get("share_from") else {})} if m.unpivot else m.unpivot
+    unp = rename_unpivot_columns(m.unpivot, fix) if m.unpivot else m.unpivot
     comb = {k: [fix(c) for c in v] for k, v in m.combine.items()} if m.combine else m.combine
     flt = {fix(k): v for k, v in m.filter.items()}
     if not notes:

@@ -78,6 +78,23 @@ def test_report_stage_projection_preserves_original_parameter_positions(tmp_path
     assert not view._binding_gaps()
 
 
+def test_invalid_new_allocation_exposes_missing_entity_with_a_verified_pool(tmp_path):
+    ws = prepared(make_workspace(tmp_path))
+    ws.calculate_basis('S')
+    assert ws.review_basis('S')['status'] == 'PASS'
+    flow = ws._flow()
+    flow.approve('S', '财务', fingerprint(ws.workflow['basis']['S']))
+    board = TaskBoard(ws)
+    alloc = next(task for task, spec in board.state['tasks'].items() if spec['target'] == '/allocation')
+    original = copy.deepcopy(ws.drafts['S']['allocation'])
+    candidate = copy.deepcopy(original)
+    candidate[-1]['key'] = 'missing_recipient_key'
+    result = ws.submit_formula_task(alloc, candidate)
+    assert result['status'] == 'FAIL' and not result['saved']
+    assert any('level_no_entity' in issue and 'missing_recipient_key' in issue for issue in result['issues'])
+    assert ws.drafts['S']['allocation'] == original and flow.current('approved:S')
+
+
 def test_local_ratio_default_hazard_is_rejected_before_full_calculation(tmp_path):
     ws = make_workspace(tmp_path)
     ws.set_rules(scheme='S', tables={'coefficient': {'kind': 'tier', 'purpose': 'coefficient',
@@ -138,3 +155,36 @@ def test_data_load_failure_keeps_structural_diagnosis_first(tmp_path, monkeypatc
     assert ws.workflow['data_report']['report'] == report
     assert ws._flow().current('data') is False
     assert 'level_no_entity' in ws._flow().hint()
+
+
+def test_data_stage_checks_inferred_auxiliary_parents_without_allocation(tmp_path):
+    from bonus_agent.stuck_question import program_issue
+
+    def add_reference(workbook):
+        tab = workbook.create_sheet('rates')
+        tab.append(['code', 'rate'])
+        tab.append(['A', '20%'])
+
+    ws = make_workspace(tmp_path, mutate_workbook=add_reference)
+    ws.drafts['S']['allocation'] = []
+    ws.drafts['S']['report'] = None
+    ws.drafts['S']['pool']['scope'] = 'projects'
+    group_field = {'type': 'id', 'column': 'pid'}
+    ws.update_dataset('projects', {'fields': {'group_key': group_field}})
+    ws.define_dataset('rates', 'data.xlsx', 'rates',
+                      {'group_key': {'type': 'id', 'column': 'code'}, 'rate': {'type': 'ratio', 'column': 'rate'}},
+                      key='group_key')
+    failed = ws.prepare_data()
+    assert failed['status'] == 'FAIL'
+    link_issue, = [issue for issue in failed['issues'] if 'link_unmatched' in issue]
+    assert '「projects」按同名字段 group_key 被推断挂到「rates」' in link_issue
+    assert '1 行找不到上级（如 B）' in link_issue
+    assert program_issue(f'错误：{link_issue}')
+
+    ws.update_dataset('rates', {'key': None})
+    ws.define_dataset('groups', 'data.xlsx', 'projects', {'group_key': group_field}, key='group_key', distinct=True)
+    ws.update_dataset('rates', {'link': 'group_key'})
+    repaired = ws.prepare_data()
+    assert repaired['status'] == 'PASS', repaired['issues']
+    assert repaired['counts']['projects'] == repaired['counts']['groups'] == 2
+    assert repaired['counts']['rates'] == 1

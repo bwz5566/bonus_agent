@@ -55,7 +55,8 @@ FRAGMENT_CHARS = 3800  # raw JSON text; escaping inside the result makes it long
 # coordinates, hashes) are ~4x larger and made a 135-fact ledger unreadable within the history budget.
 _BRIEF = {'facts': ('name', 'value', 'unit', 'page', 'context', 'meaning'),
           'clauses': ('id', 'file', 'point', 'where'),
-          'construction': ('id', 'scheme', 'target', 'title', 'status', 'depends_on')}
+          'construction': ('id', 'scheme', 'target', 'title', 'status', 'confidence_level',
+                           'depends_on', 'planned_depends_on', 'missing_pool')}
 
 
 def _brief(section, item):
@@ -149,6 +150,12 @@ def _rule_index(ws, scheme, parts, value):
                               'args': {'section': 'rules', 'scheme': scheme, 'name': _pointer(path)}}}
         if isinstance(child, (dict, list)):
             item['entries'] = len(child)
+        # A short coefficient matrix, its bounds and scalar policies fit in the
+        # index. Keep the existing pointers for evidence and larger definitions.
+        if parts and parts[0] == 'tables' and len(parts) >= 2 and not isinstance(child, dict):
+            if not isinstance(child, list) or all(not isinstance(v, dict) for v in child):
+                if len(json.dumps(child, ensure_ascii=False, default=str)) <= 460:
+                    item['value'] = child
         if isinstance(child, dict):
             item.update({k: child[k] for k in ('scope', 'level', 'kind') if isinstance(child.get(k), str)})
         result.append(item)
@@ -265,8 +272,22 @@ def workspace_view(
             _drop_empty({'dataset': n, 'definition': d.model_dump(mode='json'), 'mapping': ws.mapping[n].model_dump(mode='json')})
             for n, d in ws.datasets.items()
         ]
+        if detail and name in ws.datasets:
+            args = _drop_empty(ws._dataset_definition(name))
+            next(item for item in items if item['dataset'] == name)['define_args'] = args
     elif section == 'basis':
         items = [{'scheme': s, **v} for s, v in ws.workflow.get('basis', {}).items() if not scheme or s == scheme]
+    elif section == 'checks' and name == 'data':
+        saved = ws.workflow.get('data_report', {})
+        if not saved or saved.get('version') != ws._flow().version('data'):
+            return {'section': 'checks', 'status': 'STALE' if saved else 'NOT_RUN', 'items': [],
+                    'next_call': {'tool': 'prepare_data', 'args': {}}}
+        report = saved['report']
+        items = sorted(report.get('source_coverage', ()), key=lambda item: item['status'] == 'MAPPED')
+        items += [{'kind': 'history', **history} for history in report.get('history_sources', ())]
+        items += [{'kind': 'join', **join} for join in report.get('join_coverage', ())]
+        items += [{'kind': 'issue', 'message': message} for message in report['issues']]
+        name = None
     elif section == 'checks':
         from bonus_agent.workflow import Workflow
         saved = ws.workflow.get('formula_report', {})
@@ -309,8 +330,19 @@ def workspace_view(
         from bonus_agent.construction import TaskBoard
         board = TaskBoard(ws)
         statuses = board.statuses()
-        items = [{'name':n, **spec, **statuses[n], 'report':board.state['reports'].get(n)}
-                 for n,spec in board.state['tasks'].items()]
+        items = []
+        for n, spec in board.state['tasks'].items():
+            status = statuses[n]
+            item = {'name': n, **spec, **status, 'report': None}
+            if report := board.state['reports'].get(n):
+                item['report_current'] = report.get('version') == status['version']
+                if item['report_current']:
+                    item['report'] = report
+                else:
+                    item['previous_report'] = {'version': report.get('version'), 'status': report.get('status')}
+            if set(spec['depends_on']) != set(status['depends_on']):
+                item['planned_depends_on'] = spec['depends_on']
+            items.append(item)
     else:
         from bonus_agent.workflow import fail
 
@@ -474,6 +506,8 @@ def _repair_focus(ws, flow, construction):
     """One current compiler blocker becomes actionable context; no rules/receipts are changed."""
     if construction is None or construction.get('active'):
         return None
+    if (planning := construction.get('planning_gap')) and planning.get('kind') != 'parameter_owners':
+        return None
     saved = ws.workflow.get('formula_report', {}).get('report', {})
     report = flow.compile_feedback(saved.get('phase', 'all'))
     if not report or report.get('status') != 'FAIL' or not report.get('issues'):
@@ -531,7 +565,140 @@ def _repair_focus(ws, flow, construction):
     return focus
 
 
-def task_card(ws):
+def _tier_repair_context(ws, active):
+    """Expose the complete physical header and source coordinates of referenced tiers."""
+    from bonus_agent import facts as fx
+    from bonus_agent.agent import ToolError
+    from bonus_agent.construction import TaskBoard
+    from bonus_core.dsl.parser import Call, ExprError, Name, parse, walk
+    import re
+
+    try:
+        formula = parse(active['formula'])
+    except (KeyError, ExprError):
+        return None
+    scheme = active['scheme']
+    board = TaskBoard(ws)
+    rules = ws._ruleset(scheme)
+    table_names = {n.args[0].id for n in walk(formula) if isinstance(n, Call)
+                   and n.fn == 'tier' and n.args and isinstance(n.args[0], Name)}
+    tables, pages = {}, {}
+    for task in board.state['tasks'].values():
+        parts = fx.target_parts(task['target'])
+        if task['scheme'] != scheme or parts[0] != 'tables' or parts[1] not in table_names:
+            continue
+        name = parts[1]
+        if name not in rules.tables:
+            continue
+        tables[name] = {'task': task['id'], 'guard': rules.tables[name].applies_when, 'clauses': task['clauses']}
+        for fact in ws.facts:
+            if not fact.page or not fact.file.lower().endswith('.pptx') or not any(board.owns(task, ref) for ref in fact.targets):
+                continue
+            key = (fact.file, fact.page)
+            if key not in pages and len(pages) < 8:
+                try:
+                    page = ws.read_parameter_table(*key)
+                except ToolError:
+                    continue
+                pages[key] = {
+                    'file': fact.file, 'page': fact.page, 'scope': page['page_scope'],
+                    'context': page['page_context'],
+                    'tables': [{'table': t['table'],
+                                'rows': [[{'column': c['column'], 'text': '\n'.join(c['lines'])} for c in row['cells']]
+                                         for row in t['rows'][:12]]} for t in page['tables'][:2]],
+                }
+            if key in pages:
+                tables[name]['source'] = {'file': fact.file, 'page': fact.page}
+                break
+    tier_mode = next((c for c in ws.clauses if c.id in active.get('clauses', []) and '超额累进' in c.quote), None)
+    variants = []
+    for name, spec in tables.items():
+        source = spec.get('source')
+        if not source or not tier_mode or '_new_' not in name:
+            continue
+        old_name = name.replace('_new_', '_old_', 1)
+        if old_name in rules.tables:
+            continue
+        page = pages[source['file'], source['page']]
+        if any('按照新项目的奖励标准执行' in text for text in page['context']):
+            continue
+        if len(page['tables']) != 1:
+            continue
+        grid = page['tables'][0]
+        header, *body = grid['rows']
+        old = [cell['column'] for cell in header if '旧项目' in cell['text'] or '老客户' in cell['text']]
+        if len(old) != 1 or not body or not all(row[0]['column'] == 1 and old[0] <= len(row)
+                                                and re.search(r'\d(?:\.\d+)?\s*%', row[old[0] - 1]['text'])
+                                                for row in body):
+            continue
+        cells_from = {**source, 'table': grid['table']}
+        positions = [(row, not ws._UPPER_BAND.search(cells[0]['text']))
+                     for row, cells in enumerate(body, 2)]
+        if sum(not lower for _, lower in positions) != 1:
+            continue
+        variant = {
+            'name': old_name, 'task': 'tier_' + old_name, 'clauses': spec['clauses'],
+            'register': {**cells_from, 'applies_to': page['scope'],
+                         'cells': [*[{'row': row, 'column': old[0]} for row in range(2, 2 + len(body))],
+                                   *[{'row': row, 'column': 1} for row, lower in positions if lower]]},
+            'compile': {
+                'cells_from': cells_from, 'rows': [
+                    {'value': f'R{row}C{old[0]}', **({'lower': f'R{row}C1'} if lower else {})}
+                    for row, lower in positions],
+                'algorithm_basis': {'file': tier_mode.file, 'quote': tier_mode.quote},
+                'applies_when': spec['guard'], 'below_first': rules.tables[name].below_first,
+                'lower_inclusive': rules.tables[name].lower_inclusive,
+            },
+        }
+        variants.append(variant)
+    routing_columns = {f['source']['column'] for f in active['table_applicability'].get('field_evidence', ())
+                       if f.get('source', {}).get('column')}
+    routing = [{'id': c.id, 'file': c.file, 'quote': c.quote} for c in ws.clauses
+               if '归类' in c.quote and any(column in c.quote for column in routing_columns)]
+    return {'task': active['task'], 'scheme': scheme, 'defined_tiers': tables, 'source_pages': list(pages.values()),
+            'routing_clauses': routing[:8],
+            'variant_candidates': variants,
+            'next': '按原文的各区域和新旧列补齐参数表任务。费率按原格编译，用实际分类值同步修改选表分支与表的适用条件。'}
+
+
+def task_card(ws, *, data=None):
+    if data is None:
+        data = task_card_data(ws)
+    return json.dumps(data, ensure_ascii=False, default=str)
+
+
+def _recipient_scheme_plan(plan, scheme, sources):
+    """Offer a structural plan when the material explicitly requires rounding after grouping."""
+    from bonus_agent.facts import split_target, target_parts
+
+    if plan['schemes'] != [scheme] or not plan.get('output_targets'):
+        return None
+    after_sum = next((source for source in sources if re.search(
+        r'先.{0,12}(?:人员|每人|同一人).{0,16}汇总.{0,12}(?:再|后).{0,12}(?:四舍五入|舍入|保留到分)',
+        source['quote'])), None)
+    if after_sum is None:
+        return None
+    recipient = scheme + '人员分配'
+    targets = {}
+    moved = []
+    for output, pointers in plan['output_targets'].items():
+        targets[output] = []
+        for pointer in pointers:
+            owner, path = split_target(pointer)
+            parts = target_parts(path)
+            if owner == scheme and len(parts) >= 2 and parts[1] in ('people', 'pending', 'distributions'):
+                pointer = recipient + '::' + path
+                moved.append(pointer)
+            targets[output].append(pointer)
+    if not any(pointer.endswith('::/report/people') for pointer in moved):
+        return None
+    args = {k: plan[k] for k in ('summary', 'outputs', 'files', 'ignored')}
+    args.update(schemes=[scheme, recipient], output_targets=targets)
+    return {'source': after_sum, 'funding_scheme': scheme, 'recipient_scheme': recipient,
+            'call': {'tool': 'plan_calculation', 'args': args}}
+
+
+def task_card_data(ws):
     from bonus_agent.workflow import Workflow
 
     flow = Workflow(ws)
@@ -568,14 +735,96 @@ def task_card(ws):
             'first_issues': [x[:450] for x in report['report']['issues'][:3]],
             'lookup': 'read_workspace(section="checks")；current=false须先重新compile_formulas',
         }
-    active = (data['workflow'].get('construction') or {}).get('active')
+    construction = data['workflow'].get('construction') or {}
+    active = construction.get('runtime_repair') or construction.get('active')
+    if construction.get('next', '').startswith('plan_formula_tasks'):
+        # Small plans can use the full exact registry. Larger registries stay
+        # available through the normal paginated citation interface.
+        entries = [{'name': f.name, 'value': f.value, 'file': f.file} for f in ws.facts[:12]]
+        if len(json.dumps(entries, ensure_ascii=False)) > 2400:
+            entries = []
+        construction['planning_facts'] = {
+            'items': entries, 'total': len(ws.facts), 'read_call': {'tool': 'read_workspace', 'args': {'section': 'facts'}},
+        }
+    saved_data = ws.workflow.get('data_report', {})
+    histories = saved_data.get('report', {}).get('history_sources', ())
+    if histories and data['workflow']['stage'] <= 3 and saved_data.get('version') == flow.version('data'):
+        with_alternatives = [source for source in histories if source['alternatives']]
+        if with_alternatives:
+            data['history_sources'] = with_alternatives[:2]
     if active:
+        if data['workflow']['stage'] == 3 and active.get('scheme') in ws.schemes:
+            from bonus_agent.construction import TaskBoard
+            from bonus_agent.indicator_scope import repair_context
+            from bonus_agent.indicator_history import history_repair
+            from bonus_agent.indicator_budget import budget_repair
+            from bonus_agent.recovery import fingerprint
+            board = TaskBoard(ws)
+            scope_repair = (repair_context(board, active) if active.get('confidence_level') == 'CONFLICT'
+                            or construction.get('runtime_repair') else None)
+            if not scope_repair and flow.current('data'):
+                key = fingerprint((saved_data.get('version'), ws._merged(active['scheme']), ws.clauses))
+                if getattr(ws, '_history_repair_key', None) != key:
+                    ws._history_repair = (history_repair(board, active['scheme'], histories)
+                                          or budget_repair(board, active['scheme']))
+                    ws._history_repair_key = key
+                scope_repair = ws._history_repair
+            if scope_repair:
+                construction['scope_repair'] = scope_repair
+            elif active.get('table_applicability'):
+                key = fingerprint((ws._source_version, active['formula'], ws._merged(active['scheme']).get('tables')))
+                if getattr(ws, '_tier_repair_key', None) != key:
+                    ws._tier_repair = _tier_repair_context(ws, active)
+                    ws._tier_repair_key = key
+                if ws._tier_repair:
+                    resumed_candidate = getattr(ws, '_resume_tier_candidate', None)
+                    if resumed_candidate and resumed_candidate['args'].get('task') == active['task']:
+                        construction['tier_repair'] = {**ws._tier_repair, 'candidate_call': resumed_candidate}
+                    else:
+                        construction['tier_repair'] = ws._tier_repair
         data['evidence']['uncovered'] = [x for x in data['evidence']['uncovered'] if x['id'] in active.get('clauses', [])]
         data['current_task_evidence'] = {
-            'clauses':[{'id':c.id,'file':c.file,'quote':c.quote} for c in ws.clauses if c.id in active.get('clauses', [])][:6],
+            'clauses':[{'id':c.id,'file':c.file,'quote':c.quote,'point':c.point}
+                       for c in ws.clauses if c.id in active.get('clauses', [])][:6],
             'facts':[{'name':f.name,'value':f.value,'unit':f.unit,'file':f.file,'page':f.page}
                      for f in ws.facts if f.name in active.get('facts', [])][:6],
         }
+        scheme = active.get('scheme')
+        if (data['workflow']['stage'] == 3 and active.get('target') in ('/allocation', '/report')
+                and scheme in ws.schemes and flow.current('approved:' + scheme)):
+            from bonus_agent.construction import TaskBoard
+
+            board = TaskBoard(ws)
+            statuses, basis_tasks = board.statuses(with_confidence=False), board.required('basis')
+            role_clauses = set(active.get('clauses', ()))
+            report = ws._merged(scheme).get('report') or {}
+            for spec in board.state['tasks'].values():
+                if spec['scheme'] == scheme and spec['target'] in ('/allocation', '/report'):
+                    role_clauses.update(spec['clauses'])
+            sources = [{'id': c.id, 'file': c.file, 'quote': c.quote}
+                       for c in ws.clauses if c.id in role_clauses]
+            tables = [
+                {'task': n, 'target': s['target'], 'clauses': s['clauses'],
+                 'definition': {k: v for k, v in board.value(s).items() if k not in ('sources', 'desc', 'confidence')}}
+                for n, s in board.state['tasks'].items()
+                if n not in basis_tasks and s['scheme'] == scheme and s['target'].startswith('/tables/')
+                and statuses[n]['status'] == 'PASS' and board.value(s) and role_clauses.intersection(s['clauses'])
+            ]
+            rs = ws._ruleset(scheme)
+            plan = data['workflow']['plan']
+            proposal = _recipient_scheme_plan(plan, scheme, sources) if rs.pool.scope != 'global' and not report.get('people') else None
+            data['personnel_task'] = {
+                'scheme': scheme, 'target': active['target'], 'basis_scope': rs.pool.scope,
+                'basis_scope_keys': board.scope_keys(rs), 'basis_objects': len(flow.state['basis'][scheme]['objects']),
+                'basis_pool': {'scope': rs.pool.scope, 'expr': rs.pool.expr, 'negative': rs.pool.negative},
+                'basis_detail': [item['name'] for item in report.get('details', []) if item.get('stage', 'basis') == 'basis'],
+                'allocation': ws._merged(scheme).get('allocation') or [],
+                'rule_sources': sources, 'checked_role_tables': tables[:6],
+                'answers': [{'id': q.id, 'text': q.text, 'answer': q.answer} for q in ws.questions
+                            if q.answer and not q.withdrawn],
+            }
+            if proposal:
+                data['personnel_task']['scheme_proposal'] = proposal
     elif focus := _repair_focus(ws, flow, data['workflow'].get('construction')):
         data['current_task_evidence'] = focus.pop('evidence', {'facts': [], 'clauses': []})
         data['repair_focus'] = focus
@@ -589,4 +838,4 @@ def task_card(ws):
             construction['compile_failure'].update(issue_count=focus['remaining_issues'] + 1,
                                                    issues=[focus['issue']], remaining_issues=focus['remaining_issues'])
         data['last_formula_check']['first_issues'] = [focus['issue']]
-    return json.dumps(data, ensure_ascii=False, default=str)
+    return data

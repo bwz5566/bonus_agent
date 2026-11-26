@@ -1,18 +1,30 @@
 """Check explicit algorithm statements against the rules that claim to implement them."""
 import re
+import unicodedata
 
 from bonus_agent import clauses as cl, facts as fx
-from bonus_core.dsl.parser import Call, Name, ExprError, parse, walk
+from bonus_core.dsl.parser import Call, Cmp, Name, Str, ExprError, parse, walk
+from bonus_core.dsl.scope import is_aggregate
 
 
-def stated_mode(text):
+def stated_modes(text):
+    """Find the explicitly affirmed algorithms in a source quotation."""
     text = fx.scope_norm(text)
     found = set()
-    for mode, pattern in [('excess', r'超额累进|excess|marginal'), ('whole', r'全额累进|整额累进|wholeamount')]:
+    patterns = (
+        ('excess', r'超额累[进進]|超额部分分段累[加计]|每段按各自(?:的)?比例|excess|marginal'),
+        ('whole', r'(?:全|整)额(?:累[进進]|分[档檔])|整[笔筆]按所在[档檔]|wholeamount'),
+    )
+    for mode, pattern in patterns:
         for match in re.finditer(pattern, text):
             if re.search(r'不|非|取消|禁止', text[max(0, match.start()-3):match.start()]):
                 continue
             found.add(mode)
+    return found
+
+
+def stated_mode(text):
+    found = stated_modes(text)
     return next(iter(found)) if len(found) == 1 else None
 
 
@@ -97,9 +109,191 @@ def target_mode_issues(ws, scheme, target, clause_ids):
     return issues
 
 
+def _identity_literal_witnesses(ws, rules, name, clause_ids):
+    variable = rules.variables[name]
+    level = rules.level(variable.scope)
+    entity = rules.entity_dataset(level.key) if level else None
+    dataset = variable.scope if variable.scope in ws.mapping else entity[0] if entity else None
+    if dataset not in ws.mapping or dataset not in rules.datasets:
+        return None, []
+    try:
+        expression = parse(variable.expr)
+    except ExprError:
+        return None, []
+
+    fields = rules.datasets[dataset].fields
+    sources = [(s.doc, s.page, s.quote) for s in variable.sources]
+    sources += [(c.file, None, c.quote) for c in ws.clauses if c.id in clause_ids]
+    values_by_field = {}
+    exact_sources = {}
+    issues = []
+    nodes = list(walk(expression))
+    aggregate_comparisons = {id(node) for call in nodes if isinstance(call, Call) and is_aggregate(call)
+                             for node in walk(call) if isinstance(node, Cmp)}
+    for node in nodes:
+        if not isinstance(node, Cmp) or node.op not in ('==', '!='):
+            continue
+        if id(node) in aggregate_comparisons:
+            continue
+        field, literal = node.left, node.right
+        if isinstance(field, Str):
+            field, literal = literal, field
+        if (not isinstance(field, Name) or not isinstance(literal, Str) or not literal.value
+                or field.id in rules.variables or field.id not in fields
+                or fields[field.id].type not in ('id', 'text', 'enum')):
+            continue
+        normalized = unicodedata.normalize('NFKC', literal.value)
+        for doc, page, quote in sources:
+            if literal.value in quote or normalized not in unicodedata.normalize('NFKC', quote):
+                continue
+            key = (doc, page)
+            if key not in exact_sources:
+                if doc not in ws._corpus():
+                    continue
+                raw = '\n'.join(ws._lines(doc)) if page is None else ws._page_raw(doc).get(page, '')
+                exact_sources[key] = ' '.join(raw.split())
+            normalized_quote = ' '.join(quote.split())
+            if normalized_quote not in exact_sources[key]:
+                # Spreadsheet quotes may span cells from one physical row. The
+                # excerpt renderer adds separators that were not present in those cells.
+                same_sheet_row = page is None and any(
+                    normalized_quote in ' '.join(' '.join(str(cell).split()) for cell in row if cell not in (None, ''))
+                    for sheet in ws.inv.sheets if sheet.file == doc
+                    for _, row in sheet.rows
+                )
+                if not same_sheet_row:
+                    continue
+            if field.id not in values_by_field:
+                try:
+                    values_by_field[field.id] = set(ws._values(dataset, field.id))
+                except (IndexError, KeyError, ValueError):
+                    # The data gate owns missing sheets, columns and invalid period values.
+                    values_by_field[field.id] = set()
+            values = values_by_field[field.id]
+            if literal.value in values:
+                continue
+            equivalent = {value for value in values if unicodedata.normalize('NFKC', value) == normalized}
+            alternatives = {value for value in equivalent if value in quote}
+            if len(alternatives) == 1:
+                actual, = alternatives
+                issues.append((literal, actual, doc, dataset, field.id, quote, len(equivalent) == 1))
+    return expression, issues
+
+
+def identity_literal_issues(ws, rules, name, clause_ids=()):
+    _, witnesses = _identity_literal_witnesses(ws, rules, name, clause_ids)
+    return list(dict.fromkeys(
+        f'construction.identity_literal：变量「{name}」比较「{dataset}.{field}」'
+        f'时用的是 {literal.value!r}。材料《{doc}》原文和该列有 {actual!r}，'
+        '当前写法在该列无匹配。核对字符后修正公式，保留原始标识值。'
+        for literal, actual, doc, dataset, field, _, _ in witnesses
+    ))
+
+
+def tier_dispatch_issues(ws, rules, name, declared_dependencies):
+    """Verify declared classification inputs and live labels used to select amount tiers."""
+    from bonus_agent.agent import ToolError
+    from bonus_agent.lint import _near_values
+
+    variable = rules.variables[name]
+    try:
+        nodes = list(walk(parse(variable.expr)))
+    except ExprError:
+        return []
+    if not any(isinstance(node, Call) and node.fn == 'tier' for node in nodes):
+        return []
+
+    used = set()
+    todo = [node.id for node in nodes if isinstance(node, Name)]
+    while todo:
+        ref = todo.pop()
+        if ref in used:
+            continue
+        used.add(ref)
+        if ref in rules.variables:
+            try:
+                todo.extend(node.id for node in walk(parse(rules.variables[ref].expr)) if isinstance(node, Name))
+            except ExprError:
+                continue
+
+    issues = []
+    for path in declared_dependencies:
+        parts = fx.target_parts(path)
+        if len(parts) != 2 or parts[0] != 'variables' or parts[1] in used or parts[1] not in rules.variables:
+            continue
+        for source in rules.variables[parts[1]].sources:
+            text = fx.scope_norm(source.quote)
+            if (re.search(r'新项目|新客户', text) and re.search(r'(?:老|旧)(?:项目|客户)', text)
+                    and re.search(r'判定|归类|界限|区分', text)
+                    and not cl.check_quote(source.doc, source.quote, ws._corpus())):
+                issues.append(f'algorithm.tier_classification：变量「{name}」计划依赖「{parts[1]}」，'
+                              f'《{source.doc}》原文「{source.quote}」明确区分新旧项目，当前阶梯公式没有使用该分类。'
+                              '按制度费率列分别建立表，并在适用区域明确选用新项目或旧项目费率。')
+                break
+
+    level = rules.level(variable.scope)
+    entity = rules.entity_dataset(level.key) if level else None
+    dataset = variable.scope if variable.scope in ws.mapping else entity[0] if entity else None
+    if dataset not in ws.mapping or dataset not in rules.datasets:
+        return issues
+    fields = rules.datasets[dataset].fields or {}
+    values = {}
+    for call in nodes:
+        if not isinstance(call, Call) or call.fn != 'if' or not call.args:
+            continue
+        for node in walk(call.args[0]):
+            if not isinstance(node, Cmp) or node.op not in ('==', '!='):
+                continue
+            left, right = (node.right, node.left) if isinstance(node.left, Str) else (node.left, node.right)
+            if (not isinstance(left, Name) or not isinstance(right, Str) or not right.value or left.id in rules.variables
+                    or left.id not in fields or fields[left.id].type not in ('text', 'enum', 'id')):
+                continue
+            if left.id not in values:
+                try:
+                    values[left.id] = {value: 1 for value in ws._values(dataset, left.id) if isinstance(value, str)}
+                except (ToolError, ValueError, KeyError, IndexError):
+                    values[left.id] = {}
+            actual = values[left.id]
+            if right.value in actual or not (near := _near_values(right.value, actual)):
+                continue
+            issues.append(f'algorithm.tier_label：{dataset}.{left.id} 没有 {right.value!r}；实际相近取值为 '
+                          f'{"、".join(near[:6])}。按原文核对地区或分类映射后再选择阶梯，避免这些记录落入默认分支。')
+    return list(dict.fromkeys(issues))
+
+
+def ground_identity_literals(ws, rules, name, clause_ids):
+    """Bind a comparison literal when the source and its field identify one exact spelling."""
+    from dataclasses import fields, is_dataclass, replace
+    from bonus_core.dsl.parser import unparse
+
+    expression, witnesses = _identity_literal_witnesses(ws, rules, name, clause_ids)
+    substitutions, sources = {}, {}
+    for literal, actual, doc, dataset, field, quote, unique in witnesses:
+        if unique and '"' not in actual and '\n' not in actual:
+            substitutions[id(literal)] = Str(actual)
+            sources[id(literal)] = {'variable': name, 'dataset': dataset, 'field': field,
+                                    'submitted': literal.value, 'physical': actual, 'document': doc, 'quote': quote}
+    if not substitutions:
+        return rules.variables[name].expr, []
+
+    def rewrite(value):
+        if id(value) in substitutions:
+            return substitutions[id(value)]
+        if isinstance(value, tuple):
+            return tuple(rewrite(item) for item in value)
+        if is_dataclass(value):
+            return replace(value, **{field.name: rewrite(getattr(value, field.name)) for field in fields(value)})
+        return value
+
+    return unparse(rewrite(expression)), list(sources.values())
+
+
 def semantic_gates(ws):
     issues = []
     for scheme in ws.schemes:
+        rules = ws._ruleset(scheme)
+        for name in rules.variables:
+            issues += identity_literal_issues(ws, rules, name)
         for name, table in ws._merged(scheme).get('tables', {}).items():
             for source in table.get('sources', []):
                 expected = stated_mode(source.get('quote', ''))

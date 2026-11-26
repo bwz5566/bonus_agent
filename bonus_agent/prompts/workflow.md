@@ -2,7 +2,13 @@
 
 程序的当前任务卡决定下一步。先plan_calculation盘点全部文件、核算目标、输出与全部方案，再分别登记规则、定义数据、绑定公式。参数、条款和公式保存在工作区；read_workspace分页检索，原文用read_document/read_parameter_table/read_sheet。没有材料包全文时必须检索，不凭名称补业务规则。
 
-从材料要求的表格和金额倒推构建任务。涉及不同汇总层次或多个方案时，在plan_calculation用output_targets列出每项交付需要的报表位置，并在plan_formula_tasks登记负责这些位置和上游公式的任务。按来源确定核算对象、方案间资金依赖、人员与待分配的去向、各阶段舍入时点。在提交基础金额复核前，给所有后续交付建立实际报表结构。后续公式按阶段验证。
+从材料要求的表格和金额倒推构建任务。涉及不同汇总层次或多个方案时，在plan_calculation用output_targets列出每项交付需要的报表位置，并在plan_formula_tasks登记负责这些位置和上游公式的任务。按来源确定核算对象、方案间资金依赖、人员与待分配的去向、各阶段舍入时点。基础金额复核前按任务卡 report_task.outputs 构建本阶段的对象明细和总额。财务确认总额后，继续构建人员分配和待分配去向。
+
+把工作表和模块标题登记为 outputs。用 output_targets 将一个模块关联到它包含的实际报表明细、汇总和人员位置。report.details 以制度定义的单项金额或业务指标命名，例如一个项目底稿模块可关联项目应计、暂扣和分配三项明细。
+
+项目资金先核定、同一个人参与多个项目并按人汇总后舍入时，初始计划就声明项目资金和人员结算的依赖。先定义必要的项目键、人员唯一键及份额明细，人员结算引用已确认的项目金额。设置人员层奖金池和按人汇总的对账，待分配列单独核定。完成分配公式与正式计算遵循确认后的阶段。
+
+准备数据先覆盖本批计算数据、场景规定的原始列及核算条款引用的对象。数据覆盖未通过时用 read_workspace(section="checks", name="data") 读取具体原始文件、页签和受影响的业务范围。按本批原文使用主来源及有效的关联键，先补第一个缺失来源，再检查已修正版本。参考或无关附件按实际用途登记。
 
 任务卡的rule_requirements逐文件列出已有参数数、条款数及缺失类别；只补缺项，已有参数不能代替原文计算条款。read_workspace会按条数和结果长度缩页，直接使用next_call续读，不能按请求limit猜下一页位置。单条过大时按item_fragment和next_call续读完整JSON。facts/clauses列表默认是简表（名称、取值、含义），需要原文和坐标时按name读单条或detail=true。只读分页、文件类型和页码错误按程序反馈处理，不需要升级纠错模型。可选顾问协议失败后本作业停止继续调用；这不影响必须通过的独立审核。
 
@@ -17,8 +23,10 @@ calculate_basis不执行分配权重或发放。review_basis在独立会话中�
 每次只完成当前任务需要的局部改动。上下文不足时缩小任务、按引用取证；不得删减规则覆盖来通过。完成金额计算后仍须原文、逐对象、逐人、去向、暂缓/抵扣及导出校验全部通过，才能finish。
 # 修复与进度
 
-- 准备数据通过后先用plan_formula_tasks规划构建任务，每项只指向一个/variables/名称、/tables/名称或/pool、/allocation、/report，列出depends_on、clauses和facts。按id分批补充；先基础后上层，不必一次输出全部公式。
+- 准备数据通过后用plan_formula_tasks规划构建任务。每个方案都要登记/pool，按原文把计算项目可分配总额所需的直接上游任务 ID 列入 depends_on。参数表和变量各建一项，记录所用条款和参数。/allocation 在总额确认后使用，/report 的项目金额部分应能在确认前核验。任务卡出现 planning_gap 时，先用 plan_formula_tasks 补齐指定方案的任务，再按 active 继续构建。
 - 只完成任务卡中的active任务：查该任务的原文，优先submit_formula_task(task,value,bindings,facts)一次提交目标及证据。程序负责登记、绑定、局部检查和原子保存；成功后直接处理下一任务，不重复check_formula_task。已有草稿可check_formula_task，原生参数表仍可compile_table/compile_coefficient_table。新增公式也须安排任务。不要只通读台账或在没有公式时反复compile_formulas。
+- 公式按类别分支时，用 query_dataset(dataset, values_of=字段) 获取映射后的实际写法和源行。field_evidence 给出完整范围或下一页，related_clauses 提供分类条款线索。材料规定的派生类别应写入判定条件。已得到完整取值后按原文构建公式，勿逐个猜测同义写法。
+- 奖金池局部检查按实际核算对象执行其已建公式。遇到 runtime_repair 时，按其中的 task、scope_keys、反例和条款修正上游公式或映射，再检查同一奖金池；保留原有业务口径和对象范围。
 - 表格算法由明确原文决定。超额累进使用excess，整额分档使用whole；compile_table可给algorithm_basis={file,quote,page}。省略mode时按明确原文选择，与原文矛盾则拒绝。系数表和金额阶梯分别核对，不能把所有表统一成一种算法。
 - 指标区间取系数使用compile_coefficient_table(name,scheme,cells_from,applies_to,rows=[{range:"R1C2",value:"R2C2"},...])，水平表引用同列表头，竖直表引用同行区间。程序一次读取端点及系数并登记绑定，不必反复补区间格；原文不明或冲突时不保存。用tier_rate(表,指标)取系数，禁止用tier把达成率乘系数当奖金。不把普通标题当algorithm_basis，不编造负下界。错误有next_call时先核对原文用途再执行该修复路径，不原样重试。
 - 新证据的首次分页读取会被记录；换limit/query重读同一条不算进展。数据修复退回前一步时保留已构建任务和上下文。未通过的未来分配层不作为当前基础公式的停滞依据；必要审核和最终整体编译仍必须通过。

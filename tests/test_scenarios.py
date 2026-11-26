@@ -164,6 +164,37 @@ def test_prepare_stages_guide_as_material_and_briefs_agent(tmp_path, reg):
     assert "【场景记忆】" not in prepare(reg, "demo_quarter", [m], use_memory=False).brief
 
 
+def test_confirmed_batch_is_citable_only_for_exact_materials_and_period(tmp_path, reg):
+    from bonus_agent.case import fingerprint, sha256
+
+    material = tmp_path / "业务输入.xlsx"
+    shutil.copy(run_case.XLSX, material)
+    sc = reg.get("demo_quarter")
+    original = prepare(reg, sc.id, [material])
+    confirmation = sc.dir / "本批确认.md"
+    confirmation.write_text("本批财务确认：未分配金额单列。", encoding="utf-8")
+    configuration = sc.dir / "scenario.yaml"
+    spec = yaml.safe_load(configuration.read_text(encoding="utf-8"))
+    spec.update(outputs="汇总金额与未分配金额分别列示。", confirmed_batches=[{
+        "period": "2026-09", "material_hashes": fingerprint([material, *original.files]),
+        "document": confirmation.name, "document_sha256": sha256(confirmation),
+    }])
+    configuration.write_text(yaml.safe_dump(spec, allow_unicode=True), encoding="utf-8")
+
+    matched = prepare(reg, sc.id, [material], period="2026-09", use_memory=False)
+    assert confirmation in matched.files and confirmation.name in matched.brief
+    assert confirmation.read_text(encoding="utf-8") in matched.brief
+    output = next(p for p in matched.files if p.name.startswith("场景输出要求"))
+    assert spec["outputs"] in output.read_text(encoding="utf-8") and output.name in matched.brief
+    assert {confirmation, output} <= set(matched.supplements)
+    assert confirmation not in prepare(reg, sc.id, [material], period="2026-08").files
+    assert confirmation not in prepare(reg, sc.id, [material]).files
+    assert confirmation not in prepare(reg, sc.id, [material, confirmation], period="2026-09").files
+    confirmation.write_text("已被修改", encoding="utf-8")
+    with pytest.raises(ScenarioError, match="确认"):
+        prepare(reg, sc.id, [material], period="2026-09")
+
+
 def test_playbook_goes_into_brief(tmp_path, reg):
     """场景目录里有 playbook.md（这类奖金固定的做法）：写进【做法】，并说明参数从材料读、和材料对不上以材料为准"""
     m = tmp_path / "材料"

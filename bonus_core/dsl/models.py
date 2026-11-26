@@ -253,6 +253,13 @@ class ReportPending(ReportTotal):
     """An explicitly named unallocated component; not a recipient of the allocated pool."""
 
 
+class FundingReconciliation(_Base):
+    """Check raw recipient amounts per entity against an upstream funding result."""
+    scheme: str
+    level: str
+    allocated: str
+
+
 class ReportDistribution(RuleItem):
     """Reconcile a material entitlement against actual allocated money and named pending items."""
     name: str
@@ -260,6 +267,7 @@ class ReportDistribution(RuleItem):
     total: str
     pending: list[str] = []
     rounding: Literal["per_pool", "after_sum"] = "per_pool"
+    source_funding: FundingReconciliation | None = None
 
 
 class Report(RuleItem):

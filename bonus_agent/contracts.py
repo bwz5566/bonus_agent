@@ -45,20 +45,25 @@ def ratio_default_gaps(rs):
                 if hasattr(ast, attr):
                     yield from calls(getattr(ast, attr), guards)
 
-    def missing_default(ast, seen=()):
+    def missing_default(ast, scope, guards=(), seen=()):
         """Find a scalar fallback for absent rows before the coefficient lookup."""
         if isinstance(ast, Name) and ast.id in rs.variables:
             if ast.id in seen:
                 return False
-            return missing_default(parse(rs.variables[ast.id].expr), (*seen, ast.id))
+            definition = rs.variables[ast.id]
+            return missing_default(parse(definition.expr), definition.scope,
+                                   guards if definition.scope == scope else (), (*seen, ast.id))
         if isinstance(ast, Call) and ast.fn == 'if' and len(ast.args) == 3:
             condition, yes, no = ast.args
+            determined = next((truth for check, truth in reversed(guards) if check == condition), None)
+            if determined is not None:
+                return missing_default(yes if determined else no, scope, guards, seen)
             nodes = list(walk(expand(condition)))
             absent_rows = (any(isinstance(n, Call) and n.fn == 'count' for n in nodes)
                            and any(isinstance(n, Num) and n.value == 0 for n in nodes))
             if absent_rows and any(isinstance(expand(branch), Num) for branch in (yes, no)):
                 return True
-            return missing_default(yes, seen) or missing_default(no, seen)
+            return missing_default(yes, scope, guards, seen) or missing_default(no, scope, guards, seen)
         return False
 
     for name, variable in rs.variables.items():
@@ -68,7 +73,7 @@ def ratio_default_gaps(rs):
             ratio = expand(call.args[1])
             if variable.ratio_default == 'rate' and variable.sources:
                 continue  # An explicit rate fallback is a distinct source-bound policy.
-            if missing_default(ratio):
+            if missing_default(call.args[1], variable.scope, guards):
                 gaps.append((f'variables.{name}',
                     f'变量 {name} 把缺少记录时的常数再次送入tier_rate查档；默认最终系数可能被换成另一档。'
                     '按原文将缺失判断放在查表外，或用tier_ratio(..., missing: 缺失条件)。'

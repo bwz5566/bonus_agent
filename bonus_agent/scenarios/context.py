@@ -5,23 +5,27 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from bonus_agent.scenarios import Registry, Scenario
+from bonus_agent.scenarios import InputTable, Registry, Scenario, ScenarioError
 from bonus_agent.scenarios.inputs import check_inputs, template_text
 
 
 def guide_file(reg: Registry, sc: Scenario) -> Path | None:
     """场景说明作为一份材料交给智能体（能按原文引用、核对出处）：放在本机场景目录下，内容变了才重写。"""
-    text = sc.guide_text()
+    return _stage_document(reg, sc, f"场景说明（{sc.name}）.md", sc.guide_text())
+
+
+def _stage_document(reg, sc, name, text):
     if not text:
         return None
-    p = reg.data_dir(sc.id) / "staged" / f"场景说明（{sc.name}）.md"
+    p = reg.data_dir(sc.id) / "staged" / name
     if not p.exists() or p.read_text(encoding="utf-8") != text:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text, encoding="utf-8")
     return p
 
 
-def agent_brief(reg: Registry, sc: Scenario, files: list[str | Path], *, use_memory: bool = True) -> str:
+def agent_brief(reg: Registry, sc: Scenario, files: list[str | Path], *, use_memory: bool = True,
+                confirmations=(), output_source=None) -> str:
     parts = [f"【场景】{sc.name}" + (f"：{sc.description.strip()}" if sc.description.strip() else "")
              + "\n本批次按这个场景计算，只用这个场景的规则和输入格式。"]
     guide = guide_file(reg, sc)
@@ -40,7 +44,14 @@ def agent_brief(reg: Registry, sc: Scenario, files: list[str | Path], *, use_mem
         parts.append("【输入模板】本场景每期的数据按下面的表和列提供：\n" + tpl + "\n" + rep.text()
                      + ("\n有错误时：先用 ask_question 请财务确认或补正数据，不要自己猜测或改用别的列。" if rep.errors else ""))
     if sc.outputs.strip():
-        parts.append("【输出要求】" + sc.outputs.strip())
+        citation = f"原文可引用材料「{output_source.name}」。\n" if output_source else ""
+        parts.append("【输出要求】" + citation + sc.outputs.strip())
+    if confirmations:
+        parts.append("【本批已确认口径】核算期间及所有原始规则、业务材料指纹已经匹配。"
+                     "以下正式确认文件作为可引用依据；只登记实际参与计算的参数，行号、页码与例子是定位信息。"
+                     "新财务答复与本记录冲突时须核对适用范围。\n"
+                     + "\n\n".join(f"《{file.name}》原文：\n" + file.read_text(encoding="utf-8").strip()
+                                      for file in confirmations))
     if use_memory and sc.memory:
         mem = reg.memory(sc.id).brief()
         if mem:
@@ -58,6 +69,10 @@ class AgentScenario:
     files: list[Path] = field(default_factory=list)
     outputs: str = ""          # 场景的输出要求：有的话，规则里要写 report（汇总核算、分配人员金额）
     regressions: list[dict] = field(default_factory=list, repr=False)  # server-only holdout references; never in brief
+    inputs: list[InputTable] = field(default_factory=list)
+    supplements: list[Path] = field(default_factory=list)
+    execution: str = 'generic'
+    rule_store: Path | None = None  # fixed-chain, versioned financial decisions
 
 
 def expand(paths: list[str | Path]) -> list[Path]:
@@ -67,10 +82,40 @@ def expand(paths: list[str | Path]) -> list[Path]:
     return out
 
 
-def prepare(reg: Registry, scenario_id: str, materials: list[str | Path], *, use_memory: bool = True) -> AgentScenario:
+def _matching_confirmations(sc, materials, guide, period):
+    from bonus_agent.auto import collect_files
+    from bonus_agent.case import fingerprint, sha256
+    from bonus_core.data.period import Period
+
+    if not period or not sc.confirmed_batches:
+        return []
+    label = Period.parse(period).label
+    matching_period = [entry for entry in sc.confirmed_batches if Period.parse(entry.period).label == label]
+    if not matching_period:
+        return []
+    hashes = fingerprint(collect_files(materials) + ([guide] if guide else []))
+    selected = []
+    for entry in matching_period:
+        if entry.material_hashes != hashes:
+            continue
+        path = sc.file(entry.document)
+        if not path.is_file() or sha256(path) != entry.document_sha256:
+            raise ScenarioError(f"本批确认文件缺失或已修改：{entry.document}；须核对确认版本")
+        selected.append(path)
+    return list(dict.fromkeys(selected))
+
+
+def prepare(reg: Registry, scenario_id: str, materials: list[str | Path], *, use_memory: bool = True,
+            period: str | None = None) -> AgentScenario:
     sc = reg.get(scenario_id)
     guide = guide_file(reg, sc)
+    output = _stage_document(reg, sc, f"场景输出要求（{sc.name}）.md", sc.outputs.strip())
+    confirmations = _matching_confirmations(sc, materials, guide, period)
+    supplements = ([output] if output else []) + confirmations
     cases = [{"id": c.id, "files": [str(sc.file(f)) for f in c.data], "expected": str(sc.file(c.expected)), "period": c.period}
              for c in sc.acceptance]
-    return AgentScenario(sc.id, agent_brief(reg, sc, expand(materials), use_memory=use_memory), [guide] if guide else [],
-                         sc.outputs.strip(), cases)
+    brief = agent_brief(reg, sc, expand(materials), use_memory=use_memory,
+                        confirmations=confirmations, output_source=output)
+    return AgentScenario(sc.id, brief, ([guide] if guide else []) + supplements,
+                         sc.outputs.strip(), cases, sc.inputs, supplements, sc.execution,
+                         reg.data_dir(sc.id) / 'commission_rules' / 'versions.json' if sc.execution == 'sales_commission_v1' else None)

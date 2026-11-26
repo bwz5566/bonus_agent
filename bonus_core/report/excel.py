@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from itertools import zip_longest
 from pathlib import Path
 
 import openpyxl
@@ -40,12 +41,80 @@ def _d(s) -> Decimal:
     return Decimal(str(s))
 
 
+def add_consolidated_reports(wb, results: dict[str, dict[str, Result]]) -> dict[str, list[list]]:
+    """Put scope-specific amounts and named recipients in the primary workbook."""
+    versions = [(scheme, rev, result) for scheme, editions in results.items() for rev, result in editions.items()]
+    reports = list(dict.fromkeys(name for _, _, result in versions for name in result.details))
+    detail_rows, raw_rows = [], []
+    for scheme, rev, result in versions:
+        raw = result.detail_raw_amounts()
+        by_object = {}
+        for report, items in result.details.items():
+            for ident, item in items.items():
+                row = by_object.setdefault(ident, (item['key'], item['name'], {}))
+                amount = _d(item['amount'])
+                row[2][report] = amount
+                raw_rows.append([scheme, rev, report, ident, item['key'], item['name'], str(raw[report][ident]), amount])
+        detail_rows.extend([scheme, rev, ident, key, name, *(amounts.get(report) for report in reports)]
+                           for ident, (key, name, amounts) in by_object.items())
+    detail_header = ['方案', '修订', '对象标识', '编号', '名称', *reports]
+    _sheet(wb, '核算底稿', detail_header, detail_rows,
+           money_cols=range(6, 6 + len(reports)))
+
+    total_rows = [[scheme, rev, label, _d(value)]
+                  for scheme, rev, result in versions
+                  for label, value in (result.totals or [('奖金池', result.pool)])]
+    total_header = ['方案', '修订', '核算类型', '金额']
+    summary = _sheet(wb, '汇总核算', total_header, total_rows, money_cols=(4,))
+    expected_summary = [total_header, *total_rows]
+
+    def append_section(headers, rows, money_cols):
+        if not rows:
+            return
+        expected_summary.extend([[], headers, *rows])
+        summary.append([])
+        summary.append(headers)
+        for cell in summary[summary.max_row]:
+            if cell.value is not None:
+                cell.font, cell.fill = Font(bold=True), HEAD_FILL
+                column = summary.column_dimensions[cell.column_letter]
+                column.width = max(column.width, 16, len(str(cell.value)) * 2)
+        for row in rows:
+            summary.append(row)
+            for col in money_cols:
+                summary.cell(summary.max_row, col).number_format = MONEY
+
+    # Only explicit people reports contribute. The project funding scheme's
+    # payout nodes are not people and may finance the next scheme.
+    append_section(
+        ['方案', '修订', '人员或待分配项', '类型', '参与条数', '应得', '暂缓', '本次实发'],
+        [[scheme, rev, row['name'], '待分配' if row.get('pending') else '人员',
+          row['count'], _d(row['final']), _d(row['held']), _d(row['paid'])]
+         for scheme, rev, result in versions for row in result.people],
+        (6, 7, 8),
+    )
+    append_section(
+        ['方案', '修订', '去向核对', '理论金额', '人员金额合计', '待分配合计', '舍入差额'],
+        [[scheme, rev, row['name'], *(_d(row[key]) for key in ('total', 'allocated', 'pending', 'residual'))]
+         for scheme, rev, result in versions for row in result.rounding],
+        (4, 5, 6, 7),
+    )
+    expected = {'核算底稿': [detail_header, *detail_rows], '汇总核算': expected_summary}
+    if raw_rows:
+        header = ['方案', '修订', '核算项', '对象标识', '编号', '名称', '舍入前金额（精确文本）', '核算金额']
+        sheet = _sheet(wb, '明细原值', header, raw_rows, money_cols=(8,))
+        expected[sheet.title] = [header, *raw_rows]
+    return expected
+
+
 def write_excel(rs: RuleSet, res: Result, path: str | Path, ledger: list[dict] | None = None,
-                extra_sheets: list[tuple[str, list[str], list[list], dict]] | None = None) -> Path:
+                extra_sheets: list[tuple[str, list[str], list[list], dict]] | None = None, *,
+                explicit_people_only: bool = False) -> Path:
     """extra_sheets：(标题, 表头, 行, 列宽) 列表，放在「汇总」之后（如智能体的规划说明、待确认问题）。"""
     path = Path(path)
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
+    expected_sheets = {}
     nodes = res.nodes
     leaf = res.levels[-1]
 
@@ -56,8 +125,8 @@ def write_excel(rs: RuleSet, res: Result, path: str | Path, ledger: list[dict] |
         ["规则", f"{res.rule_set}（{res.rule_version}）"],
         ["奖金池（精确值）", float(_d(res.pool_exact))],
         ["奖金池（保留到分）", float(_d(res.pool))],
-        ["本期实发合计", float(total_paid)],
-        ["本期挂起合计", float(total_held)],
+        *([["本期可分配资金", float(_d(res.pool))]] if res.funding else
+          [["本期实发合计", float(total_paid)], ["本期挂起合计", float(total_held)]]),
         *[[f"  其中 挂起：{c.id}", float(sum((_d(p.holds.get(c.id, 0)) for p in res.payouts.values()), Decimal(0)))]
           for c in rs.payout],
         *([["应得扣除挂起后（正常发放）", float(sum((_d(p.final) for p in res.payouts.values()), Decimal(0)) - total_held)]]
@@ -74,13 +143,17 @@ def write_excel(rs: RuleSet, res: Result, path: str | Path, ledger: list[dict] |
     for title, headers, extra_rows, widths in extra_sheets or []:
         _sheet(wb, title, headers, extra_rows, widths=widths)
     if res.rounding:
-        _sheet(wb,'舍入对账',['名称','理论金额','人员金额合计','待分配合计','舍入差额','说明'],
-            [[r['name'],float(_d(r['total'])),float(_d(r['allocated'])),float(_d(r['pending'])),
-              float(_d(r['residual'])),'先汇总到人员再舍入；差额单列，不转加到人员'] for r in res.rounding],
-            money_cols=(2,3,4,5))
+        header = ['名称', '理论金额', '人员金额合计', '待分配合计', '舍入差额', '说明']
+        rows = [[r['name'], *(_d(r[key]) for key in ('total', 'allocated', 'pending', 'residual')),
+                 '先汇总到人员再舍入；差额单列，不转加到人员'] for r in res.rounding]
+        sheet = _sheet(wb, '舍入对账', header, rows, money_cols=(2, 3, 4, 5))
+        expected_sheets[sheet.title] = [header, *rows]
+    raw = res.detail_raw_amounts()
     for name, group in res.details.items():
-        _sheet(wb,f'{name}核算结果',['节点','编号','名称','核算金额'],
-               [[nid,r['key'],r['name'],float(_d(r['amount']))] for nid,r in group.items()],money_cols=(4,))
+        header = ['节点', '编号', '名称', '核算金额', '舍入前金额（精确文本）']
+        rows = [[nid, row['key'], row['name'], _d(row['amount']), str(raw[name][nid])] for nid, row in group.items()]
+        sheet = _sheet(wb, f'{name}核算结果', header, rows, money_cols=(4,))
+        expected_sheets[sheet.title] = [header, *rows]
     auxiliary={}
     for item in res.auxiliary.values():
         auxiliary.setdefault(item['level'],[]).append(item)
@@ -118,8 +191,9 @@ def write_excel(rs: RuleSet, res: Result, path: str | Path, ledger: list[dict] |
         pay_rows.append([nid, n.label, nodes[n.parent].label, float(_d(p.final)), float(_d(p.held)),
                          float(_d(p.cap or p.paid)), float(_d(p.offset)), float(_d(p.paid)), float(_d(p.overpaid))]
                         + [float(_d(p.holds[c])) for c in conds])
-    _sheet(wb, f"{leaf}发放", ["节点", "名称", "上级", "应得", "暂缓", "可发上限", "已发抵扣", "本次实发", "超发待核对"]
-           + [f"挂起：{c}" for c in conds], pay_rows, money_cols=range(4, 10 + len(conds)))
+    if not res.funding:
+        _sheet(wb, f"{leaf}发放", ["节点", "名称", "上级", "应得", "暂缓", "可发上限", "已发抵扣", "本次实发", "超发待核对"]
+               + [f"挂起：{c}" for c in conds], pay_rows, money_cols=range(4, 10 + len(conds)))
     if res.rollups:
         ent = next(iter(res.rollups.values())).entity
         _sheet(wb, f"按{ent}汇总发放", ["节点", "名称", "包含", "应得", "暂缓", "可发上限", "已发抵扣", "实际抵扣", "本次实发", "超发待核对"],
@@ -155,49 +229,64 @@ def write_excel(rs: RuleSet, res: Result, path: str | Path, ledger: list[dict] |
         ["数据哈希（规则+数据）", res.data_hash],
     ], widths={"项目": 14, "值": 70})
 
-    _summary_sheet(wb, rs, res)
+    expected_sheets['汇总核算'] = _summary_sheet(wb, rs, res, explicit_people_only=explicit_people_only)
     wb.calculation.fullCalcOnLoad = True       # Excel 打开时整本重算
     wb.save(path)
     xlcalc.fill_cached(path)                   # 公式单元格写入计算值：不重算的程序读到的也不是空白
-    _self_check(path, res)
+    check_report_sheets(path, expected_sheets, allocation=res)
     return path
 
 
-def _summary_sheet(wb, rs: RuleSet, res: Result) -> None:
+def _summary_sheet(wb, rs: RuleSet, res: Result, *, explicit_people_only: bool) -> list[list]:
     """固定的第一张表「汇总核算」：上面是按核算类型的总金额（规则 report.totals），下面是分配人员金额（按 report.people 合计）。
     规则没写 report 时，用奖金池、各发放条件的暂缓和正常发放代替上半部分。"""
     ws = wb.create_sheet("汇总核算", 0)
     bold = Font(bold=True)
-    ws.append(["一、核算汇总"])
+    expected = [["一、核算汇总"], ["核算类型", "金额"]]
+    ws.append(expected[0])
     ws["A1"].font = bold
-    ws.append(["核算类型", "金额"])
-    totals = [(n, float(_d(v))) for n, v in res.totals]
+    ws.append(expected[1])
+    totals = [(n, _d(v)) for n, v in res.totals]
     if not totals:
         held = {c.id: sum((_d(p.holds.get(c.id, 0)) for p in res.payouts.values()), Decimal(0)) for c in rs.payout}
-        totals = [("奖金池（应得合计）", float(_d(res.pool)))] + [(f"挂起：{c}", float(v)) for c, v in held.items()]
+        totals = [("奖金池（应得合计）", _d(res.pool)), *((f"挂起：{c}", v) for c, v in held.items())]
         if res.payouts:
-            totals.append(("正常发放（应得扣除挂起）", float(_d(res.pool) - sum(held.values(), Decimal(0)))))
+            totals.append(("正常发放（应得扣除挂起）", _d(res.pool) - sum(held.values(), Decimal(0))))
     for n, v in totals:
-        ws.append([n, v])
+        row = [n, v]
+        expected.append(row)
+        ws.append(row)
     top = ws.max_row
     for r in range(3, top + 1):
         ws.cell(r, 2).number_format = MONEY
+    ws.column_dimensions["A"].width = 30
+    ws.column_dimensions["B"].width = 16
+    if explicit_people_only and not (rs.report and rs.report.people):
+        for cell in ws[2]:
+            cell.font, cell.fill = bold, HEAD_FILL
+        return expected
     ws.append([])
     ws.append(["二、分配人员金额"])
     ws.cell(ws.max_row, 1).font = bold
     conds = [c.id for c in rs.payout]
     head = ["人员", "参与条数", "应得"] + [f"挂起：{c}" for c in conds] + ["本次实发"]
     ws.append(head)
+    expected.extend([[], ["二、分配人员金额"], head])
     hr = ws.max_row
-    people = res.people or [{"name": res.nodes[nid].label, "count": 1, "final": p.final, "held": p.held, "paid": p.paid,
-                             "holds": p.holds} for nid, p in res.payouts.items()]
-    for o in people:
-        ws.append([o["name"], o["count"], float(_d(o["final"]))] + [float(_d(o["holds"].get(c, 0))) for c in conds]
-                  + [float(_d(o["paid"]))])
+    people = res.people
+    if not people and not (rs.report and rs.report.people):
+        people = [{"name": res.nodes[nid].label, "count": 1, "final": p.final, "paid": p.paid,
+                   "holds": p.holds} for nid, p in res.payouts.items()]
+    amounts = [[row["name"], row["count"], _d(row["final"]),
+                *(_d(row["holds"].get(c, 0)) for c in conds), _d(row["paid"])] for row in people]
+    for row in amounts:
+        ws.append(row)
+    expected.extend(amounts)
     last = ws.max_row
     if last > hr:
-        ws.append(["合计", f"=SUM(B{hr + 1}:B{last})"] + [f"=SUM({get_column_letter(i)}{hr + 1}:{get_column_letter(i)}{last})"
-                                                      for i in range(3, len(head) + 1)])
+        ws.append(["合计", f"=SUM(B{hr + 1}:B{last})"] + [f"=ROUND(SUM({get_column_letter(i)}{hr + 1}:{get_column_letter(i)}{last}),2)"
+                                                        for i in range(3, len(head) + 1)])
+        expected.append(["合计", *(sum(row[i] for row in amounts) for i in range(1, len(head)))])
         ws.cell(ws.max_row, 1).font = bold
     for r in range(hr + 1, ws.max_row + 1):
         for i in range(3, len(head) + 1):
@@ -206,9 +295,9 @@ def _summary_sheet(wb, rs: RuleSet, res: Result) -> None:
         for c in ws[r]:
             if c.value is not None:
                 c.font, c.fill = bold, HEAD_FILL
-    ws.column_dimensions["A"].width = 30
     for i in range(2, len(head) + 1):
         ws.column_dimensions[get_column_letter(i)].width = 16
+    return expected
 
 
 GREY = PatternFill("solid", fgColor="EDEDED")
@@ -316,12 +405,30 @@ def _review_sheets(wb, rs: RuleSet, res: Result) -> None:
         ps.column_dimensions["A"].width, ps.column_dimensions["B"].width, ps.column_dimensions["C"].width = 50, 16, 16
 
 
-def _self_check(path: Path, res: Result) -> None:
-    """重新读取文件，核对各层级合计与快照一致。"""
-    wb = openpyxl.load_workbook(path, data_only=True)
-    pool = _d(res.pool)
-    for lv in res.levels:
-        ws = wb[f"{lv}明细"[:31]]
-        s = sum((_d(round(r[5], 2)) for r in ws.iter_rows(min_row=2, values_only=True)), Decimal(0))
-        if s.quantize(Decimal("0.01")) != pool:
-            raise AssertionError(f"结果 Excel 自检失败：「{lv}」合计 {s} ≠ 奖金池 {pool}")
+def check_report_sheets(path, expected_sheets, *, allocation: Result | None = None) -> None:
+    """Read the stored workbook and verify its financial rows against engine data."""
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    try:
+        for title, expected_rows in expected_sheets.items():
+            if title not in wb:
+                raise AssertionError(f"结果 Excel 回读失败：缺少「{title}」")
+            for number, (actual, expected) in enumerate(zip_longest(wb[title].values, expected_rows), 1):
+                if actual is None or expected is None:
+                    raise AssertionError(f"结果 Excel 回读失败：「{title}」第 {number} 行缺失或多出")
+                for col, (value, wanted) in enumerate(zip_longest(actual, expected), 1):
+                    if type(wanted) in (Decimal, int):
+                        equal = type(value) in (int, float) and _d(value) == wanted
+                    else:
+                        equal = value == (None if wanted == '' else wanted)
+                    if not equal:
+                        cell = f'{get_column_letter(col)}{number}'
+                        raise AssertionError(f"结果 Excel 回读失败：「{title}」{cell} 为 {value!r}，核算值为 {wanted}")
+        if allocation is not None:
+            pool = _d(allocation.pool)
+            for level in allocation.levels:
+                ws = wb[f"{level}明细"[:31]]
+                total = sum((_d(round(row[5], 2)) for row in ws.iter_rows(min_row=2, values_only=True)), Decimal(0))
+                if total.quantize(Decimal("0.01")) != pool:
+                    raise AssertionError(f"结果 Excel 回读失败：「{level}」合计 {total} ≠ 奖金池 {pool}")
+    finally:
+        wb.close()

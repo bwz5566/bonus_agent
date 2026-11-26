@@ -62,6 +62,22 @@ class AcceptanceCase(_Strict):
     note: str = ""
 
 
+class ConfirmedBatch(_Strict):
+    """A financial decision document scoped to the exact rule/data inputs and period."""
+    period: str
+    material_hashes: dict[str, str] = Field(min_length=1)
+    document: str
+    document_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("material_hashes")
+    @classmethod
+    def _hashes(cls, value):
+        if any(Path(name).name != name or not re.fullmatch(r"[0-9a-f]{64}", digest)
+               for name, digest in value.items()):
+            raise ValueError("已确认批次须使用真实材料文件名与 SHA-256")
+        return value
+
+
 class Scenario(_Strict):
     id: str
     name: str
@@ -75,6 +91,8 @@ class Scenario(_Strict):
     mcp: list[str] = Field(default_factory=list)        # 允许调用的外部服务（server/tool），默认不开
     memory: bool = True               # 是否把发布时财务确认过的口径记为场景记忆，供下次编制参考
     acceptance: list[AcceptanceCase] = Field(default_factory=list)
+    confirmed_batches: list[ConfirmedBatch] = Field(default_factory=list)
+    execution: Literal['generic','sales_commission_v1'] = 'generic'
     _dir: Path = PrivateAttr(default=Path("."))
 
     @field_validator("id")

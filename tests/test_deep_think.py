@@ -18,15 +18,30 @@ def test_think_switch_covers_each_dialect():
     assert think_switch({"enable_thinking": True}) is None and think_switch(None) is None and think_switch({"x": 1}) is None
 
 
-def test_every_configured_model_is_adapted():
-    """配置里每个能关掉思考的模型都能按需打开；本来不思考或一直思考的模型不切换。DeepSeek 思考内容要带回。"""
+def test_every_configured_model_is_adapted(monkeypatch):
+    """Explicit Gemini/Kimi thinking profiles, automatic switches and alternate
+    thinking models all follow their configured capability, without real keys."""
     cfg = load_config(L.DEFAULT_CONFIG)
+    for provider in cfg['providers'].values():
+        if provider.get('require_api_key'):
+            monkeypatch.setenv(provider['api_key_env'],'offline-model-config-test')
+
+    def contract(name, auxiliary=False):
+        model=cfg['models'][name];setting=model.get('think','auto')
+        body=setting if isinstance(setting,dict) else think_switch(L._merge(model.get('extra_body'),model.get('tools_extra_body'))) if setting=='auto' else None
+        echo=bool(model.get('think_echo','thinking' in (body or {})))
+        alternate=model.get('think_model') if not auxiliary else None
+        if alternate and alternate!=name:
+            _,alternate_echo=contract(alternate,True)
+            return True,echo or alternate_echo
+        return body is not None,echo
     for name, m in cfg["models"].items():
         llm = LLM.from_config(name, cfg)
-        body = {**(m.get("extra_body") or {}), **(m.get("tools_extra_body") or {})}
-        off = "false" in str(body).lower() or "disabled" in str(body)
-        assert llm.can_think == off, name
-        assert llm.think_echo == (name.startswith("deepseek")), name
+        can_think,echo=contract(name)
+        assert llm.can_think==can_think, name
+        assert llm.think_echo==echo, name
+        if isinstance(m.get('think'),dict):assert llm.think_body==m['think'],name
+        if m.get('think_model') and m['think_model']!=name:assert llm.think_llm.name==m['think_model'],name
 
 
 class _Client:
@@ -102,16 +117,22 @@ class _Recorder(FakeLLM):
 
 
 def test_agent_thinks_after_error_then_switches_back():
-    """出错的下一步深度思考（附分析要求、思考内容记进步骤），成功后切回普通模式；参数格式小错第一次不思考。"""
+    """First use deterministic structural feedback, escalate repeated failures,
+    then switch back after a successful action. Small format errors stay shallow."""
     from bonus_agent.agent import run_agent
     cols = {"a": {"column": "b", "type": "id"}}
-    bad = {"tool": "define_dataset", "args": {"name": "x", "file": "无.xlsx", "sheet": "a", "fields": cols}}
-    llm = _Recorder([bad, {"tool": "list_files"}, {"tool": "define_dataset", "args": {"nam": "x"}}, {"tool": "list_files", "args": {"a": 1}}])
+    bad = {"tool": "define_dataset", "args": {"name": "x", "file": "无0.xlsx", "sheet": "a", "fields": cols}}
+    # Two different file names with the same normalized error signature.
+    retry={**bad,'args':{**bad['args'],'file':'无1.xlsx'}}
+    llm = _Recorder([bad,retry,{"tool":"list_files"},{"tool":"list_files","args":{"a":1}}])
     ar = run_agent(llm, [ANNUAL], max_steps=4)
-    assert llm.flags == [False, True, False, False]
-    assert "深度思考" in llm.tails[1] and "define_dataset 失败" in llm.tails[1] and "深度思考" not in llm.tails[2]
-    assert ar.steps[1].deep and ar.steps[1].thought.startswith("【深度思考】错在文件名") and not ar.steps[0].deep
+    assert llm.flags == [False,False,True,False]
+    assert "深度思考" in llm.tails[2] and "define_dataset 失败" in llm.tails[2] and "深度思考" not in llm.tails[3]
+    assert ar.steps[2].deep and ar.steps[2].thought.startswith("【深度思考】错在文件名") and not ar.steps[0].deep and not ar.steps[1].deep
     assert ar.deep_steps == 1
+    for first_error in (bad,{"tool":"define_dataset","args":{"nam":"x"}}):
+        shallow=_Recorder([first_error,{"tool":"list_files"}]);run_agent(shallow,[ANNUAL],max_steps=2)
+        assert shallow.flags==[False,False]
 
 
 def test_deep_budget_and_off():
@@ -120,7 +141,7 @@ def test_deep_budget_and_off():
     bad = [{"tool": "define_dataset", "args": {"name": "x", "file": f"无{i}.xlsx", "sheet": "a", "fields": cols}} for i in range(5)]
     llm = _Recorder(bad)
     run_agent(llm, [ANNUAL], max_steps=5, deep=2)
-    assert llm.flags == [False, True, True, False, False]
+    assert llm.flags == [False, False, True, True, False]
     llm = _Recorder(bad)
     run_agent(llm, [ANNUAL], max_steps=3, deep=0)
     assert llm.flags == [False, False, False]
@@ -130,10 +151,11 @@ def test_deep_step_with_only_analysis_hands_back():
     """深度思考那一步（如换成更强的模型）只回了分析、没调用工具：不算失败，分析留在历史里，下一步不思考、按分析动手"""
     from bonus_agent.agent import run_agent
     cols = {"a": {"column": "b", "type": "id"}}
-    bad = {"tool": "define_dataset", "args": {"name": "x", "file": "无.xlsx", "sheet": "a", "fields": cols}}
-    script = [bad] + ["错在文件名，应该先 list_files 看清文件"] * 1 + [{"tool": "list_files"}] * 6
+    bad = {"tool": "define_dataset", "args": {"name": "x", "file": "无0.xlsx", "sheet": "a", "fields": cols}}
+    retry={**bad,'args':{**bad['args'],'file':'无1.xlsx'}}
+    script = [bad,retry,"错在文件名，应该先 list_files 看清文件"] + [{"tool": "list_files"}] * 6
     llm = _Recorder(script)
     ar = run_agent(llm, [ANNUAL], max_steps=6)
-    assert llm.flags[:3] == [False, True, False]
+    assert llm.flags[:4] == [False, False, True, False]
     assert any("深度思考得出的分析" in str(c) and "错在文件名" in str(c) for c in llm.calls)
     assert "没有调用工具" not in (ar.error or "")

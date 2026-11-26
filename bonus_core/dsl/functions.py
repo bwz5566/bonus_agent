@@ -48,6 +48,7 @@ FUNCTIONS: dict[str, FnSpec] = {
     "quarter": FnSpec(1, 1, doc="日期所在季度 1~4"),
     "period_start": FnSpec(0, 0, doc="本次核算期间的第一天（日期）。期间在计算时选，规则里不要写死月份，如 month(period_end())"),
     "period_end": FnSpec(0, 0, doc="本次核算期间的最后一天（日期）"),
+    "has_ref": FnSpec(1, 1, doc='has_ref("关联实体名") 当前对象按关联键是否能取得该实体；有键但无对应记录时为否。仅在原文允许缺失时用条件分支处理'),
     "scheme_paid": FnSpec(1, 2, doc='scheme_paid("方案名", "修订名") 同一批里另一个方案（某个修订，默认 R0）给本人的本次实发金额，用于跨方案抵扣'),
 }
 

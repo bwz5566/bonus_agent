@@ -52,6 +52,14 @@ class RunBudgetError(LLMError):
     """A shared job allowance stopped the request, not a provider/protocol failure."""
 
 
+def _moonshot_quota_denial(base_url, exc):
+    if base_url.rstrip('/') != 'https://api.moonshot.cn/v1' or getattr(exc, 'status_code', None) != 429:
+        return False
+    body = getattr(exc, 'body', None)
+    error = body.get('error', body) if isinstance(body, dict) else None
+    return isinstance(error, dict) and error.get('type') == 'exceeded_current_quota_error'
+
+
 def _safe_error_text(value, secret=''):
     """Bound and redact exception text; callers do not separately attach raw requests/headers."""
     text = str(value)
@@ -518,7 +526,7 @@ class LLM:
     name: str
     model: str
     base_url: str
-    api_key: str
+    api_key: str = field(repr=False)
     json_mode: str = "json_object"
     extra_body: dict | None = None
     tool_mode: str = "native"         # native：OpenAI 兼容的工具调用；json：模型输出 JSON 动作（不支持工具调用时用）
@@ -548,6 +556,10 @@ class LLM:
     min_request_seconds: float = 0   # minimum job time remaining before a potentially billable request
     basis_review_split: bool = False  # independently generate bounded basis review sections
     basis_review_reasoning_effort: str | None = None
+    repair_llm: "LLM | None" = None
+    fixed_temperature: float | None = None
+    json_with_thinking: bool = False
+    fallback_api_key: str = field(default='', repr=False, compare=False)
 
     @classmethod
     def from_config(cls, name: str | None = None, config: dict | None = None, checker: str | None = None,
@@ -562,9 +574,22 @@ class LLM:
             raise LLMError(f"未配置的模型 {name}，可选：{', '.join(cfg['models'])}")
         m = cfg["models"][name]
         prov = cfg["providers"][m["provider"]]
-        llm = cls(name, m["model"], prov["base_url"], provider_key(prov), m.get("json_mode", "json_object"),
+        key = provider_key(prov)
+        if prov.get('require_api_key') and (not str(key).strip() or key == 'EMPTY'):
+            raise LLMError(f"模型 {name} 缺少 API Key。请设置 {prov['api_key_env']}，或填写 "
+                           f"config/secrets.yaml 的 providers.{m['provider']}.api_key。")
+        llm = cls(name, m["model"], prov["base_url"], key, m.get("json_mode", "json_object"),
                   m.get("extra_body"), m.get("tool_mode", "native"), cache=m.get("cache"),
                   tools_extra_body=m.get("tools_extra_body"), timeout=float(m.get("timeout", 300)))
+        if m['provider'] == 'moonshot' and llm.base_url.rstrip('/') == 'https://api.moonshot.cn/v1':
+            spare = os.environ.get(prov.get('fallback_api_key_env', ''), '') or prov.get('fallback_api_key')
+            if isinstance(spare, str) and spare.strip() and spare != llm.api_key:
+                llm.fallback_api_key = spare.strip()
+        if (temperature := m.get('fixed_temperature')) is not None:
+            if not isinstance(temperature, (int, float)) or isinstance(temperature, bool) or not 0 <= temperature <= 2:
+                raise LLMError(f'模型 {name} 的 fixed_temperature 须为 0 至 2 的数值')
+            llm.fixed_temperature = float(temperature)
+        llm.json_with_thinking = m.get('json_with_thinking', False)
         t = m.get("think", "auto")      # auto：按关闭开关推出来；false：不切换；字典：打开思考时的请求参数
         if t == "auto":
             llm.think_body = think_switch(_merge(m.get("extra_body"), m.get("tools_extra_body")))
@@ -627,6 +652,14 @@ class LLM:
                 raise LLMError(f"交叉验证模型 {c} 没有配置，可选：{', '.join(cfg['models'])}")
             llm.checker_llm = cls.from_config(c, cfg, _auxiliary=True, _path=route_path)
             llm.checker_llm.usage = llm.usage          # 用量记在同一处
+        repair = m.get('repair_model') if not _auxiliary else None
+        if repair:
+            if not isinstance(repair, str) or repair == name or repair not in cfg['models']:
+                raise LLMError(f'模型 {name} 的 repair_model 须引用另一个已配置模型')
+            provider = cfg['providers'][cfg['models'][repair]['provider']]
+            if provider_key(provider) != 'EMPTY':
+                llm.repair_llm = cls.from_config(repair, cfg, _auxiliary=True, _path=route_path)
+                llm.repair_llm.usage = llm.usage
         return llm
 
     @property
@@ -691,29 +724,39 @@ class LLM:
         return client
 
     def _send(self, kwargs, think):
-        if self.run_budget is None:
-            return self._send_once(kwargs, think)  # ordinary calls retain only the SDK retry policy
         started = time.monotonic()
-        attempts = self.last_call['request_attempts'] = []
+        attempts = None
+        if self.run_budget is not None:
+            attempts = self.last_call['request_attempts'] = []
         try:
-            for attempt in range(3):  # initial request plus at most two proven pre-send retries
-                for field in ('error_type', 'error_message', 'request_error'):
-                    self.last_call.pop(field, None)
-                try:
-                    return self._send_once(kwargs, think, probe=_PresendProbe(), attempts=attempts)
-                except LLMError as exc:
-                    if not getattr(exc, '_presend_retry_safe', False) or attempt == 2:
-                        raise
-                    self.last_call['presend_retries'] = attempt + 1
-                    # Backoff consumes the same deadline. The next attempt must reserve anew.
-                    try:
-                        delay = self.run_budget.request_timeout((0.2, 0.5)[attempt])
-                        time.sleep(delay)
-                    except RunBudgetError:
-                        self.last_call.update(status='budget_blocked', budget=self.run_budget.snapshot())
-                        raise
+            try:
+                return self._send_current(kwargs, think, attempts)
+            except LLMError as exc:
+                if not self.fallback_api_key or not _moonshot_quota_denial(self.base_url, exc.__cause__):
+                    raise
+                self.api_key, self.fallback_api_key = self.fallback_api_key, ''
+                self.last_call['credential_failover'] = {'provider': 'moonshot', 'reason': 'exceeded_current_quota_error'}
+            return self._send_current(kwargs, think, attempts)
         finally:
             self.last_call['request_seconds'] = round(time.monotonic() - started, 3)
+
+    def _send_current(self, kwargs, think, attempts):
+        if attempts is None:
+            return self._send_once(kwargs, think)
+        for attempt in range(3):  # initial request plus at most two proven pre-send retries
+            for field in ('error_type', 'error_message', 'request_error'):
+                self.last_call.pop(field, None)
+            try:
+                return self._send_once(kwargs, think, probe=_PresendProbe(), attempts=attempts)
+            except LLMError as exc:
+                if not getattr(exc, '_presend_retry_safe', False) or attempt == 2:
+                    raise
+                self.last_call['presend_retries'] = attempt + 1
+                try:
+                    time.sleep(self.run_budget.request_timeout((0.2, 0.5)[attempt]))
+                except RunBudgetError:
+                    self.last_call.update(status='budget_blocked', budget=self.run_budget.snapshot())
+                    raise
 
     def _send_once(self, kwargs, think, *, probe=None, attempts=None):
         budget, reservation = self.run_budget, None
@@ -781,7 +824,11 @@ class LLM:
             if budget is not None and reservation is not None:
                 if failure is not None:
                     failure['budget_request_sequence'] = reservation
-                budget.settle(reservation, reported=reported, sent=sent and not not_sent, failure=failure)
+                quota_denial = _moonshot_quota_denial(self.base_url, request_exception)
+                if quota_denial:
+                    failure['provider_rejection'] = 'exceeded_current_quota_error'
+                budget.settle(reservation, reported=reported, sent=sent and not not_sent, failure=failure,
+                              quota_denial=quota_denial)
                 self.last_call['budget'] = budget.snapshot()
             if attempts is not None:
                 diagnostic = {'attempt': len(attempts) + 1, 'budget_request_sequence': reservation,
@@ -853,10 +900,12 @@ class LLM:
                 self.last_call = self.think_llm.last_call
         think, body, max_tokens = self._think(think, dict(self.extra_body or {}), max_tokens)
         if getattr(self,'_max_output_tokens',None):max_tokens=min(max_tokens,int(self._max_output_tokens))
+        if self.fixed_temperature is not None:
+            temperature = self.fixed_temperature
         kwargs = dict(model=self.model, messages=self._prepare(messages), temperature=temperature, max_tokens=max_tokens)
         if body:
             kwargs["extra_body"] = body
-        if (json_out or schema) and not think:
+        if (json_out or schema) and (not think or self.json_with_thinking):
             if schema and self.json_mode == "json_schema":
                 kwargs["response_format"] = {"type": "json_schema", "json_schema": {"name": "output", "schema": schema}}
             else:
@@ -893,6 +942,8 @@ class LLM:
                 self.last_call = self.think_llm.last_call
         think, body, max_tokens = self._think(think, _merge(self.extra_body, self.tools_extra_body), max_tokens)
         if getattr(self,'_max_output_tokens',None):max_tokens=min(max_tokens,int(self._max_output_tokens))
+        if self.fixed_temperature is not None:
+            temperature = self.fixed_temperature
         kwargs = dict(model=self.model, messages=self._prepare(messages), tools=tools, temperature=temperature,
                       max_tokens=max_tokens)
         if body:
@@ -904,7 +955,13 @@ class LLM:
         msg = resp.choices[0].message
         calls = [{"id": c.id, "name": c.function.name, "arguments": c.function.arguments or "{}"}
                  for c in (msg.tool_calls or [])]
-        return {"content": msg.content or "", "tool_calls": calls, "reasoning": _reasoning(msg) if think else ""}
+        reply = {"content": msg.content or "", "tool_calls": calls, "reasoning": _reasoning(msg) if think else ""}
+        # Gemini signs the original assistant turn, including the location of the signature on parallel calls.
+        if any(isinstance(extra := getattr(part, 'extra_content', None), dict) and extra.get('google')
+               for part in [msg, *(msg.tool_calls or [])]):
+            reply['signed_message'] = msg.model_dump(mode='json', exclude_none=True, exclude_unset=True,
+                                                    include={'role', 'content', 'tool_calls', 'extra_content'})
+        return reply
 
 
 class FakeLLM(LLM):

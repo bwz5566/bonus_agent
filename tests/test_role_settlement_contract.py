@@ -6,7 +6,8 @@ import pytest
 
 from bonus_core.data.table import from_records
 from bonus_core.dsl.models import RuleSet
-from bonus_core.engine.run import compute
+from bonus_core.engine.issues import EngineError
+from bonus_core.engine.run import Engine, compute
 
 
 @pytest.mark.parametrize(
@@ -14,8 +15,9 @@ from bonus_core.engine.run import compute
     [('0.25', '125', '125.01', '750.03', '-0.01'),
      ('0.40', '200', '200.01', '600.02', '0.00')],
 )
+@pytest.mark.parametrize('entity_funding', [False, True])
 def test_role_and_personal_shares_are_multiplied_before_rounding_by_recipient(
-    rate, sample_contribution, recipient_total, pending, residual
+    rate, sample_contribution, recipient_total, pending, residual, entity_funding
 ):
     sources = [{'doc': 'policy.md', 'quote': 'Apply role rates, then personal shares. Round per recipient.'}]
     datasets = {
@@ -36,12 +38,24 @@ def test_role_and_personal_shares_are_multiplied_before_rounding_by_recipient(
             for pid, _, _ in project_amounts for name in ('A', 'B')
         ],
     }
-    project_rules = RuleSet.model_validate({
+    funding_definition = {
         'name': 'Project', 'version': '1', 'datasets': datasets,
         'allocation': [{'level': 'projects', 'key': 'pid'}],
         'pool': {'scope': 'projects', 'expr': 'round(if(unpaid == 1, 0, amount), 2)'},
-    })
+    }
+    if entity_funding:
+        funding_definition['allocation'] = []
+        funding_definition['report'] = {
+            'totals': [{'name': 'funds', 'level': 'projects', 'expr': 'round(if(unpaid == 1, 0, amount), 2)'}],
+            'details': [{'name': 'funds', 'level': 'projects', 'expr': 'round(if(unpaid == 1, 0, amount), 2)',
+                         'sources': sources}],
+        }
+    project_rules = RuleSet.model_validate(funding_definition)
     project_result = compute(project_rules, from_records(project_rules, records))
+    if entity_funding:
+        basis = Engine.prepare_basis(project_rules, from_records(project_rules, records)).calculate_basis()
+        assert project_result.funding == {key: row['amount'] for key, row in basis['objects'].items()}
+        assert project_result.pool == basis['pool'] and not project_result.people and not project_result.payouts
 
     person_rules = RuleSet.model_validate({
         'name': 'Recipient', 'version': '1', 'datasets': datasets,
@@ -62,13 +76,29 @@ def test_role_and_personal_shares_are_multiplied_before_rounding_by_recipient(
                                'pending': ['NPD pending'], 'rounding': 'after_sum', 'sources': sources}],
         },
     })
-    result = compute(person_rules, from_records(person_rules, records), refs={'Project/R0': project_result})
+    if entity_funding:
+        from bonus_core.dsl.models import FundingReconciliation
+
+        person_rules.report.distributions[0].source_funding = FundingReconciliation(
+            scheme='Project', level='projects', allocated='sum(contribution, of: "contributions")')
+    people_data = from_records(person_rules, records)
+    reference = {'Project/R0': project_result}
+    result = compute(person_rules, people_data, refs=reference)
 
     contributions = {row['key']: Decimal(row['amount']) for row in result.details['role contribution'].values()}
     assert contributions['PA'] == Decimal(sample_contribution)
     assert contributions['HA'] == 0
+    assert contributions['QA'] == 0
+    raw = result.detail_raw_amounts()['role contribution']
+    assert raw['contributions:QA'] == Decimal('0.02') * Decimal(rate) * Decimal('0.5')
     people = {row['name']: Decimal(row['paid']) for row in result.people}
     assert people == {'A': Decimal(recipient_total), 'B': Decimal(recipient_total), 'NPD pending': Decimal('0')}
     pending_row = next(row for row in result.people if row['name'] == 'NPD pending')
     assert pending_row['pending'] and Decimal(pending_row['final']) == Decimal(pending)
     assert Decimal(result.rounding[0]['residual']) == Decimal(residual)
+    if entity_funding:
+        contract = person_rules.report.distributions[0].source_funding
+        assert result.rounding[0]['funding_objects'] == 4
+        contract.allocated += ' + if(pid == "P", 1, if(pid == "Q", -1, 0))'
+        with pytest.raises(EngineError, match='资金.*与实名原值'):
+            compute(person_rules, people_data, refs=reference)

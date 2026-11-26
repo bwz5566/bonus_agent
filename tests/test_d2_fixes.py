@@ -52,6 +52,27 @@ def test_rule_value_from_materials_that_data_writes_differently_is_gated():
     assert "取值 空缺" not in rep.keys and any("空缺" in w for w in rep.warns)
 
 
+def test_mixed_lookup_keys_do_not_become_literals_for_the_source_column():
+    tables = {"shares": {"kind": "lookup", "mapping": {"负责人-新增": "0.25", "执行人-存量": "0.35"}}}
+    data = _data("role", ["负责人", "执行人"])
+    material = "按负责人 25%，执行人 35% 分配。"
+    mixed = _rs('if(role == "负责人", lookup(shares, "负责人-新增"), lookup(shares, role))', tables)
+    direct = _rs('lookup(shares, role)', tables)
+    assert "取值 负责人-新增" not in lint.check(mixed, data, material).keys
+    assert "取值 负责人-新增" in lint.check(direct, data, material).keys
+
+
+def test_excluding_generated_remainders_accepts_the_names_in_the_roster():
+    data = _data("person", ["甲", "乙", "执行余项"])
+    material = "实名来自名单，空份额单列。"
+    placeholders = {"person": {"负责人余项", "执行余项"}}
+    valid = _rs('if(person != "负责人余项" and person != "执行余项", 1, 0)')
+    misspelled = _rs('if(person != "负责余项" and person != "执行余项", 1, 0)')
+    assert not [key for key in lint.check(valid, data, material, generated_values=placeholders).keys
+                if key.startswith("取值 ")]
+    assert "取值 负责余项" in lint.check(misspelled, data, material, generated_values=placeholders).keys
+
+
 def test_percent_written_as_whole_numbers_elsewhere_is_not_a_missing_percent():
     text = "分配比例：销售负责人 25%，执行人 35%。提成比例 0.25%、0.35%。\n角色 | 分配比例\n执行人 | 42.5"
     rep = lint.check(_rs("0.25 + 0.35 + 0.425 + 0.0025"), {}, text)
@@ -59,6 +80,19 @@ def test_percent_written_as_whole_numbers_elsewhere_is_not_a_missing_percent():
     # 材料只写了 0.24%：规则写 0.24 仍要拦
     rep = lint.check(_rs("0.24"), {}, "提成比例 0.24%")
     assert "百分号 0.24" in rep.keys
+
+
+def test_exact_percentage_evidence_does_not_cover_other_positions_with_the_same_value():
+    from bonus_agent.facts import Fact, table_percentage_evidence
+
+    tables = {"shares": {"kind": "lookup", "mapping": {"a": "0.4", "b": "0.4"}}}
+    rs = _rs('lookup(shares, "a") + lookup(shares, "b")', tables)
+    a = Fact(name="a", file="rates.xlsx", quote="a 40%", value="40%", targets=["team::/tables/shares/mapping/a"])
+    b = Fact(name="b", file="rates.xlsx", quote="b 40%", value="40%", targets=["team::/tables/shares/mapping/b"])
+    text = "另一制度的提成档 0.4%。"
+    for records, scheme, warned in (([a], "team", True), ([a, b], "another", True), ([a, b], "team", False)):
+        evidence = table_percentage_evidence(tables, records, scheme)
+        assert ("百分号 0.4" in lint.check(rs, {}, text, table_percentages=evidence).keys) is warned
 
 
 def test_name_with_percent_in_data_is_a_gate():
@@ -76,6 +110,16 @@ def test_tier_method_must_be_stated_near_the_table_or_by_finance():
     near = "提成比例：500 万以下 1%，500 万以上 2%，超额累进。"
     assert "阶梯方式 rate" not in lint.check(_tier_rs(), {}, near).keys
     assert "阶梯方式 rate" not in lint.check(_tier_rs(), {}, far, said="按全额计算，整笔按所在档").keys
+
+
+def test_bound_tier_clause_checks_the_formula_even_without_nearby_band_values():
+    policy = {"rate": ["按区域对应超额累进阶梯比例计算"]}
+    rs = _tier_rs()
+    assert "计算契约 tables.rate" in lint.check(rs, {}, "档位见附表", tier_quotes=policy).keys
+    rs.tables["rate"].mode = "excess"
+    assert not any("tables.rate" in key or key == "阶梯方式 rate"
+                   for key in lint.check(rs, {}, "档位见附表", tier_quotes=policy).keys)
+    assert "阶梯方式 rate" in lint.check(rs, {}, "档位见附表", tier_quotes={"other": policy["rate"]}).keys
 
 
 def test_tier_rate_on_commission_rates_also_needs_the_method():

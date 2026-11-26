@@ -5,7 +5,7 @@ from decimal import Decimal as D
 import openpyxl
 import pytest
 
-from bonus_agent.agent import ToolError
+from bonus_agent.agent import AgentResult, ToolError, _overview
 from bonus_agent.compare import compare_expected
 from bonus_agent.reread import _disagree
 from bonus_agent.validation import result_integrity
@@ -53,6 +53,47 @@ def test_recipient_settlement_matches_group_then_round_and_exports_auxiliary_tra
     path=tmp_path/'settlement.xlsx';write_excel(ws._ruleset('S'),res,path)
     book=openpyxl.load_workbook(path,read_only=True,data_only=True)
     assert {'舍入对账','orders核算底稿','orders核算结果'}<=set(book.sheetnames)
+
+
+def test_primary_multischeme_workbook_contains_detail_people_and_rounding(tmp_path):
+    ws = recipient_model(tmp_path)
+    source = [{'doc': 'data.xlsx', 'quote': 'amount'}]
+    ws.set_rules(scheme='项目资金', pool={'scope': 'orders', 'expr': 'amount', 'sources': source},
+                 allocation=[{'level': 'orders', 'key': 'pid'}],
+                 report={'details': [{'name': '项目拨款', 'level': 'orders', 'expr': 'amount', 'sources': source}]})
+    ws.trial_run('项目资金')
+    ws.report_required = True
+    ar = AgentResult(ws, [], ws._ruleset('S'), ws.results['S']['R0'], results=ws.results)
+    path = tmp_path / 'result.xlsx'
+    _overview(ar, [], path)
+
+    book = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        assert book.sheetnames[:2] == ['核算底稿', '汇总核算']
+        details = list(book['核算底稿'].values)
+        col = details[0].index('项目拨款')
+        project, = (r for r in details[1:] if r[0] == '项目资金')
+        assert project[3] == 'P' and D(str(project[col])) == D('.01')
+        rows = list(book['汇总核算'].values)
+        people = {r[2]: D(str(r[5])) for r in rows if r[3] == '人员'}
+        assert people == {'A': D('0'), 'B': D('.01')}
+        rounding, = (r for r in rows if r[2] == 'funding')
+        assert tuple(map(lambda x: D(str(x)), rounding[3:7])) == (D('.01'), D('.01'), D(0), D(0))
+    finally:
+        book.close()
+
+
+def test_independent_review_catches_changed_raw_share_with_same_display_cents(tmp_path):
+    ws = recipient_model(tmp_path)
+    ws.drafts['S']['report']['details'][0]['stage'] = 'distribution'
+    ws.trial_run('S')
+    per_person = 'sum(amount / independently_counted, of: "shares")'
+    spec = {'pool': per_person,
+            'helpers': {'independently_counted': {'scope': 'orders', 'expr': 'count(of: "shares")'}},
+            'people': {'mode': 'after_sum', 'key': 'person', 'expr': per_person},
+            'details': {'orders': 'amount + 0.001'}}
+    differences = _disagree(ws, 'S', spec)
+    assert differences and {kind for kind, *_ in differences} == {'明细原值'}
 
 
 def test_independent_pending_amount_uses_auxiliary_projects_and_its_own_formula(tmp_path):

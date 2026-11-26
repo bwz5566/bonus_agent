@@ -171,6 +171,23 @@ bonus run --rules rules.yaml --mapping mapping.yaml \
 
 ## 二、模型选型
 
+### Windows 本机试用 Gemini 4 Hydrogen
+
+在 `config/secrets.yaml` 填写 `providers.gemini.api_key`，保存后重启网页服务。也可以设置环境变量 `GEMINI_API_KEY`，环境变量优先。密钥可在 [Google AI Studio](https://aistudio.google.com/apikey) 创建。
+
+```powershell
+Set-Location D:\hy_project\bonus_agent
+.\tools\restart-local.ps1
+```
+
+脚本在端口 8080 启动服务，默认模型为 `gemini-4-hydrogen`，数据目录为 `D:\bonus_data`。看到模型名和 PID 后打开 <http://127.0.0.1:8080>。日常执行使用低推理强度，独立复核使用单独的 Gemini 上下文，主要金额复核使用高推理强度。已配置的 Kimi 继续负责故障协助。切换服务会保留案卷和累计用量。
+
+切回 DeepSeek 时，在同一目录运行 `.\tools\restart-local.ps1 -Model deepseek-flash`。
+
+### 其他模型
+
+使用 `deepseek-flash` 或 `deepseek-flash-pro` 时，可在本地 `config/secrets.yaml` 的 `providers.moonshot.api_key` 配置 Kimi 密钥，也可设置 `MOONSHOT_API_KEY`。配置后，任务的构建校验失败或持续无进展可触发 `kimi-k3.1-pro`。修复只读取当前任务的局部证据，每个任务版本最多尝试一次，并计入同一作业限额。程序验证候选通过后，DeepSeek 接着执行原案卷。原有的独立金额复核和财务确认仍走各自阶段。
+
 1. 在阿里云百炼开通服务，拿到 API Key。
 2. 写入 Key：`cp config/secrets.example.yaml config/secrets.yaml`，填 `api_key`（该文件已加入 .gitignore，不会提交）；也可以设置环境变量 `DASHSCOPE_API_KEY`，环境变量优先。
 3. 核对模型能否调用：`bonus-agent models --remote`，每个已配置模型后面会标“可用 / 不可用”，并列出账号下所有 VL、3.5、3.6 相关的模型 ID。
@@ -238,17 +255,18 @@ bonus-agent map --model qwen3-vl-32b --rules draft.yaml 数据.xlsx
 
 ```bash
 pip install -r requirements.txt
-bonus-agent user add --data /srv/bonus 张会计账号 --roles editor --display 张会计       # 口令在终端输入，只存 PBKDF2 哈希
-bonus-agent user add --data /srv/bonus 李经理账号 --roles approver --display 李经理
+bonus-agent user add --data /srv/bonus finance --display 财务       # 默认具备核算及审批全部功能；口令在终端输入，只存 PBKDF2 哈希
 bonus-agent serve --data /srv/bonus --host 127.0.0.1 --port 8080 [--model local]
 ```
 
 - 对话：案卷页的“对话”框可以直接问结果（智能体用 explain / evaluate 查算式，不自己算），也可以让它修改（改系数、改口径、答复问题）。
   改了规则、数据表或台账时，程序自动试算全部方案并做完成前检查，通过才生成新的一轮；只是提问不生成新的一轮。要求不明确或与材料冲突时智能体反问，不猜。
   对话里答复的问题记为“某某（对话）”，对话内容记入 `chat.jsonl` 和操作记录。
-- 角色：`editor`（经办）传材料、答复问题、运行、按模板计算；`approver`（审批）确认结果；其他登录用户只读。
+- 单账号使用无需切换账号。已有多个账号时，执行 `bonus-agent user single --data /srv/bonus finance` 保留指定**现有**账号及原密码，赋予全部功能，停用其他登录账号（历史审批记录不变，原账号配置留非活动备份）。只有需要多人分工时才分别配置 `editor`（核算）和 `approver`（审批）；仍保留真实用户登录及确认记录。
 - 答复记录答复人和时间（写进 questions.yaml）；新建、上传（含 sha256）、删除、答复、运行、确认、按模板计算、下载都记入案卷的 `audit.jsonl`，页面上可查。
 - 每个案卷同时只跑一轮，运行中不能改材料和答复；全局最多同时跑 `--max-parallel` 轮。
+- 固定提成案卷的正式底稿支持主表动态人员列、参考源数据公式及汇总资金闭合；对已核验案卷仅调整报表格式可从页面「新版报表」直接重新导出，或执行 `bonus-agent reexport --out 案卷输出目录 --by 修订人`。严格复算确认金额未变后，生成单独报表版本，不调用模型、不覆盖旧版已确认结果。
+- 网页启动参数 `--max-tokens` 是每案卷累计模型用量上限。续跑、从头开始和重启服务均沿用账本，已发出但用量未确认的请求继续占用估算额度。
 - 安全：默认只监听本机，内网访问请放在 HTTPS 反向代理（nginx 等）后面；网页登录（服务端会话，HttpOnly Cookie，8 小时过期，右上角可退出；同一用户名 5 分钟内输错 5 次暂停登录），表单带防伪码；上传只收支持的格式、只取文件名、单个不超过 50 MB；下载限制在案卷目录内，不提供 case.json；不开放 API 文档页。
 - 数据目录结构见 `bonus_agent/web.py` 开头的说明；材料、结果都只存在这台服务器上。生产环境请在 `models.yaml` 里把默认模型改成本地 vLLM，数据不出内网。
 
@@ -285,5 +303,5 @@ vllm serve deepseek-ai/DeepSeek-V4-Flash --port 8000 --tensor-parallel-size 4 --
 ## 场景
 
 每类奖金（提成、开发奖金、年度奖金……）是一个场景，有固定的输入模板和规则：编制模式下智能体按场景说明起草规则，
-财务确认后发布成规则版本；计算模式下按版本直接算，不调用大模型。详见 [docs/scenarios.md](docs/scenarios.md)。
+财务确认后发布成规则版本；计算模式下按版本直接算，不调用大模型。确认前可用 `bonus-agent template-check --out 案卷目录` 离线复算，核对原轮材料指纹和完整金额。详见 [docs/scenarios.md](docs/scenarios.md)。
 公司真实的场景说明和数据放在本机场景目录，不进仓库。

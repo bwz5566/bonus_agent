@@ -4,15 +4,76 @@ import json
 
 import pytest
 
-from bonus_agent.agent import READ_ONLY, Step, ToolError
+from bonus_agent.agent import READ_ONLY, Step, ToolError, run_agent
 from bonus_agent.progress import RepairReadBudget, repair_scope
-from bonus_agent.recovery import RecoveryJournal
+from bonus_agent.recovery import RecoveryJournal, fingerprint, native_repair_feedback
 from tests.test_repair_read_budget import read
 from tests.test_repair_phase_scope import ROLE, workspace
-from tests.test_staged_workflow import make_workspace
+from tests.test_staged_workflow import _staged_llm, make_workspace, save_staged_case
 
 
 pytestmark = pytest.mark.evidence
+
+
+def test_update_envelope_reaches_existing_dataset_validator(tmp_path):
+    ws = make_workspace(tmp_path)
+    out = tmp_path / 'out'
+    save_staged_case(ws, out)
+    args = {'name': 'projects', 'changes': {'fields': {'amount': {'desc': '净收入'}}}}
+    calls = [{'tool': 'define_dataset', 'args': args}]
+    calls.extend({'tool': 'read_workspace', 'args': {'section': 'facts', 'offset': i}} for i in range(8))
+    ar = run_agent(_staged_llm(ws, calls), ws.inv.files, out, max_steps=len(calls), deep=0)
+    patch = next(step for step in ar.steps if step.tool == 'update_dataset')
+    assert patch.ok and '已按 name + changes' in patch.result
+    assert ar.ws.datasets['projects'].fields['amount'].desc == '净收入'
+    assert '已累计读取' not in ar.error
+
+
+def test_argument_rejection_does_not_become_data_repair(tmp_path):
+    ws = make_workspace(tmp_path)
+    out = tmp_path / 'out'
+    save_staged_case(ws, out)
+    call = {'tool': 'define_dataset', 'args': {'name': 'projects', 'file': 'other', 'changes': {'filter': {}}}}
+    ar = run_agent(_staged_llm(ws, [call] * 3), ws.inv.files, out, max_steps=6, deep=0)
+    rejected = [step for step in ar.steps if step.tool == 'define_dataset']
+    assert len(rejected) == 3 and all(not step.ok for step in rejected)
+    assert '累计失败 3 次' in ar.error
+    saved = json.loads((out / 'recovery.json').read_text(encoding='utf-8'))
+    assert not saved.get('native_repairs')
+
+
+@pytest.mark.parametrize('evidence', ['current', 'wrong_patch', 'changed_mapping'])
+def test_legacy_cross_tool_halt_requires_accepted_and_current_patch(tmp_path, evidence):
+    ws = make_workspace(tmp_path)
+    journal = RecoveryJournal(None, 'same')
+    args = {'name': 'projects', 'changes': {'fields': {'amount': {'desc': '净收入'}}}}
+    reject = '错误：参数不对：define_dataset 没有参数 changes'
+    item = native_repair_feedback('define_dataset', args, reject)
+    journal.state['native_repairs'] = {
+        fingerprint(['define_dataset', 'tool.arguments', ['projects']]): {**item, 'phase': None}}
+    guard = RepairReadBudget(journal.state.setdefault('repair_reads', {}))
+    budget = guard.observe([read(i) for i in range(8)], journal.state['native_repairs'], None, READ_ONLY)
+    assert budget['halt']
+    journal.halt(budget['message'], repair_read=budget)
+    assert journal.error
+    accepted = copy.deepcopy(args)
+    if evidence == 'wrong_patch':
+        accepted['changes']['fields']['amount']['desc'] = '别的口径'
+    result = ws.update_dataset(**accepted)
+    if evidence == 'changed_mapping':
+        ws.update_dataset('projects', {'fields': {'amount': {'desc': '后来改过'}}})
+    last = {'n': 1, 'status': 'FAILED', 'error': journal.error}
+    log = tmp_path / 'history' / '第1轮' / 'agent_log.json'
+    log.parent.mkdir(parents=True)
+    log.write_text(json.dumps({'error': last['error'], 'steps': [
+        {'tool': 'define_dataset', 'args': args, 'result': reject, 'ok': False},
+        {'tool': 'update_dataset', 'args': accepted, 'result': result, 'ok': True},
+    ]}, ensure_ascii=False), encoding='utf-8')
+    check = journal.revalidate_saved_dataset_patches(ws, tmp_path, last)
+    if evidence == 'current':
+        assert check['dataset'] == 'projects' and not journal.error
+    else:
+        assert check is None and journal.error == last['error']
 
 
 def halted_role(tmp_path):
@@ -84,6 +145,42 @@ def test_noop_unrelated_success_and_reads_cannot_archive_halt(tmp_path, success)
     assert journal.error == original and not guard.state.get('resolved_halts')
 
 
+def test_current_receipt_for_same_table_closes_compile_error(tmp_path):
+    ws = make_workspace(tmp_path)
+    ws.plan_formula_tasks([{'id': 'rates', 'scheme': 'S', 'target': '/tables/rates', 'clauses': ['C1']}])
+    ws.compile_table('rates', [{'value': '提成率'}], scheme='S')
+    journal = RecoveryJournal(tmp_path / 'recovery.json', 'same')
+    journal.observe_native_feedback('compile_table', {'scheme': 'S', 'name': 'rates'},
+                                    '错误：parameter.ref：首档坐标是上限', False)
+    guard = RepairReadBudget(journal.state.setdefault('repair_reads', {}))
+    outcome = guard.observe([read(i) for i in range(8)], journal.state['native_repairs'], None, READ_ONLY)
+    journal.halt(outcome['message'], repair_read=outcome)
+    saved = copy.deepcopy(journal.state['read_budget_halt'])
+
+    checked = ws.check_formula_task('rates')
+    assert checked['status'] == 'PASS', checked
+    for different in ({'scheme': 'other'}, {'target': '/tables/other'}, {'status': 'FAIL'},
+                      {'checked_rule_source': {'state': 'PARTIAL'}}):
+        journal.observe_native_feedback('check_formula_task', {'task': 'rates'},
+                                        json.dumps({**checked, **different}), True)
+        assert journal.error
+    journal.observe_native_feedback('check_formula_task', {'task': 'rates'}, json.dumps(checked), True)
+    assert not journal.error
+    assert guard.state['resolved_halts'][saved['id']]['halt'] == saved
+    assert not journal.state['native_repairs']
+
+
+def test_same_table_name_in_different_schemes_keeps_each_failure():
+    journal = RecoveryJournal(None, 'same')
+    for scheme in ('first', 'second'):
+        journal.observe_native_feedback('compile_table', {'scheme': scheme, 'name': 'rates'},
+                                        '错误：parameter.ref：首档坐标是上限', False)
+    pending = journal.state['native_repairs']
+    assert {item['scheme'] for item in pending.values()} == {'first', 'second'}
+    journal.observe_native_feedback('compile_table', {'scheme': 'first', 'name': 'rates'}, '参数表已编译并绑定', True)
+    assert [item['scheme'] for item in pending.values()] == ['second']
+
+
 @pytest.mark.parametrize('damage', ['missing', 'bad_type', 'wrong_identity', 'failed_verification', 'wrong_subject'])
 def test_damaged_closure_cannot_prove_resolution(tmp_path, damage):
     ws, journal, guard, original, _, _ = halted_role(tmp_path)
@@ -146,8 +243,11 @@ def test_real_complete_compilation_archives_only_the_checked_static_halt(tmp_pat
     assert journal.error == original and not guard.state.get('resolved_halts')
     ws.bind_facts([{'name': '提成率', 'targets': targets}])
     from bonus_agent.construction import TaskBoard
-    for task in TaskBoard(ws).required('basis'):
-        assert ws.check_formula_task(task)['status'] == 'PASS'
+    board = TaskBoard(ws)
+    required = board.required('basis')
+    for task in board.statuses():
+        if task in required:
+            assert ws.check_formula_task(task)['status'] == 'PASS'
     verified = ws.compile_formulas()
     assert verified['status'] == 'PASS', verified
     guard.observe([], {}, verified, READ_ONLY)

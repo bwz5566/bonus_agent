@@ -131,6 +131,8 @@ def _exprs(rs: RuleSet):
                 yield f'report.balances.{i}.parts.{j}', expr
         for i, item in enumerate(rs.report.distributions):
             yield f'report.distributions.{i}.total', item.total
+            if item.source_funding:
+                yield f'report.distributions.{i}.source_funding.allocated', item.source_funding.allocated
 
 
 def _parsed(rs: RuleSet):
@@ -189,6 +191,7 @@ def _field_values(data: Datasets) -> dict[str, dict[str, int]]:
 def _compared(rs: RuleSet, negated: set[str] | None = None) -> dict[str, dict[str, set[str]]]:
     """字段 -> {比较用的文字: 位置}（== 和 != 都算，日期除外）。negated 收集用 != 排除取值的字段。"""
     out: dict[str, dict[str, set[str]]] = {}
+    lookup_inputs: dict[str, set[str | None]] = {}
     for where, ast in _parsed(rs):
         for c in walk(ast):
             if isinstance(c, Cmp) and c.op in ("==", "!="):
@@ -197,21 +200,27 @@ def _compared(rs: RuleSet, negated: set[str] | None = None) -> dict[str, dict[st
                         out.setdefault(a.id, {}).setdefault(b.value, set()).add(where)
                         if c.op == "!=" and negated is not None:
                             negated.add(a.id)
-    for name, t in rs.tables.items():      # 查找表的键：lookup(表, 字段)
-        if not isinstance(t, LookupTable):
+            if isinstance(c, Call) and c.fn == "lookup" and len(c.args) == 2 and isinstance(c.args[0], Name):
+                key = c.args[1]
+                lookup_inputs.setdefault(c.args[0].id, set()).add(key.id if isinstance(key, Name) else None)
+    for name, fields in lookup_inputs.items():
+        table = rs.tables.get(name)
+        # A heterogeneous lookup does not describe any single source field's categories.
+        # Its real-key misses are checked by the evaluator and coverage report.
+        if not isinstance(table, LookupTable) or len(fields) != 1 or None in fields:
             continue
-        for where, ast in _parsed(rs):
-            for c in walk(ast):
-                if isinstance(c, Call) and c.fn == "lookup" and len(c.args) == 2 and isinstance(c.args[0], Name) \
-                        and c.args[0].id == name and isinstance(c.args[1], Name):
-                    for k in t.mapping:
-                        out.setdefault(c.args[1].id, {}).setdefault(k, set()).add(f"tables.{name}")
+        field_name = next(iter(fields))
+        for k in table.mapping:
+            out.setdefault(field_name, {}).setdefault(k, set()).add(f"tables.{name}")
     return out
 
 
 def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, sourced: str = "",
           headers: dict[str, str] | None = None, tiers: dict | None = None, used_elsewhere: set[str] | None = None,
-          coverage: list | None = None, reached_elsewhere: set[str] | None = None, said: str = "") -> Report:
+          coverage: list | None = None, reached_elsewhere: set[str] | None = None, said: str = "",
+          tier_quotes: dict[str, list[str]] | None = None,
+          table_percentages: set[tuple[str, Decimal]] | None = None,
+          generated_values: dict[str, set[str]] | None = None) -> Report:
     """text：规则材料原文（规则文档、财务的话和答复）。sourced 非空时（如有图片没转写）常数出处无法核对，只提示。
     headers：字段 -> Excel 表头原文（含工作表名），判断字段含义时不只看智能体起的名字。
     tiers：引擎记录的分档表实际取值分布；coverage：查找表、条件分支的命中分布；used_elsewhere：其他方案用到的名字（一个金额字段只要有方案用到就不算漏用）。
@@ -247,6 +256,8 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
     for n, where in constants(rs):
         if where.removeprefix("tables.") in copied:
             continue
+        if table_percentages and (where, n) in table_percentages:
+            continue                      # 正式结束还会逐参数核对原文、位置和单位
         k = _key(abs(n))
         if abs(n) not in FREE and (k in pct_only or (where.removeprefix("tables.") in rate_tables and k in pct_strict)):
             unit.setdefault(k, set()).add(where)
@@ -272,8 +283,9 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
         have = values.get(fld)
         if not have:
             continue
+        placeholders = (generated_values or {}).get(fld, set())
         for lit, ws in lits.items():
-            if lit in have:
+            if lit in have or lit in placeholders:
                 continue
             if lit not in norm:
                 rep.gates.append(f"「{fld}」写的取值「{lit}」（{'、'.join(sorted(ws))}）在数据和材料里都没有；数据里的取值是："
@@ -291,7 +303,7 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
             elif len(have) <= MAX_CATEGORIES:
                 rep.warns.append(f"「{fld}」写的取值「{lit}」（{'、'.join(sorted(ws))}）在数据里没有，按它比较一行都对不上；"
                                  f"数据里的取值是：{'、'.join(list(have)[:12])}。核对是否是数据的另一种写法")
-        if len(have) > MAX_CATEGORIES:
+        if len(have) > MAX_CATEGORIES or lits.keys() <= placeholders:
             continue
         for v, cnt in have.items():
             if v in lits or v in norm or _opposite(v, lits):
@@ -350,18 +362,25 @@ def check(rs: RuleSet, data: Datasets, text: str, traces: dict | None = None, so
     # 6'. 阶梯直接算金额（tier）时，全额累进还是超额累进算出来差很多；材料和答复都没说是哪种，不能自己定
     # 只认财务的话 / 答复，或材料里这张表的分档点、比例附近写明的算法；材料别处出现“累进”“分段”不算
     said_n = unicodedata.normalize("NFKC", said)
-    if norm.strip():         # 没有材料原文（只校验结构）时不查
-        for t, how in sorted(_tier_amount_tables(rs, pct_strict).items()):
-            tb = rs.tables[t]
-            if _tier_stated(norm, tb) or _tier_stated(said_n, tb) or _TIER_SAID.search(said_n):
-                continue
-            algo = ("超额部分分段累加" if tb.mode == "excess" else "整笔按所在档的比例") if how == "tier" else \
-                "用 tier_rate 取所在档的比例再乘金额，等于整笔按所在档的比例（全额）"
-            (rep.warns if sourced else rep.gates).append(
-                f"阶梯表 {t} 现在是{algo}。材料里这张表附近和财务答复都没说是全额（整笔按所在档）还是超额累进（每段按各自比例），"
-                "两种算法差很多，不能默认。用 ask_question 问财务，问题里各举一个金额按两种算法的结果")
-            if not sourced:       # 没有规则文档可核对时只提示
-                rep.keys.append(f"阶梯方式 {t}")
+    for t, how in sorted(_tier_amount_tables(rs, pct_strict).items()):
+        tb = rs.tables[t]
+        mode = tb.mode if how == "tier" else "whole"
+        modes = _bound_tier_modes((tier_quotes or {}).get(t, []))
+        if modes:
+            if modes != {mode}:
+                choices = "、".join("超额累进" if m == "excess" else "按所在档全额" for m in sorted(modes))
+                rep.gates.append(f"阶梯表 {t} 的算法与已绑定的原文条款不一致（条款：{choices}）。核对后修正阶梯公式或条款绑定。")
+                rep.keys.append(f"计算契约 tables.{t}")
+            continue
+        if not norm.strip() or _tier_stated(norm, tb) or _tier_stated(said_n, tb) or _TIER_SAID.search(said_n):
+            continue
+        algo = ("超额部分分段累加" if mode == "excess" else "整笔按所在档的比例") if how == "tier" else \
+            "用 tier_rate 取所在档的比例再乘金额，等于整笔按所在档的比例（全额）"
+        (rep.warns if sourced else rep.gates).append(
+            f"阶梯表 {t} 现在是{algo}。材料里这张表附近和财务答复都没说是全额（整笔按所在档）还是超额累进（每段按各自比例），"
+            "两种算法差很多，不能默认。用 ask_question 问财务，问题里各举一个金额按两种算法的结果")
+        if not sourced:       # 没有规则文档可核对时只提示
+            rep.keys.append(f"阶梯方式 {t}")
     # 7. 参数表、用参数表算的变量定义了，却没接进计算（如系数表建了、提成里没乘）：要么接上，要么说明为什么不用
     used = _reachable(rs)
     live = reached(rs) | (reached_elsewhere or set())
@@ -719,6 +738,13 @@ _TIER_HOW = re.compile(r"累进|超额|分段|全额|整笔|全部按|按所在�
 # 财务答复里明确说了阶梯算法的（“全额”“整笔”单独出现常指别的事，如“全额冻结”，要和阶梯、档位连在一起才算）
 _TIER_SAID = re.compile(r"累进|(?:阶梯|分档|档位|提成档|点数)[^。；\n]{0,20}(?:全额|整笔|超额|分段|所在档)|"
                         r"(?:全额|整笔|超额|分段)[^。；\n]{0,20}(?:阶梯|分档|档位|计提|提成比例|点数)|按所在档|按达到的档|按达成的档")
+
+
+def _bound_tier_modes(quotes: list[str]) -> set[str]:
+    """Explicit method in a verified clause linked to this particular rate table."""
+    from bonus_agent.semantics import stated_modes
+
+    return set().union(*(stated_modes(quote) for quote in quotes))
 
 
 def _tier_amount_tables(rs: RuleSet, pct_strict: set[str] | None = None) -> dict[str, str]:

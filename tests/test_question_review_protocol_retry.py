@@ -4,7 +4,7 @@ import copy
 import pytest
 
 from bonus_agent.agent import ToolError
-from bonus_agent.question_review import review_question
+from bonus_agent.question_review import review_disputed_question, review_question
 from bonus_agent.recovery import RunBudget
 from tests.test_pending_question_review import EVIDENCE, RULE, opinion, setup
 from tests.test_request_budget import model, response, transport
@@ -151,6 +151,19 @@ def test_unsent_initial_budget_block_keeps_first_request_pending_and_audited(tmp
     assert len(audit['attempts']) == 1 and len(audit['budget_events']) == 1
     assert audit['proposed_reason'] == original_reason and not audit.get('initial_request_pending')
     assert ws.workflow['question_review_history']['q1'][-1]['initial_request_pending']
+
+
+@pytest.mark.parametrize('next_allowance', [200000, None])
+def test_automatic_resume_sends_only_the_still_unsent_opinion(tmp_path, monkeypatch, next_allowance):
+    ws, _, client, _ = prepared(tmp_path, monkeypatch, [reply()], tokens=1000)
+    ws.workflow['enabled'] = True
+    assert review(ws)['initial_request_not_sent']
+    q = ws.pending[0]
+    assert not client.requests and q.answer is None
+    RunBudget(0, next_allowance, 900).bind(ws.llm)
+    result = review_disputed_question(ws, q)
+    assert result['outcome'] == 'COMPLETED' and len(client.requests) == 1 and q.answer is None
+    assert review_disputed_question(ws, q) is None and len(client.requests) == 1
 
 
 def legacy_length(ws):

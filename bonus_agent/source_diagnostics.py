@@ -2,6 +2,34 @@
 import json
 
 
+def explicit_sources(value, path=()):
+    """Enumerate explicit DSL references, also in nested reports and lists."""
+    if isinstance(value, dict):
+        for key, part in value.items():
+            if key == 'sources' and isinstance(part, list):
+                for index, source in enumerate(part):
+                    if isinstance(source, dict):
+                        yield (*path, key, index), source
+            else:
+                yield from explicit_sources(part, (*path, key))
+    elif isinstance(value, list):
+        for index, part in enumerate(value):
+            yield from explicit_sources(part, (*path, index))
+
+
+def source_reference_error(ws, source, corpus):
+    """A quoted document and any declared page must both contain the quotation."""
+    from bonus_agent.clauses import check_quote
+
+    doc, quote = source.get('doc', ''), source.get('quote', '')
+    if gap := check_quote(doc, quote, corpus):
+        return gap
+    page = source.get('page')
+    if page is not None and page not in ws._quote_pages(quote, ws._page_texts(doc)):
+        return f'原文在「{doc}」第 {page} 页找不到，须核对实际所在页。'
+    return None
+
+
 def _pointer(*parts):
     return '/' + '/'.join(str(part).replace('~', '~0').replace('/', '~1') for part in parts)
 

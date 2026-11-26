@@ -148,3 +148,46 @@ def test_missing_bindings_precede_trial_hint_and_phase_progress(tmp_path):
         fact.targets = []  # simulate a restored legacy rule with its evidence binding missing
     assert 'validate_parameters' in ws.next_hint(), (ws._binding_gaps(), ws.drafts, [f.model_dump() for f in ws.facts])
     assert '用 trial_run 试算' not in ws.next_hint()
+def test_recovery_journal_retries_temporary_windows_replace_failures(tmp_path, monkeypatch):
+    import json
+
+    from bonus_agent.infra import atomic
+    from bonus_agent.recovery import RecoveryJournal
+
+    target = tmp_path / 'recovery.json'
+    journal = RecoveryJournal(target, {'period': '2026-09'})
+    journal.save()
+    original = target.read_bytes()
+    real_replace = atomic.os.replace
+    attempts = []
+
+    def replace(source, dest):
+        attempts.append(source)
+        assert target.read_bytes() == original
+        if len(attempts) <= 2:
+            error = PermissionError('temporary Windows sharing violation')
+            error.winerror = 32
+            raise error
+        real_replace(source, dest)
+
+    monkeypatch.setattr(atomic.os, 'replace', replace)
+    journal.state['checkpoint'] = 3
+    journal.save()
+    assert len(attempts) == 3 and len(set(attempts)) == 1
+    assert json.loads(target.read_text(encoding='utf-8'))['checkpoint'] == 3
+
+
+def test_data_dependency_stays_open_until_its_formula_is_validated():
+    import json
+
+    from bonus_agent.recovery import RecoveryJournal
+
+    journal = RecoveryJournal(None, {})
+    failed = {'status': 'FAIL', 'scheme': 'S', 'task': 'average',
+              'issues': ['construction.data_dependency：缺少累计表']}
+    assert journal.observe_native_feedback('prepare_formula_inputs', {}, json.dumps(failed, ensure_ascii=False), False)
+    passed = {'status': 'PASS', 'scheme': 'S', 'task': 'average', 'saved': True}
+    for update in ({'task': 'other'}, {'scheme': 'T'}, {'saved': False}):
+        assert not journal.observe_native_feedback('submit_formula_task', {}, json.dumps({**passed, **update}), True)
+    assert journal.observe_native_feedback('submit_formula_task', {}, json.dumps(passed), True)
+    assert journal.state['native_repairs'] == {}

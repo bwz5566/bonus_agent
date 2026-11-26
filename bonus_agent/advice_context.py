@@ -292,6 +292,25 @@ def build_advice_context(ws, steps, report=None):
             '缺少这些证据时只指出下一条证据，不编造根因、缺失政策或强制验收口径。'),
     }
     if not valid:
+        if report is None and ws.staged:
+            from bonus_agent.construction import TaskBoard
+            from bonus_agent.recovery import _feedback_report
+            board = TaskBoard(ws)
+            for step in reversed(steps[-4:]):
+                if step.tool not in ('submit_formula_task', 'check_formula_task'):
+                    continue
+                attempt = _feedback_report(step.result)
+                task = step.args.get('task')
+                spec = board.state['tasks'].get(task) if isinstance(task, str) else None
+                if (spec and attempt.get('status') == 'FAIL' and attempt.get('task') == task
+                        and attempt.get('target') == spec['target']
+                        and attempt.get('scheme', spec['scheme']) == spec['scheme']
+                        and board.statuses()[task]['status'] != 'PASS'):
+                    packet['recent_task_check'] = {
+                        'task': task, 'scheme': spec['scheme'], 'target': spec['target'],
+                        'issues': [str(issue)[:400] for issue in attempt.get('issues', [])[:3]],
+                        'note': '这是该任务上次提交的程序反馈。调度器的下一任务可不同，请按任务 ID 和目标归属。'}
+                break
         return packet
     packet['report_summary'] = {
         'status': current.get('status'), 'issue_count': len(current.get('issues', [])),

@@ -25,22 +25,67 @@ def test_first_explicit_contract_failure_uses_program_feedback(code):
     assert _deep_reason([step], 0, object(), {'bind_facts': 1}) == ''
 
 
+def test_unpivot_repair_retains_read_budget_across_dataset_tools(tmp_path):
+    from bonus_agent.progress import RepairReadBudget
+
+    journal = RecoveryJournal(tmp_path / 'recovery.json', {'file': 'roster.xlsx'})
+    args = {'name': '分配名单'}
+    journal.observe_native_feedback('define_dataset', args, '错误：unpivot.columns：重名比例列', False)
+    budget = RepairReadBudget(journal.state.setdefault('repair_reads', {}))
+    reads = [Step('read_sheet', {'file': 'roster.xlsx', 'start_row': row}, 'ok', True) for row in range(4)]
+    budget.observe(reads, journal.state['native_repairs'], None, {'read_sheet'})
+    journal.observe_native_feedback('update_dataset', args, '错误：unpivot.share_parse：姓名不是比例', False)
+    result = budget.observe(reads, journal.state['native_repairs'], None, {'read_sheet'})
+    assert result['halt'] and '分配名单' in result['message'] and 'update_dataset' in result['message']
+    journal.observe_native_feedback('update_dataset', {'name': '其他表'}, '已保存', True)
+    assert budget.observe([], journal.state['native_repairs'], None, {'read_sheet'})['halt']
+    journal.observe_native_feedback('update_dataset', args, '已保存「分配名单」', True)
+    assert not budget.observe([], journal.state['native_repairs'], None, {'read_sheet'})['active']
+
+
 @pytest.mark.evidence
 def test_binding_failure_followed_by_only_reads_stops_without_pro(tmp_path):
+    from bonus_agent.construction import TaskBoard
+
     ws = ready_workspace(tmp_path, unbound=True)
+    # The missing parameter must have an owner before a real binding attempt
+    # can reach the validator. Otherwise this only tests the planning gate.
+    pool = next(t for t in TaskBoard(ws).state['tasks'].values() if t['target'] == '/pool')
+    ws.plan_formula_tasks([{**pool, 'facts': [*pool['facts'], '待绑定提成率']}])
     out = tmp_path / 'out'
     save_staged_case(ws, out)
     reads = [{'tool': 'query_dataset', 'args': {'dataset': 'projects', 'expr': f'sum(amount, of: "projects") + {i} * 0'}} for i in range(18)]
     llm = _staged_llm(ws, [bad_binding(), *reads])
     llm.recovery_mode, llm.think_llm = 'advisor', advisor()
     ar = run_agent(llm, ws.inv.files, out, max_steps=20)
-    assert any(s.tool == 'bind_facts' and not s.ok for s in ar.steps)
+    assert any(s.tool == 'bind_facts' and not s.ok and 'parameter.binding' in s.result for s in ar.steps)
     assert len([s for s in ar.steps if s.tool == 'query_dataset']) >= 3
     assert not llm.think_llm.calls and not any(s.tool == '（局部诊断）' for s in ar.steps)
     assert '纠错预算耗尽' in ar.error
     state = json.loads((out / 'recovery.json').read_text(encoding='utf-8'))
     assert state['native_repairs'] and any(row['reads'] >= 8 for row in state['repair_reads']['records'].values())
     assert state['failures'] and not state['advised']
+
+
+@pytest.mark.evidence
+def test_read_budget_stop_with_a_blocking_question_waits_without_additional_calls(tmp_path):
+    from bonus_agent.agent import Question
+    from bonus_agent.web import _round_status
+
+    ws = ready_workspace(tmp_path, unbound=True)
+    ws.questions.append(Question(id='q1', text='本批制度费率按百分数还是千分数计？', blocking=True))
+    out = tmp_path / 'out'
+    save_staged_case(ws, out)
+    reads = [{'tool': 'query_dataset', 'args': {'dataset': 'projects', 'expr': f'sum(amount) + {i} * 0'}}
+             for i in range(12)]
+    ar = run_agent(_staged_llm(ws, [bad_binding(), *reads]), ws.inv.files, out, max_steps=16)
+    assert ar.status == 'NEEDS_CONFIRMATION', ar.error
+    assert [q['id'] for q in ar.pending] == ['q1'] and not ar.results
+    assert 'q1' in _round_status(ar)
+    assert json.loads((out / 'recovery.json').read_text(encoding='utf-8'))['halted']
+    resumed = _staged_llm(ws, [])
+    again = run_agent(resumed, ws.inv.files, out, max_steps=2)
+    assert again.status == 'NEEDS_CONFIRMATION' and not resumed.calls
 
 
 @pytest.mark.evidence
@@ -126,6 +171,40 @@ def test_atomic_submit_unknown_task_tracks_task_not_its_binding_and_resolves_ali
     assert not journal.native_guidance
 
 
+def test_rejected_candidate_is_closed_by_verified_same_task_joint_repair():
+    from bonus_agent.progress import RepairReadBudget
+
+    journal = RecoveryJournal(None, {})
+    task = {'id': 'amount', 'scheme': 'S', 'target': '/variables/amount'}
+    args = {'task': 'amount', 'bindings': [{'name': '人员汇总舍入位数'}]}
+    rejected = {'status': 'FAIL', 'saved': False, 'task': 'amount', 'target': task['target'],
+                'issues': ['parameter.binding：人员汇总舍入位数不应绑定项目公式']}
+    # A legacy rejection may lack the scheme. Its exact registered task supplies it.
+    journal.observe_native_feedback('submit_formula_task', args, json.dumps(rejected), False, task_specs=[task])
+    unrelated = {'bindings': [{'name': '独立参数'}]}
+    journal.observe_native_feedback('bind_facts', unrelated, '错误：parameter.binding：独立参数缺绑定', False)
+    pending = journal.state['native_repairs']
+    candidate = next(row for row in pending.values() if row['tool'] == 'submit_formula_task')
+    assert candidate['objects'] == ['amount']
+    budget = RepairReadBudget(journal.state.setdefault('repair_reads', {}))
+    budget.observe([], pending, None, {'read_sheet'})
+    key = budget._native_key(candidate, 'amount')
+    assert key in budget.state['records']
+    passed = {'status': 'PASS', 'saved': True, 'scheme': 'S', 'task': 'amount', 'target': task['target'],
+              'checked': [{'status': 'PASS', 'task': 'amount', 'target': task['target']}]}
+    for invalid in ({**passed, 'saved': False},
+                    {**passed, 'scheme': 'other'},
+                    {**passed, 'checked': [{'status': 'PASS', 'task': 'other', 'target': task['target']}]},
+                    {**passed, 'checked': [{'status': 'PASS', 'task': 'amount', 'target': '/pool'}]}):
+        journal.observe_native_feedback('submit_construction_repair', {'task': 'amount'},
+                                        json.dumps(invalid), True)
+        assert len(pending) == 2
+    # The valid replacement deliberately removes the wrong parameter binding.
+    journal.observe_native_feedback('submit_construction_repair', {'task': 'amount'}, json.dumps(passed), True)
+    assert [v['objects'] for v in pending.values()] == [['独立参数']]
+    assert key not in budget.state['records']
+
+
 @pytest.mark.evidence
 def test_restored_automatic_contract_failure_blocks_stagnation_advice(tmp_path, monkeypatch):
     from bonus_agent.workflow import Workflow
@@ -134,10 +213,14 @@ def test_restored_automatic_contract_failure_blocks_stagnation_advice(tmp_path, 
     def automatic_failure(self, **kwargs):
         if not self.state.get('test_auto_failure'):
             self.state['test_auto_failure'] = True
-            self._save_compile_report({'status': 'FAIL', 'issues': ['parameter.unit：提成率单位未确认'],
-                                       'warnings': [], 'graph': {}, 'repaired': [], 'phase': 'basis', 'preflight': {}})
+            issues = ['parameter.unit：提成率单位未确认']
+            report = {'status': 'FAIL', 'issues': issues, 'warnings': [], 'graph': {}, 'repaired': [],
+                      'phase': 'basis', 'preflight': {}}
+            self._save_compile_report(report)
             self._invalidate_compilation('basis')
-            return [('compile_formulas', False, ['parameter.unit：提成率单位未确认'])]
+            if record := kwargs.get('on_result'):
+                record('compile_formulas', 'basis', None, False, issues, self.compile_summary(report))
+            return [('compile_formulas', False, issues)]
         return original(self, **kwargs)
     monkeypatch.setattr(Workflow, 'recheck', automatic_failure)
     reads = [{'tool': 'query_dataset', 'args': {'dataset': 'projects', 'expr': f'sum(amount, of: "projects") + {i} * 0'}} for i in range(18)]

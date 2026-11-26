@@ -4,7 +4,7 @@ from copy import deepcopy
 import pytest
 
 from bonus_core.data.table import from_records
-from bonus_core.dsl.models import Check, FieldDef, RuleSet, Variable
+from bonus_core.dsl.models import Check, FieldDef, RuleSet, TierTable, Variable
 from bonus_core.engine.preflight import preflight_basis
 from bonus_core.engine.run import Engine
 
@@ -50,6 +50,60 @@ def test_first_missing_detail_reports_real_object_formula_source_and_coverage():
     assert '历史' in ' '.join(issue['repair'])
     assert report['summary']['candidate_objects'] == 2
     assert report['summary']['completed_expression_traces'] == 0
+
+
+def test_equally_close_references_cannot_silently_choose_the_first_budget_field():
+    rules = RuleSet.model_validate({
+        'name': 'budget origins',
+        'version': '1',
+        'datasets': {
+            'orders': {'key': 'order_id', 'fields': {
+                'order_id': {'type': 'id'}, 'unit_id': {'type': 'id'},
+                'market_id': {'type': 'id'}, 'alternate_market': {'type': 'id'}}},
+            'unit_targets': {'key': 'unit_id', 'fields': {
+                'unit_id': {'type': 'id'}, 'month_target': {'type': 'money'}}},
+            'market_targets': {'key': 'market_id', 'fields': {
+                'market_id': {'type': 'id'}, 'month_target': {'type': 'money'}}},
+        },
+        'pool': {'scope': 'orders', 'expr': 'sum(month_target, of: "orders")'},
+        'allocation': [],
+    })
+    records = {'orders': [
+        {'order_id': '001', 'unit_id': 'Unit1', 'market_id': 'North', 'alternate_market': 'North'},
+        {'order_id': '002', 'unit_id': 'Unit1', 'market_id': 'A9', 'alternate_market': 'NORTH'}],
+               'unit_targets': [{'unit_id': 'Unit1', 'month_target': 500}],
+               'market_targets': [{'market_id': 'North', 'month_target': 500}]}
+    data = from_records(rules, records, file='source.xlsx')
+    report = preflight_basis(rules, data)
+    assert report['status'] == 'FAIL'
+    issue, = report['issues']
+    assert issue['field_conflict']['field'] == 'month_target'
+    assert {item['source'] for item in issue['field_conflict']['sources']} == {
+        'source.xlsx/unit_targets!1', 'source.xlsx/market_targets!1'}
+    assert issue['coverage'][0]['active_row_source'] == 'source.xlsx/orders!1'
+    market = next(scope for scope in issue['field_conflict']['source_scopes'] if scope['scope'] == 'market_targets')
+    assert market['pool_objects_reaching_scope'] == 1
+    assert market['key_candidates'] == [
+        {'field': 'alternate_market', 'exact_pool_objects': 1, 'unique_normalized_only_pool_objects': 1}]
+    selected = rules.model_copy(update={'pool': rules.pool.model_copy(update={
+        'scope': 'global', 'expr': 'sum(month_target, of: "unit_targets")'})})
+    assert preflight_basis(selected, data)['status'] == 'PASS'
+    assert Engine.prepare_basis(selected, data).calculate_basis()['pool'] == '500.00'
+
+
+def test_failed_table_applicability_includes_evaluated_source_values():
+    rules, records = example('tier(scale, sum(amount, of: "sales"))')
+    rules.datasets['projects'].fields['route'] = FieldDef(type='text')
+    rules.tables['scale'] = TierTable(mode='whole', steps=[(0, '0.1')], applies_when='route == "North"')
+    records['projects'][0]['route'] = 'North'
+    records['projects'][1]['route'] = 'North-east'
+    report = preflight_basis(rules, from_records(rules, records, file='data.xlsx'))
+    assert report['status'] == 'FAIL'
+    guard = report['issues'][0]['table_applicability']
+    assert guard['table'] == 'scale' and guard['condition'] == 'route == "North"'
+    assert guard['evaluated'] == '"North-east" == "North"'
+    assert guard['source'] == 'data.xlsx/projects!2'
+    assert not report['execution_evidence']['policy_successful']
 
 
 def test_filter_empty_is_distinguished_from_missing_relationship_rows():

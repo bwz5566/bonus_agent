@@ -1,6 +1,7 @@
 """Read table coordinates from source documents; never locate a value by its amount."""
 from decimal import Decimal
 import re
+import unicodedata
 
 
 def ppt_cell(path, page, locator):
@@ -98,3 +99,116 @@ def parameter_cell(path,page,table,row,column,line=None):
     return {'locator':locator,'value':value,'quote':'\n'.join([*labels,selected]),
             'name':f'{path.name}::P{page}.T{table}.R{row}.C{column}.L{line or 1}',
             'selected':selected,'labels':labels}
+
+
+_UNIT_HEADER = ['制度表标题', '适用行', '适用列', '裸数默认单位']
+_HEADING_UNIT = re.compile(r'[(（]\s*(%|‰|万元|亿元|元|万|亿)\s*[）)]$')
+
+
+def scenario_unit_defaults(guides, source_hashes):
+    """Index explicit rows of the financial scenario guide, retaining their literal evidence."""
+    from bonus_agent.facts import scope_norm
+
+    rules = {}
+    for path in guides:
+        if path.suffix.lower() != '.md':
+            continue
+        in_table = False
+        for line in path.read_text(encoding='utf-8-sig').splitlines():
+            quote = line.strip()
+            if not quote.startswith('|'):
+                in_table = False
+                continue
+            cells = [col.strip() for col in quote.strip('|').split('|')]
+            if cells == _UNIT_HEADER:
+                in_table = True
+                continue
+            if not in_table or all(re.fullmatch(r':?-+:?', col) for col in cells):
+                continue
+            if len(cells) != 4 or not all(cells) or cells[3] not in ('%', '‰', '元', '万元', '亿元', '万', '亿'):
+                raise ValueError(f'《{path.name}》默认单位声明无效：{quote}')
+            title, rows, columns, unit = cells
+            basis = {'file': path.name, 'quote': quote, 'source_hash': source_hashes[path.name]}
+            for row in rows.split('、'):
+                for column in columns.split('、'):
+                    key = (scope_norm(title), scope_norm(row), scope_norm(column))
+                    if key in rules and rules[key][0] != unit:
+                        raise ValueError(f'《{path.name}》{title} / {row} / {column} 的默认单位有冲突')
+                    rules[key] = (unit, basis)
+    return rules
+
+
+def apply_cell_unit(fact, path, defaults, pages, corpus):
+    """Apply a declared default only at the physical title, row and column that own it."""
+    from bonus_agent import facts as fx
+
+    loc = fact.source_cell or {}
+    if not defaults or path.suffix.lower() != '.pptx' or not fact.page or fact.component != 'literal':
+        return fact
+    key = (fact.file, fact.page)
+    if key not in pages:
+        if path not in pages:
+            pages[path] = ppt_page_index(path)
+        index = pages[path]
+        if fact.page > len(index):
+            raise ValueError(f'source.page：第 {fact.page} 页不存在')
+        entry = index[fact.page - 1]
+        titles = [line.strip() for text in entry['context'] for line in text.splitlines()
+                  if any(fx.scope_norm(line) == k[0] for k in defaults)]
+        # A slide-level title cannot identify which of several tables it describes.
+        pages[key] = (titles, read_ppt_tables(path, fact.page)[0]['rows']) if titles and entry['table_count'] == 1 else ([], [])
+    titles, rows = pages[key]
+    if not titles:
+        return fact
+    if not loc:
+        table_rows = [fx.norm(' '.join(v for cell in r['cells'] for v in cell['lines'])) for r in rows[1:]]
+        quote = fx.norm(fact.quote)
+        if fx.number(fact.value) is not None and (quote == fx.norm(fact.value) or
+                any(quote and quote in row for row in table_rows) or
+                any(fx.scope_norm(fact.context) == fx.scope_norm(title) for title in titles)):
+            raise ValueError('source.cell：本页声明了按行列适用的默认单位，请提供原表 source_cell 或使用 record_parameter_cells')
+        return fact
+    row, col, line = loc.get('row'), loc.get('column'), loc.get('line', 1)
+    if (loc.get('table') != 1 or any(type(n) is not int or n < 1 for n in (row, col, line))
+            or row <= 1 or col <= 1 or row > len(rows) or col > len(rows[0]['cells'])):
+        return fact
+    labels = [' '.join(c['lines']).strip() for c in (rows[row-1]['cells'][0], rows[0]['cells'][col-1])]
+    bare_labels = [fx.scope_norm(_HEADING_UNIT.sub('', label)) for label in labels]
+    matches = [(t, defaults[(fx.scope_norm(t), *bare_labels)]) for t in titles
+               if (fx.scope_norm(t), *bare_labels) in defaults]
+    if not matches:
+        return fact
+    if len({entry[1][0] for entry in matches}) != 1:
+        raise ValueError('parameter.unit：同一物理单元格有多种适用单位，请核对制度表标题')
+    title, (unit, basis) = matches[0]
+    physical = [v.strip() for v in rows[row-1]['cells'][col-1]['lines'] if v.strip()]
+    if line > len(physical) or (len(physical) > 1 and 'line' not in loc):
+        raise ValueError('source.cell：请按表内实际行号指定 line')
+    selected = physical[line-1]
+    if fact.context and fx.scope_norm(fact.context) not in fx.scope_norm(title):
+        raise ValueError(f'source.scope：本单元格属于「{title}」，请按实际表标题登记 context')
+    if fx.check_fact(fact.model_copy(update={'quote': selected, 'unit': None}), {fact.file: fx.norm(selected)}):
+        raise ValueError(f'source.cell：单元格原文「{selected}」与登记值「{fact.value}」不符')
+    native_quote = '\n'.join([*labels, selected])
+    if fx.norm(fact.quote) == fx.norm(' '.join([labels[0], *physical])):
+        # A row label plus one complete cell may be non-contiguous in the rendered Markdown row.
+        fact = fact.model_copy(update={'quote': native_quote})
+    fact = fact.model_copy(update={'context': title})
+    headings = {m[1] for label in labels if (m := _HEADING_UNIT.search(label))}
+    scalar = fx._NUM.fullmatch(unicodedata.normalize('NFKC', fact.value).strip())
+    explicit = scalar.group(2) if scalar else None
+    if len(headings | ({explicit} if explicit else set())) > 1:
+        raise ValueError('parameter.unit：单元格与行列表头的明示单位冲突')
+    if explicit or headings:
+        native_unit = explicit or next(iter(headings))
+        if fx.check_fact(fact.model_copy(update={'unit': None}), corpus):
+            return fact  # a real header cannot repair an invented or wrong value quotation
+        # Units such as 年 already belong to the literal and are not conversion hints.
+        return fact.model_copy(update={'unit': None if explicit else native_unit, 'unit_basis': None, 'quote': native_quote})
+    if fact.unit_basis and fact.unit_basis.get('file') != fact.file:
+        if not fx.unit_basis_matches(fact, corpus):
+            raise ValueError(f'parameter.unit：所引单位依据不适用于「{title}」，基本规则的单位为 {unit}')
+        return fact
+    if fact.unit_basis and fx.unit_basis_matches(fact, corpus):
+        return fact  # an explicit policy in the source takes precedence over its default
+    return fact.model_copy(update={'unit': unit, 'unit_basis': basis})

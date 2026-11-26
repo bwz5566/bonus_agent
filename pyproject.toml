@@ -11,6 +11,7 @@ dependencies = [
   "pydantic>=2.6",
   "lark>=1.1",
   "openpyxl>=3.1",
+  "xlsxwriter>=3.1",
   "PyYAML>=6",
 ]
 

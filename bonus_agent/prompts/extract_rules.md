@@ -2,6 +2,7 @@
 
 # 底线
 - 预算缺失/分母0的最终系数默认值应在查阶梯外生效，优先 tier_ratio，不能将默认达成率继续查到别的系数。预算记录不存在与预算为0都要按原文处理。
+- 输出实际比例和系数时，分别保留观测比例、缺失原因和采用的系数。缺失记录、零分母和真实比例为零分别判断。比例未取得时留空或输出原因，按原文单独计算默认系数。
 - 原文明确规定的是默认达成率继续查档时，在变量上写 ratio_default: rate 并附 sources；不能把最终系数默认值误标成默认达成率。
 - report 支持 distributions：在奖金池作用域逐对象声明 {name,level,total,pending:[待分配名称],sources}，保证原文应分配总额=分配池+已列示待分配。待分配表达式在 report.pending 中定义，不能仅从 pool 扣除。
 - 按人员汇总后才舍入时，奖金池及最末层均设为人员，每人汇总参与记录的原值；distributions 声明 rounding: after_sum、level: global，单列舍入差额。辅助项目/工单的逐对象金额用 report.details 的 {name,level,expr,desc,sources} 声明，保留逐对象对账。

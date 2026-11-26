@@ -8,11 +8,12 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from bonus_core.data.population import prepare as apply_patches
 from bonus_core.data.table import Datasets
 from bonus_core.dsl.models import RuleSet
+from bonus_core.dsl.phases import funding_only
 from bonus_core.dsl.validator import _weighted, basis_rules, validate, validate_basis
 from bonus_core.engine.allocation import CENT, AdjustConflict, allocate, max_allowed, round_pool
 from bonus_core.dsl import excel_formula as xf
@@ -21,6 +22,10 @@ from bonus_core.engine.issues import EngineError, Issue
 from bonus_core.engine.tree import ROOT_LEVEL, Node, build_tree
 
 ENGINE_VERSION = "0.1.0"
+
+
+def detail_trace_id(node_id: str, report: str) -> str:
+    return f'{node_id}/明细核算/{report}'
 
 
 @dataclass
@@ -108,6 +113,7 @@ class Result:
     auxiliary: dict[str, dict] = field(default_factory=dict)
     details: dict[str, dict] = field(default_factory=dict)
     rules_hash: str = ""
+    funding: dict[str, str] = field(default_factory=dict)
 
     def payout_rows(self) -> list:
         """发放的最终口径：有按实体汇总的抵扣时用汇总行，否则用最末层。"""
@@ -119,10 +125,32 @@ class Result:
     def amount(self, node_id: str) -> Decimal:
         return Decimal(self.nodes[node_id].final)
 
+    def detail_raw_amounts(self) -> dict[str, dict[str, Decimal]]:
+        """Read unrounded report amounts from the same traces used to calculate the displayed cents."""
+        raw = {}
+        for report, rows in self.details.items():
+            amounts = {}
+            for node_id, row in rows.items():
+                trace = self.traces.get(detail_trace_id(node_id, report))
+                location = f'「{report}」{node_id}'
+                if trace is None or trace.rule_item != 'report.details' or trace.node_id not in ('', node_id):
+                    raise ValueError(f'明细原值缺少对应的计算记录：{location}')
+                try:
+                    amount = Decimal(trace.value)
+                    if not amount.is_finite() or round_pool(amount) != Decimal(row['amount']):
+                        raise ValueError(f'明细原值与到分金额不一致：{location}')
+                except InvalidOperation as exc:
+                    raise ValueError(f'明细原值无法解析为有效金额：{location}') from exc
+                amounts[node_id] = amount
+            raw[report] = amounts
+        return raw
+
     def to_dict(self) -> dict:
         d = asdict(self)
         d.pop("tier_stats", None)
         d.pop("coverage", None)
+        if not self.funding:
+            d.pop('funding', None)
         return json.loads(json.dumps(d, default=str, ensure_ascii=False))
 
 
@@ -368,16 +396,36 @@ class Engine:
 
     def compute(self, adjustments: list[Adjustment] = (), actor_scopes=None) -> Result:
         adjustments = list(adjustments)
-        active = self._apply(adjustments, actor_scopes)
-        payouts = self._payouts()
-        rollups = self._rollups(payouts)
+        funding = {}
+        levels = [lv.level for lv in self.rs.allocation]
+        if funding_only(self.rs) and not self._basis_only:
+            if adjustments:
+                raise AdjustConflict(self.root.id, '项目资金由核算规则确定，须通过正式规则和确认流程变更')
+            scope = self.rs.pool.scope
+            leaves = self._report_nodes(scope)
+            if not leaves:
+                raise EngineError([Issue.block('funding_scope_empty', '资金对象范围为空', scope)])
+            self.root.exact = self.pool_exact
+            self.root.final = round_pool(self.pool_exact)
+            for node in leaves:
+                node.exact = Decimal(self.ev.traces[f'{node.id}/奖金池'].value)
+                node.final = round_pool(node.exact)
+            funding = {node.id: str(node.final) for node in leaves}
+            levels = [scope]
+            out_nodes = [self.root, *leaves]
+            active, payouts, rollups = [], {}, {}
+        else:
+            active = self._apply(adjustments, actor_scopes)
+            payouts = self._payouts()
+            rollups = self._rollups(payouts)
+            out_nodes = self.root.walk()
         nodes = {
             n.id: NodeResult(
                 id=n.id, level=n.level, key=n.key, label=n.label,
-                parent=n.parent.id if n.parent else None,
+                parent=self.root.id if n.id in funding else (n.parent.id if n.parent else None),
                 weight=str(n.weight), exact=str(n.exact), final=str(n.final), locked=n.locked and n.fixed is None,
             )
-            for n in self.root.walk()
+            for n in out_nodes
         }
         # Reports also evaluate financial expressions: capture their traces before taking a snapshot.
         totals, people = self._report_totals(), self._report_people(payouts)
@@ -387,13 +435,13 @@ class Engine:
         return Result(
             rule_set=self.rs.name, rule_version=self.rs.version, engine_version=ENGINE_VERSION,
             input_hash=run_hash(self.hash, active, self.refs), data_hash=self.hash, pool_exact=str(self.pool_exact), pool=str(self.root.final),
-            levels=[lv.level for lv in self.rs.allocation], nodes=nodes, payouts=payouts,
+            levels=levels, nodes=nodes, payouts=payouts,
             traces=dict(self.ev.traces), adjustments=adjustments, issues=list(self.issues), rollups=rollups,
             inputs=inputs, tier_stats=dict(self.ev.tier_stats),
             totals=totals, people=people,
             coverage=self.ev.coverage(),
             rounding=list(getattr(self,'rounding_checks',[])), auxiliary=auxiliary,
-            details=details, rules_hash=rule_fingerprint(self.rs),
+            details=details, rules_hash=rule_fingerprint(self.rs), funding=funding,
         )
 
     def _report_nodes(self, level):
@@ -415,7 +463,7 @@ class Engine:
                     'key': str(n.key or n.id),
                     'name': n.label,
                     'amount': str(
-                        round_pool(self.ev.evaluate(item.expr, n, f'{n.id}/明细核算/{item.name}', 'report.details'))
+                        round_pool(self.ev.evaluate(item.expr, n, detail_trace_id(n.id, item.name), 'report.details'))
                     ),
                 }
                 for n in nodes
@@ -522,6 +570,7 @@ class Engine:
         claimed.update(contract.pending)
         waiting = Decimal(0)
         rounded_waiting = Decimal(0)
+        raw_pending = {}
         for name in contract.pending:
             if name not in pending:
                 raise fail('distribution_pending_missing', f'待分配项 {name} 不存在')
@@ -534,6 +583,7 @@ class Engine:
             )
             waiting += value
             rounded_waiting += round_pool(value)
+            raw_pending[name] = value
         total = self.ev.evaluate(
             contract.total, self.root, f'{self.root.id}/去向/{contract.name}/总额', 'report.distributions'
         )
@@ -541,6 +591,7 @@ class Engine:
             raise fail(
                 'distribution_unbalanced', f'舍入前金额去向不闭合：{total} != 人员原值 {raw} + 待分配原值 {waiting}'
             )
+        funding_evidence = self._check_source_funding(contract, raw, raw_pending, total)
         allocated = sum((n.final for n in self.by_level[self.rs.pool.scope]), Decimal(0))
         residual = round_pool(total) - allocated - rounded_waiting
         self.rounding_checks.append(
@@ -554,8 +605,32 @@ class Engine:
                 'allocated': str(allocated),
                 'pending': str(rounded_waiting),
                 'residual': str(residual),
+                **funding_evidence,
             }
         )
+
+    def _check_source_funding(self, contract, raw, raw_pending, total):
+        source = contract.source_funding
+        if source is None:
+            return {}
+        reference = self.refs.get(source.scheme + '/R0')
+        nodes = self._report_nodes(source.level)
+        if not reference or not reference.funding or {n.id for n in nodes} != set(reference.funding):
+            raise EngineError([Issue.block('funding_reconciliation_scope', '人员核算对象与来源资金对象不一致', source.scheme)])
+        epsilon = Decimal('0.000000000001')
+        allocated = Decimal(0)
+        for node in nodes:
+            subtotal = self.ev.evaluate(source.allocated, node,
+                                        f'{node.id}/资金核对/{contract.name}/实名原值', 'report.distributions')
+            pending = sum((Decimal(self.ev.traces[f'{node.id}/待分配/{name}'].value) for name in raw_pending), Decimal(0))
+            if abs(subtotal + pending - Decimal(reference.funding[node.id])) > epsilon:
+                raise EngineError([Issue.block('funding_reconciliation_amount',
+                    f'资金 {reference.funding[node.id]} 与实名原值 {subtotal} 加待分配原值 {pending} 不一致', node.id)])
+            allocated += subtotal
+        if abs(allocated - raw) > epsilon or total != Decimal(reference.pool):
+            raise EngineError([Issue.block('funding_reconciliation_total',
+                '逐对象分配汇总、人员原值或理论资金合计与来源方案不一致', contract.name)])
+        return {'funding_scheme': source.scheme, 'funding_objects': len(nodes)}
 
     def _report_people(self, payouts: dict[str, PayoutResult]) -> list[dict]:
         """分配人员金额：最末层每个对象按 report.people 的取值（人名）合计应得、暂缓、本次实发。"""

@@ -17,6 +17,24 @@ RULE = ('本期仅核算销售明细中的项目。\n\n'
         '首发日期用于新老项目判断。')
 
 
+def test_failed_formula_advice_identifies_the_submitted_task_when_the_scheduler_focuses_elsewhere(tmp_path):
+    from tests.test_staged_workflow import make_workspace
+
+    ws = make_workspace(tmp_path)
+    ws.plan_formula_tasks([
+        {'id': 'one', 'scheme': 'S', 'target': '/variables/first'},
+        {'id': 'two', 'scheme': 'S', 'target': '/variables/second'},
+        {'id': 'fund', 'scheme': 'S', 'target': '/pool', 'depends_on': ['one', 'two']},
+    ])
+    rejected = ws.submit_formula_task('two', value={'scope': '项目', 'expr': 'unknown_field'})
+    assert rejected['status'] == 'FAIL'
+    step = Step('submit_formula_task', {'task': 'two'}, json.dumps(rejected), False)
+    focus = build_advice_context(ws, [step])['recent_task_check']
+    assert focus['task'] == 'two' and focus['target'] == '/variables/second' and focus['issues']
+    assert ws.submit_formula_task('two', value={'scope': '项目', 'expr': 'amount'})['saved']
+    assert 'recent_task_check' not in build_advice_context(ws, [step])
+
+
 def example(tmp_path):
     ws = _ws(tmp_path, RULE)
     _sales(ws)

@@ -1,0 +1,77 @@
+version: 1
+description: 固定提成核算节点。只固定数据依赖、运算类型和验收条件；费率、档位、字段、例外和人员来自本次材料。
+nodes:
+  - id: inventory
+    name: 来源盘点与规则版本
+    needs: []
+    inputs: 当期销售、历史、制度、补充说明、业务答复及参考数据
+    acceptance: 文件指纹、实际表头和物理行号完整；不读取验收答案
+    history: [同名列歧义, PPT错页, 缺少已确认口径, 长上下文重复读取]
+  - id: scope_mapping
+    name: 销售项目与项目级参考表绑定
+    needs: [inventory]
+    inputs: 源表列坐标、实际行样本、期间和主外键政策
+    acceptance: 从当期有效销售构造项目集合；每个参考表独立连到项目、客户或区域；报告匹配、未匹配、重复、空值和排除行
+    history: [T3/T7/T13父键不一致, T5/T8/T12/T16重复列或粒度, T30虚构项目列]
+  - id: reference_mapping
+    name: 历史、预算和客户风险余额
+    needs: [inventory]
+    inputs: 当前月及本年历史表、客户与区域预算、库存和逾期的实际坐标
+    acceptance: 预算列与核算月一致；历史明细与当期销售分离；参考表独立匹配客户和区域，不创建项目
+    history: [T17-2历史依赖, T22-2错误作用域, T23-3月均预算混杂, T31历史字段往复]
+  - id: project_policy
+    name: 项目基数、新老与阶梯编译
+    needs: [scope_mapping]
+    inputs: 制度原文、区间标签、实际区域枚举、财务确认
+    acceptance: 新老阈值、币种调整、档位模式、端点、负值、区域路线、缺失默认值及扣减算法逐项有来源；直接读取数值单元格
+    history: [T10/T14-2错绑, T18累进语义, T20/T21百分数单位, T24/T30首档下界, T31地区/新老分支]
+  - id: coefficient_policy
+    name: 达成率、月均及各系数表
+    needs: [reference_mapping,project_policy]
+    inputs: 本期实际销售、各预算与历史月均、毛利/库存/逾期制度表
+    acceptance: 区域和客户系数分别绑定；区间边界逐格核对；缺失/零值分离；实际销售区域与阶梯路线分离；PI/BIU/ODM毛利列按原文
+    history: [T22-2作用域, T31 ODM错用PI毛利表, 达成率和库存档位上界误读]
+  - id: hold_policy
+    name: 提成总额、冻结及项目结算精度
+    needs: [project_policy,coefficient_policy]
+    inputs: 总额与分类暂扣、欠款冻结及项目舍入原文
+    acceptance: 按本批算法闭合去向；冻结不重复暂扣；项目与人员舍入各自绑定
+    history: [乘法替代加法, 冻结重复扣减, T31人员位数错绑项目]
+  - id: basis
+    name: 项目原始量、月均、系数、阶梯、暂扣
+    needs: [scope_mapping,reference_mapping,project_policy,coefficient_policy,hold_policy]
+    inputs: 本批销售和参考数据、已编译参数
+    acceptance: 项目基数独立重算；客户年内有效月份、预算和分组不混用；逐项目保留费率段、各系数、冻结和舍入前后；三类去向闭合
+    history: [T17-2依赖漂移, T22-2作用域, T23-3月均/预算混杂, T31错误金额]
+  - id: basis_review
+    name: 独立项目检查
+    needs: [basis]
+    inputs: 原件、直接依赖的真实映射/地区例外及逐项目指标和程序反例
+    acceptance: 独立模型核对来源、政策和分支；程序逐对象独立算术检查；错项反馈其责任节点而非猜总数
+    history: [T7/T9独立复核差异, T31只核对全局总数且不能evaluate, 首次固定链独立复核遗漏BIU例外导致误判]
+  - id: confirm_basis
+    name: 真实总额确认
+    needs: [basis_review]
+    acceptance: 业务用户确认本版指纹和金额；任何相关材料/规则变化使审批失效
+    history: [阶段错位, 过期或跨版本确认]
+  - id: roster
+    name: 人员名单与角色分配规则
+    needs: [confirm_basis]
+    inputs: 本期项目集合、角色比例原表、名单行、比例空值和优先级政策
+    acceptance: 按项目四键匹配；角色比例从原表取值、合计为一；优先级和缺姓名明确；多名无比例不猜；过量分配阻断
+    history: [T3名册父键, T10百分数及分配缺口, T21/Q列空值, NPD漏列]
+  - id: settlement
+    name: 项目角色金额到个人汇总
+    needs: [roster]
+    acceptance: 逐条精确金额、未分配、符号保留；按本批指定时点舍入；逐项目及总体资金守恒、尾差单列
+    history: [T7负数差异, T10提前逐人舍入, T31项目舍入位数错误绑定]
+  - id: settlement_review
+    name: 人员逐项核验
+    needs: [settlement]
+    acceptance: 从实际角色、姓名、项目资金和份额重算，不使用期望答案；独立审查名单、边界和舍入
+    history: [角色错列, 未分配重复或遗漏, 仅总金额一致]
+  - id: export
+    name: 正式核算底稿与汇总
+    needs: [settlement_review]
+    acceptance: 输出可追查的公式、各项目及人员、资金去向；回读金额及对象，与冻结计算结果完全一致
+    history: [T20-1报表缺口, 人员汇总错位, 虚假完成]

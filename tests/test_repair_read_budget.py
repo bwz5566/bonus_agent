@@ -181,9 +181,15 @@ def test_real_runtime_repair_budget_survives_static_gap_skipping_preflight(tmp_p
     observed = observe(guard, journal, [attempt, read(1)], second)
     assert observed['subject'] == '方案「S」基础求值预检' and observed['reads'] == 1
 
-    ws.facts[0].targets = []
+    # Removing a known binding alone is automatically repaired from its exact
+    # source. Use an actual static error that prevents the dependent preflight.
+    detail = ws.drafts['S']['report']['details'][0]
+    original_expression = detail['expr']
+    detail['expr'] = 'nonexistent_source_field'
     static_failure = ws.compile_formulas()
     assert static_failure['status'] == 'FAIL' and static_failure['static_checks_complete']
+    assert any('name_unknown' in issue and 'nonexistent_source_field' in issue
+               for issue in static_failure['issues'])
     assert not static_failure['preflight']
     retained = observe(guard, journal, [read(2)], static_failure)
     assert retained['active'] and retained['reads'] == 2
@@ -193,6 +199,7 @@ def test_real_runtime_repair_budget_survives_static_gap_skipping_preflight(tmp_p
                 'preflight': {'S': {'status': 'DEFERRED'}, 'other': {'status': 'PASS'}}}
     assert observe(guard, journal, [], deferred)['reads'] == 2
 
+    detail['expr'] = original_expression
     ws.bind_facts([{'name': '提成率', 'targets': original_targets}])
     still_runtime = ws.compile_formulas()
     assert still_runtime['preflight']['S']['status'] == 'FAIL'

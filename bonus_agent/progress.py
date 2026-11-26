@@ -22,6 +22,19 @@ def discover(step, seen):
             return False
         seen.add(key)
         return True
+    if step.ok and step.tool == 'query_dataset':
+        try:
+            result, _ = json.JSONDecoder().raw_decode(step.result.lstrip())
+        except (AttributeError, ValueError):
+            return False
+        if not isinstance(result, dict) or result.get('dataset') != step.args.get('dataset'):
+            return False
+        fields = {fingerprint(('category_field', result['dataset'], item['field']))
+                  for item in result.get('field_evidence', []) if isinstance(item, dict)
+                  and item.get('scan_complete') is True and isinstance(item.get('field'), str)}
+        fresh = bool(fields - seen)
+        seen.update(fields)
+        return fresh
     if not step.ok or not step.tool.startswith('read_'):
         return False
     keys = []
@@ -198,7 +211,13 @@ class ProgressWatch:
     stagnant: int = 0
     compile_state: dict = field(default_factory=dict)
 
-    def observe(self, blockers, *, discovery=False, compile_report=None, fact_names=()):
+    def observe_workspace(self, ws, *, discovery=False, compile_report=None):
+        receipts = set()
+        blockers = ws.blocker_frontier(construction_receipts=receipts)
+        return self.observe(blockers, discovery=discovery, compile_report=compile_report,
+                            fact_names=(f.name for f in ws.facts), construction_receipts=receipts)
+
+    def observe(self, blockers, *, discovery=False, compile_report=None, fact_names=(), construction_receipts=None):
         old_objects = set(self.compile_state.get('objects', {}))
         objects = compile_frontier(self.compile_state, compile_report, fact_names)
         current = {x for x in blockers if not x.startswith('compile:')} | objects
@@ -210,6 +229,18 @@ class ProgressWatch:
         # While a compiler obligation exists, moving to another task or making
         # the report stale is not resolution. Only covered objects can clear it.
         ordinary_resolution = bool(self.previous - current) if not old_objects else False
+        if construction_receipts is not None:
+            seen = set(self.compile_state.get('construction_receipts', []))
+            # A parallel prerequisite may pass without changing the first ready
+            # task. Count each phase/scheme/target once, including across resume.
+            def tracking_tasks(frontier):
+                return any(k.startswith(('construction:', 'construction.plan:'))
+                           and not k.startswith('construction:structure:') for k in frontier)
+
+            if not old_objects and tracking_tasks(self.previous) and tracking_tasks(current):
+                ordinary_resolution = bool(construction_receipts - seen)
+            if construction_receipts - seen:
+                self.compile_state['construction_receipts'] = sorted(seen | construction_receipts)
         if discovery or real_resolution or ordinary_resolution or (
                 not had_compile_history and (not current or not self.previous)):
             self.stagnant = 0
@@ -222,7 +253,7 @@ class ProgressWatch:
 
 
 def repair_scope(ws):
-    """Identify only obligations explicitly omitted by the real basis projection.
+    """Identify obligations deferred by the phase or by dispatch of an input task.
 
     Unknown ownership, broken projections and shared basis dependencies remain
     active. This view schedules recovery; it never resolves an error or grants a
@@ -235,8 +266,18 @@ def repair_scope(ws):
     try:
         board = TaskBoard(ws)
         phase = board.phase()
+        scope = {'phase': phase, 'deferred': []}
+        input_tasks = {name for name, entry in board.state.get('input_preflight', {}).items()
+                       if entry.get('report', {}).get('status') == 'FAIL'}
+        if input_tasks:
+            # Use the same scheduler as the task card, without refreshing
+            # receipts while observing a model tool call.
+            summary = board.summary(statuses=board.statuses()) if ws._flow().stage()[0] == 3 else {}
+            active = summary.get('runtime_repair') or summary.get('active') or {}
+            scheduled = active.get('task') or active.get('id')
+            scope['deferred_input_tasks'] = sorted(input_tasks - {scheduled})
         if phase != 'basis':
-            return {'phase': phase, 'deferred': []}
+            return scope
         view = ws._flow().basis_view()
         required = board.required('basis')
         active_facts = {fact.name for fact in view.facts}
@@ -244,7 +285,8 @@ def repair_scope(ws):
         deferred = {fact.name for fact in ws.facts} - active_facts
         deferred.update({clause.id for clause in ws.clauses} - {clause.id for clause in view.clauses})
         tasks = board.state['tasks']
-        deferred.update(set(tasks) - required)
+        deferred_tasks = board.deferred(required)
+        deferred.update(deferred_tasks)
         # A target can be shared across schemes. Unqualified aliases are safe
         # only when every owner is outside the current dependency closure.
         owners = {}
@@ -252,23 +294,24 @@ def repair_scope(ws):
             path = task['target']
             for alias in (path, '.'.join(target_parts(path)), task['scheme'] + '::' + path):
                 owners.setdefault(alias, set()).add(ident)
-        deferred.update(alias for alias, ids in owners.items() if not ids & required)
-        return {'phase': phase, 'deferred': sorted(deferred)}
+        deferred.update(alias for alias, ids in owners.items() if ids <= deferred_tasks)
+        return {**scope, 'deferred': sorted(deferred)}
     except (AttributeError, KeyError, IndexError, TypeError, ValueError):
         # Missing context is not evidence that an unresolved object may wait.
         return {'phase': 'basis', 'deferred': []}
 
 
-def repair_deferred(scope, subject, phase=None):
-    return bool(scope and scope.get('phase') == 'basis' and
-                subject in scope.get('deferred', ()))
+def repair_deferred(scope, subject, phase=None, *, tool=None):
+    return bool(scope and (scope.get('phase') == 'basis' and subject in scope.get('deferred', ())
+                           or tool == 'prepare_formula_inputs' and subject in scope.get('deferred_input_tasks', ())))
 
 
 class ConstructionReadBudget:
-    """Track one unbuilt plan obligation across evidence reads and agent restarts."""
+    """Track one missing or blocked construction component across reads and restarts."""
 
     WARN = 4
     LIMIT = 8
+    REPAIR_LIMIT = 3
 
     def __init__(self, state):
         self.state = state
@@ -292,17 +335,32 @@ class ConstructionReadBudget:
         key = self.state.get('id')
         if key not in indexed:
             key = self._id(obligations[0])
-            self.state.update(id=key, reads=0)
+            self.state.update(id=key, reads=0, joint_rejections=0)
         if key == previous:
             self.state['reads'] += reads
         row = indexed[key]
         target = row['task_target'] if row['kind'] == 'missing_task' else row['target']
+        count = self.state['reads']
+        if row['kind'] in ('pool_inputs', 'clause_owners', 'parameter_owners'):
+            return {'id': key, 'obligation': row, 'halt': count >= self.LIMIT, 'warn': count >= self.WARN,
+                    'message': row['message']}
+        if row['kind'] == 'blocked_formula':
+            message = (f"当前公式反例 {row['scheme']}::{target}（任务 {row['task']}）。"
+                       f"用任务卡中的原始取值、校验问题和已通过的依赖修正后提交。已累计读取 {count}/{self.LIMIT} 次。")
+            failures = self.state.get('joint_rejections', 0)
+            if failures:
+                message += f"联合修复候选失败 {failures}/{self.REPAIR_LIMIT} 次。"
+            return {'id': key, 'obligation': row, 'halt': count >= self.LIMIT or failures >= self.REPAIR_LIMIT,
+                    'warn': count >= self.WARN, 'message': message}
         action = (f"用 plan_formula_tasks 登记 {row['scheme']}::{target} 的任务"
                   if row['kind'] == 'missing_task' else
                   f"用 submit_formula_task 向 {row['scheme']}::{row['task_target']} 的现有任务提交包含 {target} 的构件")
-        count = self.state['reads']
-        return {'id': key, 'halt': count >= self.LIMIT, 'warn': count >= self.WARN,
+        return {'id': key, 'obligation': row, 'halt': count >= self.LIMIT, 'warn': count >= self.WARN,
                 'message': f"当前方案交付缺口 {row['scheme']}::{target}。请{action}。该缺口已累计读取 {count}/{self.LIMIT} 次。"}
+
+    def reject_joint(self, focus):
+        if focus and focus['id'] == self.state.get('id'):
+            self.state['joint_rejections'] = self.state.get('joint_rejections', 0) + 1
 
 
 class RepairReadBudget:
@@ -315,7 +373,7 @@ class RepairReadBudget:
     """
     WARN = 4
     LIMIT = 8
-    WRITES = {'set_rules', 'bind_facts', 'submit_formula_task', 'update_dataset',
+    WRITES = {'set_rules', 'bind_facts', 'submit_formula_task', 'submit_construction_repair', 'update_dataset',
               'define_dataset', 'record_facts', 'compile_table', 'compile_coefficient_table'}
 
     def __init__(self, state):
@@ -329,8 +387,15 @@ class RepairReadBudget:
         return any(not row.get('deferred') for row in self.state['records'].values())
 
     @staticmethod
-    def native_keys(native):
-        return {fingerprint(('native', item['tool'], item.get('scheme'), obj))
+    def _native_key(item, obj):
+        if owner := item.get('candidate_owner'):
+            return fingerprint(('native_candidate', owner))
+        operation = 'unpivot' if item.get('code', '').startswith('unpivot.') else item['tool']
+        return fingerprint(('native', operation, item.get('scheme'), obj))
+
+    @classmethod
+    def native_keys(cls, native):
+        return {cls._native_key(item, obj)
                 for item in native.values() if item['tool'] != 'compile_formulas'
                 for obj in item.get('objects') or [item['tool']]}
 
@@ -369,15 +434,19 @@ class RepairReadBudget:
             objects.update(f'/{group}/{name}' for name in args.get(group, {}) or {})
         objects.update(key for key in ('pool', 'report', 'allocation', 'checks') if key in args)
         objects.update(str(args[key]) for key in ('name', 'task', 'dataset') if args.get(key))
-        if step.tool == 'submit_formula_task':
+        if step.tool in ('submit_formula_task', 'submit_construction_repair'):
             try:
                 # The atomic tool reports its actual saved target; a task ID
                 # alone does not match compiler diagnostics about that target.
                 report, _ = json.JSONDecoder().raw_decode(step.result.lstrip())
                 if isinstance(report, dict) and report.get('saved') is True and isinstance(report.get('target'), str):
                     from bonus_agent.facts import split_target, target_parts
-                    _, path = split_target(report['target'])
-                    objects.update((path, '.'.join(target_parts(path))))
+                    saved = [report, *report.get('checked', ())]
+                    for row in saved:
+                        _, path = split_target(row['target'])
+                        objects.update((path, '.'.join(target_parts(path))))
+                        if row.get('task'):
+                            objects.add(row['task'])
             except (TypeError, ValueError):
                 pass
         return objects
@@ -426,10 +495,10 @@ class RepairReadBudget:
         saved_draft = (step.tool in ('set_rules', 'compile_table')
                        and step.result.startswith('草稿已保存，校验未通过'))
         if ((not step.ok and not saved_draft) or step.result.lstrip().startswith('no-op')
-                or step.tool not in {'set_rules', 'submit_formula_task', 'update_dataset',
+                or step.tool not in {'set_rules', 'submit_formula_task', 'submit_construction_repair', 'update_dataset',
                                      'define_dataset', 'compile_table', 'compile_coefficient_table'}):
             return False
-        if step.tool == 'submit_formula_task':
+        if step.tool in ('submit_formula_task', 'submit_construction_repair'):
             try:
                 saved, _ = json.JSONDecoder().raw_decode(step.result.lstrip())
                 if not isinstance(saved, dict) or saved.get('saved') is not True:
@@ -486,6 +555,8 @@ class RepairReadBudget:
         """Stable program-owned halt text, also used to identify legacy records."""
         action = ('update_dataset核对对象范围/关联，或submit_formula_task/set_rules修正公式；随后compile_formulas验证' if row.get('runtime') else
                   'bind_facts；目标公式缺分支时set_rules(bindings=...)；绑定已经一致时validate_parameters核验剩余缺口' if row['tool'] == 'bind_facts' else
+                  'define_dataset或update_dataset并验证展开后的原始份额' if row.get('code', '').startswith('unpivot.') else
+                  'record_clauses/plan_formula_tasks补齐条款依据，或update_dataset/submit_construction_repair补齐取数并复验' if row.get('code') == 'construction.data_dependency' else
                   'submit_formula_task（使用已有任务ID）/set_rules，然后程序局部检查')
         return (f'当前未解决对象「{row["subject"]}」已读取 {row["reads"]}/{cls.LIMIT} 次，'
                 '换页面、换query、note、no-op或改描述不会增加额度。'
@@ -503,10 +574,10 @@ class RepairReadBudget:
             if item['tool'] == 'compile_formulas':
                 continue
             for obj in item.get('objects') or [item['tool']]:
-                key = fingerprint(('native', item['tool'], item.get('scheme'), obj))
+                key = self._native_key(item, obj)
                 native_keys.add(key)
                 row = records.setdefault(key, {'kind': 'native', 'reads': 0, 'seen': [], 'warned': False})
-                row.update(subject=obj, issue=item['issue'], tool=item['tool'], phase=item.get('phase'))
+                row.update(subject=obj, issue=item['issue'], tool=item['tool'], code=item.get('code'), phase=item.get('phase'))
         for key in list(records):
             if records[key]['kind'] == 'native' and key not in native_keys:
                 del records[key]  # native feedback clears only validated successes
@@ -607,7 +678,7 @@ class RepairReadBudget:
                 self.state['seen_compile'].append(phase)
 
         for row in records.values():
-            row['deferred'] = repair_deferred(scope, row['subject'], row.get('phase'))
+            row['deferred'] = repair_deferred(scope, row['subject'], row.get('phase'), tool=row['tool'])
         active = {key: row for key, row in records.items() if not row['deferred']}
         focus = self.state.get('focus')
         exhausted = next((key for key, row in active.items() if row['reads'] >= self.LIMIT), None)

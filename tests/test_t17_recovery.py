@@ -154,7 +154,9 @@ def test_unit_change_needs_scoped_source_and_is_not_guessed(tmp_path):
 
 def test_compile_prioritizes_structure_and_retains_all_diagnostics(tmp_path):
     ws = prepared(make_workspace(tmp_path))
-    ws.set_rules(scheme='S', variables={'broken': {'expr': 'missing_field'}})
+    pool = ws.drafts['S']['pool']
+    ws.set_rules(scheme='S', variables={'broken': {'scope': '项目', 'expr': 'missing_field'}},
+                 pool={**pool, 'expr': pool['expr'] + ' + broken'})
     for n in range(80):
         ws.facts.append(ws.facts[0].model_copy(update={'name': f'pending{n}', 'targets': []}))
     result = ws.compile_formulas()
@@ -169,7 +171,7 @@ def test_compile_prioritizes_structure_and_retains_all_diagnostics(tmp_path):
         if not page['next_call']: break
         args = page['next_call']['args']
     assert seen == ws.workflow['formula_report']['report']['issues']
-    ws.set_rules(scheme='S', variables={'broken': None})
+    ws.set_rules(scheme='S', variables={'broken': None}, pool=pool)
     stale = ws.read_workspace('checks')
     assert stale['status'] == 'STALE' and stale['next_call']['tool'] == 'compile_formulas'
 

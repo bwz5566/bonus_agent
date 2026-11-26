@@ -94,3 +94,20 @@ def test_existing_date_expression_check_is_kept_without_duplicate_direct_errors(
     rs.variables['base'].expr = 'sum(when, of: "sales")'
     failures = types(rs)
     assert len(failures) == 1 and '日期' in failures[0].message
+
+
+@pytest.mark.parametrize(('kind', 'value', 'bounds'), [
+    ('text', '202608', '"202601", "202612"'),
+    ('date', '2026-08-01', '"2026-01-01", "2026-12-31"'),
+    ('number', 8, '1, 12'),
+])
+def test_between_checks_the_declared_field_type_in_a_filter(kind, value, bounds):
+    rs, records = rules('count', kind)
+    rs.variables['base'].expr = f'count(of: "sales", where: between(item, {bounds}))'
+    records['sales'][0]['item'] = value
+    if kind == 'text':
+        failure, = types(rs)
+        assert failure.where == 'variables.base' and '「sales.item」声明为 text' in failure.message
+    else:
+        assert not types(rs)
+        assert preflight_basis(rs, from_records(rs, records))['status'] == 'PASS'

@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import json
 import re
 
 TOOL_NAMES = {
@@ -17,18 +18,126 @@ TOOL_NAMES = {
 RETRY = "直接点「重试」，会从停下的地方接着做"
 SEND = "在下方写明怎么处理，再点「发送」"
 
+DIAGNOSIS_FIELDS = {
+    'item': '涉及项目或指标',
+    'identified': '已识别内容',
+    'missing': '缺少或待确认',
+    'impact': '影响',
+}
 
-def explain(error: str) -> dict:
+
+def vague(text: str) -> bool:
+    parts = re.split(r'[。！？，、；.!?,;\s]+', text.strip())
+    placeholders = {'无法判断', '不能判断', '无法确定', '不清楚', '看不出来', '材料不足', '资料不足',
+                    '信息不足', '待确认', '需要确认', '请确认', '需要补充材料', '缺少材料', '未知', '无', '无法判断具体原因'}
+    return all(re.sub(r'^(?:我|目前|暂时|当前|仍|尚)+', '', part) in placeholders for part in parts if part)
+
+
+def question_diagnosis(value) -> dict[str, str] | None:
+    if not isinstance(value, dict) or set(value) != set(DIAGNOSIS_FIELDS):
+        return None
+    if any(not isinstance(text, str) or vague(text) for text in value.values()):
+        return None
+    return {key: value[key].strip() for key in DIAGNOSIS_FIELDS}
+
+
+def diagnosis_items(value):
+    if isinstance(value, dict):
+        return [(label, value[key]) for key, label in DIAGNOSIS_FIELDS.items() if value.get(key)]
+    return []
+
+
+def _recorded_feedback(error):
+    start = error.find('{')
+    if start < 0:
+        return {}
+    raw = error[start:]
+    try:
+        report, _ = json.JSONDecoder().raw_decode(raw)
+        return report if isinstance(report, dict) and 'task' in report else {}
+    except ValueError:
+        # Older failure records kept a bounded prefix of the tool result.
+        quoted = r'("(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*")'
+        head = raw.split('"issues"', 1)[0]
+        report = {}
+        for key in ('task', 'scheme', 'target'):
+            if match := re.search(r'"' + key + r'"\s*:\s*' + quoted, head):
+                report[key] = json.loads(match[1])
+        if first := re.search(r'"issues"\s*:\s*\[\s*' + quoted, raw):
+            report['issues'] = [json.loads(first[1])]
+        return report if 'task' in report else {}
+
+
+def stop_diagnosis(error, workspace=None, focus=None):
+    """Describe a recorded stop from its check and task. Never infer a missing business rule."""
+    error = (error or '').strip()
+    workspace = workspace or {}
+    construction = workspace.get('workflow', {}).get('construction', {})
+    tasks = construction.get('tasks', {})
+    feedback = _recorded_feedback(error)
+    stopped = [ident for ident, task in tasks.items()
+               if task.get('target') and f'construction:{ident}:{task["target"]}' in error]
+    task_id = feedback.get('task')
+    if not isinstance(task_id, str) or not task_id:
+        task_id = stopped[0] if len(stopped) == 1 else (focus or {}).get('id')
+    spec = tasks.get(task_id, {})
+    execution = feedback.get('execution')
+    repair = execution.get('repair') if isinstance(execution, dict) else None
+    node = repair.get('node') if isinstance(repair, dict) else None
+    item = ' / '.join(dict.fromkeys(str(part) for part in (
+        spec.get('scheme') or feedback.get('scheme') or (focus or {}).get('scheme'),
+        spec.get('title') or feedback.get('target') or task_id,
+        task_id if spec.get('title') else None,
+        node if isinstance(node, str) else None,
+    ) if part))
+    budget = re.search(r'已报告实际用量 (\d+) tokens，剩余额度 (\d+)，本请求估算输入 (\d+) \+ 输出上限 (\d+)', error)
+    if budget:
+        used, remaining, request, output = map(int, budget.groups())
+        return {'item': item or '核算作业的模型请求',
+                'identified': f'累计已报告 {used:,} tokens，剩余 {remaining:,}。本请求预估输入 {request:,}，输出上限 {output:,}。',
+                'missing': f'按当前请求预估，至少还需 {request + output - remaining:,} tokens 的可用额度。',
+                'impact': '本请求在发送前被限额拦截，本轮停在该任务。'}
+    issues = [s for s in feedback.get('issues', ()) if isinstance(s, str) and s] if isinstance(feedback.get('issues'), list) else []
+    issue = issues[0] if issues else _where(error)
+    if not item and not issue:
+        return {}
+    cited = [c for c in workspace.get('clauses', ()) if c.get('id') in spec.get('clauses', ())]
+    known = f'已登记《{cited[0]["file"]}》中的「{cited[0]["quote"]}」。' if cited else ''
+    stalled = re.search(r'连续 (\d+) 次检查没有消除既有问题', error)
+    if task_id in stopped and stalled:
+        return {'item': item, 'identified': known + f'连续 {stalled[1]} 次检查后，该任务仍待验证。',
+                'missing': f'「{spec.get("title") or spec["target"]}」缺少当前数据版本的通过回执。',
+                'impact': '调度器已停止重复执行，依赖该构件的下游计算尚未完成。'}
+    scope = re.search(r'scope_bad:.*?scope「([^」]+)」', issue)
+    inputs = feedback.get('input_failures')
+    inputs = inputs if isinstance(inputs, list) else []
+    gap = next((x['detail'] for x in inputs if isinstance(x, dict) and isinstance(x.get('detail'), str)), '')
+    return {'item': item or '本轮核算校验',
+            'identified': known + (issue or '有任务位置的记录，未收到该项校验的具体结果。'),
+            'missing': gap or (f'需要为「{scope[1]}」建立并验证实际核算分组，或把公式绑定到已登记的对应对象。' if scope else
+                        '当前校验尚缺通过回执。具体应补的映射、数据或规则以该检查指出的项目为准。' if issue else
+                        '缺少能定位到公式或数据行的校验明细。'),
+            'impact': '该项校验未通过，后续金额计算或复核尚未完成。' if issue else '本轮停在该任务，后续计算尚未完成。'}
+
+
+def explain(error: str, *, workspace=None, diagnosis=None) -> dict:
     """返回 {title 原因, where 具体卡在哪, advice 建议的操作, ask 想了解的信息, detail 原始信息}。"""
     err = (error or "").strip()
     x = _explain(err)
     x.setdefault("where", _where(err))
     x.setdefault("ask", "")
     x["detail"] = err
+    x['diagnosis'] = diagnosis or stop_diagnosis(err, workspace)
     return x
 
 
 def _explain(err: str) -> dict:
+    if 'recovery.json' in err and re.search(r'\[WinError (?:5|32|33)\]', err):
+        return {"title": "Windows 未能写入本轮恢复记录，核算已停止。",
+                "where": "案卷恢复记录写入被拒绝", "advice": "从最近一次成功保存的案卷续跑。"}
+    if "案卷累计 tokens 用量" in err and "达到总上限" in err:
+        return {"title": "案卷模型用量已达到上限。",
+                "where": err, "advice": "本次已在发送新请求前停止。"}
     if err.startswith("纠错预算耗尽"):
         from bonus_agent.stuck_question import program_issue
         if program_issue(err):
@@ -175,11 +284,13 @@ def retryable(error: str | None) -> bool:
     return error.startswith("达到最大步数")
 
 
-def to_text(error: str) -> str:
+def to_text(error: str, *, diagnosis=None) -> str:
     """对话框里的说明：原因 → 卡在哪 → 想了解什么 → 怎么继续。每项一行。"""
-    x = explain(error)
+    x = explain(error, diagnosis=diagnosis)
     lines = [x["title"]]
-    if x["where"]:
+    if x['diagnosis']:
+        lines.extend(f'{label}\n{value}' for label, value in diagnosis_items(x['diagnosis']))
+    elif x["where"]:
         lines.append(f"卡在：{x['where']}")
     if x["ask"]:
         lines.append(f"想请你确认：{x['ask']}")

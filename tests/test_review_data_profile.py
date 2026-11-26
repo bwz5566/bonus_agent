@@ -12,6 +12,54 @@ from bonus_core.data.mapping import DatasetMapping
 from bonus_core.data.period import Period
 from bonus_core.dsl.models import DatasetDef
 
+
+def test_historical_mapping_exposes_an_earlier_compatible_source_without_selecting_it(tmp_path):
+    from bonus_agent.context import task_card
+    from tests.test_staged_workflow import make_workspace
+
+    def add_sources(book):
+        current = book.create_sheet('current')
+        current.append(['Month', 'Client ID', 'Net Sales'])
+        current.append(['202609', '005', 90])
+        current.append(['202609', '006', 120])
+        archive = book.create_sheet('monthly archive')
+        archive.append(['Month', 'Client ID', 'Sum of Net Sales', 'Notes'])
+        archive.append(['202602', '005', 30, 'reported'])
+        archive.append(['202608', '006', 50, 'reported'])
+        archive.append(['202609', '005', 90, 'reported'])
+        archive.append(['202610', '005', 80, 'after cutoff'])
+        other = book.create_sheet('another population')
+        other.append(['Month', 'Client ID', 'Net Sales'])
+        other.append(['202601', '999', 1000])
+
+    ws = make_workspace(tmp_path, mutate_workbook=add_sources)
+    ws.period = Period.parse('2026-09')
+    fields = {
+        'month_id': {'column': 'Month', 'type': 'text'},
+        'client_id': {'column': 'Client ID', 'type': 'id'},
+        'history_amount': {'column': 'Net Sales', 'type': 'money'},
+    }
+    ws.define_dataset('history', 'data.xlsx', 'current', fields, period='month_id', window='year_to_date')
+    report = ws.prepare_data()
+    assert report['status'] == 'PASS'
+    coverage, = report['history_sources']
+    assert coverage['dataset'] == 'history' and coverage['mapped_months'] == {'2026-09': 2}
+    alternative, = coverage['alternatives']
+    assert alternative['sheet'] == 'monthly archive'
+    assert alternative['columns']['history_amount'] == 'Sum of Net Sales'
+    assert alternative['additional_months'] == ['2026-02', '2026-08']
+    assert alternative['read_call']['args']['sheet'] == 'monthly archive'
+    assert ws.mapping['history'].sheet == 'current'
+    assert json.loads(task_card(ws))['history_sources'] == [coverage]
+    ws.define_dataset('history', 'data.xlsx', 'monthly archive',
+                      {**fields, 'history_amount': {'column': 'Sum of Net Sales', 'type': 'money'}},
+                      period='month_id', window='year_to_date')
+    report = ws.prepare_data()
+    assert report['status'] == 'PASS'
+    coverage, = report['history_sources']
+    assert coverage['mapped_months'] == {'2026-02': 1, '2026-08': 1, '2026-09': 1}
+    assert coverage['alternatives'] == []
+
 pytestmark = pytest.mark.evidence
 
 

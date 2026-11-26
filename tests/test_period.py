@@ -13,6 +13,27 @@ from bonus_core.engine.issues import EngineError
 from bonus_core.engine.run import Engine
 
 
+def test_same_month_column_name_is_required_only_in_formula_source():
+    from bonus_core.data.mapping import required_fields
+
+    months = {f'm{m:02}': {'type': 'money'} for m in range(1, 13)}
+    rs = RuleSet.model_validate({
+        'name': 'monthly budgets', 'version': '1',
+        'datasets': {
+            'regions': {'key': 'region', 'fields': {'region': {'type': 'id'}, **months}},
+            'customers': {'key': 'client', 'fields': {'client': {'type': 'id'}, **months}},
+        },
+        'variables': {'current': {'scope': 'regions', 'expr': 'period_value(' + ', '.join(months) + ')'}},
+        'pool': {'expr': '0'}, 'allocation': [],
+    })
+    assert required_fields(rs, Period.parse('2026-09')) == {
+        'regions': {'region', 'm09'}, 'customers': {'client'},
+    }
+    assert required_fields(rs, Period.parse('2026-11')) == {
+        'regions': {'region', 'm11'}, 'customers': {'client'},
+    }
+
+
 def test_parse_and_labels():
     assert Period.parse("2026-09") == Period(date(2026, 9, 1), date(2026, 9, 30))
     assert Period.parse("202609").label == "2026-09" and Period.parse("2026年9月").label == "2026-09"

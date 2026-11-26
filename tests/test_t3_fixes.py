@@ -106,6 +106,19 @@ def test_filter_can_exclude_values_and_zero_numbers():
     assert isinstance(row_filter(["金额"], {"金额": {"bad": ["0"]}}), str)
 
 
+def test_combined_identifier_resolves_declared_fields_to_source_headers(tmp_path):
+    ws = _ws(tmp_path)
+    fields = {'line_id': {'column': '行', 'type': 'id'},
+              'customer': {'column': '客户', 'type': 'text'},
+              'entity_id': {'column': '组合编号', 'type': 'id'}}
+    ws.define_dataset('对象', '数据.xlsx', '销售', fields, key='entity_id',
+                      combine={'组合编号': ['line_id', 'customer']})
+    assert ws.mapping['对象'].combine == {'组合编号': ['行', '客户']}
+    with pytest.raises(ToolError, match='未通过 fields 绑定到原始单列'):
+        ws.update_dataset('对象', {'combine': {'组合编号': ['entity_id', 'customer']}})
+    assert ws.mapping['对象'].combine == {'组合编号': ['行', '客户']}
+
+
 def test_exclusion_clause_in_material_must_be_applied(tmp_path):
     w = _ws(tmp_path, "提成按销售额的 10% 计提。销售金额为 0 的行（包括判断为“剔除”的行）不参与核算。")
     _sales(w)

@@ -119,10 +119,14 @@ def test_confirmation_rejects_changed_inputs_and_full_money_baseline(tmp_path):
     wb=openpyxl.load_workbook(p);wb.active.cell(2,3).value=80;wb.save(p);wb.close()
     with pytest.raises(case.ConfirmError,match='输入版本'):
         case.confirm(out,'reviewer',review=False)
+    with pytest.raises(case.ConfirmError,match='输入版本'):
+        case.check_template(out)
     # Even if a persisted input fingerprint matches, the frozen paid baseline must catch a difference.
     snap['rounds'][0]['files'][p.name]=case.sha256(p);case.save_case(out,snap)
     with pytest.raises(case.ConfirmError,match='不一致'):
         case.confirm(out,'reviewer',review=False)
+    with pytest.raises(case.ConfirmError,match='不一致'):
+        case.check_template(out)
     assert not (out/'template').exists()
 
 

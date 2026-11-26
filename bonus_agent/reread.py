@@ -60,24 +60,35 @@ def _is_data(st, data: set) -> bool:
     return (st.file, st.sheet) in data or (None, st.sheet) in data
 
 
-def material(ws, *, full_documents=False) -> str:
+def material(ws, *, full_documents=False, omit_answers=(), data_sheets=(),
+             include_files=None, page_slices=None, include_profile=True) -> str:
     """交给复读的材料：规则文档、财务答复、参数表整表、数据表只给表头和列类型。"""
     from bonus_agent.agent import CHAT_SOURCE, _json_data_summary
     parts = []
+    page_slices = page_slices or {}
     for d in ws.inv.docs:
-        text = ws.read_document(d.name, 0, limit=10 ** 9, folded=True)   # 独立复读看全文（预筛折叠的页也看），作为兜底
+        if include_files is not None and d.name not in include_files:
+            continue
+        if d.name in page_slices:
+            pages = ws._page_raw(d.name)
+            text = "\n\n".join(f"第 {n} 页\n{pages[n]}" for n in sorted(page_slices[d.name]))
+        else:
+            text = ws.read_document(d.name, 0, limit=10 ** 9, folded=True)
         if len(text) > DATA_JSON_CHARS and _json_data_summary(ws._file(d.name)):    # 大的结构化数据文件（数据行），不给
             continue
         if text.strip():
             parts.append(f"## 文件 {d.name}\n{text if full_documents else text[:DOC_CHARS]}")
-    answered = [q for q in ws.questions if q.answer not in (None, "") and not getattr(q, "withdrawn", "")]
+    answered = [q for q in ws.questions if q.answer not in (None, "") and not getattr(q, "withdrawn", "")
+                and q.id not in omit_answers]
     if answered:
         parts.append("## 财务答复\n" + "\n".join(f"问：{q.text}\n答：{q.answer}" for q in answered))
     if getattr(ws, "said", ""):
         parts.append(f"## {CHAT_SOURCE}\n{ws.said}")
-    data = _data_sheets(ws)
+    data = _data_sheets(ws) | set(data_sheets)
     heads = []
     for st in ws.inv.sheets:
+        if include_files is not None and st.file not in include_files:
+            continue
         ref = f"{st.file}/{st.sheet}"
         if not _is_data(st, data) and len(st.rows) <= PARAM_ROWS and ref in ws.inv.sheet_text:
             parts.append(f"## 工作表 {ref}（整表）\n{ws.inv.sheet_text[ref]}")
@@ -87,9 +98,86 @@ def material(ws, *, full_documents=False) -> str:
             f"{h}（{_col_type(c)}）" for h, c in zip(st.headers, cols) if h))
     if heads:
         parts.append("## 数据表（只有表头和列类型，没有数据行）\n" + "\n".join(heads))
-    from bonus_agent.data_profile import review_context
-    parts.append(review_context(ws))
+    if include_profile:
+        from bonus_agent.data_profile import review_context
+        parts.append(review_context(ws))
     return "\n\n".join(parts)
+
+
+def settlement_material(ws, name):
+    """Select original allocation evidence after upstream funding is independently confirmed."""
+    from pathlib import Path
+    from bonus_agent.facts import norm
+    from bonus_agent.extract_rules import data_dictionary
+
+    flow = ws._flow()
+    upstream = flow.answered_settlement_schemes().get(name)
+    if not upstream or not flow.current('approved:' + upstream):
+        return None
+    rs = ws._ruleset(name)
+    view = flow._review_workspace(name, rs)
+    roles = flow.state.get('plan', {}).get('files', {})
+    if not roles or name not in flow.state.get('scheme_datasets', {}):
+        return None
+    selected = {doc for doc, role in roles.items() if role in ('rule', 'rule_and_data')}
+    # Physical material used by any field of the recipient scheme is retained.
+    for dataset in rs.datasets:
+        mapping = ws.mapping.get(dataset)
+        if not mapping or not mapping.file:
+            return None
+        selected.add(Path(mapping.file).name)
+
+    def refs(value):
+        if isinstance(value, dict):
+            yield from value.get('sources', [])
+            for key, item in value.items():
+                if key != 'sources':
+                    yield from refs(item)
+        elif isinstance(value, list):
+            for item in value:
+                yield from refs(item)
+
+    cited = list(refs(rs.model_dump(mode='json')))
+    for question in view.questions:
+        if question.answer not in ('', None) and not question.withdrawn:
+            cited.extend({**ev, 'doc': ev.get('file')} for ev in question.evidence or [] if ev.get('ok'))
+    files = {path.name for path in ws.inv.files}
+    selected.update(r.get('doc') for r in cited if r.get('doc') in files)
+    if not selected <= files or any(roles.get(doc) in ('ignored', 'reference') for doc in selected):
+        return None
+    pages = {}
+    deferred = []
+    for doc in sorted(selected):
+        if Path(doc).suffix.lower() not in ('.pptx', '.pdf'):
+            continue
+        raw = ws._page_raw(doc)
+        original = {n: norm(text) for n, text in raw.items()}
+        quotes = [r for r in cited if r.get('doc') == doc and r.get('quote')]
+        if not original or not quotes:
+            continue
+        needed = set()
+        for ref in quotes:
+            hits = ws._quote_pages(ref['quote'], original)
+            if ref.get('page') is not None:
+                hits = [n for n in hits if n == ref['page']]
+            if not hits:
+                break
+            needed.update(hits)
+        else:
+            if 0 < len(needed) < len(raw):
+                pages[doc] = needed
+                for n in sorted(raw.keys() - needed):
+                    heading = next((line.strip() for line in raw[n].splitlines()
+                                    if line.strip() and not line.startswith('==')), '')
+                    deferred.append({'doc': doc, 'page': n, 'heading': heading[:100]})
+
+    deferred_files = sorted(files - selected)
+    visible = material(view, include_files=selected, page_slices=pages, include_profile=False,
+                       data_sheets=_data_sheets(ws))
+    locator = json.dumps({'deferred_files': deferred_files, 'deferred_pages': deferred}, ensure_ascii=False)
+    text = (visible + "\n\n## 暂未展开的原始材料目录\n" + locator
+            + "\n下列数据字典只描述本方案原表字段。\n" + data_dictionary(rs.datasets))
+    return text, selected, pages
 
 
 def signature(text: str) -> str:
@@ -124,7 +212,7 @@ def basis_part_request_policy(ws):
         BASIS_PART_REASONING.reset(token)
 
 
-def guard_request(ws, msgs: list[dict], *, checker_only=False):
+def guard_request(ws, msgs: list[dict], *, checker_only=False, max_tokens=8192):
     """Reserve context for the actual reviewer route before spending a review attempt."""
     from bonus_agent.context import guard_messages
 
@@ -141,24 +229,25 @@ def guard_request(ws, msgs: list[dict], *, checker_only=False):
     budget = getattr(model, 'run_budget', None)
     if budget is not None:
         budget.ensure_request_window(model)
-    output = max(8192, model.think_max_tokens) if think and model.can_think else 8192
+    output = max(max_tokens, model.think_max_tokens) if think and model.can_think else max_tokens
     if cap := getattr(model, '_max_output_tokens', None):
         output = min(output, int(cap))
     guard_messages(msgs, model, output_tokens=output)
     return model
 
 
-def _ask(ws, msgs: list[dict], *, checker_only=False) -> str:
+def _ask(ws, msgs: list[dict], *, checker_only=False, max_tokens=8192) -> str:
     """交叉验证：配置了另一个模型就让它来复读、写独立算式（和主流程的模型错法不同，验得更真）；
     它调用失败时退回主模型，并记下来，不让整轮失败。"""
+    limits = {'max_tokens': max_tokens} if max_tokens != 8192 else {}
     if checker_only:
-        guard_request(ws, msgs, checker_only=True)
+        guard_request(ws, msgs, checker_only=True, **limits)
     else:
-        guard_request(ws, msgs)
+        guard_request(ws, msgs, **limits)
     other = getattr(ws.llm, "checker_llm", None)
     if other is not None and not getattr(ws, "checker_down", ""):
         try:
-            return other.chat(msgs, json_out=True, temperature=0, max_tokens=8192, think=True)
+            return other.chat(msgs, json_out=True, temperature=0, max_tokens=max_tokens, think=True)
         except RunBudgetError:
             raise  # A job allowance is not evidence that the reviewer is unavailable.
         except LLMError as e:
@@ -171,7 +260,7 @@ def _ask(ws, msgs: list[dict], *, checker_only=False) -> str:
                 try:
                     # The fallback may have a different context/output allowance
                     # and minimum request window from the failed reviewer.
-                    guard_request(ws, msgs)
+                    guard_request(ws, msgs, **limits)
                 except RunBudgetError as stop:
                     # This marker can describe the unsent fallback only; the
                     # checker was already attempted in this review invocation.
@@ -184,14 +273,17 @@ def _ask(ws, msgs: list[dict], *, checker_only=False) -> str:
             raise LLMError('关键复核模型未配置；独立复核不能标记通过')
         raise LLMError(f'关键复核模型 {other.name} 不可用；本轮不降级为主模型自验')
     think = not bool(getattr(ws, 'checker_down', '') and getattr(ws.llm, 'think_llm', None))
-    return ws.llm.chat(msgs, json_out=True, temperature=0, max_tokens=8192, think=think)
+    return ws.llm.chat(msgs, json_out=True, temperature=0, max_tokens=max_tokens, think=think)
 
 
 def run(ws) -> dict:
     """调用模型复读；材料没变时用上次的结果。返回 {"sig", "items", "unclear", "error"}。"""
+    old = getattr(ws, "reread", None) or {}
+    if combined := bound_settlement_review(ws):
+        ws.reread = combined
+        return combined
     text = material(ws)
     sig = review_signature(ws, text)
-    old = getattr(ws, "reread", None) or {}
     if old.get("sig") == sig and not old.get("error"):
         calc(ws, old)
         return old
@@ -222,7 +314,7 @@ def run(ws) -> dict:
 
 # ---- 独立算式 ----
 
-def structure(ws) -> str:
+def structure(ws, selected=None) -> str:
     """独立算式要用的结构：数据字典（字段名、对应表头、类型）和每个方案的分配层级、奖金池在哪一层算。不给规则的算式。"""
     from bonus_agent.extract_rules import data_dictionary
     heads = []
@@ -230,14 +322,15 @@ def structure(ws) -> str:
         cols = "、".join(f"{f} ← {c}" for f, c in m.columns.items())
         heads.append(f"- {ds}：{m.file}/{m.sheet}" + (f"（只取 {m.filter}）" if m.filter else "") + f"；{cols}")
     out = ["# 数据字典（规则里只能用这些字段名）", data_dictionary(ws.datasets), "", "## 字段对应的原表头", *heads]
-    levels = {lv.get("key") for n in schemes(ws) for lv in ws._merged(n).get("allocation") or []}
+    selected = schemes(ws) if selected is None else selected
+    levels = {lv.get("key") for n in selected for lv in ws._merged(n).get("allocation") or []}
     reach = {ds: v for ds, v in _reachable(ws.datasets).items() if getattr(ws.datasets[ds], "key", None) not in levels}
     if reach:
         out += ["", "## 行上可以直接用的被引用对象字段（行上有对象的编号，按编号取到该对象的字段，筛选、计算都能直接写字段名）"]
         out += [f"- {ds}：" + "；".join(f"经 {via} 取到「{ent}」的 {'、'.join(fs)}" for via, ent, fs in items)
                 for ds, items in reach.items()]
     out += ["", "# 方案"]
-    for name in schemes(ws):
+    for name in selected:
         full = ws._merged(name)
         levels = " → ".join(f"{lv.get('level')}（主键 {lv.get('key')}）" for lv in full.get("allocation") or [])
         scope = (full.get("pool") or {}).get("scope") or "global"
@@ -251,7 +344,7 @@ def structure(ws) -> str:
                        f'待分配项及层级：{[(p.name,p.level) for p in report.pending]}；只给结构，不给主规则算式。')
         if report and report.details:
             out.append('  对象金额报告（details 须逐一提供独立表达式）：' +
-                       str([(d.name,d.level,d.desc) for d in report.details]))
+                       str([(d.name, d.level) for d in report.details]))
     return "\n".join(out)
 
 
@@ -281,6 +374,91 @@ def schemes(ws) -> list[str]:
     return [n for n in ws.schemes if (ws._merged(n).get("pool") or {}).get("expr") and n in ws.results]
 
 
+def _reviewed_funding(ws, names):
+    """Reuse an independent basis declaration only for the identical approved funding output."""
+    from bonus_agent.agent import ToolError
+    from bonus_agent.recovery import fingerprint
+    from bonus_core.dsl.phases import funding_only
+
+    if not getattr(ws, 'staged', False):
+        return {}, None
+    flow = ws._flow()
+    refs = {}
+    for name in names:
+        result = ws.results[name].get('R0')
+        review = flow.state.get('references', {}).get(name, {})
+        spec = review.get('spec')
+        if (not result or not result.funding or name in ws.untested or review.get('spec_state') != 'valid'
+                or review.get('report', {}).get('status') != 'PASS' or not isinstance(spec, dict) or spec.get('unclear')
+                or review.get('reviewer_policy') != flow.reviewer_policy()):
+            continue
+        rs = ws._ruleset(name)
+        if (not funding_only(rs) or any(item.stage != 'basis' for item in [*rs.report.details, *rs.report.totals, *rs.report.balances])
+                or not all(flow.current(step + ':' + name) for step in ('basis', 'review', 'approved'))):
+            continue
+        basis = flow.state['basis'][name]
+        if (review.get('basis_digest') != fingerprint(basis)
+                or result.funding != {nid: row['amount'] for nid, row in basis['objects'].items()}):
+            continue
+        ws._check_source_version()
+        try:
+            flow.check_basis_result(name, rs, result)
+        except ToolError:
+            continue
+        refs[name] = spec
+    return refs, flow
+
+
+def bound_settlement_review(ws):
+    """Use a complete independent terminal declaration only for its exact approved case."""
+    from bonus_agent.recovery import fingerprint
+
+    if not getattr(ws, 'staged', False) or not getattr(ws.llm, 'checker_required', False):
+        return None
+    flow = ws._flow()
+    linked = flow.answered_settlement_schemes()
+    names = schemes(ws)
+    if len(linked) != 1 or len(names) != 2:
+        return None
+    name, parent = next(iter(linked.items()))
+    if set(names) != {name, parent} or not all(flow.current(step + ':' + name)
+                                               for step in ('basis', 'review', 'approved')):
+        return None
+    ref = flow.state.get('references', {}).get(name, {})
+    approval = flow.state['receipts']['approved:' + name]['payload']
+    terminal = ref.get('terminal') or {}
+    ver = flow.version()
+    cfg = terminal.get('declaration')
+    if (approval.get('origin') != 'confirmed_funding' or approval.get('funding_scheme') != parent
+            or ref.get('spec_state') != 'valid' or ref.get('reviewer_policy') != flow.reviewer_policy()
+            or ref.get('basis_digest') != approval.get('basis_digest') or terminal.get('version') != ver
+            or not isinstance(cfg, dict) or set(cfg) - {'items', 'people', 'details', 'pending', 'unclear'}
+            or not isinstance(cfg.get('items'), list) or not cfg['items']
+            or not all(isinstance(item, dict) and item.get('name') for item in cfg['items'])
+            or not isinstance(cfg.get('unclear', []), list) or cfg.get('unclear')):
+        return None
+    report = ws._ruleset(name).report
+    if (not report or not isinstance(cfg.get('people'), dict)
+            or not isinstance(cfg.get('details'), dict) or set(cfg['details']) != {item.name for item in report.details}
+            or not isinstance(cfg.get('pending'), dict) or set(cfg['pending']) != {item.name for item in report.pending}):
+        return None
+    if any(d.rounding == 'after_sum' for d in report.distributions) and cfg['people'].get('mode') != 'after_sum':
+        return None
+    for key in ('details', 'pending'):
+        if not all(isinstance(expr, str) and expr.strip() for expr in cfg[key].values()):
+            return None
+    approved, _ = _reviewed_funding(ws, names)
+    if set(approved) != {parent}:
+        return None
+    selected = {key: ref['spec'][key] for key in ('pool', 'helpers', 'tables')}
+    selected.update({key: cfg[key] for key in ('details', 'pending', 'people')})
+    full = {**approved, name: selected}
+    sig = fingerprint((ver, full, cfg['items'], flow.reviewer_policy(), 'funded_terminal'))
+    return {'sig': sig, 'items': cfg['items'], 'unclear': [], 'error': '', 'by': ref['reviewer']['name'],
+            'terminal_version': ver, 'calc': {'sig': sig, 'schemes': full, 'error': '', 'unclear': [],
+            'second': [], 'unsettled': {}, 'reused_funding': [parent]}}
+
+
 def calc(ws, rr: dict) -> dict:
     """让复读按材料写出每个方案的奖金池算式，写不对就带着报错让它改。结果存在 rr["calc"]：
     {"sig", "schemes": {方案: {"tables", "helpers", "pool"}}, "unclear", "error", "second"}。
@@ -291,17 +469,34 @@ def calc(ws, rr: dict) -> dict:
     if not names:
         return {}
     from bonus_core.dsl.functions import describe
+    from bonus_agent.recovery import fingerprint
+
+    approved, flow = _reviewed_funding(ws, names)
+    pending = [name for name in names if name not in approved]
+    view = flow._review_workspace(pending[0], ws._ruleset(pending[0])) if approved and len(pending) == 1 else ws
     full = prompt("extract_rules")
     dsl = full[full.index("## 表达式语法"):full.index("## 发放与抵扣")].replace("{functions}", describe())
-    text = (material(ws) + "\n\n# 你上一步列出的计算项\n" + json.dumps(rr.get("items") or [], ensure_ascii=False)
-            + "\n\n" + structure(ws))
+    text = ''
+    if pending:
+        text = (material(view, data_sheets=_data_sheets(ws)) + "\n\n# 你上一步列出的计算项\n"
+                + json.dumps(rr.get("items") or [], ensure_ascii=False) + "\n\n" + structure(view, pending))
+    if approved and pending:
+        funding_scopes = {name: ws._ruleset(name).pool.scope for name in approved}
+        text += ('\n\n以下方案的逐对象资金已独立复核并确认。只为上面列出的待核方案提交独立算式。'
+                 '经材料规定允许引用时，使用 scheme_paid(资金方案名, "R0")，资金方案及对象层级为 '
+                 + json.dumps(funding_scopes, ensure_ascii=False))
     sig = review_signature(ws, text)
+    if approved:
+        sig = signature(sig + fingerprint(approved))
     old = rr.get("calc") or {}
     if old.get("sig") == sig and old.get("schemes"):
         return old
     base = [{"role": "system", "content": prompt("reread_calc").replace("{dsl}", dsl)},
             {"role": "user", "content": text}]
-    out = {"sig": sig, **_sample(ws, base, names), "second": [], "unsettled": {}}
+    sample = _sample(ws, base, pending) if pending else {"schemes": {}, "unclear": [], "error": ""}
+    out = {"sig": sig, **sample, "schemes": {**approved, **sample['schemes']}, "second": [], "unsettled": {}}
+    if approved:
+        out['reused_funding'] = sorted(approved)
     rr["calc"] = out
     return out
 
@@ -323,6 +518,7 @@ def _sample(ws, base: list[dict], names: list[str]) -> dict:
         out["schemes"] = {n: v for n, v in got.items() if n in names and isinstance(v, dict) and v.get("pool")}
         out["unclear"] = [str(u) for u in (data.get("unclear") or []) if u]
         errs = []
+        retry_errors = {}
         for n in names:
             if n not in out["schemes"]:
                 errs.append(f"方案「{n}」：没有写奖金池算式")
@@ -332,20 +528,27 @@ def _sample(ws, base: list[dict], names: list[str]) -> dict:
                 out["schemes"].pop(n)
                 continue
             try:
+                check = '奖金池'
                 ws._independent_pool(n, out["schemes"][n], strict=True)
+                check = '可发比例'
                 ws._independent_pay(n, out["schemes"][n], strict=True)
                 if hasattr(ws, '_independent_people'):
+                    check = '人员汇总'
                     ws._independent_people(n, out['schemes'][n])
                 if hasattr(ws, '_independent_details'):
+                    check = '对象金额明细'
                     ws._independent_details(n,out['schemes'][n])
             except Exception as e:          # 算式是模型写的，任何报错都交还它自己改
                 errs.append(f"方案「{n}」：{str(e)[:400]}")
+                if getattr(ws, 'staged', False):
+                    retry_errors[errs[-1]] = f'方案「{n}」独立{check}未通过求值校验，请核对字段、作用域和语法。'
                 out["schemes"].pop(n)
         out["error"] = "；".join(errs)[:600]
         if not errs:
             break
         msgs = msgs + [{"role": "assistant", "content": raw},
-                       {"role": "user", "content": "这些算式算不出来，请按报错改正后重新输出完整的 JSON：\n" + "\n".join(errs)}]
+                       {"role": "user", "content": "这些算式算不出来，请按报错改正后重新输出完整的 JSON：\n"
+                        + "\n".join(retry_errors.get(error, error) for error in errs)}]
     return out
 
 
@@ -399,7 +602,12 @@ def _disagree(ws, name: str, spec: dict) -> list[tuple[str, str, Decimal, Decima
             out += [('人员汇总', p, value, actual[p]) for p,value in people.items()
                     if value.quantize(Decimal('.01'), ROUND_HALF_UP) != actual[p].quantize(Decimal('.01'), ROUND_HALF_UP)]
     if hasattr(ws,'_independent_details'):
-        reference=ws._independent_details(name,spec)
+        rules = ws._ruleset(name)
+        raw_names = {item.name for item in rules.report.details if item.stage == 'distribution'} if (
+            rules.report and any(d.rounding == 'after_sum' for d in rules.report.distributions)) else set()
+        raw_reference = ws._independent_details(name, spec, raw=True) if raw_names else {}
+        reference = ({key: value.quantize(Decimal('.01'), ROUND_HALF_UP) for key, value in raw_reference.items()}
+                     if raw_names else ws._independent_details(name, spec))
         if reference:
             actual={json.dumps([label,nid],ensure_ascii=False):Decimal(row['amount'])
                     for label,group in ws.results[name]['R0'].details.items() for nid,row in group.items()}
@@ -409,6 +617,13 @@ def _disagree(ws, name: str, spec: dict) -> list[tuple[str, str, Decimal, Decima
             ws._full_coverage[name]['expected'] += len(actual)
             ws._full_coverage[name]['checked'] += len(reference)
             out += [('明细核算',key,value,actual[key]) for key,value in reference.items() if value!=actual[key]]
+            result = ws.results[name]['R0']
+            if raw_names:
+                raw_actual = {json.dumps([label, nid], ensure_ascii=False): value
+                              for label, group in result.detail_raw_amounts().items() if label in raw_names
+                              for nid, value in group.items()}
+                out += [('明细原值', key, raw_reference[key], value) for key, value in raw_actual.items()
+                        if abs(raw_reference[key] - value) > Decimal('0.000000000001')]
     return out
 
 
@@ -468,7 +683,7 @@ def _calc_gaps_now(ws, rr: dict) -> list[tuple[str, str]]:
                             for k, h in (spec.get("helpers") or {}).items())
         tables = "；".join(f"{k} = {json.dumps(t, ensure_ascii=False)}" for k, t in (spec.get("tables") or {}).items())
         how = (f"；辅助变量 {helpers}" if helpers else "") + (f"；参数表 {tables}" if tables else "")
-        for kind in ("奖金池", "可发比例", "人员汇总", "明细核算"):
+        for kind in ("奖金池", "可发比例", "人员汇总", "明细核算", "明细原值"):
             rows = [b for b in bad if b[0] == kind]
             if not rows:
                 continue
@@ -484,6 +699,10 @@ def _calc_gaps_now(ws, rr: dict) -> list[tuple[str, str]]:
                 total = len(ws.results[name]['R0'].people)
                 eg = '；'.join(f'{k} 复读 {_money(v)}、规则 {_money(t)}' for _,k,v,t in rows[:CALC_SHOW])
                 expr = '人员独立汇总 = ' + json.dumps(spec.get('people'), ensure_ascii=False)
+            elif kind == '明细原值':
+                total = sum(len(group) for group in ws.results[name]['R0'].details.values())
+                eg = '；'.join(f'{key} 复读 {v}、规则 {t}' for _, key, v, t in rows[:CALC_SHOW])
+                expr = '对象独立核算 = ' + json.dumps(spec.get('details'), ensure_ascii=False)
             else:
                 total=sum(len(group) for group in ws.results[name]['R0'].details.values())
                 eg='；'.join(f'{key} 复读 {_money(v)}、规则 {_money(t)}' for _,key,v,t in rows[:CALC_SHOW])

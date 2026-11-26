@@ -5,14 +5,28 @@ from bonus_core.dsl.models import RuleSet
 from bonus_core.dsl.parser import ExprError, names, parse
 
 
-def basis_rules(rs: RuleSet) -> RuleSet:
+def funding_only(rs: RuleSet) -> bool:
+    """An entity's earmarked funds can be an output without a recipient allocation."""
+    entity = rs.datasets.get(rs.pool.scope)
+    report = rs.report
+    return bool(
+        not rs.allocation and not rs.payout and not rs.offsets and entity and entity.key
+        and rs.pool.scope != 'global' and report and report.totals
+        and not (report.people or report.pending or report.distributions)
+        and any(item.level == rs.pool.scope and item.sources for item in report.details)
+    )
+
+
+def basis_rules(rs: RuleSet, *, additional_inputs=()) -> RuleSet:
     """Keep the transitive inputs of the pre-distribution calculation.
 
     Data, population patches and declared relationships remain authoritative.
-    Only explicitly distribution-stage checks/report rows are deferred. Broken
-    selected expressions are kept so validation reports them, never discarded.
+    Distribution weights and explicitly distribution-stage checks/report rows
+    are deferred. Broken selected expressions stay visible to validation.
     """
     result = rs.model_copy(deep=True)
+    for level in result.allocation:
+        level.weight = ''
     result.payout = []
     result.offsets = []
     result.checks = [c for c in result.checks if c.stage == 'basis']
@@ -24,7 +38,7 @@ def basis_rules(rs: RuleSet) -> RuleSet:
         result.report.balances = [b for b in result.report.balances if b.stage == 'basis']
         result.report.distributions = []
 
-    pending = [result.pool.expr, *(c.expr for c in result.checks)]
+    pending = [result.pool.expr, *(c.expr for c in result.checks), *additional_inputs]
     if result.report:
         pending += [r.expr for r in [*result.report.totals, *result.report.details]]
         pending += [expr for b in result.report.balances for expr in [b.total, *b.parts]]

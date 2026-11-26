@@ -60,6 +60,11 @@ def result_integrity(result):
     total = sum((Decimal(n.final) for n in leaves), Decimal(0))
     if total != Decimal(result.pool):
         errors.append({"error": "最末层金额与奖金池不一致", "leaves": str(total), "pool": result.pool})
+    if result.funding and (
+        result.people or result.payouts or result.rollups
+        or {key: Decimal(value) for key, value in result.funding.items()} != {n.id: Decimal(n.final) for n in leaves}
+    ):
+        errors.append({"error": "可分配资金与各基础对象金额不一致，或混入了人员发放"})
     if result.people and sum((Decimal(p["final"]) for p in result.people if not p.get("pending")), Decimal(0)) != total:
         errors.append({"error": "人员汇总与最末层金额不一致"})
     for row in [*result.payouts.values(), *result.rollups.values()]:
