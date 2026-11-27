@@ -91,10 +91,13 @@ def read_datasets(catalog: Catalog, specs: dict, *, period, owner='scope_mapping
             if not isinstance(ds['sources'],list) or not ds['sources']:raise ProgramError(f'{name} 没有实际材料',owner=owner)
             rows=[];seen_physical=set();excluded=[];source_summary=[];seen_keys={};ranges_by_sheet=defaultdict(list);headers_by_sheet=defaultdict(set);outside_by_sheet=defaultdict(list)
             for src in ds['sources']:
-                contract(src,required=('sheet','header_row','columns'),optional=('start_row','end_row','skip','constants','excluded_ranges'),label=f'{name} 物理来源',owner=owner)
-                sheet=catalog.sheet(src);h=src['header_row'];cols=src['columns'];constants=src.get('constants',{})
-                if not isinstance(cols,dict) or not isinstance(constants,dict) or set(cols)&set(constants) or set(cols)|set(constants)!=set(fields):
-                    raise ProgramError(f'{name}/{sheet.id} 每个语义字段必须恰有一个物理列或明确来源常量',owner=owner)
+                contract(src,required=('sheet','header_row','columns'),optional=('start_row','end_row','skip','constants','excluded_ranges','absent_fields'),label=f'{name} 物理来源',owner=owner)
+                sheet=catalog.sheet(src);h=src['header_row'];cols=src['columns'];constants=src.get('constants',{});absent=src.get('absent_fields',{})
+                if not all(isinstance(v,dict) for v in (cols,constants,absent)):raise ProgramError(f'{name}/{sheet.id} columns/constants/absent_fields 必须是对象',owner=owner)
+                supplied=set(cols)|set(constants)|set(absent);overlap=(set(cols)&set(constants))|(set(cols)&set(absent))|(set(constants)&set(absent))
+                if overlap or supplied!=set(fields):
+                    missing=sorted(set(fields)-supplied);extra=sorted(supplied-set(fields))
+                    raise ProgramError(f'{name}/{sheet.id} 语义字段绑定不完整：未绑定 {missing}，多余 {extra}，重复 {sorted(overlap)}。若本来源确实没有可空字段，需以 absent_fields 明确实际缺列证据，不能猜测映射或填0。',owner=owner,kind='contract',details={'missing_fields':missing,'extra_fields':extra,'overlap':sorted(overlap),'source':sheet.file+'/'+sheet.name})
                 raw_cols={};units={}
                 for f,c in cols.items():
                     if isinstance(c,dict):
@@ -107,6 +110,21 @@ def read_datasets(catalog: Catalog, specs: dict, *, period, owner='scope_mapping
                 # Explicit field constants must be traceable to an actual
                 # document/cell or the selected period, not model inventions.
                 constant_values={};constant_locations={}
+                headers={normalized(string(v)) for v in sheet.rows[h-1] if string(v).strip()}
+                for f,proof in absent.items():
+                    contract(proof,required=('reason','rules'),label=f'{name}.{f} 来源缺列',owner=owner)
+                    if not fields[f]['nullable'] or f in keys or not isinstance(proof['reason'],str) or not proof['reason'].strip():
+                        raise ProgramError(f'{name}/{sheet.id} 缺失字段 {f} 必须可空、非粒度键并说明实际缺列证据',owner=owner,kind='binding')
+                    names(proof['rules'],f'{name}.{f} 缺列条款',owner,nonempty=False)
+                    known={normalized(f),normalized(fields[f].get('label',f))}
+                    for other in ds['sources']:
+                        col=other.get('columns',{}).get(f)
+                        if isinstance(col,dict):col=col.get('column')
+                        if not col:continue
+                        try:known.add(normalized(catalog.sheet(other).literal(other['header_row'],column_index_from_string(col))))
+                        except (ChainError,ValueError,TypeError,KeyError):continue
+                    if headers&known:raise ProgramError(f'{name}/{sheet.id} 声明缺列的 {f} 实际存在已知表头 {sorted(headers&known)}，必须真实绑定',owner=owner,kind='binding')
+                    constant_values[f]=None;constant_locations[f]=f'{sheet.file}/{sheet.name}!{h}：来源未提供 {f}；{proof["reason"]}'
                 for f,source in constants.items():
                     if source=={'period':'month'}:
                         from bonus_core.data.period import Period
@@ -175,7 +193,8 @@ def read_datasets(catalog: Catalog, specs: dict, *, period, owner='scope_mapping
                     record=Record(vals,where,locations);rows.append(record);count+=1
                     if keys:seen_keys[key]=record
                 source_summary.append({'sheet':sheet.id,'file':sheet.file,'name':sheet.name,'header_row':h,'range':[start,end],
-                                       'physical_rows':max(0,end-start+1),'included':count,'blank':empty_rows,'duplicate_identical':dupes,'columns':raw_cols})
+                                       'physical_rows':max(0,end-start+1),'included':count,'blank':empty_rows,'duplicate_identical':dupes,'columns':raw_cols,
+                                       'absent_fields':{f:{**proof,'source':constant_locations[f]} for f,proof in absent.items()}})
             for sid,ranges in ranges_by_sheet.items():
                 sheet=catalog.sheets[sid];start=min(headers_by_sheet[sid])+1
                 for n in range(start,len(sheet.rows)+1):

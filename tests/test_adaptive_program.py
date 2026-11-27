@@ -252,6 +252,59 @@ def test_literal_formula_boundary_does_not_absorb_following_explanation():
     assert obligations['R1:3']['formula']=='max(预发合计-应得提成,0)'
 
 
+def test_category_footnotes_and_identifier_predicates_are_not_arithmetic():
+    from bonus_agent.adaptive_rules import explicit_formulas,matrix_header
+    assert explicit_formulas('| 新类别 | 旧类别*')==[]
+    assert matrix_header(['','新类别','旧类别*'],[['负责人',25,15],['其他',35,40]])
+    assert not matrix_header(['','金额×费率','另项'],[['负责人',25,15]])
+    assert explicit_formulas('区域指定 | 当区域=GROUP-A,按另一个区域归类')==[]
+    assert explicit_formulas('每个合同一行（合同=月份+客户编号+产品编码）')==[]
+    assert explicit_formulas('项目编号=月份+客户编号+产品编码')==[]
+    assert explicit_formulas('计算金额=销售额×(费率-0.05)')==['销售额*(费率-0.05)']
+    assert explicit_formulas('净额 | 收入-成本')==['收入-成本']
+    # A model-proposed formula cannot reintroduce the false conditional RHS.
+    u={'R1':{'file':'rules.txt','where':'1','text':'区域指定 | 当区域=GROUP-A,按另一个区域归类'}}
+    c={'quote':u['R1']['text'],'meaning':'实际区域映射','level':'primary','operation':'adjustment','kind':'formula','formula':'GROUP-A'}
+    ob,_=validate_clause_chunk(u,{'units':{'R1':{'disposition':'operative','reason':'条件规则','clauses':[c]}}})
+    assert ob['R1:1']['formula'] is None and ob['R1:1']['kind']=='policy'
+
+
+def test_source_line_recovers_verbatim_mixed_script_without_fuzzy_inference():
+    text='类别说明\n如負責人直接负责的客户，分配40%。\n其他条件使用60%。'
+    u={'R1':{'file':'rules.pptx','where':'1','text':text}}
+    c={'quote':'如负责人直接負責的客戶，分配40%。','meaning':'责任人归属','level':'person','operation':'assignment','kind':'policy'}
+    proposal={'units':{'R1':{'disposition':'operative','reason':'原件规则','clauses':[c]}}}
+    with pytest.raises(ProgramError,match='实际连续文字') as exc:validate_clause_chunk(u,proposal)
+    assert exc.value.details['source_lines']['2']=='如負責人直接负责的客户，分配40%。'
+    c.pop('quote');c['source_line']=2
+    ob,_=validate_clause_chunk(u,proposal);assert ob['R1:1']['quote']==text.splitlines()[1]
+    c['quote']='其他条件使用60%。'
+    with pytest.raises(ProgramError,match='实际连续文字'):validate_clause_chunk(u,proposal)
+    c.pop('quote');c['source_line']=4
+    with pytest.raises(ProgramError,match='有效行号'):validate_clause_chunk(u,proposal)
+    c['source_line']=2;c['kind']='parameter'
+    with pytest.raises(ProgramError,match='kind=.*parameter'):validate_clause_chunk(u,proposal)
+
+
+def test_merged_sources_explicitly_preserve_physically_missing_nullable_fields():
+    cat=Catalog([])
+    cat.sheets={'S1':Sheet('S1','early.xlsx','data',[('单号','金额'),('001',100)]),
+                'S2':Sheet('S2','late.xlsx','data',[('单号','金额','回款状态'),('002',50,'未回款')])}
+    ds={'sales':{'label':'多来源销售','fields':{'id':{'kind':'id','nullable':False},'amount':{'kind':'money','nullable':False},'paid':{'kind':'text','nullable':True,'label':'回款状态'}},
+                  'sources':[{'sheet':'S1','header_row':1,'columns':{'id':'A','amount':'B'}},
+                             {'sheet':'S2','header_row':1,'columns':{'id':'A','amount':'B','paid':'C'}}],
+                  'grain':{'kind':'unique','keys':['id'],'duplicates':'error','rules':[]},'rules':[]}}
+    with pytest.raises(ProgramError,match='未绑定.*paid'):read_datasets(cat,ds,period='2027Q1')
+    absence={'reason':'早期原件实际没有回款状态列','rules':[]}
+    ds['sales']['sources'][0]['absent_fields']={'paid':absence}
+    actual,diag=read_datasets(cat,ds,period='2027Q1')
+    assert [r.values['paid'] for r in actual['sales'].rows]==[None,'未回款'] and diag['sales']['null_counts']['paid']==1
+    wrong=deepcopy(ds);wrong['sales']['sources'][1]['columns'].pop('paid');wrong['sales']['sources'][1]['absent_fields']={'paid':absence}
+    with pytest.raises(ProgramError,match='实际存在已知表头'):read_datasets(cat,wrong,period='2027Q1')
+    wrong=deepcopy(ds);wrong['sales']['fields']['paid']['nullable']=False
+    with pytest.raises(ProgramError,match='必须可空'):read_datasets(cat,wrong,period='2027Q1')
+
+
 def test_actual_person_grain_cannot_route_to_primary_formula():
     text='人员应得：先按员工编号汇总。应得金额=ROUND(订单合计×人员表计奖系数,2)。'
     unit={'R1':{'file':'policy','where':'line','text':text}}

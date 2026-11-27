@@ -13,7 +13,7 @@ import re
 
 from openpyxl.utils import get_column_letter,column_index_from_string
 
-from bonus_agent.adaptive_rules import (PHASES,coverage,rule_units,source_index,unit_chunks,
+from bonus_agent.adaptive_rules import (PHASES,coverage,rule_units,source_index,unit_chunks,source_lines,merge_rule_review,
     validate_clause_chunk,validate_source_inventory,validate_numeric_literals,verify_parameter_usage,normalized)
 from bonus_agent.adaptive_sources import compile_inputs,read_datasets,read_parameters,read_schedules
 from bonus_agent.recovery import fingerprint
@@ -39,6 +39,7 @@ EXPRESSION_HELP+='\n同一物理阶梯表可用紧凑 layout 替代 bands：纵�
 DATASET_HELP='''数据集合同：datasets={"语义ID":{"label":"用途","fields":{"语义字段":{"kind":"id/text/number/money/ratio/month/date/bool","nullable":false,"unit":"raw/percent/wan/yi（可省默认raw）","normalize":"trim/casefold（可省）","minimum":明确下界（可省）, "maximum":明确上界（可省）, "allowed":[明确允许原值]（可省）, "rules":[字段校验条款ID]（可省）}},"sources":[{"sheet":"实际S编号","header_row":实际行号,"columns":{"语义字段":"列字母"},"start_row":首数据行（可省）, "end_row":末行（可省）, "skip":[{"column":"实际判断列","values":[实际排除原值],"reason":"排除理由","rules":[条款ID]}]（可省）}],"grain":{"kind":"detail/unique","keys":[行身份字段，如预算唯一对象或明细单号；明细无唯一号可空],"duplicates":"error/identical","rules":[条款ID]},"relationships":[{"fields":[外键字段],"target":"已定义的目标数据集ID","target_fields":[真实目标键],"cardinality":"exactly_one/at_least_one/optional_unique","rules":[条款ID]}]（可省）,"rules":[条款ID]}}。
 同一语义数据集可绑定多源，每个来源单独列位置/表头；不同来源单位时 columns字段值可为{"column":"实际列","unit":"raw/percent/wan/yi"}。实际标题提供月度的宽表可用 constants:{"月份字段":{"period":"month"}}；不能把不知月份的表当本月。同一语义列恰有一个来源；缺值保持null，0不是缺失。先明确原始明细还是已汇总唯一对象，再定义去重/加总；不要根据金额猜。'''
 DATASET_HELP+='\n若实际表存在不参与的非空物理行段，必须注明 excluded_ranges:[{"start":实际行,"end":实际行,"reason":"为何不参与","rules":[实际条款ID]}]，不能截断未解释的物理行。制度表若当参数查找数据集使用，dataset.purpose="lookup"；不可由它创建项目主集合。实际原始外键须用relationships校验全表，不只验证有计算结果的匹配行。'
+DATASET_HELP+='\n多来源的同一语义字段若在某一真实来源完全没有列，必须 fields 中声明 nullable:true，且该来源使用 absent_fields:{"该语义字段":{"reason":"实际表头缺少此字段的证据","rules":[相关原文条款ID]}}；程序填真实缺失null并保留缺列来源，不得绑定不相关列、填0或假设业务状态。非空字段与粒度键不能声明缺列；每个来源的columns/constants/absent_fields合计应恰好覆盖语义字段。'
 
 
 def _empty_fragment():return {'metrics':{},'parameters':{},'schedules':{},'checks':[],'formula_bindings':{}}
@@ -531,7 +532,7 @@ class AdaptiveCompiler:
                 if name.endswith('/解析') and ev.get('status')=='PASS':drafts[name.removesuffix('/解析')]=ev.get('result')
                 elif name.endswith('/独立复核') and isinstance(ev.get('result'),dict):
                     task=name.removesuffix('/独立复核');review=ev['result'];draft=drafts.get(task)
-                    selected=review.get('replacement') if review.get('status')=='REVISE' else draft if review.get('status')=='PASS' else None
+                    selected=merge_rule_review(draft,review.get('replacement'),(draft or {}).get('units',{})) if review.get('status')=='REVISE' else draft if review.get('status')=='PASS' else None
                     if isinstance(selected,dict) and isinstance(selected.get('units'),dict) and not selected.get('questions') and not review.get('questions'):
                         reviewed.append((task,ev,selected))
             for old_task,ev,candidate in reversed(reviewed):
@@ -548,8 +549,10 @@ class AdaptiveCompiler:
                 self.event('adaptive/rules/历史原文逐条重验',True,{'reused_units':recovered,'note':'仅复用同源真实独立复核响应中现程序能完整验证的条款；错误层级或引用重新编制'})
         for chunk in unit_chunks(pending):
             task='adaptive/rules/'+fingerprint(chunk)[:16]
-            reply=self.ask(task,'scope_mapping',{'period':period,'units':chunk},
+            visible={uid:{**unit,**({'source_lines':source_lines(unit)} if len(source_lines(unit))>1 else {})} for uid,unit in chunk.items()}
+            reply=self.ask(task,'scope_mapping',{'period':period,'units':visible},
                 '只覆盖当前一小组原文，不构造公式合同或节点名称。逐个真实unit ID返回 {"disposition":"operative/context/output","reason":"实际理由","clauses":[{"quote":"unit.text 或 active_text 内真实连续原文，不许引用title上下文","meaning":"一个可验证业务义务","level":"source/primary/person/report","operation":"population/binding/calculation/adjustment/funding/assignment/validation/parameter/report","kind":"policy/formula/table/validation/output"}]}。\n'
+                '枚举严格分开：level只有source、primary、person、report；kind只有policy、formula、table、validation、output；parameter只属于operation。表格比例行通常是kind=table；实际适用到的主对象或人员决定level，而不是因为来源是参数表就归source。繁简混排的多行文字可用source_line（从1计的实际行号或连续行号列表）代替quote，程序直接取原件；不要改写引文。\n'
                 '层级：source只表示原始表、关联键、主集合及数据完整性；primary是在订单/项目/实际主对象上计算金额、比率、汇总、舍入；person是确认上游归属后按实际员工/收款人汇总，计奖系数、预发抵扣、人员应得与实发、零人员覆盖和全部角色名单，也包含一单仅归属一个人的直接归属。report只表示输出要求。人员层运算不能放到项目层。实际逐对象求和不能只登记原始数据绑定。\n'
                 '动作按原文选择：population主集合、binding字段关联、calculation普通计算、adjustment系数、funding资金归属/总额、assignment人员归属、validation实际检查、parameter制度参数、report实际输出。程序根据level和operation负责内部路由。'
                 '标题、纯说明等context必须明示原因；带有效规则、费率或分支不能以context跳过。若来源有active_text仅它仍有效。一个条款只对应一个真实算式；程序直接读取原文算式，不要自行把自然语言改写成原文不存在的公式。跨项目与人员层的段落拆成各自实际原文条款。每个原文单元恰一项。输出{"units":{...}}。',

@@ -349,6 +349,27 @@ def test_adaptive_revision_new_formula_and_dynamic_identity_roundtrip(tmp_path):
     assert cs.sha256(out/'case.json')==before
 
 
+def test_rule_reviewer_can_correct_one_unit_without_replacing_the_batch(tmp_path):
+    class ScopedReview(Contracts):
+        def __init__(self):super().__init__();self.corrected=None
+        def reviewer(self,msg):
+            data=json.loads(msg[-1]['content'])
+            if data['current_node'].startswith('adaptive/rules/') and not self.corrected:
+                original=data['candidate']['units'];uid=next(k for k,v in original.items() if v['clauses'])
+                assert len(original)>1
+                local=deepcopy(original[uid]);local['reason']='独立逐条核对该原文'
+                self.corrected=(data['current_node'],uid,len(original))
+                return json.dumps({'status':'REVISE','reason':'仅修改这个单元的覆盖说明','replacement':{'units':{uid:local}}},ensure_ascii=False)
+            return super().reviewer(msg)
+    paths=_write_sources(tmp_path/'materials');out=tmp_path/'case';c=ScopedReview()
+    primary=FakeLLM(c.primary,name='fixture-flash');primary.checker_llm=FakeLLM(c.reviewer,name='fixture-pro')
+    scenario=SimpleNamespace(execution=ADAPTIVE_MODE,files=[],rule_store=None)
+    ar=run_agent(primary,paths,out,scenario=scenario,period='2027-01',max_steps=250)
+    assert ar.status=='AWAITING_TOTAL_CONFIRMATION',ar.error
+    task,uid,count=c.corrected;state=rv.state_of(cs.load_case(out));accepted=state['specs'][task]['units']
+    assert len(accepted)==count and accepted[uid]['reason']=='独立逐条核对该原文'
+
+
 class PersonalContracts(Contracts):
     """A different layer graph: direct attribution, then employee calculation."""
     def __init__(self):

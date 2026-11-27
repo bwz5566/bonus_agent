@@ -8,6 +8,7 @@ symbol and compare the actual expression tree, not merely a matching quote.
 from __future__ import annotations
 
 from collections import defaultdict
+from copy import deepcopy
 from decimal import Decimal as D
 import re
 import unicodedata
@@ -74,6 +75,22 @@ def normalized(text):
 def structural_header(cells):
     labels=[normalized(string(c)).lower() for c in cells if string(c).strip()]
     return len(labels)>1 and all(label in HEADER_LABELS for label in labels)
+
+
+def matrix_header(cells,following):
+    """A native matrix can have a blank corner and footnoted category names.
+
+    Recognize the physical header only from its actual shape and following
+    numeric cells, never from a particular product, role, or business title.
+    """
+    if len(cells)<3 or string(cells[0]).strip():return False
+    labels=[normalized(string(c)) for c in cells[1:] if string(c).strip()]
+    if len(labels)<2 or len(set(labels))!=len(labels):return False
+    if any(re.search(r'\d|%|=|[+/]',x) or _has_arithmetic(x) for x in labels):return False
+    for row in following[:4]:
+        if len(row)>=len(cells) and string(row[0]).strip() and sum(bool(re.fullmatch(r'[+-]?[\d.,]+%?',normalized(string(c)))) for c in row[1:])>=2:
+            return True
+    return False
 
 
 def explicit_binding_assertions(text):
@@ -199,7 +216,7 @@ def rule_units(catalog,inventory):
                 unit={'file':t.file,'where':t.location(row,1),'text':raw,'table':tid,'row':row,'title':t.title}
                 # Header labels are preserved at the actual parameter cells,
                 # but are not meant to become standalone business equations.
-                if row==1 and len(t.rows)>1 and structural_header(cells):
+                if row==1 and len(t.rows)>1 and (structural_header(cells) or matrix_header(cells,t.rows[1:])):
                     unit['structural_header']=True
                 units[f'{tid}R{row}']=unit
     # A real version deliberately replaces only the selected original clause.
@@ -230,6 +247,24 @@ def unit_chunks(units,*,max_chars=4800,max_units=8):
     if chunk:yield chunk
 
 
+def _has_arithmetic(text):
+    """A footnote marker or a bare signed literal is not a binary expression."""
+    return bool(re.search(r'[\w%)](?:[*/+\-])(?:[+\-])?[\w(]',text) or re.search(r'(?i)(?:ROUND|MIN|MAX|ABS|IF)\(',text))
+
+
+def _non_arithmetic_declaration(segment):
+    if '=' not in segment:return False
+    lhs,rhs=segment.split('=',1);lhs=lhs.rsplit('|',1)[-1]
+    # Equality of a category/code in a conditional is not assignment to a
+    # monetary formula. Identifier-composition requirements are key bindings.
+    if re.match(r'(?i)^(?:当|若|如果|假如|仅当|if|when)',lhs) and re.fullmatch(r'[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+',rhs):return True
+    fields=rhs.rstrip(')）').split('+')
+    if len(fields)>1 and all(re.fullmatch(r'[\w]+',x) for x in fields):
+        if re.search(r'(?:编号|标识|主键|唯一键|组合键|ID)$',lhs,re.I):return True
+        if re.search(r'每(?:个|笔|项)[^。；;]{1,30}一行',segment) and re.search(r'(?:项目|订单|合同|客户|对象)$',lhs):return True
+    return False
+
+
 def explicit_formulas(text):
     """Recognize an explicit RHS, not a prose mention of percentage/units.
 
@@ -250,11 +285,12 @@ def explicit_formulas(text):
     segments.append(n[start:])
     for segment in segments:
         rhs=None
+        if _non_arithmetic_declaration(segment):continue
         if '=' in segment:rhs=segment.split('=',1)[1]
         elif '|' in segment:
             tail=segment.split('|')[-1]
-            if any(x in tail for x in ('*','/','+','-')) or re.search(r'(?i)(?:ROUND|MIN|MAX|ABS|IF)\(',tail):rhs=tail
-        arithmetic=rhs and (any(x in rhs for x in ('*','/','+','-')) or re.search(r'(?i)(?:ROUND|MIN|MAX|ABS|IF)\(',rhs))
+            if _has_arithmetic(tail):rhs=tail
+        arithmetic=rhs and _has_arithmetic(rhs)
         if arithmetic:
             # Numeric band labels are parameter tables, not formulas.
             if re.fullmatch(r'[\d%万亿元.,<>+=-]+',rhs):continue
@@ -285,7 +321,7 @@ def route_clause(clause,source,formula):
     """
     phase=clause.get('phase');level=clause.get('level');operation=clause.get('operation')
     if level is not None or operation is not None:
-        if level not in LEVELS or operation not in OPERATIONS:raise ProgramError('条款需明确实际计算层级(level)与动作(operation)',owner='scope_mapping',kind='coverage')
+        if level not in LEVELS or operation not in OPERATIONS:raise ProgramError(f'条款层级/动作枚举无效：level={level!r}（只能 {sorted(LEVELS)}），operation={operation!r}（只能 {sorted(OPERATIONS)}）；parameter 是动作，不是层级或条款kind',owner='scope_mapping',kind='contract',details={'field_values':{'level':level,'operation':operation},'allowed':{'level':sorted(LEVELS),'operation':sorted(OPERATIONS)}})
         if level=='report' or operation=='report':phase='export'
         elif level=='person' or operation=='assignment':phase='roster'
         elif level=='source':phase='scope_mapping' if operation=='population' else 'reference_mapping'
@@ -335,6 +371,45 @@ def validate_clause_chunk(chunk,proposal):
     return obligations,decisions
 
 
+def merge_rule_review(draft,replacement,unit_ids):
+    """Apply a reviewer correction at the real source-unit boundary.
+
+    The caller still validates the complete merged contract and source
+    coverage. A complete replacement can also remove an invalid extra unit.
+    """
+    if (not isinstance(draft,dict) or not isinstance(draft.get('units'),dict) or not isinstance(replacement,dict)
+            or set(replacement)!={'units'} or not isinstance(replacement.get('units'),dict) or not replacement['units']):return deepcopy(replacement)
+    expected=set(unit_ids);changed=set(replacement['units'])
+    if not changed<=expected or changed==expected:return deepcopy(replacement)
+    return {**deepcopy(draft),'units':{**deepcopy(draft['units']),**deepcopy(replacement['units'])}}
+
+
+def source_lines(source):
+    return {str(i):line for i,line in enumerate(source.get('active_text',source['text']).splitlines(),1) if line.strip()}
+
+
+def _source_quote(uid,source,clause):
+    raw=source.get('active_text',source['text']);quote=clause.get('quote')
+    line=clause.get('source_line')
+    if line is not None:
+        ids=line if isinstance(line,list) else [line];lines=source_lines(source)
+        if not ids or any(type(i) is not int or str(i) not in lines for i in ids) or any(b!=a+1 for a,b in zip(ids,ids[1:])):
+            raise ProgramError(f'{uid} source_line 必须是当前原文有效行号或连续行号列表，实际 {line!r}',owner='scope_mapping',kind='coverage',details={'source_lines':lines})
+        raw='\n'.join(lines[str(i)] for i in ids)
+        if quote is None:quote=raw
+    if not isinstance(quote,str) or not normalized(quote) or normalized(quote) not in normalized(raw):
+        raise ProgramError(f'{uid} 引文并非当前原件实际连续文字：收到 {str(quote)[:300]!r}。不要转写繁简字或改标点；可直接提交 source_line 行号代替 quote，程序读取原文。',owner='scope_mapping',kind='coverage',details={'received_quote':quote,'source_lines':source_lines(source),'source_line':line})
+    if quote in raw:clause['quote']=quote;return
+    # Freeze the actual original substring, not a typographically normalized
+    # model transcription. A line citation cannot override a conflicting quote.
+    chars=[];positions=[]
+    for i,c in enumerate(raw):
+        for x in normalized(c):chars.append(x);positions.append(i)
+    target=normalized(quote);at=''.join(chars).find(target)
+    if at<0:raise ProgramError(f'{uid} 无法定位引文原字符区间',owner='scope_mapping',kind='coverage')
+    clause['quote']=raw[positions[at]:positions[at+len(target)-1]+1]
+
+
 def _validate_unit(uid,source,selected):
     contract(selected,required=('disposition','reason','clauses'),label=f'{uid} 规则覆盖',owner='scope_mapping')
     disposition=selected['disposition'];clauses=selected['clauses']
@@ -354,14 +429,17 @@ def _validate_unit(uid,source,selected):
     assertions=[] if source.get('superseded_entirely') else explicit_binding_assertions(source.get('active_text',source['text']))
     covered_assertions=set()
     for i,c in enumerate(clauses,1):
-        contract(c,required=('quote','meaning','kind'),optional=('phase','formula','level','operation'),label=f'{uid} 条款',owner='scope_mapping')
-        if c['kind'] not in KINDS or not isinstance(c['quote'],str) or not c['quote'].strip() or normalized(c['quote']) not in normalized(source.get('active_text',source['text'])) or not c['meaning']:
-            raise ProgramError(f'{uid} 条款缺实际连续引用或责任节点：{c!r}',owner='scope_mapping',kind='coverage')
+        contract(c,required=('meaning','kind'),optional=('quote','source_line','phase','formula','level','operation'),label=f'{uid} 条款',owner='scope_mapping')
+        if c['kind'] not in KINDS:raise ProgramError(f'{uid} 条款kind={c["kind"]!r} 无效，只能 {sorted(KINDS)}；制度参数的kind为table或实际policy，parameter只属于operation',owner='scope_mapping',kind='contract',details={'received_kind':c['kind'],'allowed_kind':sorted(KINDS)})
+        if not c['meaning']:raise ProgramError(f'{uid} 条款缺少实际业务含义',owner='scope_mapping',kind='coverage')
+        _source_quote(uid,source,c)
         formulas=explicit_formulas(c['quote']);formula=formulas[0] if len(formulas)==1 else None
         if len(formulas)>1:raise ProgramError(f'{uid} 一个条款含多个不同算式，请按各公式分别登记完整原文及目标',owner='scope_mapping',kind='coverage')
         if not formula and c.get('formula'):
             proposed=normalized(c['formula'])
-            if proposed in normalized(c['quote']) and (any(x in proposed for x in ('*','/','+','-')) or re.search(r'(?i)(?:ROUND|MIN|MAX|ABS|IF)\(',proposed)):
+            quote_normal=normalized(c['quote'])
+            declaration=any(proposed in s and _non_arithmetic_declaration(s) for s in [quote_normal,*re.split(r'[。；;，,]',quote_normal)])
+            if proposed in quote_normal and _has_arithmetic(proposed) and not declaration:
                 extracted=explicit_formulas(proposed);formula=extracted[0] if extracted else proposed.lstrip('=')
         if formula:
             # Literal original expression is parsed by the program, never invented by the model.
