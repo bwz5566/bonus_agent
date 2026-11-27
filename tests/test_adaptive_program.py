@@ -462,19 +462,18 @@ def test_native_interval_schedules_are_compiled_by_actual_axis_not_copied_rates(
     normalize_calculation_phases(c,units,ob)
     assert ob['T2R2:1']['phase']=='coefficient_policy' and ob['R2:1']['phase']=='hold_policy'
     def request(name,data,prompt,validate,**kw):
-        v={'schedules':{sid:{'bound_unit':'raw','rate_unit':'percent','method':'whole','negative':'zero','below':'first','includes':[True,True]}
-                        for sid in data['required_schedule_ids']}}
-        validate(v);return v
+        raise AssertionError('已审核的明确累进口径与物理格无需再请求模型')
     compiler=AdaptiveCompiler(c,'2027-01',request,lambda *a:None,{})
     fragment,covered=compiler._compile_native_schedules('project_policy',{k:v for k,v in ob.items() if v['phase']=='project_policy'},units)
     assert covered=={'T1R2:1'} and len(fragment['schedules'])==2
     schedules,_=read_schedules(c,fragment['schedules'])
     assert all(s.method=='progressive' and s.negative=='signed' for s in schedules.values())
     assert schedules['interval_T1_c2'].steps==((D(0),D('.01'),True),(D(100),D('.02'),True))
+    assert compiler.state['receipts']['adaptive/project_policy/schedule/T1']['reviewer']=='程序'
 
 
 def test_actual_detail_attribute_uniqueness_is_not_amount_aggregation():
-    from bonus_agent.adaptive_compiler import source_attributes,_compile_prefix,_empty_fragment
+    from bonus_agent.adaptive_compiler import source_attributes,source_aggregates,_compile_prefix,_empty_fragment
     c=Catalog([]);c.sheets['S1']=Sheet('S1','detail.xlsx','detail',[('合同','币种','汇率','金额','记录'),('A','USD',7,100,'x'),('A','USD',7,120,'y'),('B','RMB',1,200,'z')])
     ds={'label':'原始明细','fields':{'id':{'kind':'id','nullable':False},'currency':{'kind':'text','nullable':False},'fx':{'kind':'number','nullable':False},'amount':{'kind':'money','nullable':False},'row_id':{'kind':'id','nullable':False}},
         'sources':[{'sheet':'S1','header_row':1,'columns':{'id':'A','currency':'B','fx':'C','amount':'D','row_id':'E'}}],
@@ -484,6 +483,9 @@ def test_actual_detail_attribute_uniqueness_is_not_amount_aggregation():
     attrs=source_attributes(scope,p)
     assert set(attrs)=={'source:detail:currency','source:detail:fx'}
     assert all(v['expr']['query']['duplicates']=='identical' for v in attrs.values())
+    sums=source_aggregates(c,scope,{'R1':{'phase':'scope_mapping','quote':'先合计每个合同的金额。'}})
+    assert set(sums)=={'source_sum:detail:amount'} and sums['source_sum:detail:amount']['expr']['query']['aggregate']=='sum'
+    assert source_aggregates(c,scope,{'R1':{'phase':'scope_mapping','quote':'每个合同的金额从原件读取。'}})=={}
 
 
 def test_progressive_policy_rejects_whole_rate_times_base():
@@ -531,6 +533,10 @@ def test_review_patch_is_atomic_and_bound_to_exact_reviewed_candidate():
     pairs=archived_candidates([{'node':'x/解析','status':'PASS','result':{'older':True}},
         {'node':'x/独立复核','result':actual,'review_base':base,'review_base_digest':fingerprint(base)}],'x')
     assert pairs==[(base,actual)]
+    nested={'schedules':{'rate':{'includes':[False,False]}}}
+    assert apply_review_patches(nested,[{'op':'set','path':['rate','includes',0],'value':True}],owner='project_policy')['schedules']['rate']['includes']==[True,False]
+    ambiguous={'a':{'rate':{'includes':[False]}},'b':{'rate':{'includes':[False]}}}
+    with pytest.raises(ProgramError,match='无法定位'):apply_review_patches(ambiguous,[{'op':'set','path':['rate','includes',0],'value':True}],owner='project_policy')
 
 
 def test_native_interval_rate_rules_cannot_be_only_data_binding():

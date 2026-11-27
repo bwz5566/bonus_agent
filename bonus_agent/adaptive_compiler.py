@@ -92,8 +92,11 @@ def normalize_calculation_phases(catalog,units,obligations):
     tables=native_interval_layouts(catalog)
     for rid,rule in obligations.items():
         source=units[rule['unit']]
-        if source.get('authority') or rule['phase'] in ('scope_mapping','reference_mapping','export','roster'):continue
+        if source.get('authority'):continue
         quote=rule['quote'];text=source['text'];subject=normalized(text.split('|',1)[0]) if '|' in text else normalized(quote)
+        if re.search(r'计算基数|计提基数|阶梯基数',quote) and re.search(r'负数|负基数|负的提成',quote) and re.search(r'阶梯|累进',quote) and not re.search(r'个人|人员|员工|每人',quote):
+            rule.update(phase='project_policy',level='primary',operation='calculation');continue
+        if rule['phase'] in ('scope_mapping','reference_mapping','export','roster'):continue
         if re.search(r'汇总每(?:个|位|名)?(?:人|员工|人员)|按(?:人员|员工|个人)(?:身份)?汇总',quote):
             rule.update(phase='roster',level='person',operation='calculation');continue
         if re.fullmatch(r'汇总(?:各项目)?(?:提成|奖金)(?:总)?金额[。.]?',normalized(quote)):
@@ -218,6 +221,31 @@ def source_attributes(scope,program=None):
     return result
 
 
+def source_aggregates(catalog,scope,obligations):
+    """Compile exact original per-object monetary summation directives."""
+    pop=scope['population'];ds=scope['datasets'][pop['dataset']];aliases=defaultdict(set)
+    for src in ds['sources']:
+        sheet=catalog.sheet(src);h=src['header_row'];head=[normalized(v) if v is not None else '' for v in sheet.rows[h-1]]
+        for field,binding in src['columns'].items():
+            if ds['fields'][field]['kind']!='money':continue
+            col=binding['column'] if isinstance(binding,dict) else binding;i=column_index_from_string(col)-1;label=head[i]
+            if not label:continue
+            if head.count(label)>1:label+=str(head[:i+1].count(label))
+            base=re.sub(r'\([^)]*\)$','',label);aliases[field].update((label,base,base.replace('金额','额')))
+    result={}
+    for field,labels in aliases.items():
+        rids=[]
+        for rid,r in obligations.items():
+            if r['phase'] not in ('scope_mapping','project_policy'):continue
+            quote=r['quote'];n=normalized(quote)
+            if re.search(r'合计|汇总|求和|相加',quote) and re.search(r'每个(?:项目|合同|订单|对象)|每笔(?:订单|交易|合同)|按(?:项目|订单|合同|主对象)|逐(?:项目|订单|合同)',quote) and any(x and x in n for x in labels):rids.append(rid)
+        if rids:
+            result[f'source_sum:{pop["dataset"]}:{field}']={'label':f'{field}（原文明示的主对象明细合计）',
+                'expr':{'query':{'dataset':'$project','aggregate':'sum','match':{},'value':{'field':field},'empty':'zero','nulls':'error'}},
+                'type':'number','rules':rids,'owner':'scope_mapping'}
+    return result
+
+
 def _project_source_expr(expr,scope,attributes,*,row=False):
     """A project field isn't a row field unless the grain/key proves its value."""
     if not isinstance(expr,dict):return expr
@@ -264,8 +292,8 @@ def bind_formula_atoms(fragment,available,scope,obligations,phase,period):
     subtree already present in the candidate is lifted verbatim, and the
     original literal formula is still compared to the resulting expression.
     """
-    prefix=f'source:{scope["population"]["dataset"]}:'
-    attrs={**source_attributes(scope),**{k:v for k,v in available.items() if k.startswith(prefix)}};metrics=fragment['metrics']
+    prefixes=(f'source:{scope["population"]["dataset"]}:',f'source_sum:{scope["population"]["dataset"]}:')
+    attrs={**source_attributes(scope),**{k:v for k,v in available.items() if k.startswith(prefixes)}};metrics=fragment['metrics']
     _canonical_parameter_sources(fragment.get('parameters',{}),obligations)
     for m in metrics.values():m['expr']=_project_source_expr(m['expr'],scope,attrs)
     for c in fragment['checks']:c['expr']=_project_source_expr(c['expr'],scope,attrs)
@@ -791,7 +819,7 @@ def replay_basis(catalog,saved,period):
     _validate_data_use(saved['inventory'],datasets)
     _validate_global_bindings(catalog,saved['inventory'],obligations,datasets,owner='reference_mapping',complete=True)
     fragment=_empty_fragment();scope_probe=_compile_prefix(catalog,scope['datasets'],scope['population'],_empty_fragment(),period,calculate=False,allow_unbound=True)
-    attrs=source_attributes(scope,scope_probe)
+    attrs={**source_attributes(scope,scope_probe),**source_aggregates(catalog,scope,obligations)}
     if 'source_attributes' in parts and parts['source_attributes'].get('metrics')!=attrs:
         raise ProgramError('底层原始属性与实际唯一粒度合同不一致',owner='scope_mapping',kind='binding')
     fragment['metrics'].update(attrs)
@@ -905,7 +933,7 @@ class AdaptiveCompiler:
                             flags=[x for x in (interval.include_lower,not iv[i-1].include_upper if i and iv[i-1].include_upper is not None else None) if x is not None]
                             if flags and any(x!=flags[0] for x in flags):raise ProgramError('原始制度区间对同一端点给出了冲突的明确归属',owner=phase,kind='material',metric=name)
                             if flags:requested[i]=flags[0]
-                            elif type(requested[i]) is not bool and s['method']=='progressive':requested[i]=True
+                            elif s['method']=='progressive':requested[i]=True
                         if any(type(x) is not bool for x in requested):raise ProgramError('原文未确定的整档系数端点必须由本批实际规则或财务确认决定',owner=phase,kind='coverage',metric=name)
                         s['includes']=requested
                         if iv[0].lower is None:s['below']='first'
@@ -913,12 +941,29 @@ class AdaptiveCompiler:
                     if not set(selected)<=set(phase_rules):raise ProgramError(f'{name} 阶梯元数据引用非本阶段规则',owner=phase,kind='coverage')
                     s['rules']=list(dict.fromkeys([*rids,*method_rules,*selected]))
                 read_schedules(self.catalog,v['schedules'],owner=phase)
-            reply=self.ask(f'adaptive/{phase}/schedule/{tid}',phase,
+            task=f'adaptive/{phase}/schedule/{tid}'
+            explicit_progressive=bool(positive_method=='progressive' and signed and all(
+                all(re.search(r'万|亿|元|萬|億',str(x)) for x in f['labels']) and all('%' in normalized(x) for x in f['rates']) and
+                any(parse_interval(x,unit='元').lower in (None,to_decimal(0)) for x in f['labels']) for f in forms.values()))
+            if explicit_progressive:
+                # Every value/axis/unit and the progressive/negative policy
+                # is already independently reviewed source evidence. A
+                # shared unmarked endpoint cannot change a progressive
+                # amount; choose the uniform lower-inclusive convention,
+                # respecting all explicit original markers.
+                reply={'schedules':{name:{'bound_unit':'raw','rate_unit':'percent','method':'progressive','negative':'signed','below':'first','includes':[True]*len(f['labels']),'rules':[]} for name,f in forms.items()}}
+                validate(reply)
+                proof={'table':tid,'actual_layouts':{name:f['layout'] for name,f in forms.items()},'table_rules':rids,'method_rules':method_rules,
+                       'endpoint_convention':'原文明确归属优先；未标明的超额累进共享端点采用下界包含，连续累进金额不变'}
+                receipt={'status':'PASS','inputs':fingerprint(proof),'output':fingerprint(reply),'reviewer':'程序','review':'真实已审核原文确定超额累进和负基数，物理单元格完整重读并通过连续区间校验','confidence':'deterministic_native_progressive_layout'}
+                self.state.setdefault('specs',{})[task]=deepcopy(reply);self.state.setdefault('receipts',{})[task]=receipt;self.state.setdefault('task_owners',{})[task]=phase
+                self.event(task,True,{'receipt':receipt,'proof':proof})
+            else:reply=self.ask(task,phase,
                 {'period':self.period,'actual_table':table,'required_schedule_ids':list(forms),'table_rules':_compact({r:phase_rules[r] for r in rids}),
                  'method_evidence':{rid:{'quote':r['quote'],'meaning':r['meaning']} for rid,r in policy.items()},'program_contract':{'method':positive_method,'negative':'signed' if signed else None}},
                 '只处理当前一张原生制度区间表的计算口径，不生成奖金公式，不复制任何档位数值或坐标。程序已确定各费率轴和完整原始单元格。'
                 '每个required_schedule_id返回 {"bound_unit":"raw/percent/wan/yi","rate_unit":"raw/percent","method":"whole/progressive","negative":"signed/zero/error","below":"first/zero/error","includes":[按区间下界从低到高的布尔值],"rules":[实际口径条款ID，可空]}。'
-                '原始区间明确包含/不含端点时必须遵照实际文字。程序确定method或negative时不得另改；区间为百分数时bound_unit=percent。累进金额和整档系数是不同模式。若实际规则确有影响金额而原件未明确的端点/算法，请提供具体业务问题和例子。'
+                '原始区间明确包含/不含端点时必须遵照实际文字。程序明确的端点归属和超额累进统一共享端点约定由程序负责，无需重复争论。程序确定method或negative时不得另改；区间为百分数时bound_unit=percent。累进金额和整档系数是不同模式。若实际规则确有影响金额而原件未明确的端点/算法，请提供具体业务问题和例子。'
                 '输出 {"schedules":{"实际schedule ID":上述元数据}}。不要输出bands、费率数组、坐标或新增指标。',validate)
             _merge_map(fragment['schedules'],reply['schedules'],'阶梯表',phase);covered.update(rids)
         return fragment,covered
@@ -1069,7 +1114,7 @@ class AdaptiveCompiler:
         parts['reference_mapping']=reference;_merge_map(datasets,reference['datasets'],'数据集','reference_mapping')
         aggregate=_empty_fragment();aggregate['checks']=deepcopy(reference['checks'])
         scope_probe=_compile_prefix(cat,scope['datasets'],scope['population'],_empty_fragment(),period,calculate=False,allow_unbound=True)
-        attrs=source_attributes(scope,scope_probe)
+        attrs={**source_attributes(scope,scope_probe),**source_aggregates(cat,scope,rules)}
         if attrs:
             parts['source_attributes']={'metrics':attrs};aggregate['metrics'].update(deepcopy(attrs))
             self.event('adaptive/source_attributes',True,{'metrics':list(attrs),'reason':'实际主集合粒度保证每对象唯一源行，保留原始字段及其真实查询'})

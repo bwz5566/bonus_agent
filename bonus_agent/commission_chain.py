@@ -365,6 +365,12 @@ def apply_review_patches(candidate,patches,*,owner):
         expected={'op','path','value'} if op=='set' else {'op','path'}
         if op not in ('set','remove') or set(patch)!=expected or not isinstance(path,list) or not path or any(type(k) not in (str,int) or isinstance(k,int) and k<0 for k in path):
             raise ProgramError(f'独立复核补丁第{n}项格式无效；op=set/remove，path为实际键/下标数组，set须有value',owner=owner,kind='contract')
+        # Models may omit the single envelope key (e.g. schedules) while
+        # referring to an actual unique nested object. Resolve only a
+        # uniquely provable omitted prefix; never guess among multiple roots.
+        if len(path)>1 and isinstance(path[0],str) and path[0] not in result:
+            parents=[k for k,v in result.items() if isinstance(v,dict) and path[0] in v]
+            if len(parents)==1:path=[parents[0],*path]
         cursor=result
         try:
             for key in path[:-1]:
