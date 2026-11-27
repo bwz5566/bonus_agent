@@ -499,6 +499,44 @@ def test_progressive_policy_rejects_whole_rate_times_base():
     verify_progressive_amounts(good,schedules,rules,financial_ids={'amount','base'})
 
 
+def test_explicit_period_average_uses_activity_months_and_never_future_months():
+    from bonus_agent.adaptive_compiler import source_period_averages,_compile_prefix,_empty_fragment
+    c=Catalog([]);c.sheets['S1']=Sheet('S1','detail.xlsx','detail',[('月份','客户','金额'),('202701','A',100),('202702','A',-20),('202703','A',0),('202703','B',50)])
+    ds={'label':'真实明细','fields':{'month':{'kind':'month','nullable':False},'customer':{'kind':'text','nullable':False},'amount':{'kind':'money','nullable':False}},
+        'sources':[{'sheet':'S1','header_row':1,'columns':{'month':'A','customer':'B','amount':'C'}}],
+        'grain':{'kind':'detail','keys':[],'duplicates':'error','rules':[]},'rules':[]}
+    scope={'datasets':{'detail':ds},'population':{'dataset':'detail','keys':['month','customer'],'where':op('ne',fld('amount'),0),'rules':[]}}
+    rules={'R1':{'phase':'scope_mapping','quote':'先合计每个项目的金额。'},
+           'R2':{'phase':'coefficient_policy','quote':'月平均出货：该客户本年1月到本月出货金额合计除以实际有出货的月份数。'},
+           'R3':{'phase':'coefficient_policy','quote':'对应客户，计算库存金额与客户月平均金额之比。'}}
+    period='2027-01~2027-03'
+    p=_compile_prefix(c,scope['datasets'],scope['population'],_empty_fragment(),period,calculate=False)
+    metrics,covered=source_period_averages(c,scope,rules,period,p)
+    assert covered=={'R2'} and len(metrics)==1
+    mid=next(iter(metrics));fragment=_empty_fragment();fragment['metrics']=metrics
+    b=_compile_prefix(c,scope['datasets'],scope['population'],fragment,period).basis()
+    assert {tuple(x['key_values'].values()):x['metrics'][mid] for x in b['projects'].values()}=={('202701','A'):D(100),('202702','A'):D(40),('202703','B'):D(50)}
+    assert source_period_averages(c,scope,rules,'2027-02~2027-03',p)==({},set())
+    # A real typed month field accepts the aligned period-date anchor.
+    fragment['metrics']['count']={'label':'活动月份数','expr':{'query':{'dataset':'$population','aggregate':'count_distinct','match':{'customer':key('customer')},'where':op('ge',fld('month'),{'period':'year_start'}),'value':fld('month'),'empty':'zero','nulls':'error'}},'rules':[]}
+    _compile_prefix(c,scope['datasets'],scope['population'],fragment,period)
+
+
+def test_query_cache_preserves_exact_arithmetic_and_actual_trace_per_context():
+    from bonus_core.engine.adaptive import Context
+    c,ds,parameters,plan,_=fixture()
+    p=CalculationProgram(compile_inputs(c,ds,parameters,{},period='2027-01'),plan,'2027-01')
+    p.prepare_population()
+    q={'dataset':'$population','aggregate':'sum','match':{'office':{'key':'office'}},'value':{'field':'revenue'},'empty':'zero','nulls':'error'}
+    a=Context(keys={'office':'N','irrelevant':'p1'},trace=[]);b=Context(keys={'office':'N','irrelevant':'p2'},trace=[])
+    first=p.query(q,a);size=len(p._query_cache)
+    assert p.query(q,b)==first and len(p._query_cache)==size and a.trace==b.trace
+    p.query(q,Context(keys={'office':'N'},trace=None),exact=True)
+    assert len(p._query_cache)>size
+    assert p.query(q,Context(keys={'office':'S'}))!=first
+    p.prepare_population();assert not p._query_cache
+
+
 def test_literal_exclusion_and_nonzero_counterexample_on_real_source_coordinates():
     from bonus_agent.adaptive_compiler import apply_literal_source_exclusions,validate_explicit_zero_exclusion,_compile_prefix,_empty_fragment
     c=Catalog([]);c.sheets={

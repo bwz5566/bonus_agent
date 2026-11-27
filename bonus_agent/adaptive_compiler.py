@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from collections import defaultdict
+from calendar import monthrange
 import re
 
 from openpyxl.utils import get_column_letter,column_index_from_string
@@ -21,6 +22,7 @@ from bonus_core.engine.adaptive import (CalculationProgram,Inputs,ProgramError,c
     apply_person_program,CONTRIBUTION_DATASET,CONTRIBUTION_FIELDS,canonical_program,canonical_roster,canonical_expression,Context,Record)
 from bonus_core.dsl.models import to_decimal
 from bonus_core.engine.intervals import parse_interval
+from bonus_core.data.period import Period
 
 
 MODE='sales_commission_v2'
@@ -31,7 +33,7 @@ FRAGMENT_FIELDS=('metrics','parameters','schedules','checks','formula_bindings')
 
 EXPRESSION_HELP='''表达式是JSON数据，禁止生成Python。形式：数字/文字/bool/null，{"key":"项目键字段"}、{"ref":"已有指标ID"}、{"field":"当前明细行字段"}、{"param":"真实参数ID"}、{"period":"month/start/end/year_start/month_number/year"}；{"op":"mul","args":[{"ref":"x"},{"param":"r"}]}。
 聚合：{"query":{"dataset":"实际数据集ID或$project(本项目明细)/$population(已筛选本期全集)","aggregate":"sum/avg/count/count_distinct/unique/min/max/exists","match":{"该数据集字段":{"key":"项目键"}},"where":{"op":"eq","args":[{"field":"month"},{"key":"实际月份键"}]},"value":{"field":"金额字段"},"empty":"error/null/zero","nulls":"error/ignore","duplicates":"error/identical（仅unique必填）"}}。match={}代表显式全表范围，不能把全表当项目。where可省；count/exists不用value。字段作用域仅query/主集合where内；指标引用用ref。if条件只选一支，coalesce区分空与零。
-期间语义：period.month是整个核算区间的结束月，不是每个主对象自己的月份。跨期若实际规则要求按对象所属月份匹配预算、名单、首发日期、累计历史等，应使用真实对象月份key或已编译的对象日期指标；只有全期统一时点的规则才能引用全局period值。原件不存在月份键时不得发明该键。
+期间语义：period.month是整个核算区间的结束月（YYYYMM），不是每个主对象自己的月份。month类型字段也是YYYYMM；month运算只返回月序号，year运算返回年序。跨期若实际规则要求按对象所属月份匹配预算、名单、首发日期、累计历史等，应使用真实对象月份key或已编译的对象日期指标；只有全期统一时点的规则才能引用全局period值。count_distinct必须提供value用于定义去重字段，只有count/exists不需要。原件不存在月份键时不得发明该键。
 阶梯：{"tier":{"schedule":"已编译阶梯ID","value":{"ref":"基数"},"output":"amount/rate"}}。参数仅指向真实格或原文：{"source":{"table":"T编号","row":2,"column":3},"kind":"number/ratio/text/date/month/bool/id/money","unit":"raw/percent/wan/yi","rules":["条款ID"]}；也可source={"sheet":"S编号","row":2,"column":"B"}或{"block":"实际原文单元ID","quote":"原文","value":"确在引文中的单值"}。
 阶梯定义：{"bands":[{"label":实际格坐标,"rate":实际格坐标}],"bound_unit":"raw/percent/wan/yi","rate_unit":"raw/percent","method":"whole/progressive","negative":"signed/zero/error","below":"first/zero/error","includes":[从低到高逐档布尔值],"rules":[条款ID]}；原文为纯数值下限表才可设 interpretation="thresholds"。
 所有业务运算必须有所在阶段条款ID。未知算子不得省略；用questions说明确切缺口及影响。'''
@@ -101,6 +103,8 @@ def normalize_calculation_phases(catalog,units,obligations):
             rule.update(phase='roster',level='person',operation='calculation');continue
         if re.fullmatch(r'汇总(?:各项目)?(?:提成|奖金)(?:总)?金额[。.]?',normalized(quote)):
             rule.update(phase='hold_policy',level='primary',operation='funding');continue
+        if re.search(r'月平均出货|月均出货|月平均金额',quote) and re.search(r'月份数|实际有出货|本年|当年',quote):
+            rule.update(phase='coefficient_policy',level='primary',operation='calculation');continue
         if ((re.search(r'暂扣|冻结|可分配|正常分配|应发',subject) and re.search(r'提成|奖金|金额|资金|分配',quote)) or
             (re.search(r'提成总金额|提成总额|奖金总额',subject) and re.search(r'系数',quote)) or
             (re.search(r'项目',quote) and re.search(r'分配提成金额|正常可分配金额',quote) and re.search(r'保留到分|四舍五入|ROUND',quote,re.I))):
@@ -244,6 +248,54 @@ def source_aggregates(catalog,scope,obligations):
                 'expr':{'query':{'dataset':'$project','aggregate':'sum','match':{},'value':{'field':field},'empty':'zero','nulls':'error'}},
                 'type':'number','rules':rids,'owner':'scope_mapping'}
     return result
+
+
+def source_period_averages(catalog,scope,obligations,period,program):
+    """Compile explicit year-to-object-month averages at the actual grain.
+
+    Only an original definition with a real distinct-activity-month
+    denominator, one unambiguous physical amount/group/month field and a
+    complete year-start scope can be materialized without a model formula.
+    Partial historical inputs or ambiguous dimensions stay on the normal
+    binding/clarification path.
+    """
+    window=Period.parse(period);pop=scope['population'];ds=scope['datasets'][pop['dataset']]
+    if window is None or (window.start.month,window.start.day)!=(1,1) or window.end.day!=monthrange(window.end.year,window.end.month)[1]:return {},set()
+    months=[k for k in pop['keys'] if ds['fields'][k]['kind']=='month']
+    if len(months)!=1:return {},set()
+    month=months[0]
+    observed={str(r.values[month]) for r in program.sales.rows if r.values.get(month) is not None}
+    expected={f'{y:04d}{m:02d}' for y in range(window.start.year,window.end.year+1) for m in range(1,13)
+              if (y,m)<=(window.end.year,window.end.month)}
+    if not expected<=observed:return {},set()
+    definitions={rid:r for rid,r in obligations.items() if r['phase']=='coefficient_policy' and
+                 re.search(r'月平均|月均',r['quote']) and re.search(r'本年|当年',r['quote']) and
+                 re.search(r'1\s*月|一月',r['quote']) and re.search(r'本月|项目月|所属月份|所属月',r['quote']) and
+                 re.search(r'实际有出货.{0,20}月份数',r['quote'])}
+    if not definitions:return {},set()
+    sums=source_aggregates(catalog,scope,obligations)
+    fields={x['expr']['query']['value']['field'] for x in sums.values()}
+    if len(fields)!=1:return {},set()
+    amount=next(iter(fields));aliases=defaultdict(set)
+    for src in ds['sources']:
+        sheet=catalog.sheet(src);head=[normalized(x) if x is not None else '' for x in sheet.rows[src['header_row']-1]]
+        for field in pop['keys']:
+            if field==month or field not in src['columns']:continue
+            col=src['columns'][field];col=col['column'] if isinstance(col,dict) else col;i=column_index_from_string(col)-1;label=head[i]
+            if label:aliases[field].add(label+str(head[:i+1].count(label)) if head.count(label)>1 else label)
+    groups={field for field,labels in aliases.items() if any(re.search(r'月平均|月均',r['quote']) and
+            any(label and label in normalized(r['quote']) for label in labels) for r in obligations.values() if r['phase']=='coefficient_policy')}
+    if len(groups)!=1:return {},set()
+    group=next(iter(groups));where={'op':'and','args':[
+        {'op':'eq','args':[{'op':'year','args':[{'field':month}]},{'op':'year','args':[{'key':month}]}]},
+        {'op':'le','args':[{'field':month},{'key':month}]}]}
+    shared={'dataset':'$population','match':{group:{'key':group}},'where':where,'empty':'zero','nulls':'error'}
+    expr={'op':'div','args':[{'query':{**shared,'aggregate':'sum','value':{'field':amount}}},
+                            {'query':{**shared,'aggregate':'count_distinct','value':{'field':month}}}]}
+    ident=f'source_period_average:{pop["dataset"]}:{group}:{month}:{amount}'
+    result={ident:{'label':f'{group} 本年累计至对象月的实际出货月份平均金额','expr':expr,'type':'number','rules':list(definitions),'owner':'coefficient_policy'}}
+    pure={rid for rid,r in definitions.items() if re.match(r'^(?:\d+[.、]\s*)?月平均出货',r['quote']) and not re.search(r'快照|暂扣|冻结',r['quote'])}
+    return result,pure
 
 
 def _project_source_expr(expr,scope,attributes,*,row=False):
@@ -820,6 +872,9 @@ def replay_basis(catalog,saved,period):
     _validate_global_bindings(catalog,saved['inventory'],obligations,datasets,owner='reference_mapping',complete=True)
     fragment=_empty_fragment();scope_probe=_compile_prefix(catalog,scope['datasets'],scope['population'],_empty_fragment(),period,calculate=False,allow_unbound=True)
     attrs={**source_attributes(scope,scope_probe),**source_aggregates(catalog,scope,obligations)}
+    expected_history,_=source_period_averages(catalog,scope,obligations,period,scope_probe)
+    if any(parts['coefficient_policy']['metrics'].get(k)!=v for k,v in expected_history.items()):
+        raise ProgramError('已保存客户/主对象历史平均指标与实际原文明示窗口、金额及活动月份定义不一致',owner='coefficient_policy',kind='coverage')
     if 'source_attributes' in parts and parts['source_attributes'].get('metrics')!=attrs:
         raise ProgramError('底层原始属性与实际唯一粒度合同不一致',owner='scope_mapping',kind='binding')
     fragment['metrics'].update(attrs)
@@ -1155,12 +1210,22 @@ class AdaptiveCompiler:
         # from other phases or invent a coefficient/deduction just to fill it.
         if not phase_rules:return _empty_fragment()
         prepared,table_covered=self._compile_native_schedules(phase,phase_rules,units)
+        if phase=='coefficient_policy':
+            scope_probe=_compile_prefix(self.catalog,scope['datasets'],scope['population'],_empty_fragment(),self.period,calculate=False,allow_unbound=True)
+            history,history_covered=source_period_averages(self.catalog,scope,all_rules,self.period,scope_probe)
+            if history:
+                prepared['metrics'].update(history);table_covered.update(history_covered)
+                task='adaptive/coefficient_policy/source_period_average'
+                proof={'metrics':history,'covered_pure_definitions':sorted(history_covered)}
+                receipt={'status':'PASS','inputs':fingerprint({'scope':scope,'rules':{r:all_rules[r] for m in history.values() for r in m['rules']}}),'output':fingerprint(proof),'reviewer':'程序','review':'原文明确本年累计至对象月、按实际活动月份数平均；实际主集合全期物理月份覆盖、群组及金额字段已核验','confidence':'deterministic_source_period_average'}
+                self.state.setdefault('specs',{})[task]=deepcopy(proof);self.state.setdefault('receipts',{})[task]=receipt;self.state.setdefault('task_owners',{})[task]=phase
+                self.event(task,True,{'receipt':receipt,'proof':proof})
         phase_rules={rid:r for rid,r in phase_rules.items() if rid not in table_covered}
         if not phase_rules:return prepared
         # The outline carries only compact semantic obligations and existing
         # dependency names. Actual formulas and raw parameter cells are fetched
         # separately for each bounded group.
-        outline_data={'period':self.period,'phase':phase,'obligations':_compact(phase_rules),'available_metrics':_metric_summary(previous['metrics']),
+        outline_data={'period':self.period,'phase':phase,'obligations':_compact(phase_rules),'available_metrics':_metric_summary({**previous['metrics'],**prepared['metrics']}),
                       'available_schedule_sources':self._schedule_sources({**previous['schedules'],**prepared['schedules']}),
                       'data_contracts':_schema_summary(datasets),'project_keys':scope['population']['keys']}
         def valid_outline(v):

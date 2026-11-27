@@ -175,7 +175,7 @@ def canonical_expression(expr,period,*,depth=0):
     """
     if depth>60 or not isinstance(expr,dict):return expr
     norm=lambda value:canonical_expression(value,period,depth=depth+1)
-    if set(expr)=={'value'} and _scalar(expr['value']):return expr['value']
+    if set(expr) in ({'value'},{'const'}) and _scalar(next(iter(expr.values()))):return next(iter(expr.values()))
     if set(expr)=={'op','args'} and isinstance(expr['args'],list):
         op=expr['op'];args=[norm(x) for x in expr['args']]
         if op=='in_period' and len(args)==2 and args[1]=={'period':'month'}:
@@ -257,7 +257,7 @@ class CalculationProgram:
         self.metrics=plan['metrics']
         if not isinstance(self.metrics,dict) or not self.metrics:raise ProgramError('至少需要一个可计算指标')
         if any(not isinstance(k,str) or not k.strip() for k in self.metrics):raise ProgramError('指标ID必须为非空字符串')
-        self._validate_expr(self.population['where'],set(),set(),set(self.sales.fields),owner='scope_mapping')
+        self._validate_expr(self.population['where'],set(),set(),self.sales.fields,owner='scope_mapping')
         self.deps={}
         for name,metric in self.metrics.items():
             contract(metric,required=('label','expr','rules'),optional=('type','owner'),label=f'指标 {name}')
@@ -287,6 +287,7 @@ class CalculationProgram:
             self._validate_expr(check['expr'],set(self.metrics),set(self.keys),None,owner=check.get('owner','project_policy'))
         self._population_rows=()
         self._index={}
+        self._query_cache={}
 
     def _validate_expr(self,expr,metrics,keys,row_fields,*,owner,depth=0):
         if depth>60:raise ProgramError('表达式嵌套过深，拆分为具名指标',owner=owner)
@@ -301,6 +302,24 @@ class CalculationProgram:
             if op not in OPERATORS or not isinstance(args,list):raise ProgramError(f'未支持的运算 {op!r}；需要扩展算子或澄清规则',owner=owner,kind='unsupported')
             low,high=OPERATORS[op]
             if len(args)<low or high is not None and len(args)>high:raise ProgramError(f'运算 {op} 参数数量不符',owner=owner)
+            # A typed YYYYMM field compared with a full-month-aligned
+            # period date is a month-grain comparison, not an arbitrary
+            # text/date comparison. Normalize the actual static anchor.
+            if op in ('eq','ne','lt','le','gt','ge') and len(args)==2:
+                def month_operand(x):
+                    if not isinstance(x,dict):return False
+                    if set(x)=={'field'} and isinstance(row_fields,dict):return row_fields.get(x['field'],{}).get('kind')=='month'
+                    if set(x)=={'key'} and x['key'] in keys:return self.sales.fields.get(x['key'],{}).get('kind')=='month'
+                    return False
+                def aligned_period(x):
+                    if not isinstance(x,dict) or set(x)!={'period'}:return None
+                    k=x['period']
+                    if k=='year_start':return date(self.period.end.year,1,1)
+                    if k=='start' and self.period.start.day==1:return self.period.start
+                    if k=='end' and self.period.end.day==monthrange(self.period.end.year,self.period.end.month)[1]:return self.period.end
+                    return None
+                for i in (0,1):
+                    if month_operand(args[i]) and (anchor:=aligned_period(args[1-i])) is not None:args[1-i]=anchor.strftime('%Y%m')
             return set().union(*(recurse(x) for x in args))
         if len(expr)!=1:raise ProgramError(f'表达式必须是单一形式：{expr!r}',owner=owner)
         kind,value=next(iter(expr.items()))
@@ -318,8 +337,8 @@ class CalculationProgram:
         if kind=='query':
             contract(value,required=('dataset','aggregate','match','empty','nulls'),optional=('where','value','duplicates'),label='聚合表达式',owner=owner)
             ds=value['dataset'];agg=value['aggregate']
-            if ds in ('$project','$population'):fields=set(self.sales.fields)
-            elif ds in self.inputs.datasets:fields=set(self.inputs.datasets[ds].fields)
+            if ds in ('$project','$population'):fields=self.sales.fields
+            elif ds in self.inputs.datasets:fields=self.inputs.datasets[ds].fields
             else:raise ProgramError(f'聚合引用未绑定的数据集 {ds!r}',owner=owner,kind='binding',dataset=ds,details={'available_datasets':sorted(self.inputs.datasets)})
             if agg not in AGGREGATES or value['empty'] not in ('error','null','zero') or value['nulls'] not in ('error','ignore'):
                 raise ProgramError(f'{ds} 聚合、空集或空值处理未明确',owner=owner)
@@ -327,7 +346,7 @@ class CalculationProgram:
                 raise ProgramError(f'{ds} 的唯一值查找必须明确重复行处理',owner=owner)
             if agg not in ('count','exists') and 'value' not in value:raise ProgramError(f'{ds}/{agg} 缺少求值表达式',owner=owner)
             match=value['match']
-            if not isinstance(match,dict) or not set(match)<=fields:raise ProgramError(f'{ds} 关联字段不在源表：{match}',owner=owner)
+            if not isinstance(match,dict) or not set(match)<=set(fields):raise ProgramError(f'{ds} 关联字段不在源表：{match}',owner=owner)
             deps=set().union(*(recurse(v) for v in match.values()))
             try:
                 if 'where' in value:deps|=recurse(value['where'],fields)
@@ -469,7 +488,33 @@ class CalculationProgram:
             rctx.trace=ctx.trace
             yield row,rctx
 
+    def _query_cache_key(self,q,ctx,exact):
+        """Cache only immutable non-project queries with exact context deps."""
+        if q['dataset']=='$project' or ctx.row is not None:return None
+        refs={'key':set(),'ref':set()}
+        def visit(x):
+            if isinstance(x,dict):
+                if 'query' in x:return False  # nested query may depend on project rows
+                for kind in refs:
+                    if set(x)=={kind}:refs[kind].add(x[kind]);return True
+                return all(visit(v) for v in x.values())
+            if isinstance(x,list):return all(visit(v) for v in x)
+            return True
+        if not visit(q):return None
+        try:
+            deps=tuple((kind,k,type((ctx.keys if kind=='key' else ctx.metrics)[k]).__name__,(ctx.keys if kind=='key' else ctx.metrics)[k])
+                       for kind,ids in refs.items() for k in sorted(ids))
+            cachekey=(json.dumps(q,sort_keys=True,ensure_ascii=False,default=str,separators=(',',':')),deps,exact,ctx.trace is not None)
+            hash(cachekey);return cachekey
+        except (KeyError,TypeError):return None
+
     def query(self,q,ctx,*,exact=False):
+        cachekey=self._query_cache_key(q,ctx,exact)
+        if cachekey is not None and cachekey in self._query_cache:
+            value,events=self._query_cache[cachekey]
+            if ctx.trace is not None:ctx.trace.extend(events)
+            return value
+        trace_start=len(ctx.trace) if ctx.trace is not None else 0
         name=q['dataset'];agg=q['aggregate'];rows=[];values=[];items=[]
         used_fields=_field_refs(q.get('value'))|_field_refs(q.get('where'))|set(q['match'])
         # Keep precise locations of selected rows separate from rows inspected
@@ -487,6 +532,7 @@ class CalculationProgram:
         def finish(value):
             if ctx.trace is not None:ctx.trace.append({'kind':'query','dataset':name,'aggregate':agg,'query':q,'rows':rows,'items':items,
                 'selected':len(rows),'numeric_or_values':len(values),'result':value})
+            if cachekey is not None:self._query_cache[cachekey]=(value,tuple(ctx.trace[trace_start:]) if ctx.trace is not None else ())
             return value
         if agg=='exists':return finish(bool(rows))
         if agg=='count':return finish(_native(len(rows),exact))
@@ -516,6 +562,7 @@ class CalculationProgram:
 
     def prepare_population(self):
         self._index.clear()
+        self._query_cache.clear()
         groups=defaultdict(list);included=[];excluded=[]
         for row in self.sales.rows:
             try:keep=self._bool(self.eval(self.population['where'],Context(row=row)))
@@ -534,7 +581,7 @@ class CalculationProgram:
             arithmetic.prec=40
             groups,excluded=self.prepare_population();projects={};cross_checks=0
             self._contexts={}
-            trace_pool={};risk_index=defaultdict(list)
+            trace_pool={};trace_identity={};risk_index=defaultdict(list)
             funding=self.funding;destinations=funding['destinations'];digits=funding['summary_digits']
             raw_sums=defaultdict(lambda:D(0));exact_sums=defaultdict(lambda:F(0))
             for key,raw in sorted(groups.items(),key=lambda kv:tuple(map(str,kv[0]))):
@@ -558,7 +605,11 @@ class CalculationProgram:
                     compact=[]
                     for event in dctx.trace:
                         if event['kind']=='query':
-                            sig=hashlib.sha256(json.dumps(event,ensure_ascii=False,sort_keys=True,default=str,separators=(',',':')).encode('utf8')).hexdigest()
+                            old=trace_identity.get(id(event))
+                            if old is not None and old[0] is event:sig=old[1]
+                            else:
+                                sig=hashlib.sha256(json.dumps(event,ensure_ascii=False,sort_keys=True,default=str,separators=(',',':')).encode('utf8')).hexdigest()
+                                trace_identity[id(event)]=(event,sig)
                             trace_pool.setdefault(sig,event);compact.append({'kind':'query_ref','id':sig})
                         elif event['kind']!='cell':compact.append(event) # physical query cells retained in shared query evidence
                     traces[name]=compact
@@ -616,9 +667,9 @@ class CalculationProgram:
             if kind not in ('rows','columns'):raise ProgramError(f'{key} 未支持的名单布局 {kind!r}',owner='roster',kind='unsupported')
             ds=spec['dataset']
             if ds not in self.inputs.datasets:raise ProgramError(f'{key} 名单数据集 {ds!r} 未绑定',owner='roster')
-            fields=set(self.inputs.datasets[ds].fields)
+            fields=self.inputs.datasets[ds].fields
             match=spec['match']
-            if not isinstance(match,dict) or not set(match)<=fields:raise ProgramError(f'{key} 名单关联字段不正确',owner='roster')
+            if not isinstance(match,dict) or not set(match)<=set(fields):raise ProgramError(f'{key} 名单关联字段不正确',owner='roster')
             for expr in match.values():self._validate_expr(expr,set(self.metrics),set(self.keys),None,owner='roster')
             if 'where' in spec:self._validate_expr(spec['where'],set(self.metrics),set(self.keys),fields,owner='roster')
             if spec['missing_share'] not in ('single','equal','remaining_equal','error') or spec['missing'] not in ('pending','error') or spec['duplicates'] not in ('error','identical','sum'):
