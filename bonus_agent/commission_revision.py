@@ -167,13 +167,25 @@ def _applicable(version, period):
     return (not version.get('from') or version['from'] <= period) and (not version.get('to') or period <= version['to'])
 
 
+def period_months(period):
+    from bonus_core.data.period import Period
+    p=Period.parse(period)
+    if p is None:raise RevisionError('必须明确核算期间。')
+    a=p.start.year*12+p.start.month-1;b=p.end.year*12+p.end.month-1
+    return [f'{n//12:04d}{n%12+1:02d}' for n in range(a,b+1)]
+
+
 def select_versions(versions, period):
     """Latest authorized version per field within its actual effective interval."""
-    chosen = {}
-    for version in versions:
-        if _applicable(version, period):
-            chosen[version['field']] = version
-    return [chosen[k] for k in sorted(chosen)]
+    choices=[]
+    for month in period_months(period):
+        chosen={}
+        for version in versions:
+            if _applicable(version,month):chosen[version['field']]=version
+        choices.append([chosen[k] for k in sorted(chosen)])
+    if any(v!=choices[0] for v in choices[1:]):
+        raise RevisionError('本核算期间跨越不同已生效财务规则版本；不能用末月规则覆盖此前月份，请按真正适用区间分段核算或登记覆盖整期的明确规则。')
+    return choices[0]
 
 
 def effective_rules(ledger, rule_store, period):
@@ -181,8 +193,41 @@ def effective_rules(ledger, rule_store, period):
     return select_versions(scenario + ledger.get('case_rules', []), period)
 
 
+def rule_owner(version):
+    if version.get('owner') in OWNERS:return version['owner']
+    return FIELDS[version['field']][0]
+
+
+def adaptive_rule_fields(state):
+    """Actual current clauses, not a fixed list of 18 legacy slot names."""
+    if state.get('mode')!='sales_commission_v2':return {}
+    from bonus_agent.adaptive_rules import normalized,PHASES
+    saved=state.get('adaptive_basis_contract') or {};sources=state.get('adaptive_rule_sources',{})
+    active_versions={str(v['id']):v for v in state.get('active_rules',[])}
+    result={}
+    for uid,decision in saved.get('clause_proposals',{}).items():
+        source=sources.get(uid,{})
+        for i,clause in enumerate(decision.get('clauses',[]),1):
+            phase=clause['phase'];quote=clause['quote'];raw=source.get('text',quote)
+            prior=active_versions.get(uid.removeprefix('Rrev_')) if uid.startswith('Rrev_') else None
+            field=prior['field'] if prior and prior.get('kind')=='adaptive_clause' else 'adaptive:'+fingerprint((phase,normalized(raw),normalized(quote)))[:24]
+            result[field]={'field':field,'owner':phase,'label':clause.get('meaning') or quote,'old':quote,'rule_id':f'{uid}:{i}',
+                'original_quote':prior.get('original_quote') if prior else quote,
+                'original_unit_text':prior.get('original_unit_text') if prior else raw,
+                'source':source}
+    for phase in PHASES:
+        result['adaptive:add:'+phase]={'field':'adaptive:add:'+phase,'owner':phase,'label':'新增规则：'+OWNERS.get(phase,phase),'old':'（新增，不替代现有条款）'}
+    return result
+
+
+def roles_for_state(state):
+    if state.get('mode')=='sales_commission_v2':
+        return {k:v['label'] for k,v in (state.get('adaptive_roster_contract') or {}).get('roles',{}).items()}
+    return {r:r for r in ROLES}
+
+
 def basis_rules(rules):
-    return [v for v in rules if FIELDS[v['field']][0] in BASIS_NODES]
+    return [v for v in rules if rule_owner(v) in BASIS_NODES]
 
 
 def receipt_token(state):
@@ -252,15 +297,19 @@ def affected_nodes(owners, graph=None):
         affected = expanded
 
 
-def parse_recipients(text):
+def parse_recipients(text,*,identities=False):
     """Explicit named shares, never an implicit redistribution of the pool."""
     pairs = []
     for part in re.split(r'[,，、;；\n]+', str(text).strip()):
         match = re.fullmatch(r'\s*(.+?)\s*(\d+(?:\.\d+)?)\s*[%％]\s*', part)
         if not match or not match[1].strip() or match[1].strip().endswith(('-', '+', '−')):
             raise RevisionError('请填写明确姓名及百分比，例如：张三70%，李四30%。')
-        pairs.append({'name': match[1].strip(), 'share': str(Decimal(match[2])/100)})
-    if len({x['name'] for x in pairs}) != len(pairs):
+        name=match[1].strip();pid=None
+        if identities and (':' in name or '：' in name):
+            pid,name=re.split(r'[:：]',name,maxsplit=1);pid=pid.strip();name=name.strip()
+            if not pid or not name:raise RevisionError('人员身份格式应为 编号:姓名70%。')
+        pairs.append({'name':name,'share':str(Decimal(match[2])/100),**({'id':pid} if pid else {})})
+    if len({x.get('id',x['name']) for x in pairs}) != len(pairs):
         raise RevisionError('同一角色的姓名重复，请合并为唯一的人员份额。')
     if sum((Decimal(x['share']) for x in pairs), Decimal(0)) > 1:
         raise RevisionError('同一项目角色的份额合计不得超过100%。')
@@ -281,7 +330,7 @@ def _checked_artifact(out, rnd, key):
 def source_manifest(catalog):
     """Physical ID namespace, distinct from the content fingerprints."""
     result={sid:{'file':s.file,'coordinate':s.name,'kind':'sheet'} for sid,s in catalog.sheets.items()}
-    result.update({sid:{'file':t.file,'coordinate':[t.page,t.table],'kind':'parameter_table'} for sid,t in catalog.tables.items()})
+    result.update({sid:{'file':t.file,'coordinate':[t.sheet_name,t.row_offset,t.col_offset] if t.sheet_name else [t.page,t.table],'kind':'parameter_table'} for sid,t in catalog.tables.items()})
     result.update({sid:{'file':v['file'],'coordinate':v['where'],'kind':'rule_text','text_digest':fingerprint(v['text'])}
                    for sid,v in catalog.blocks.items() if sid.startswith('R')})
     return result
@@ -332,6 +381,8 @@ def _save_baseline(out, case, rid):
                 'source_order':state.get('source_order') or [p.name for p in source_paths],
                 'basis_revision': state.get('basis_revision', ''), 'active_rules': state.get('active_rules', []),
                 'confirmed': case.get('confirmed'), 'source_inputs': rnd.get('source_inputs', [])}
+    if state.get('mode')=='sales_commission_v2':
+        snapshot.update(mode=state['mode'],adaptive_basis_contract=state.get('adaptive_basis_contract'),adaptive_roster_contract=state.get('adaptive_roster_contract'),adaptive_output_contract=state.get('adaptive_output_contract'))
     _write(folder/'baseline.json', snapshot)
     # The original approvals and per-round histories are never rewritten.
     # Capture verified current deliverables even if there is no older archive.
@@ -451,7 +502,7 @@ def submit_locked(out, case, *, by, kind='discrepancy', stage='unknown', owner='
     if rule_store:state['rule_store'] = str(Path(rule_store).resolve())
     if not request['project_keys'] and state.get('basis_view') and kind == 'discrepancy':
         request['project_keys'] = [key for key, p in state['basis_view']['projects'].items()
-            if key in description or (p.get('product') and str(p['product']) in description)]
+            if key in description or (p.get('product') and str(p['product']) in description) or any(len(str(v))>=2 and str(v) in description for v in p.get('key_values',{}).values())]
     if kind == 'material_correction':
         # S/T/R ids can shift when a source is replaced/added. Until a
         # provenance-preserving remap is proved, conservatively rebind all.
@@ -460,15 +511,25 @@ def submit_locked(out, case, *, by, kind='discrepancy', stage='unknown', owner='
     elif kind == 'rule_change':
         if not approver:
             raise RevisionError('正式修改业务规则需要财务确认权限；普通异议不能改变制度。')
-        new = normalize_value(field, value)
-        detected, path, _, label, _ = FIELDS[field]
-        try:
-            old = _get(state['specs'][detected], path)
-        except KeyError:
-            raise RevisionError('原规则尚未成功绑定，先补充规则材料并完成该节点核验。') from None
+        dynamic=state.get('mode')=='sales_commission_v2'
+        extra={}
+        if dynamic:
+            choices=adaptive_rule_fields(state);choice=choices.get(field)
+            if not choice:raise RevisionError('请从本版本实际规则中选择被替代条款，或选择明确责任环节新增规则。')
+            new=str(value).strip()
+            if not new:raise RevisionError('请填写完整、明确的新规则原文（含条件、单位及公式），不是期望金额。')
+            old=choice['old'];detected=choice['owner'];label=choice['label']
+            if field.startswith('adaptive:add:'):field='adaptive:'+request['id']
+            extra={'kind':'adaptive_clause','statement':new,'owner':detected,'original_quote':choice.get('original_quote'),
+                   'original_unit_text':choice.get('original_unit_text'),'target_rule':choice.get('rule_id'),'source':choice.get('source',{})}
+        else:
+            new = normalize_value(field, value)
+            detected, path, _, label, _ = FIELDS[field]
+            try:old = _get(state['specs'][detected], path)
+            except KeyError:raise RevisionError('原规则尚未成功绑定，先补充规则材料并完成该节点核验。') from None
         period = state['period']
         if scope == 'this_case':
-            start = end = period
+            months=period_months(period);start=months[0];end=months[-1]
         elif scope == 'this_period':
             start = end = normalize_month(effective_from or period)
         elif scope in ('future_periods', 'scenario'):
@@ -481,6 +542,7 @@ def submit_locked(out, case, *, by, kind='discrepancy', stage='unknown', owner='
         version = {'id': request['id'], 'field': field, 'label': label, 'value': new, 'old_value': old,
                    'scope': scope, 'from': start, 'to': end, 'reason': description, 'evidence': request['evidence'],
                    'by': by, 'at': request['created_at']}
+        version.update(extra)
         request['rule'] = version
         if scope == 'this_case':
             prior=next((v for v in effective_rules(ledger,rule_store,period) if v['field']==field),None)
@@ -498,7 +560,7 @@ def submit_locked(out, case, *, by, kind='discrepancy', stage='unknown', owner='
                 doc['versions'].append(version)
                 _write(store, doc)
             # A future-only policy does not invalidate today's work.
-            if not _applicable(version, period):
+            if not any(_applicable(version,m) for m in period_months(period)):
                 ledger.setdefault('scheduled', []).append(request)
                 _write(Path(out)/FILE, ledger)
                 return {'id': request['id'], 'status': 'SCHEDULED', 'rule': version, 'affected': []}
@@ -513,12 +575,18 @@ def submit_locked(out, case, *, by, kind='discrepancy', stage='unknown', owner='
         if not approver:
             raise RevisionError('指定或替换实际收款人需要财务确认权限。')
         keys = request['project_keys']
-        if len(keys) != 1 or role not in ROLES:
+        if len(keys) != 1 or role not in roles_for_state(state):
             raise RevisionError('人员修订必须选择一个完整项目键及一个制度角色。')
         if not state.get('basis_view') or keys[0] not in state['basis_view']['projects']:
             raise RevisionError('该项目不在当前已核验的核算范围内，请核对项目四键。')
         detected = 'settlement'
-        record = {'id': request['id'], 'project': keys[0], 'role': role, 'shares': parse_recipients(shares),
+        dynamic=state.get('mode')=='sales_commission_v2';parsed=parse_recipients(shares,identities=dynamic)
+        if dynamic:
+            contract_=(state.get('adaptive_roster_contract') or {}).get('roles',{}).get(role,{})
+            pairs=contract_.get('recipients',{}).get('pairs',[])
+            if any(p.get('id') for p in pairs) and any('id' not in p for p in parsed):
+                raise RevisionError('本角色按人员唯一编号识别，请填写 编号:姓名70%，编号:姓名30%，不能仅按姓名合并。')
+        record = {'id': request['id'], 'project': keys[0], 'role': role, 'shares': parsed,
                   'by': by, 'at': request['created_at'], 'reason': description, 'period': state['period']}
         request['recipient'] = record
         ledger['recipients'].append(record)
@@ -549,6 +617,11 @@ def invalidate(state, revision):
     for name in owners | (dirty & {'basis_review', 'settlement_review'}):
         state.setdefault('receipts', {}).pop(name, None)
         state.setdefault('prior_accepted_specs', {}).pop(name, None)
+    for task,owner in state.get('task_owners',{}).items():
+        if owner in owners:
+            state.setdefault('receipts',{}).pop(task,None)
+            state.setdefault('prior_accepted_specs',{}).pop(task,None)
+            state.setdefault('feedback',{}).pop(task,None)
     for name in dirty:
         state.setdefault('node_receipts', {}).pop(name, None)
         state.setdefault('revisions', {}).pop(name, None)
@@ -592,7 +665,7 @@ def register_detected_change(out, case, ledger, *, hashes, period, current_rules
         old, new = previous.get(field), selected.get(field)
         if old == new or (new and new['id'] in already):
             continue
-        owner = FIELDS[field][0]
+        owner = rule_owner(new or old)
         requests.append({'id': uuid4().hex[:16], 'kind': 'rule_change', 'stage': _stage(owner), 'owner': owner,
                          'description': '适用的已授权规则版本发生变化。' if new else '原规则版本已不在有效期间。',
                          'rule': new or old, 'rule_expired': not bool(new), 'project_keys': [], 'created_at': now(),
@@ -668,7 +741,7 @@ def validate_current(out, case, *, final=False):
         return
     if state.get('status')=='AWAITING_TOTAL_CONFIRMATION':
         from bonus_agent.commission_chain import execution_profile
-        if state.get('profile')!=execution_profile():
+        if state.get('profile')!=execution_profile(state.get('mode','sales_commission_v1')):
             raise cs.ConfirmError('核算程序已更新，本版预核算需要从已保存节点重新核验后才能确认。')
     ledger = load(out); rev = active(ledger)
     if rev and (state.get('revision_id') != rev['id'] or (final and rev['status'] != 'OK')
@@ -700,7 +773,7 @@ def edit_token(case, ledger):
 
 
 def rules_for_node(rules, node):
-    return [v for v in rules if FIELDS[v['field']][0] == node]
+    return [v for v in rules if v['field'] in FIELDS and FIELDS[v['field']][0] == node]
 
 
 def apply_rule_versions(catalog, obj, node, rules):
@@ -831,7 +904,7 @@ def review_context(catalog, scoped, node, basis, settlement, overrides):
     keys = {k for r in scoped['requests'] for k in r.get('project_keys', [])}
     current = {k: p for k,p in projects.items() if not keys or k in keys}
     if node == 'basis_review':
-        scoped['actual_project_indicators'] = [{k:p.get(k) for k in ('key','route','region','old','frozen') + INDICATORS} for p in current.values()]
+        scoped['actual_project_indicators'] = [{k:p.get(k) for k in ('key','key_values','metrics','total','payable','alloc','destinations')} if 'metrics' in p else {k:p.get(k) for k in ('key','route','region','old','frozen') + INDICATORS} for p in current.values()]
         scoped['current_totals'] = (basis or {}).get('totals', {})
         checks=(basis or {}).get('checks',{})
         scoped['diagnostic_priority']={'default_counts':checks.get('default_counts',{}),'unmatched':checks.get('unmatched',{}),
@@ -849,6 +922,11 @@ def review_context(catalog, scoped, node, basis, settlement, overrides):
     # A model may cite real evidence from the current owner's material or
     # a specific, physically re-read row. Limit excerpts, not calculations.
     sources = catalog.sources(words)['text']
+    if (basis or {}).get('metric_fields'):
+        all_rules=(basis or {}).get('rule_coverage',{}) if node=='basis_review' else (settlement or {}).get('rule_coverage',{})
+        for rule in all_rules.values():
+            sid=rule['clause']['unit']
+            if sid in catalog.blocks:sources[sid]=catalog.blocks[sid]
     for sid, block in catalog.blocks.items():
         if sid.startswith('V') and (node=='basis_review' or any(word in block['text'] for word in ('人员','名单'))):
             sources[sid] = block
@@ -857,7 +935,8 @@ def review_context(catalog, scoped, node, basis, settlement, overrides):
         sheet_locations = {f'{s.file}/{s.name}': s for s in catalog.sheets.values()}
         locations = []
         for p in current.values():
-            for refs in p.get('sources', {}).values():
+            value=p.get('sources',{})
+            for refs in (value.values() if isinstance(value,dict) else [value]):
                 if isinstance(refs, str):refs = [refs]
                 if isinstance(refs, (list,tuple)):locations.extend(x for x in refs if isinstance(x,str))
         if node=='settlement_review':locations.extend(r['source'] for r in scoped['actual_target_role_rows'] if 'source' in r)
@@ -926,11 +1005,17 @@ def diff_report(old, basis, settlement, state, revision):
     if basis is not None:
         for key in sorted(set(b) | set(a)):
             left, right = b.get(key, {}), a.get(key, {})
-            for field in INDICATORS + ('region', 'route', 'first_date', 'old', 'frozen', 'currency', 'tier_steps', 'sources'):
+            dynamic=state.get('mode')=='sales_commission_v2'
+            if dynamic:
+                left={**left,**{'metric.'+k:v for k,v in left.get('metrics',{}).items()},**{'destination.'+k:v for k,v in left.get('destinations',{}).items()}}
+                right={**right,**{'metric.'+k:v for k,v in right.get('metrics',{}).items()},**{'destination.'+k:v for k,v in right.get('destinations',{}).items()}}
+                fields=('key_values','total','payable','alloc','round_delta','sources')+tuple(sorted(k for k in set(left)|set(right) if k.startswith(('metric.','destination.'))))
+            else:fields=INDICATORS + ('region', 'route', 'first_date', 'old', 'frozen', 'currency', 'tier_steps', 'sources')
+            for field in fields:
                 before, after = left.get(field), right.get(field)
                 if before != after:
                     project_changes.append({'project': key, 'field': field, 'before': before, 'after': after,
-                                            'delta': _delta(before, after) if field in INDICATORS else None,
+                                            'delta': _delta(before, after) if field in INDICATORS or dynamic and field.startswith(('metric.','destination.')) else None,
                                             'direct_target': key in targeted,
                                             'sources_before': left.get('sources', {}), 'sources_after': right.get('sources', {})})
     totals = list(_changes(old_basis.get('totals', {}), (basis or {}).get('totals', {}))) if basis is not None else []
@@ -953,8 +1038,10 @@ def diff_report(old, basis, settlement, state, revision):
     prior_s = old.get('settlement') or {}
     people, roles = [], []
     if settlement is not None:
-        people = group_diff(prior_s.get('people', []), settlement['people'], ('name', 'destination'), ('raw', 'amount'))
-        roles = group_diff(prior_s.get('rows', []), settlement['rows'], ('project', 'role', 'name', 'destination'), ('raw', 'share'))
+        people_keys=('id','name','destination') if state.get('mode')=='sales_commission_v2' else ('name','destination')
+        role_keys=('project','role_id','role','person_id','name','destination') if state.get('mode')=='sales_commission_v2' else ('project','role','name','destination')
+        people = group_diff(prior_s.get('people', []), settlement['people'], people_keys, ('raw', 'amount'))
+        roles = group_diff(prior_s.get('rows', []), settlement['rows'], role_keys, ('raw', 'share'))
     return _plain({'revision': revision['id'], 'basis_revision': revision['basis_revision'],
                    'previous_round': old.get('round'), 'previous_basis_digest': old.get('basis_digest'),
                    'current_basis_digest': state.get('basis_digest'), 'previous_totals': old_basis.get('totals', {}),
@@ -983,7 +1070,7 @@ def assert_unaffected_recipients(old, settlement, revision):
         return
     targets = {(r['recipient']['project'],r['recipient']['role']) for r in revision['requests']}
     def rows(s):
-        return sorted(fingerprint(r) for r in s['rows'] if (r['project'],r['role']) not in targets)
+        return sorted(fingerprint(r) for r in s['rows'] if (r['project'],r.get('role_id',r['role'])) not in targets)
     if rows(old['settlement']) != rows(settlement):
         raise RevisionError('指定名单修改之外的项目/角色原值、人员或来源发生变化；发现越界变更，禁止作为本次人员单独修订交付。')
 
@@ -1019,8 +1106,8 @@ def write_diff(out, report):
     add('逐项目指标', report['projects']['indicators'], ['project', 'field', 'before', 'after', 'delta', 'direct_target', 'sources_before', 'sources_after'])
     add('规则合同差异', report['rules'], ['field', 'before', 'after', 'delta'])
     add('材料指纹差异', report['files'], ['field', 'before', 'after'])
-    add('人员差异', report['people'], ['name', 'destination', 'field', 'before', 'after', 'delta'])
-    add('项目角色原值差异', report['roles'], ['project', 'role', 'name', 'destination', 'field', 'before', 'after', 'delta'])
+    add('人员差异', report['people'], ['id','name', 'destination', 'field', 'before', 'after', 'delta'])
+    add('项目角色原值差异', report['roles'], ['project', 'role_id','role','person_id', 'name', 'destination', 'field', 'before', 'after', 'delta'])
     add('反馈及处理', report['requests'], ['id', 'kind', 'description', 'observed', 'evidence', 'created_by', 'created_at', 'rule', 'recipient'])
     add('独立复核结论', [dict(node=n, **r) for n, rows in report['findings'].items() for r in rows],
         ['node', 'id', 'identified', 'checked', 'disposition', 'conclusion', 'evidence'])
@@ -1055,9 +1142,12 @@ def explanation(out, case, message):
     except cs.ConfirmError as exc:return str(exc)+'；历次存档仍可查看，不能将历史金额当作当前有效版本。'
     lines = ['以下来自本版已核验的程序计算记录（只读查询，不修改规则或触发计算）：']
     selected = [p for key, p in basis['projects'].items() if key in message or (p.get('product') and str(p['product']) in message)
-                or (p.get('customer') and str(p['customer']) in message)]
+                or (p.get('customer') and str(p['customer']) in message) or any(len(str(v))>=2 and str(v) in message for v in p.get('key_values',{}).values())]
     if selected:
         for p in selected[:8]:
+            if 'metrics' in p:
+                labels=basis.get('metric_fields',{});lines.append(f"项目 {p['key']}："+'；'.join(f'{labels.get(k,k)}={v}' for k,v in p['metrics'].items()))
+                lines.append('实际项目来源：'+'；'.join(p.get('sources',[])[:8]));continue
             lines.extend([f"项目 {p['key']}：基数 {p['base']} × 对应阶梯 → {p['tier']}；区域 {p['region_factor']}、客户 {p['customer_factor']}、毛利 {p['gross_factor']}；"
                           f"提成 {p['total']}，库存及逾期暂扣 {p['hold']}，欠款暂扣 {p['debt']}，可分配 {p['alloc']}。",
                           '来源：' + json.dumps({k:({'示例行':v[:3],'总行数':len(v)} if isinstance(v,list) and len(v)>3 else v) for k,v in p['sources'].items()}, ensure_ascii=False)])
@@ -1067,9 +1157,9 @@ def explanation(out, case, message):
         if p := _checked_artifact(out, rnd, 'details'):
             detail = _read(p, {}).get('settlement') or {}
             for person in detail.get('people', []):
-                if person['name'] in message:
-                    lines.append(f"{person['name']}：汇总原值 {person['raw']}，本期金额 {person['amount']} 元。")
-                    for row in (r for r in detail['rows'] if r['name'] == person['name']):
+                if person['name'] in message or person.get('id') and person['id'] in message:
+                    lines.append(f"{person['name']}（{person.get('id',person['name'])}）：汇总原值 {person['raw']}，本期金额 {person['amount']} 元。")
+                    for row in (r for r in detail['rows'] if r.get('person_id',r['name']) == person.get('id',person['name'])):
                         lines.append(f"{row['project']} / {row['role']}：角色率 {row['role_rate']} × 个人份额 {row['share']}，原值 {row['raw']}；{row['source']}")
-        lines.append('若需定位一个特定金额，请输入项目完整四键、客户简称、型号或人员姓名。')
+        lines.append('若需定位一个特定金额，请输入本版完整项目键、实际键值、人员姓名或唯一编号。')
     return '\n'.join(lines)

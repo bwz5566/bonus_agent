@@ -80,7 +80,10 @@ def discover_history_sources(catalog,period):
     if period in cache:return cache[period]
     candidates=[]
     for sheet in catalog.sheets.values():
-        for header,row in enumerate(sheet.rows[:4],1):
+        headers=sorted(set(range(1,min(len(sheet.rows),4)+1))|set(sheet.header_candidates(6)))
+        for header in headers:
+            if header>len(sheet.rows):continue
+            row=sheet.rows[header-1]
             columns={f:[] for f in HISTORY_FIELDS}
             for i,cell in enumerate(row,1):
                 if (kind:=_kind(cell)):columns[kind].append(get_column_letter(i))

@@ -118,4 +118,4 @@ def prepare(reg: Registry, scenario_id: str, materials: list[str | Path], *, use
                         confirmations=confirmations, output_source=output)
     return AgentScenario(sc.id, brief, ([guide] if guide else []) + supplements,
                          sc.outputs.strip(), cases, sc.inputs, supplements, sc.execution,
-                         reg.data_dir(sc.id) / 'commission_rules' / 'versions.json' if sc.execution == 'sales_commission_v1' else None)
+                         reg.data_dir(sc.id) / 'commission_rules' / 'versions.json' if sc.execution in ('sales_commission_v1','sales_commission_v2') else None)

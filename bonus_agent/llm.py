@@ -14,6 +14,7 @@ import time
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Event, Thread
 from typing import Callable
 
 import yaml
@@ -21,6 +22,34 @@ import yaml
 DEFAULT_CONFIG = Path(__file__).parent / "config" / "models.yaml"      # 随安装包发布的默认配置
 REPO_CONFIG = Path(__file__).parent.parent / "config"                   # 源码目录下的 config/（放 secrets.yaml）
 BASIS_PART_REASONING = ContextVar('basis_part_reasoning', default=None)
+# Per-workflow-node caps are context-local; a web worker must not mutate a
+# shared LLM's global timeout or thinking budget while another case runs.
+NODE_REQUEST_LIMITS = ContextVar('node_request_limits', default=None)
+
+
+class ScopedRequestDeadline(TimeoutError):
+    """A dispatched request exceeded a scoped wall-clock deadline."""
+
+
+def _completion_with_deadline(client,kwargs,seconds):
+    """Bound elapsed time, not just socket inactivity.
+
+    Some gateways keep a connection alive or eventually return an empty
+    response. HTTP read timeouts alone do not cap total elapsed time. On a
+    deadline the caller closes the client, records the dispatch as unknown,
+    retains the budget reservation and stops; no late response is accepted
+    and no retransmission is made. A daemon worker cannot hold CLI shutdown.
+    """
+    done=Event();result=[]
+    def receive():
+        try:result.append((True,client.chat.completions.create(**kwargs)))
+        except BaseException as exc:result.append((False,exc))
+        finally:done.set()
+    Thread(target=receive,name='scoped-model-request',daemon=True).start()
+    if not done.wait(seconds):raise ScopedRequestDeadline(f'节点模型请求超过 {seconds:g} 秒墙时上限；已调用传输，服务结果和用量尚未确认')
+    ok,value=result[0]
+    if not ok:raise value
+    return value
 
 
 def _first(paths) -> Path | None:
@@ -710,6 +739,7 @@ class LLM:
 
     def _client(self, think: bool = False):
         timeout = self.think_timeout if think else self.timeout
+        if limits:=NODE_REQUEST_LIMITS.get():timeout=min(timeout,limits[0])
         if self.run_budget is not None:
             timeout = self.run_budget.request_timeout(timeout)
         client = openai_client(self.base_url, self.api_key, timeout)
@@ -785,8 +815,10 @@ class LLM:
                 probe.install(client)
             if budget is not None:
                 budget.ensure_request_window(self)  # client setup may consume the remaining admission margin
+            limits=NODE_REQUEST_LIMITS.get()
+            deadline=budget.request_timeout(limits[0]) if limits and budget is not None else limits[0] if limits else None
             sent = True
-            resp = client.chat.completions.create(**kwargs)
+            resp = _completion_with_deadline(client,kwargs,deadline) if deadline is not None else client.chat.completions.create(**kwargs)
             response_received = True
             reported = self._usage(resp, t0)
             if budget is not None and reported:
@@ -802,7 +834,9 @@ class LLM:
                 self.last_call.update(error_type=failure['type'], error_message=failure['message'], request_error=failure)
         except Exception as exc:
             request_exception = exc
-            not_sent = probe.not_sent(exc) if probe is not None else False
+            # A wall deadline does not prove whether the server received the
+            # request, even when a transport probe has incomplete observations.
+            not_sent = probe.not_sent(exc) if probe is not None and not isinstance(exc,ScopedRequestDeadline) else False
             status = getattr(exc, 'status_code', None)
             response_received = (response_received or getattr(exc, 'response', None) is not None
                                  or isinstance(status, int) and 100 <= status <= 599)
@@ -851,13 +885,15 @@ class LLM:
 
     def _think(self, think: bool, body: dict, max_tokens: int) -> tuple[bool, dict, int]:
         """这一步是否真的思考、请求参数、输出上限。模型不能切换思考时照常调用。"""
+        limits=NODE_REQUEST_LIMITS.get()
         if not (think and self.can_think):
-            return False, body, max_tokens
+            return False, body, min(max_tokens,limits[1]) if limits else max_tokens
         thinking_body = self.think_body
         scoped = BASIS_PART_REASONING.get()
         if scoped is not None and scoped[0] is self:
             thinking_body = {**(thinking_body or {}), 'reasoning_effort': scoped[1]}
-        return True, _merge(body, thinking_body), max(max_tokens, self.think_max_tokens)
+        requested=max(max_tokens,self.think_max_tokens)
+        return True, _merge(body, thinking_body), min(requested,limits[1]) if limits else requested
 
     def context_window(self) -> int | None:
         """模型服务的上下文长度（vLLM 在 /models 里返回 max_model_len）；查不到返回 None，不影响调用。"""

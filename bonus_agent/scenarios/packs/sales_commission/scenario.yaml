@@ -3,3 +3,4 @@
 id: sales_commission
 name: 提成奖金计算
 description: 按月计算销售提成。
+execution: sales_commission_v2

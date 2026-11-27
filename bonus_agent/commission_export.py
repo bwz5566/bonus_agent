@@ -34,16 +34,27 @@ def result_object(basis,settlement,state):
     for key,row in basis['projects'].items():
         nid='项目:'+key
         nodes[nid]=NodeResult(nid,'项目',key,key,None,'0',str(row['payable']),str(row['alloc']),False)
-    people=[{'name':x['name'],'final':str(x['amount']),'held':str(x['amount'] if x['destination']=='pending' else ZERO),
-             'paid':str(x['amount'] if x['destination']=='person' else ZERO),'holds':{},'destination':x['destination'],'raw':str(x['raw'])}
+    people=[{'name':x['name'],**({'person_id':x['id']} if 'id' in x else {}),'final':str(x.get('entitled',x['amount'])),'held':str(x['amount'] if x['destination']=='pending' else ZERO),
+             'paid':str(x['amount'] if x['destination']=='person' else ZERO),'holds':{},'destination':x['destination'],'raw':str(x['raw']),
+             **({'person_metrics':jsonable_metrics(x['metrics']),'person_deductions':jsonable_metrics(x['destinations'])} if 'metrics' in x else {})}
             for x in settlement['people']]
     revision_contract={'specs':state['specs'],'rules':state.get('active_rules',[]),'recipients':state.get('recipient_overrides',[])}
-    return Result('提成奖','fixed-commission-v1',ENGINE_VERSION,fingerprint({'files':state['files'],'contract':revision_contract,'basis':fingerprint(basis),'settlement':fingerprint(settlement),'profile':state['profile'],'revision':state.get('revision_id','')}),
+    adaptive=state.get('mode')=='sales_commission_v2'
+    if adaptive:revision_contract.update(basis=state.get('adaptive_basis_contract'),roster=state.get('adaptive_roster_contract'))
+    totals=[(k,str(v)) for k,v in basis['totals'].items()]
+    if personal:=settlement.get('person_basis'):totals.extend(('人员层：'+k,str(v)) for k,v in personal['totals'].items())
+    reconciliation={'name':'人员与待分配舍入对账','total':str(basis['sums']['alloc']),'allocated':str(settlement['allocated']),
+                              'pending':str(settlement['pending']),'residual':str(settlement['residual'])}
+    if bridge:=settlement.get('funding_bridge'):reconciliation['funding_bridge']=jsonable_metrics(bridge)
+    return Result('提成奖','adaptive-commission-v2' if adaptive else 'fixed-commission-v1',ENGINE_VERSION,fingerprint({'files':state['files'],'contract':revision_contract,'basis':fingerprint(basis),'settlement':fingerprint(settlement),'profile':state['profile'],'revision':state.get('revision_id','')}),
                   str(basis['sums']['alloc']),str(basis['pool']),['项目'],nodes,{}, {},[],data_hash=fingerprint(state['files']),
-                  totals=[(k,str(v)) for k,v in basis['totals'].items()],people=people,
-                  rounding=[{'name':'人员与待分配舍入对账','total':str(basis['sums']['alloc']),'allocated':str(settlement['allocated']),
-                             'pending':str(settlement['pending']),'residual':str(settlement['residual'])}],
+                  totals=totals,people=people,rounding=[reconciliation],
                   rules_hash=fingerprint(revision_contract))
+
+
+def jsonable_metrics(value):
+    import json
+    return json.loads(json.dumps(value,ensure_ascii=False,default=str))
 
 
 def write_workbook(path,basis,settlement,specs,state,*,catalog,report_metadata=None):

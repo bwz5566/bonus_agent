@@ -47,6 +47,29 @@ def transport(monkeypatch, responses=None):
     return client
 
 
+def test_scoped_wall_deadline_keeps_unknown_usage_and_never_retries(monkeypatch):
+    import threading,time
+    from bonus_agent.llm import NODE_REQUEST_LIMITS
+    entered=threading.Event();release=threading.Event()
+    def delayed_response():
+        entered.set();release.wait(3);return response()
+    client=transport(monkeypatch,[delayed_response]);llm=model()
+    budget=RunBudget(0,100_000).bind(llm);token=NODE_REQUEST_LIMITS.set((0.08,500))
+    started=time.monotonic()
+    try:
+        with pytest.raises(LLMError,match='ScopedRequestDeadline|墙时'):
+            llm.chat([{'role':'user','content':'test delayed provider'}],max_tokens=500)
+        assert entered.is_set() and time.monotonic()-started<1.5
+        assert len(client.requests)==1
+        state=budget.snapshot();assert state['unconfirmed_reserved_tokens']>0 and state['actual_used_tokens']==0
+        assert llm.last_call['request_attempts'][0]['dispatch_status']=='unknown'
+        with pytest.raises(RunBudgetError,match='用量未确认'):
+            llm.chat([{'role':'user','content':'must not resend'}],max_tokens=500)
+        assert len(client.requests)==1
+    finally:
+        release.set();NODE_REQUEST_LIMITS.reset(token)
+
+
 @pytest.mark.parametrize('error_type, switched', [
     ('exceeded_current_quota_error', True), ('rate_limit_reached_error', False), ('engine_overloaded_error', False)
 ])

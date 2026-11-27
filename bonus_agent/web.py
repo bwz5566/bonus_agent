@@ -674,23 +674,30 @@ def commission_feedback_section(cid, out, case, csrf, editor, approver, busy):
     action=f'/cases/{cid}/commission-feedback'
     buttons="<p><button name='run' value='1'>登记并开始复核</button> <button name='run' value='0'>仅登记，稍后运行</button></p>"
     options=''.join(f"<option value='{e(k)}'>{e(v)}</option>" for k,v in cr.OWNERS.items() if k!='settlement')
-    dissent=version+"<input type='hidden' name='kind' value='discrepancy'>"+"<p>范围：<select name='stage'><option value='unknown'>自动定位（总额/项目）</option><option value='basis'>项目/总额</option><option value='settlement'>人员分配</option><option value='output'>报表回读</option></select></p>"+f"<p>已知环节（可不选）：<select name='owner'><option value=''>自动定位</option>{options}</select></p>"+"<p>项目四键（可不填，多个换行）：<textarea name='project_keys' rows='2'></textarea></p>"+"<textarea name='description' rows='3' required placeholder='具体金额/指标有误或疑义；说明实际看到什么、期望核对什么。'></textarea>"+"<input type='text' name='observed' placeholder='现值或反例（可选）'><input type='text' name='evidence' placeholder='材料文件、行列、条款依据（可选）'>"+buttons
+    dissent=version+"<input type='hidden' name='kind' value='discrepancy'>"+"<p>范围：<select name='stage'><option value='unknown'>自动定位（总额/项目）</option><option value='basis'>项目/总额</option><option value='settlement'>人员分配</option><option value='output'>报表回读</option></select></p>"+f"<p>已知环节（可不选）：<select name='owner'><option value=''>自动定位</option>{options}</select></p>"+"<p>本版项目唯一键（可不填，多个换行）：<textarea name='project_keys' rows='2'></textarea></p>"+"<textarea name='description' rows='3' required placeholder='具体金额/指标有误或疑义；说明实际看到什么、期望核对什么。'></textarea>"+"<input type='text' name='observed' placeholder='现值或反例（可选）'><input type='text' name='evidence' placeholder='材料文件、行列、条款依据（可选）'>"+buttons
     body+='<details open><summary><b>总额有误 / 撤回确认 / 人员金额有误</b></summary>'+form(action,dissent,csrf)+'</details>'
     if approver:
         available=[]
-        for key,(node,path,_,label,typ) in cr.FIELDS.items():
-            try:old=cr._get(state['specs'][node],path)
-            except KeyError:continue
-            choices='；可选 '+ '/'.join(f'{v}（{cr.VALUE_LABELS.get(v,v)}）' for v in typ) if isinstance(typ,tuple) else ''
-            available.append(f"<option value='{e(key)}'>{e(label)}（当前 {e(old)}{e(choices)}）</option>")
+        dynamic=state.get('mode')=='sales_commission_v2'
+        if dynamic:
+            for key,choice in cr.adaptive_rule_fields(state).items():
+                available.append(f"<option value='{e(key)}'>{e(choice['label'])}（{e(choice['old'][:220])}）</option>")
+        else:
+            for key,(node,path,_,label,typ) in cr.FIELDS.items():
+                try:old=cr._get(state['specs'][node],path)
+                except KeyError:continue
+                choices='；可选 '+ '/'.join(f'{v}（{cr.VALUE_LABELS.get(v,v)}）' for v in typ) if isinstance(typ,tuple) else ''
+                available.append(f"<option value='{e(key)}'>{e(label)}（当前 {e(old)}{e(choices)}）</option>")
         if available:
-            fields=version+"<input type='hidden' name='kind' value='rule_change'>"+f"<p>被替代的规则：<select name='field'>{''.join(available)}</select></p>"+"<p>明确新值：<input name='value' type='text' required placeholder='例如 24、multiplicative、after_sum'></p>"+"<p>适用范围：<select name='scope'><option value='this_case'>仅本案</option><option value='this_period'>指定月份的场景</option><option value='future_periods'>从指定月份开始</option><option value='scenario'>场景指定有效区间</option></select></p>"+"<p>生效月份（跨案必填）：<input name='effective_from' type='month'> 终止月份（可选）：<input name='effective_to' type='month'></p>"+"<textarea name='description' rows='3' required placeholder='新规则、替代原因及适用范围；此操作是正式财务确认，不是期望答案。'></textarea>"+"<input name='evidence' type='text' placeholder='制度文件/会议/财务确认依据'>"+buttons
+            new_rule=("<p>完整新规则（含条件、公式、单位和适用范围）：<textarea name='value' rows='4' required placeholder='例如：提成总额=净销售额×提成率×回款及时率系数；回款数据以合同编号关联。'></textarea></p>" if dynamic else "<p>明确新值：<input name='value' type='text' required placeholder='例如 24、multiplicative、after_sum'></p>")
+            fields=version+"<input type='hidden' name='kind' value='rule_change'>"+f"<p>替代或新增规则：<select name='field'>{''.join(available)}</select></p>"+new_rule+"<p>适用范围：<select name='scope'><option value='this_case'>仅本案</option><option value='this_period'>指定月份的场景</option><option value='future_periods'>从指定月份开始</option><option value='scenario'>场景指定有效区间</option></select></p>"+"<p>生效月份（跨案必填）：<input name='effective_from' type='month'> 终止月份（可选）：<input name='effective_to' type='month'></p>"+"<textarea name='description' rows='3' required placeholder='新规则、替代原因及适用范围；此操作是正式财务确认，不是期望答案。'></textarea>"+"<input name='evidence' type='text' placeholder='制度文件/会议/财务确认依据'>"+buttons
             body+='<details><summary><b>调整业务规则及登记适用版本</b></summary>'+form(action,fields,csrf)+'</details>'
         projects=(state.get('basis_view') or {}).get('projects',{})
-        if projects:
+        if projects and cr.roles_for_state(state):
             choices=''.join(f"<option value='{e(p)}'>{e(p)} · {e(v['alloc'])} 元</option>" for p,v in projects.items())
-            roles=''.join(f"<option>{e(r)}</option>" for r in cr.ROLES)
-            recipients=version+"<input type='hidden' name='kind' value='recipient_change'>"+f"<p>项目：<select name='project_keys'>{choices}</select></p><p>角色：<select name='role'>{roles}</select></p>"+"<input type='text' name='shares' required placeholder='例如 张三70%，李四30%'><textarea name='description' rows='2' required placeholder='本项目本角色实际名单变更原因；未指定的剩余份额保留待分配。'></textarea>"+buttons
+            roles=''.join(f"<option value='{e(k)}'>{e(v)}</option>" for k,v in cr.roles_for_state(state).items())
+            example='例如 A001:张三70%，A002:李四30%' if dynamic else '例如 张三70%，李四30%'
+            recipients=version+"<input type='hidden' name='kind' value='recipient_change'>"+f"<p>项目：<select name='project_keys'>{choices}</select></p><p>角色：<select name='role'>{roles}</select></p>"+f"<input type='text' name='shares' required placeholder='{example}'><textarea name='description' rows='2' required placeholder='本项目本角色实际名单变更原因；未指定的剩余份额保留待分配。'></textarea>"+buttons
             body+='<details><summary><b>仅修订指定项目角色的人员份额</b></summary>'+form(action,recipients,csrf)+'</details>'
     body+='<p class="mut">更正材料使用原上传入口，程序自动登记失效范围。新公式超出当前可复用算子时，不会擅自猜测，请提供正式材料后核对扩展需求。</p>'
     return '<section><h2>财务反馈与版本修订</h2>'+body+'</section>'
@@ -1038,6 +1045,9 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
                    ('project_policy','计算基数/新老/阶梯'),('coefficient_policy','各考核系数'),('hold_policy','提成总额/暂扣/项目舍入'),
                    ('basis','项目基础金额'),('basis_review','独立项目复核'),('confirm_basis','本版总额确认'),('roster','人员名单及角色'),
                    ('settlement','逐角色与人员汇总'),('settlement_review','人员独立复核'),('export','正式输出回读')]
+            from bonus_agent.commission_chain import ADAPTIVE_MODE,workflow_manifest
+            adaptive_view=fixed.get('mode')==ADAPTIVE_MODE
+            if adaptive_view:names=[(n['id'],n['name']) for n in workflow_manifest(ADAPTIVE_MODE)['nodes']]
             observed={x.get('node'):x for x in fixed.get('events',[])}
             lines=[]
             for node,label in names:
@@ -1045,7 +1055,7 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
                 passed=cr.approval_matches(fixed) if node=='confirm_basis' else r.get('status')=='PASS'
                 text='已核验' if passed else '有反例' if r.get('status')=='FAIL' else '等待执行/确认'
                 lines.append(f"<tr><td>{e(label)}</td><td class='{'ok' if passed else 'warn'}'>{e(text)}</td><td>{e(r.get('reviewer') or r.get('model') or '程序')}</td></tr>")
-            parts.append("<section><h2>固定提成核算节点</h2><p class='mut'>节点通过代表已保存本版本验收回执；实际财务金额仍须独立核对。</p>"
+            parts.append("<section><h2>"+('自适应提成核算节点' if adaptive_view else '固定提成核算节点')+"</h2><p class='mut'>节点通过代表已保存本版本验收回执；实际财务金额仍须独立核对。</p>"
                          "<div class='wrap'><table><thead><tr><th>节点</th><th>状态</th><th>处理者</th></tr></thead><tbody>"+''.join(lines)+"</tbody></table></div>"
                          +(f"<p class='bad'>{e(fixed['error'])}</p>" if fixed.get('status')=='FAILED' and fixed.get('error') else '')+"</section>")
         if fixed_saved:parts.append(commission_feedback_section(cid,out,case,csrf,editor,approver,busy))
@@ -1440,7 +1450,7 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             revision=cr.submit(d/'out',by=u['display'],kind=kind,stage=str(f.get('stage','unknown')),
                 owner=str(f.get('owner','')),description=str(f.get('description',''))[:20000],
                 project_keys=str(f.get('project_keys','')).splitlines(),observed=str(f.get('observed',''))[:2000],
-                evidence=str(f.get('evidence',''))[:4000],field=str(f.get('field','')),value=str(f.get('value',''))[:200],
+                evidence=str(f.get('evidence',''))[:4000],field=str(f.get('field','')),value=str(f.get('value','')),
                 scope=str(f.get('scope','this_case')),effective_from=str(f.get('effective_from','')),
                 effective_to=str(f.get('effective_to','')),role=str(f.get('role','')),shares=str(f.get('shares',''))[:8000],
                 rule_store=rule_store,approver='approver' in u['roles'],base_version=str(f.get('base_version','')))
@@ -1551,9 +1561,13 @@ def create_app(root: str | Path, llm_factory: Callable[[], object], *, max_paral
             try:
                 with cs.case_lock(out):
                     obj=cs.load_case(out)
-                    if cr.state_of(obj):
-                        from bonus_agent.commission_chain import one_month
-                        one_month(period)
+                    if fixed:=cr.state_of(obj):
+                        if fixed.get('mode')=='sales_commission_v2':
+                            from bonus_core.data.period import Period
+                            if Period.parse(period) is None:raise ValueError('必须明确核算期间')
+                        else:
+                            from bonus_agent.commission_chain import one_month
+                            one_month(period)
                         cr.submit_locked(out,obj,by=u['display'],kind='material_correction',description=f"核算期间由 {m.get('period')} 改为 {period}")
             except (ValueError,cs.CaseBusyError) as err:return back(cid,f'不能修改本案卷期间：{err}')
         if period:

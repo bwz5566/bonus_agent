@@ -55,6 +55,22 @@ def test_high_repair_profile_is_explicit_and_keeps_low_profile_unchanged():
     assert low.think_body['reasoning_effort'] == 'low' and low.min_request_seconds == 120
 
 
+def test_adaptive_node_limits_are_scoped_and_do_not_change_global_model(monkeypatch):
+    from bonus_agent.llm import NODE_REQUEST_LIMITS
+    llm=LLM.from_config('deepseek-v4-pro',config());seen=[]
+    monkeypatch.setattr('bonus_agent.llm.openai_client',lambda base,key,timeout:seen.append(timeout) or object())
+    original=(llm.timeout,llm.think_timeout,llm.think_max_tokens)
+    token=NODE_REQUEST_LIMITS.set((240,8192))
+    try:
+        assert llm._think(True,{},8192)[2]==8192
+        llm._client(True);assert seen[-1]==min(original[1],240)
+        assert llm._think(False,{},10000)[2]==8192
+        assert (llm.timeout,llm.think_timeout,llm.think_max_tokens)==original
+    finally:NODE_REQUEST_LIMITS.reset(token)
+    assert llm._think(True,{},8192)[2]==max(8192,original[2])
+    llm._client(True);assert seen[-1]==original[1]
+
+
 @pytest.mark.parametrize('value', ['true', 'false', 1, None])
 def test_tools_thinking_is_a_boolean_config_option(value):
     cfg = config()

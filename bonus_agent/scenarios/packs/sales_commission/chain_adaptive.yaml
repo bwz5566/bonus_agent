@@ -1,0 +1,55 @@
+version: 2
+description: 自适应提成核算节点。固定依赖和验证要求；实际计算对象、关联键、指标、规则参数、角色、人员层和资金去向均由本批证据决定。
+nodes:
+  - id: inventory
+    name: 来源盘点与规则版本
+    needs: []
+    acceptance: 所有材料、物理表、实际原文和有效版本均登记，不能用期望答案或文件名代替原件。
+  - id: scope_mapping
+    name: 原文规则覆盖与主对象绑定
+    needs: [inventory]
+    acceptance: 每条实际原文分类并确定计算层级，主集合、业务键、粒度和物理行覆盖有证据。
+  - id: reference_mapping
+    name: 补充数据与关联完整性
+    needs: [inventory]
+    acceptance: 按实际关联键、期间、单位及重复记录口径绑定补充数据，记录实际缺失或多义反例。
+  - id: project_policy
+    name: 基础指标与计算规则
+    needs: [scope_mapping, reference_mapping]
+    acceptance: 按本批原文编译具名指标、表达式、参数及分支；明示公式的所有符号实际绑定。
+  - id: coefficient_policy
+    name: 调节指标与计算依赖
+    needs: [reference_mapping, project_policy]
+    acceptance: 按本批需要编译调节指标、约束及实际依赖；没有调节规则则不创造默认系数。
+  - id: hold_policy
+    name: 资金去向与主对象结算规则
+    needs: [project_policy, coefficient_policy]
+    acceptance: 实际金额指标、调节、扣减、归属基数和舍入由当前规则决定，所有资金去向闭合。
+  - id: basis
+    name: 主对象逐项确定性核算
+    needs: [scope_mapping, reference_mapping, project_policy, coefficient_policy, hold_policy]
+    acceptance: 每个真实对象按具名指标依赖顺序复算，精确算术路径一致，保留来源与中间过程。
+  - id: basis_review
+    name: 独立主对象复核
+    needs: [basis]
+    acceptance: 独立模型复查真实原文及对应指标，具体反例返回责任构件，不以期待金额调整规则。
+  - id: confirm_basis
+    name: 本版本总额确认
+    needs: [basis_review]
+    acceptance: 由实际用户确认当前来源、规则合同和金额凭据；相关变更使旧确认失效。
+  - id: roster
+    name: 真实归属关系与人员层规则
+    needs: [confirm_basis]
+    acceptance: 按真实身份及分配关系绑定全部角色或直接归属；人员层聚合及后续政策单独编译。
+  - id: settlement
+    name: 人员归属、汇总与实发核算
+    needs: [roster]
+    acceptance: 逐对象、逐身份计算，按本批人员层规则计算应得、扣抵、实发等适用指标及资金去向。
+  - id: settlement_review
+    name: 独立人员层复核
+    needs: [settlement]
+    acceptance: 对实际姓名和身份、来源、归属、人员层指标与资金关系逐项独立复核。
+  - id: export
+    name: 当前需求报表与回读
+    needs: [settlement_review]
+    acceptance: 按本批真实输出要求生成可追溯底稿；全部主对象、人员及资金指标回读一致。

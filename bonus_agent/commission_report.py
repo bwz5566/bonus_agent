@@ -44,13 +44,22 @@ def reexport_fixed_case(out: Path,by: str):
         catalog=Catalog(paths);specs=copy.deepcopy(state['specs']);rules=state.get('active_rules',[])
         overrides=cr.recipient_overrides(cr.load(out),state['period'])
         if overrides!=state.get('recipient_overrides',[]):raise cs.ConfirmError('人员修订版本已变化，须重新核算。')
-        for node in (*NODE_ORDER[:5],'roster'):cr.apply_rule_versions(catalog,specs[node],node,rules)
-        if fingerprint(specs)!=fingerprint(state['specs']):raise cs.ConfirmError('当前规则合同与已核验合同不同，不能仅修订报表。')
-        source_key=fingerprint(state['files'])[:16]
-        basis=calculate_basis(catalog,specs,state['period'],context={
-            'history_single_month_confirmed':history_confirmation(state.get('questions',[]),state['period'],source_key),'source_key':source_key})
-        cr.attach_recipient_sources(catalog,overrides)
-        settlement=calculate_settlement(catalog,specs['roster'],basis,state['period'],recipient_overrides=overrides)
+        dynamic=state.get('mode')=='sales_commission_v2'
+        if dynamic:
+            from bonus_agent.adaptive_rules import attach_authorized_rules,attach_image_authority
+            from bonus_agent.adaptive_compiler import replay_settlement
+            from bonus_agent.adaptive_export import FORMAT,write_adaptive_workbook
+            attach_authorized_rules(catalog,rules)
+            attach_image_authority(catalog,state.get('questions',[]))
+            _,basis,settlement,_=replay_settlement(catalog,state['adaptive_basis_contract'],state['adaptive_roster_contract'],state['period'],overrides=overrides)
+        else:
+            for node in (*NODE_ORDER[:5],'roster'):cr.apply_rule_versions(catalog,specs[node],node,rules)
+            if fingerprint(specs)!=fingerprint(state['specs']):raise cs.ConfirmError('当前规则合同与已核验合同不同，不能仅修订报表。')
+            source_key=fingerprint(state['files'])[:16]
+            basis=calculate_basis(catalog,specs,state['period'],context={
+                'history_single_month_confirmed':history_confirmation(state.get('questions',[]),state['period'],source_key),'source_key':source_key})
+            cr.attach_recipient_sources(catalog,overrides)
+            settlement=calculate_settlement(catalog,specs['roster'],basis,state['period'],recipient_overrides=overrides)
         if fingerprint(basis)!=state['basis_digest'] or fingerprint(basis)!=fingerprint(frozen['basis']):
             raise cs.ConfirmError('逐项目复算与原批准的实际核算不一致；须发起财务修订，不能只更改报表。')
         if fingerprint(settlement)!=fingerprint(frozen['settlement']):
@@ -64,11 +73,15 @@ def reexport_fixed_case(out: Path,by: str):
               'source_settlement_digest':fingerprint(settlement),'source_details_sha256':cs.sha256(details),
               'source_workbook_sha256':cs.sha256(original),'source_case_sha256':original_case_hash,
               'source_total_approval':state['approval'],'source_final_confirmation':final_confirmation if final_confirmation.get('round')==rnd['n'] else None,
-              'format':REPORT_FORMAT_VERSION,'export_profile':report_profile(),'provider_calls':0,
+              'format':FORMAT if dynamic else REPORT_FORMAT_VERSION,'export_profile':cs.sha256(Path(__file__).with_name('adaptive_export.py')) if dynamic else report_profile(),'provider_calls':0,
               'financial_amounts_changed':False,'new_financial_approval':False}
         workbook=dest/'result.xlsx'
-        proof=write_workbook(workbook,basis,settlement,specs,state,catalog=catalog,report_metadata=meta)
-        if proof['export_profile']!=meta['export_profile']:raise cs.ConfirmError('报表生成过程中导出程序版本发生变化，未发布新版。')
+        if dynamic:
+            proof=write_adaptive_workbook(workbook,basis,settlement,state,layout=state.get('adaptive_output_contract'))
+            if cs.sha256(Path(__file__).with_name('adaptive_export.py'))!=meta['export_profile']:raise cs.ConfirmError('报表生成过程中导出代码发生变化，未发布新版。')
+        else:
+            proof=write_workbook(workbook,basis,settlement,specs,state,catalog=catalog,report_metadata=meta)
+            if proof['export_profile']!=meta['export_profile']:raise cs.ConfirmError('报表生成过程中导出程序版本发生变化，未发布新版。')
         if cs.fingerprint(paths)!=state['files'] or cs.sha256(details)!=outputs['details'][1] or cs.sha256(original)!=outputs['excel'][1] or cs.sha256(out/cs.CASE_FILE)!=original_case_hash:
             raise cs.ConfirmError('报表导出期间核验版本发生变化；未发布本版报表。')
         meta.update(status='PASS',workbook='result.xlsx',workbook_sha256=cs.sha256(workbook),readback=proof,

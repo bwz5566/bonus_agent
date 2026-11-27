@@ -19,6 +19,9 @@ class Block:
     text: str = ""
     image: bytes | None = None
     mime: str | None = None
+    # Preserve physical cells as well as the human-readable Markdown. The
+    # numerical rule compiler must not re-extract values from rendered text.
+    cells: list[list] | None = None
 
     def label(self) -> str:
         loc = f"{self.doc}" + (f" 第{self.page}页" if self.page else "")
@@ -67,7 +70,8 @@ def parse_docx(path: Path) -> ParsedDoc:
                     out.blocks.append(Block(path.name, None, "image", image=part.blob, mime=part.content_type))
         elif el.tag == qn("w:tbl"):
             t = docx.table.Table(el, d)
-            out.blocks.append(Block(path.name, None, "table", md_table([[c.text for c in r.cells] for r in t.rows])))
+            cells = [[c.text for c in r.cells] for r in t.rows]
+            out.blocks.append(Block(path.name, None, "table", md_table(cells), cells=cells))
     return out
 
 
@@ -90,10 +94,10 @@ def parse_pptx(path: Path) -> ParsedDoc:
             for i, c in enumerate(cats):
                 rows.append([c] + [s.values[i] for s in ch.series])
             title = ch.chart_title.text_frame.text if ch.has_title else ""
-            out.blocks.append(Block(path.name, page, "chart", (f"图表：{title}\n" if title else "") + md_table(rows)))
+            out.blocks.append(Block(path.name, page, "chart", (f"图表：{title}\n" if title else "") + md_table(rows), cells=rows))
         elif getattr(shape, "has_table", False) and shape.has_table:
             rows = [[c.text for c in r.cells] for r in shape.table.rows]
-            out.blocks.append(Block(path.name, page, "table", md_table(rows)))
+            out.blocks.append(Block(path.name, page, "table", md_table(rows), cells=rows))
         elif shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
             out.blocks.append(Block(path.name, page, "image", image=shape.image.blob, mime=shape.image.content_type))
         elif getattr(shape, "has_text_frame", False) and shape.has_text_frame:
@@ -120,7 +124,7 @@ def parse_xlsx(path: Path, max_rows: int = 200) -> ParsedDoc:
         rows = [list(r) for r in ws.iter_rows(values_only=True)][:max_rows]
         t = md_table(rows)
         if t:
-            out.blocks.append(Block(path.name, i, "table", f"工作表：{ws.title}\n{t}"))
+            out.blocks.append(Block(path.name, i, "table", f"工作表：{ws.title}\n{t}", cells=rows))
     return out
 
 
@@ -147,9 +151,10 @@ def parse_pdf(path: Path, dpi: int = 150) -> ParsedDoc:
             if text:
                 out.blocks.append(Block(path.name, i, "text", text))
             for t in tables:
-                md = md_table(t.extract())
+                cells = t.extract()
+                md = md_table(cells)
                 if md:
-                    out.blocks.append(Block(path.name, i, "table", md))
+                    out.blocks.append(Block(path.name, i, "table", md, cells=cells))
             area = float(page.width * page.height) or 1.0
             pics = sum(abs((im["x1"] - im["x0"]) * (im["bottom"] - im["top"])) for im in page.images)
             if len(text) + sum(len(b.text) for b in out.blocks if b.page == i and b.kind == "table") < SCAN_CHARS \
@@ -193,7 +198,7 @@ def parse_text(path: Path) -> ParsedDoc:
 
 PARSERS = {".docx": parse_docx, ".pptx": parse_pptx, ".pdf": parse_pdf, ".xlsx": parse_xlsx, ".xlsm": parse_xlsx,
            ".png": parse_image, ".jpg": parse_image, ".jpeg": parse_image,
-           ".txt": parse_text, ".md": parse_text, ".json": parse_text, ".csv": parse_text}
+           ".txt": parse_text, ".md": parse_text, ".json": parse_text, ".csv": parse_text, ".tsv": parse_text}
 
 
 def parse_any(path: str | Path) -> ParsedDoc:

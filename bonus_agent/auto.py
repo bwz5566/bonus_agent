@@ -49,7 +49,7 @@ class TooManyFiles(ValueError):
     pass
 
 
-def collect_files(paths: list[str | Path], exclude: list[str | Path] = (), max_files: int = MAX_FILES) -> list[Path]:
+def collect_files(paths: list[str | Path], exclude: list[str | Path] = (), max_files: int = MAX_FILES, *, strict_formats: bool = False) -> list[Path]:
     """展开文件夹，跳过临时文件、程序目录和输出目录。一批计算应只包含本批次的文件。"""
     skip = [Path(e).resolve() for e in exclude]
     out: list[Path] = []
@@ -62,15 +62,17 @@ def collect_files(paths: list[str | Path], exclude: list[str | Path] = (), max_f
             rel = f.relative_to(p).parts[:-1] if p.is_dir() else ()
             if f.name.startswith(("~$", ".")):
                 continue
-            if f.suffix.lower() not in PARSERS:
-                unsupported.append(f.name)
-                continue
             if any(part in SKIP_DIRS or part.endswith(".egg-info") for part in rel):
                 continue
             rf = f.resolve()
             if any(rf.is_relative_to(e) for e in skip) or rf in out:
                 continue
+            if f.suffix.lower() not in PARSERS:
+                unsupported.append(f.name)
+                continue
             out.append(rf)
+    if strict_formats and unsupported:
+        raise ValueError(f'本批包含未支持的输入文件 {unsupported[:20]}；不能在未读取全部材料时发布财务结果，请转换为受支持格式或从本批输入明确移除。')
     if not out and unsupported:
         old = [n for n in unsupported if Path(n).suffix.lower() in (".doc", ".xls", ".ppt")]
         raise FileNotFoundError(f"找到 {len(unsupported)} 个文件，但格式都不支持：{unsupported[:10]}"

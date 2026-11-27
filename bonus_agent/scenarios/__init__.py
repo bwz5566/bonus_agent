@@ -92,7 +92,7 @@ class Scenario(_Strict):
     memory: bool = True               # 是否把发布时财务确认过的口径记为场景记忆，供下次编制参考
     acceptance: list[AcceptanceCase] = Field(default_factory=list)
     confirmed_batches: list[ConfirmedBatch] = Field(default_factory=list)
-    execution: Literal['generic','sales_commission_v1'] = 'generic'
+    execution: Literal['generic','sales_commission_v1','sales_commission_v2'] = 'generic'
     _dir: Path = PrivateAttr(default=Path("."))
 
     @field_validator("id")

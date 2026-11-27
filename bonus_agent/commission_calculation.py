@@ -17,6 +17,7 @@ from bonus_agent.commission_history import check_history_coverage
 from bonus_core.data.table import to_date
 from bonus_core.engine.commission import (ZERO, ONE, bracket, coefficient, rounded, tier_amount, tier_check,
                                             project_money, close_money, settle_project)
+from bonus_core.engine.intervals import parse_interval, ordered_intervals
 
 
 KEY = ('month','code','customer','product')
@@ -88,17 +89,6 @@ def _numbers(text):
     return [D(x) for x in re.findall(r'\d+(?:\.\d+)?',str(text).replace(',',''))]
 
 
-def _lower(label, *, percent):
-    s=str(label).replace('＜','<').replace('≤','<=').replace('－','-').replace('–','-')
-    n=_numbers(s)
-    if not n:
-        raise ChainError(f'区间标签缺少数值：{label!r}')
-    if s.lstrip().startswith('<') or '以下' in s or '以内' in s:
-        return ZERO
-    unit=D('.01') if percent else D(10000) if '万' in s else D(100000000) if '亿' in s else ONE
-    return n[0]*unit
-
-
 def _rate(text, *, percent=False, where=''):
     s=string(text).replace('％','%')
     if not re.fullmatch(r'[+-]?\d+(?:\.\d+)?\s*%?',s):
@@ -117,28 +107,14 @@ def _business_family(text):
 
 
 def _steps(bands, *, percent, includes, where):
-    # Preserve the source position for every threshold/rate pair. Sort by the
-    # mathematical lower bound, independent of PPT display direction.
-    rows=sorted([(_lower(label,percent=percent),value,label,source) for label,value,source in bands],key=lambda z:z[0])
-    if not rows or rows[0][0]!=0 or len({r[0] for r in rows})!=len(rows):
-        raise ChainError(f'{where}：首档/档位下限不唯一或不覆盖起点 {[(r[0],r[2]) for r in rows]}')
-    if len(includes)!=len(rows) or any(type(x) is not bool for x in includes):
-        raise ChainError(f'{where}：逐档端点归属数 {len(includes)} 与原文档数 {len(rows)} 不符')
-    # Verify explicit inclusivity where the original text settles it. A
-    # marker containing the lower value is stronger than an ambiguous dash.
-    for i,(value,_,label,_) in enumerate(rows):
-        if not i:continue
-        lo=_numbers(label)[0]
-        match=re.search(r'含\s*(\d+(?:\.\d+)?)\s*%',label)
-        if match and D(match[1])==lo and not includes[i]:
-            raise ChainError(f'{where}：{label} 已明确含下界，不能设为不含')
-        prev=rows[i-1][2]
-        if re.search(r'^\s*[<＜]\s*\d',prev) and '含' not in prev and not includes[i]:
-            raise ChainError(f'{where}：{prev} 明确不含上界，下档必须覆盖该值')
-        # A range ending in '(含)' includes its upper endpoint.
-        if re.search(r'[（(]\s*含\s*[）)]\s*$',prev) and includes[i]:
-            # For the first <X(含) or X–Y(含), this refers to the upper bound.
-            raise ChainError(f'{where}：{prev} 已含上界，下档不能重复包含')
+    # Do not manufacture a contiguous schedule from lower bounds alone.
+    # Read both literal endpoints/units before translating into the fast table.
+    try:
+        parsed=[parse_interval(label,percent=percent) for label,_,_ in bands]
+        order,bounds=ordered_intervals(parsed,includes)
+    except ValueError as exc:
+        raise ChainError(f'{where}：{exc}') from exc
+    rows=[(lo,bands[i][1],bands[i][0],bands[i][2]) for lo,i in zip(bounds,order)]
     return [(x,v,inc) for (x,v,_,_),inc in zip(rows,includes)], [dict(lower=x,rate=v,inclusive=inc,label=label,source=src) for (x,v,label,src),inc in zip(rows,includes)]
 
 
@@ -263,6 +239,17 @@ def compile_hold_policy(catalog,p,allowed):
     if type(p.get('project_round_digits')) is not int or p['project_round_digits'] not in range(0,7):
         raise ChainError('项目金额舍入位数无效')
     ev=catalog.evidence(p,('total','hold','freeze','project_round'),allowed)
+    # v1 is a specific calculation contract, not a generic formula reader.
+    # Never accept an explicit formula using a fifth factor merely because its
+    # citation exists. The adaptive program compiler handles other expressions.
+    raw=re.sub(r'\s+','',ev['total']['quote']).replace('×','*').replace('乘以','*').replace('＊','*')
+    if '*' in raw:
+        body=re.split(r'[=＝|：:]',raw)[-1].strip('。；;')
+        known=(r'阶梯(?:提成(?:金额)?|金额)',r'区域(?:达成(?:率)?)?系数',r'客户(?:达成(?:率)?)?系数',r'毛利(?:率)?系数')
+        terms=body.split('*')
+        matches=[next((j for j,pattern in enumerate(known) if re.fullmatch(pattern,t.strip('()（）'))),-1) for t in terms]
+        if sorted(matches)!=list(range(len(known))):
+            raise ChainError(f'原文提成总额公式超出固定v1算子：{ev["total"]["quote"]!r}；需按完整公式编制动态规则，不能沿用旧乘积',owner='hold_policy')
     quote=ev['hold']['quote'].replace(' ','')
     if '+' in quote and ('库存' in quote or '呆滞' in quote) and '逾期' in quote and p['hold_method']!='additive':raise ChainError('暂扣原文分别计算两项并相加，不能改为乘法')
     if ('到分' in ev['project_round']['quote'] or '保留到分' in ev['project_round']['quote']) and p['project_round_digits']!=2:raise ChainError('项目保留到分等于小数2位')
