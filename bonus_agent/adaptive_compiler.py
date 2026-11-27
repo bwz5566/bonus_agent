@@ -521,6 +521,20 @@ class AdaptiveCompiler:
             elif uid in proofs and proofs[uid].get('digest')==fingerprint(unit) and proofs[uid].get('answer_key')==answer_key and proofs[uid].get('receipt',{}).get('status')=='PASS' and (candidate:=self.state['specs'].get(proofs[uid].get('task'),{})) and fingerprint(candidate)==proofs[uid]['receipt'].get('output') and candidate.get('units',{}).get(uid)==proofs[uid]['proposal']:
                 proposals[uid]=deepcopy(proofs[uid]['proposal'])
             else:pending[uid]=unit
+        retained=self.state.get('unchanged_rule_candidates',{});revalidated=[]
+        for uid,unit in list(pending.items()):
+            digest=fingerprint(unit);old=retained.get(digest)
+            if not old or old.get('answer_key')!=answer_key or old.get('file')!=unit.get('file') or old.get('sha256')!=self.state.get('files',{}).get(unit.get('file')):continue
+            actual={'units':{uid:deepcopy(old['proposal'])}}
+            try:validate_clause_chunk({uid:unit},actual)
+            except ProgramError:continue
+            task='adaptive/recovered_rule/'+uid;proof={'status':'PASS','output':fingerprint(actual),'reviewer':old['reviewer'],'review':old['review_receipt'].get('review',''),
+                'confidence':'unchanged_original_source_real_review_revalidated','historical_task':old['historical_task'],'historical_unit':old['historical_unit'],
+                'historical_receipt':fingerprint(old['review_receipt']),'source_sha256':old['sha256'],'recovered':True}
+            self.state['specs'][task]=actual;self.state['receipts'][task]=proof;self.state.setdefault('task_owners',{})[task]='scope_mapping'
+            proposals[uid]=actual['units'][uid];proofs[uid]={'digest':digest,'answer_key':answer_key,'task':task,'proposal':deepcopy(proposals[uid]),'receipt':proof}
+            pending.pop(uid);revalidated.append(uid)
+        if revalidated:self.event('adaptive/rules/材料更正后原文重验',True,{'reused_units':revalidated,'note':'来源文件哈希及原文单元一致，真实旧独立复核已重新校验；本次数据绑定、金额及审批均重新执行'})
         # On a technical parser upgrade, recover individually valid clauses
         # from the actual independent model responses in this same case. Do
         # not make a failed large chunk erase unrelated correctly read units.

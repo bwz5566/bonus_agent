@@ -370,6 +370,40 @@ def test_rule_reviewer_can_correct_one_unit_without_replacing_the_batch(tmp_path
     assert len(accepted)==count and accepted[uid]['reason']=='独立逐条核对该原文'
 
 
+def test_corrected_business_material_reuses_only_unchanged_reviewed_rule_units(tmp_path):
+    paths=_write_sources(tmp_path/'materials');out=tmp_path/'case';c=Contracts();c.bad_gross=False
+    primary=FakeLLM(c.primary,name='fixture-flash');primary.checker_llm=FakeLLM(c.reviewer,name='fixture-pro')
+    scenario=SimpleNamespace(execution=ADAPTIVE_MODE,files=[],rule_store=None)
+    def run():return run_agent(primary,paths,out,scenario=scenario,period='2027-01',max_steps=300)
+    first=run();assert first.status=='AWAITING_TOTAL_CONFIRMATION',first.error
+    before=rv.state_of(cs.load_case(out));old_token=rv.receipt_token(before);old_amount=D(before['basis_view']['pool'])
+    old_rules=sum(json.loads(m[-1]['content'])['current_node'].startswith('adaptive/rules/') for m in primary.calls)
+    data=next(p for p in paths if p.name=='transactions.csv');original=data.read_text(encoding='utf8');assert ',1000' in original
+    data.write_text(original.replace(',1000',',1200',1),encoding='utf8')
+    rv.submit(out,by='测试财务（虚构材料修正）',kind='material_correction',description='修改实际销售明细中的一笔交易',source_changes=[data],approver=True)
+    second=run();assert second.status=='AWAITING_TOTAL_CONFIRMATION',second.error
+    after=rv.state_of(cs.load_case(out));assert D(after['basis_view']['pool'])>old_amount and rv.receipt_token(after)!=old_token
+    assert not after.get('approval') and sum(json.loads(m[-1]['content'])['current_node'].startswith('adaptive/rules/') for m in primary.calls)==old_rules
+    assert any(e['node']=='adaptive/rules/材料更正后原文重验' and e['status']=='PASS' for e in after['events'])
+    # Changed policy sources cannot inherit old unit reviews just because the
+    # row happens to share an identical-looking prefix.
+    from bonus_agent.commission_chain import unchanged_rule_candidates
+    files=deepcopy(after['files']);policy=next(k for k in files if k.endswith('.md'));files[policy]='changed'
+    assert all(x['file']!=policy for x in unchanged_rule_candidates(after,files,'fixture-pro').values())
+
+
+def test_table_review_reuse_carries_full_unit_digest_not_reduced_display_index():
+    from bonus_agent.commission_chain import unchanged_rule_candidates
+    from bonus_agent.recovery import fingerprint
+    source={'file':'actual-policy.pptx','where':'P2.T1.R2.C1','text':'服务 | 20%','table':'T1','row':2,'title':'服务费率'}
+    candidate={'units':{'T1R2':{'disposition':'operative','reason':'费率','clauses':[{'quote':'服务 | 20%','meaning':'实际制度费率','kind':'table','level':'primary','operation':'parameter'}]}}}
+    receipt={'status':'PASS','reviewer':'fixture-pro','output':fingerprint(candidate)}
+    stored={'files':{source['file']:'same-source-version'},'adaptive_rule_sources':{'T1R2':{k:source[k] for k in ('file','where','text')}},
+            'adaptive_rule_unit_proofs':{'T1R2':{'task':'review','digest':fingerprint(source),'receipt':receipt,'proposal':candidate['units']['T1R2'],'answer_key':fingerprint([])}},'specs':{'review':candidate}}
+    assert fingerprint(source) in unchanged_rule_candidates(stored,stored['files'],'fixture-pro')
+    assert not unchanged_rule_candidates(stored,{source['file']:'changed'},'fixture-pro')
+
+
 class PersonalContracts(Contracts):
     """A different layer graph: direct attribution, then employee calculation."""
     def __init__(self):

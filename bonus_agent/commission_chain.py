@@ -347,6 +347,30 @@ def archived_candidates(events,name):
     return pairs
 
 
+def unchanged_rule_candidates(stored,files,reviewer):
+    """A material correction invalidates the bindings, money and approvals.
+
+    Only independently reviewed *original rule units* from unchanged source
+    documents are eligible for fresh local validation. This never carries a
+    previous data mapping, evaluated amount, or financial confirmation.
+    """
+    retained={};old_files=stored.get('files',{});sources=stored.get('adaptive_rule_sources',{})
+    for uid,proof in stored.get('adaptive_rule_unit_proofs',{}).items():
+        source=sources.get(uid);receipt=proof.get('receipt',{});task=proof.get('task')
+        candidate=stored.get('specs',{}).get(task)
+        if not isinstance(source,dict) or not isinstance(candidate,dict) or not isinstance(candidate.get('units'),dict):continue
+        filename=source.get('file');digest=proof.get('digest')
+        if not filename or not files.get(filename) or files[filename]!=old_files.get(filename):continue
+        # The displayed source index intentionally drops table metadata. The
+        # recorded full unit digest (tested against the NEW full unit in the
+        # compiler) is the stronger identity, not a hash of that display.
+        if not isinstance(digest,str) or not re.fullmatch(r'[0-9a-f]{64}',digest) or receipt.get('status')!='PASS' or receipt.get('reviewer')!=reviewer:continue
+        if receipt.get('output')!=fingerprint(candidate) or candidate['units'].get(uid)!=proof.get('proposal'):continue
+        retained[digest]={'file':filename,'sha256':files[filename],'answer_key':proof.get('answer_key'),'proposal':copy.deepcopy(proof['proposal']),
+                          'reviewer':reviewer,'review_receipt':copy.deepcopy(receipt),'historical_task':task,'historical_unit':uid}
+    return retained
+
+
 def basis_contract_digest(state):
     contract={'files':state['files'],'period':state['period']}
     if state.get('mode')==ADAPTIVE_MODE:
@@ -470,6 +494,11 @@ def run_chain(llm,paths,out,*,scenario,period=None,answers=None,resume=True,max_
                 if proof:accepted[name]={'spec':copy.deepcopy(spec),'receipt':copy.deepcopy(proof)}
             state['prior_accepted_specs']=accepted
             if old_basis:=prior_approved_basis(stored,old):state['prior_approved_basis']=old_basis
+        elif adaptive and stored and stored.get('mode')==mode and stored.get('period')==label and last.get('model')==llm.name and stored.get('files')!=hashes:
+            # Corrected business rows may change without changing a single
+            # original policy paragraph. The compiler must revalidate exact
+            # unchanged source units; all monetary/source contracts are new.
+            state['unchanged_rule_candidates']=unchanged_rule_candidates(stored,hashes,getattr(getattr(llm,'checker_llm',None),'name',''))
         if out and (out/CHECKPOINT).exists():
             cp=json.loads((out/CHECKPOINT).read_text(encoding='utf-8'))
             if (cp.get('identity')==identity and cp.get('revision_id','')==rv.active_id(ledger)
