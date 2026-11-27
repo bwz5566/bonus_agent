@@ -309,8 +309,7 @@ def test_bad_independent_replacement_rechecks_valid_candidate_without_restarting
             if data['current_node']=='adaptive/hold_policy/funding':
                 self.reviews+=1
                 if self.reviews==1:
-                    wrong=deepcopy(data['candidate']);wrong['total']='future_person_amount'
-                    return json.dumps({'status':'REVISE','reason':'错误跨层建议','replacement':wrong},ensure_ascii=False)
+                    return json.dumps({'status':'REVISE','reason':'错误跨层建议','patches':[{'op':'set','path':['total'],'value':'future_person_amount'}]},ensure_ascii=False)
                 assert 'future_person_amount' in data['specific_counterexample'] and data['candidate']['total']=='gross'
             return super().reviewer(msg)
     paths=_write_sources(tmp_path/'materials');out=tmp_path/'case';c=ReviewFailsOnce()

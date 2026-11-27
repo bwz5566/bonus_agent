@@ -14,11 +14,11 @@ import re
 from openpyxl.utils import get_column_letter,column_index_from_string
 
 from bonus_agent.adaptive_rules import (PHASES,coverage,rule_units,source_index,unit_chunks,source_lines,merge_rule_review,
-    validate_clause_chunk,validate_source_inventory,validate_numeric_literals,verify_parameter_usage,normalized)
+    validate_clause_chunk,validate_source_inventory,validate_numeric_literals,verify_parameter_usage,normalized,primary_population_invariants)
 from bonus_agent.adaptive_sources import compile_inputs,read_datasets,read_parameters,read_schedules
 from bonus_agent.recovery import fingerprint
 from bonus_core.engine.adaptive import (CalculationProgram,Inputs,ProgramError,contract,names,OPERATORS,
-    apply_person_program,CONTRIBUTION_DATASET,CONTRIBUTION_FIELDS,canonical_program,canonical_roster,canonical_expression)
+    apply_person_program,CONTRIBUTION_DATASET,CONTRIBUTION_FIELDS,canonical_program,canonical_roster,canonical_expression,Context,Record)
 from bonus_core.dsl.models import to_decimal
 
 
@@ -360,6 +360,83 @@ def _compile_prefix(catalog,datasets,population,fragment,period,*,calculate=True
     return program
 
 
+def apply_literal_source_exclusions(catalog,scope,rules):
+    """Compile explicit quoted column/value exclusions from actual rules.
+
+    The scope compiler owns physical row selection; a model cannot turn an
+    exact text marker into an inferred numeric status or omit a confirmed
+    exclusion on one of several sources.
+    """
+    pop=scope['population'];ds=scope['datasets'].get(pop['dataset'],{})
+    applied=[]
+    pattern=r'「([^」]+)」列(?:值)?(?:为|等于|标记为)「([^」]+)」[^。；;]{0,80}?(?:不参与(?:核算|计算|统计)|不纳入(?:核算|计算|统计)|均排除|全部排除)'
+    for rid,rule in rules.items():
+        quote=rule['quote']
+        if rule.get('phase')!='scope_mapping' or re.search(r'例如|示例|是否|待确认',quote):continue
+        for m in re.finditer(pattern,quote):
+            heading,value=m[1].strip(),m[2].strip();found=[]
+            for src in ds.get('sources',[]):
+                sheet=catalog.sheet(src);h=src['header_row']
+                if type(h) is not int or not 1<=h<=len(sheet.rows):continue
+                cols=[get_column_letter(i) for i,v in enumerate(sheet.rows[h-1],1) if v is not None and normalized(v)==normalized(heading)]
+                for col in cols:
+                    found.append(f'{sheet.id}!{col}{h}')
+                    skips=src.setdefault('skip',[])
+                    old=next((item for item in skips if item.get('column')==col and value in item.get('values',[])),None)
+                    if old is None:skips.append({'column':col,'values':[value],'reason':quote,'rules':[rid]})
+                    else:old['rules']=list(dict.fromkeys(old.get('rules',[])+[rid]))
+            if not found:raise ProgramError(f'原文明确要求按「{heading}」列的「{value}」标记排除，但主数据源没有实际同名物理列',owner='scope_mapping',kind='binding',rules=[rid],details={'actual_rule':quote})
+            applied.append(rid)
+    pop['rules']=list(dict.fromkeys(pop['rules']+applied))
+    return applied
+
+
+def validate_explicit_zero_exclusion(catalog,scope,rules,program):
+    """Check explicit zero-only exclusions using source labels and actual DSL.
+
+    A sign-sensitive expression (e.g. x != abs(x)) is not equivalent to the
+    literal instruction x != 0. Other actual source restrictions remain
+    permitted; only isolated predicates on the stated field are probed.
+    """
+    pop=scope['population'];ds=scope['datasets'][pop['dataset']]
+    labels=defaultdict(set)
+    for src in ds['sources']:
+        sheet=catalog.sheet(src);h=src['header_row']
+        for field,binding in src['columns'].items():
+            if ds['fields'][field]['kind'] not in ('number','money','ratio'):continue
+            col=binding['column'] if isinstance(binding,dict) else binding
+            heading=normalized(sheet.literal(h,column_index_from_string(col),display=True))
+            labels[field].update([heading,re.sub(r'\([^)]*\)$','',heading)])
+    def field_refs(expr):
+        if isinstance(expr,dict):
+            if set(expr)=={'field'}:return {expr['field']}
+            return set().union(*(field_refs(x) for x in expr.values()))
+        if isinstance(expr,list):return set().union(*(field_refs(x) for x in expr))
+        return set()
+    def conjuncts(expr):
+        if isinstance(expr,dict) and expr.get('op')=='and':return [x for a in expr.get('args',[]) for x in conjuncts(a)]
+        return [expr]
+    for field,headings in labels.items():
+        zero_rules=[]
+        for rid,r in rules.items():
+            raw=normalized(r['quote'])
+            if any(h and re.search(re.escape(h)+r'(?:为|等于|=)0(?:元)?[^。；;]{0,80}(?:不计算|不参与|不计入|不纳入|排除|剔除)',raw) for h in headings):zero_rules.append(rid)
+        if not zero_rules:continue
+        selected=program._population_rows
+        bad=next((row for row in selected if row.values.get(field)==0),None)
+        if bad:raise ProgramError(f'原文明确零值不参与，但实际主集合保留 {field}=0',owner='scope_mapping',kind='coverage',location=bad.source,rules=zero_rules)
+        # If another original rule explicitly restricts the same amount's
+        # sign or threshold, do not equate the entire amount filter to !=0.
+        more=any(any(h and h in normalized(r['quote']) for h in headings) and re.search(r'大于|小于|超过|少于|正数|负数|正值|负值|为正|为负|[<>≥≤]',r['quote']) and re.search(r'只|仅|排除|不参与|不计算|剔除',r['quote']) for r in rules.values())
+        isolated=[x for x in conjuncts(pop['where']) if field_refs(x)=={field}]
+        if not isolated or more:continue
+        probes=[-1,0,1]
+        for value in probes:
+            actual=all(program._bool(program.eval(x,Context(row=Record({field:to_decimal(value)},'原文零值规则反例')))) for x in isolated)
+            if actual!=(value!=0):
+                raise ProgramError(f'原文该字段仅明确排除0，但当前独立字段筛选在 {field}={value} 时结果为 {actual}，不等价于非零；其他条件应按各自真实条款另行筛选',owner='scope_mapping',kind='coverage',rules=zero_rules,details={'field':field,'test_value':value,'expected':value!=0,'actual':actual,'actual_predicates':isolated})
+
+
 def _financial_metrics(program):
     f=program.funding;todo=[f['total'],f['payable'],f['alloc'],*f['destinations']];found=set()
     while todo:
@@ -371,9 +448,11 @@ def _financial_metrics(program):
 
 def _validate_data_use(inventory,datasets,*,complete=False):
     used={s['sheet'] for d in datasets.values() for s in d['sources']}
-    for d in datasets.values():
+    for dataset,d in datasets.items():
         for source in d['sources']:
             sid=source['sheet'];kind=inventory['sheets'].get(sid,{}).get('kind')
+            if sid not in inventory['sheets']:
+                raise ProgramError(f'{dataset} 的source.sheet={sid!r} 不是实际S编号。必须保留physical_sheets中的真实ID，不能改用工作表名称或猜测位置。',owner='scope_mapping',kind='binding',dataset=dataset,details={'invalid_sheet_id':sid,'actual_sheet_ids':list(inventory['sheets'])})
             if kind not in ('data','mixed') and not (kind=='rule' and d.get('purpose')=='lookup'):
                 raise ProgramError(f'数据集错误使用非数据材料 {sid}；制度表仅可明示为lookup参数关联源',owner='scope_mapping',kind='coverage')
     if complete:
@@ -425,6 +504,9 @@ def replay_basis(catalog,saved,period):
     """Recompile only original, current-version bindings and actual rule units."""
     _,obligations,decisions=_restore_obligations(catalog,saved)
     parts=saved['parts'];scope=parts['scope_mapping'];reference=parts['reference_mapping']
+    scope_rules=_clauses_for(obligations,'scope_mapping');rechecked=deepcopy(scope)
+    apply_literal_source_exclusions(catalog,rechecked,scope_rules)
+    if rechecked!=scope:raise ProgramError('已保存主集合未包含当前原文明确的物理标记排除规则，需要重新绑定',owner='scope_mapping',kind='coverage')
     datasets=deepcopy(scope['datasets']);_merge_map(datasets,reference['datasets'],'数据集','reference_mapping')
     _validate_data_use(saved['inventory'],datasets)
     _validate_global_bindings(catalog,saved['inventory'],obligations,datasets,owner='reference_mapping',complete=True)
@@ -444,7 +526,8 @@ def replay_basis(catalog,saved,period):
     proof=coverage(obligations,{ph:parts[ph] for ph in BASIS_PHASES},phases=BASIS_PHASES,
                    formula_bindings=fragment['formula_bindings'],metrics=fragment['metrics'],parameters=inputs.parameters,
                    keys=p.keys,financial_metrics=_financial_metrics(p))
-    basis=p.basis();basis['rule_coverage']=proof;basis['data_bindings']=inputs.diagnostics
+    basis=p.basis();validate_explicit_zero_exclusion(catalog,scope,scope_rules,p)
+    basis['rule_coverage']=proof;basis['data_bindings']=inputs.diagnostics
     # Roster/output rule decisions are not part of the monetary basis. They
     # are still retained in the full manifest and exported at finalization.
     basis_units={v['unit'] for v in obligations.values() if v['phase'] in BASIS_PHASES}
@@ -588,10 +671,13 @@ class AdaptiveCompiler:
             main=v['datasets'].get(v['population'].get('dataset'),{})
             if main.get('purpose')=='lookup' or any(inventory['sheets'][s['sheet']]['kind']=='rule' for s in main.get('sources',[])):
                 raise ProgramError('实际项目主集合不能由制度/费率参数表生成',owner='scope_mapping',kind='coverage')
+            apply_literal_source_exclusions(cat,v,scope_rules)
             p=_compile_prefix(cat,v['datasets'],v['population'],_empty_fragment(),period,allow_unbound=True)
+            validate_explicit_zero_exclusion(cat,v,scope_rules,p)
+            v['population']['rules']=list(dict.fromkeys(v['population']['rules']+primary_population_invariants(scope_rules)))
             coverage(rules,{'scope_mapping':v},phases=['scope_mapping'],keys=p.keys)
         scope=self.ask('scope_mapping','scope_mapping',{'period':period,'physical_sheets':profiles,'rules':scope_rules,
-                'basis_requirements':_compact({k:v for k,v in rules.items() if v['phase'] in BASIS_PHASES})},
+                'source_binding_requirements':_compact({k:v for k,v in rules.items() if v['phase']=='reference_mapping' and v['level']=='source'})},
             '只建立真实项目主集合和项目级原始数据绑定，不预制派生数据表。项目键由本次制度指定，不预设月份/客户/产品。项目主集合来自真实业务明细；参考表不擅自新增项目。主集合where为逐明细布尔筛选：例如原文明确仅排除零值，应使用字段!=0，不能使用字段!=abs(字段)或只保留正数。'
             +DATASET_HELP+'\n'+EXPRESSION_HELP+'\n输出{"datasets":{...},"population":{"dataset":"主数据集ID","keys":[由原文决定的任意组合键字段],"where":真实明细筛选表达式（无则true）, "rules":[条款ID]}}。'
             '先覆盖范围、主对象属性和后续计算所需的真实主字段。参考/历史及其他粒度源可留给下一绑定节点；人员主表若是主对象外键目标、参数来源或全表校验对象，也必须在总额确认前绑定并核查实际数据，只有人员金额计算须留到确认后。',validate_scope)

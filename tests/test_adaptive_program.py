@@ -350,6 +350,52 @@ def test_actual_financial_authority_routes_by_confirmed_owner_not_model_guess():
     with pytest.raises(ProgramError,match='不能仅绑定数据源'):validate_clause_chunk(u,r)
 
 
+def test_secondary_roster_scope_is_not_primary_population_and_reference_closure_is_structural():
+    from bonus_agent.adaptive_rules import primary_population_invariants
+    u={'R1':{'file':'rules','where':'1','text':'分配名单只取实际核算月的记录。'},
+       'R2':{'file':'rules','where':'2','text':'参考数据中有、但订单中不存在的记录不参与核算。'}}
+    p={'units':{k:{'disposition':'operative','reason':'实际业务义务','clauses':[{'quote':v['text'],'meaning':v['text'],'level':'source','operation':'population','kind':'policy'}]} for k,v in u.items()}}
+    ob,_=validate_clause_chunk(u,p)
+    assert ob['R1:1']['phase']=='roster' and ob['R1:1']['operation']=='binding'
+    assert primary_population_invariants(ob)==['R2:1']
+
+
+def test_literal_exclusion_and_nonzero_counterexample_on_real_source_coordinates():
+    from bonus_agent.adaptive_compiler import apply_literal_source_exclusions,validate_explicit_zero_exclusion,_compile_prefix,_empty_fragment
+    c=Catalog([]);c.sheets={
+        'S1':Sheet('S1','early.xlsx','data',[('单号','结算额(元)','过滤状态'),('a',100,None),('b',-30,None),('c',70,'排除'),('d',0,None)]),
+        'S2':Sheet('S2','late.xlsx','data',[('单号','结算额(元)','判断'),('e',20,20),('f',15,'排除')])}
+    ds={'label':'明细','fields':{'id':{'kind':'id','nullable':False},'amount':{'kind':'money','nullable':False}},
+        'sources':[{'sheet':s,'header_row':1,'columns':{'id':'A','amount':'B'}} for s in c.sheets],
+        'grain':{'kind':'detail','keys':[],'duplicates':'error','rules':[]},'rules':[]}
+    scope={'datasets':{'orders':ds},'population':{'dataset':'orders','keys':['id'],'where':op('ne',fld('amount'),0),'rules':['R0']}}
+    rules={'R0':{'quote':'结算额为0，不计算。','phase':'scope_mapping'},
+           'R1':{'quote':'「过滤状态」列值为「排除」的行不参与核算；「判断」列值为「排除」的行不参与核算。','phase':'scope_mapping'}}
+    assert apply_literal_source_exclusions(c,scope,rules)==['R1','R1']
+    before=deepcopy(scope);apply_literal_source_exclusions(c,scope,rules);assert scope==before
+    p=_compile_prefix(c,scope['datasets'],scope['population'],_empty_fragment(),'2027-01')
+    validate_explicit_zero_exclusion(c,scope,rules,p)
+    assert {r.values['id'] for r in p._population_rows}=={'a','b','e'}
+    scope['population']['where']=op('ne',fld('amount'),op('abs',fld('amount')))
+    p=_compile_prefix(c,scope['datasets'],scope['population'],_empty_fragment(),'2027-01')
+    with pytest.raises(ProgramError,match='不等价于非零'):validate_explicit_zero_exclusion(c,scope,rules,p)
+
+
+def test_review_patch_is_atomic_and_bound_to_exact_reviewed_candidate():
+    from bonus_agent.commission_chain import apply_review_patches,archived_candidates
+    from bonus_agent.recovery import fingerprint
+    base={'datasets':{'orders':{'sources':[{'sheet':'S1','columns':{'id':'A'}}]}},'population':{'rules':['R1']}}
+    patches=[{'op':'set','path':['datasets','orders','sources',0,'columns','amount'],'value':'B'}]
+    merged=apply_review_patches(base,patches,owner='scope_mapping')
+    assert merged['datasets']['orders']['sources'][0]['sheet']=='S1' and 'amount' not in base['datasets']['orders']['sources'][0]['columns']
+    with pytest.raises(ProgramError,match='无法定位'):apply_review_patches(base,patches+[{'op':'remove','path':['missing','field']}],owner='scope_mapping')
+    assert 'amount' not in base['datasets']['orders']['sources'][0]['columns']
+    actual={'status':'REVISE','patches':patches}
+    pairs=archived_candidates([{'node':'x/解析','status':'PASS','result':{'older':True}},
+        {'node':'x/独立复核','result':actual,'review_base':base,'review_base_digest':fingerprint(base)}],'x')
+    assert pairs==[(base,actual)]
+
+
 def test_native_interval_rate_rules_cannot_be_only_data_binding():
     text='100-500万 | 0.2% | 0.3%'
     u={'T1R2':{'file':'policy.pptx','where':'P2','text':text,'table':'T1','row':2,'title':'阶梯费率'}}

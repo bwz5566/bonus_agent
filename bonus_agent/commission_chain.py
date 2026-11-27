@@ -336,15 +336,69 @@ def archived_candidates(events,name):
     A later unsuccessful attempt must not erase an earlier real correction
     that becomes locally valid after a technical compiler repair.
     """
-    draft=review=None;pairs=[]
+    draft=None;reviewed=False;pairs=[]
     for ev in events:
         if ev.get('node')==name+'/解析' and ev.get('status')=='PASS' and isinstance(ev.get('result'),dict):
-            if draft is not None:pairs.append((draft,review))
-            draft,review=copy.deepcopy(ev['result']),None
-        elif ev.get('node')==name+'/独立复核' and draft is not None and isinstance(ev.get('result'),dict):
-            review=copy.deepcopy(ev['result'])
-    if draft is not None:pairs.append((draft,review))
+            if draft is not None and not reviewed:pairs.append((draft,None))
+            draft=copy.deepcopy(ev['result']);reviewed=False
+        elif ev.get('node')==name+'/独立复核' and isinstance(ev.get('result'),dict):
+            base=ev.get('review_base',draft)
+            if isinstance(base,dict) and (not ev.get('review_base_digest') or ev['review_base_digest']==fingerprint(base)):
+                pairs.append((copy.deepcopy(base),copy.deepcopy(ev['result'])));reviewed=True
+    if draft is not None and not reviewed:pairs.append((draft,None))
     return pairs
+
+
+def apply_review_patches(candidate,patches,*,owner):
+    """Apply only the reviewer's explicit JSON field changes, atomically.
+
+    Paths use actual object keys or zero-based list indices. No model code is
+    executed. The untouched candidate is preserved if any patch is invalid.
+    The caller revalidates the complete merged contract against real sources.
+    """
+    if not isinstance(candidate,dict) or not isinstance(patches,list) or not patches:
+        raise ProgramError('局部独立复核需要原候选和非空patches数组',owner=owner,kind='contract')
+    result=copy.deepcopy(candidate)
+    for n,patch in enumerate(patches,1):
+        op=patch.get('op') if isinstance(patch,dict) else None
+        path=patch.get('path') if isinstance(patch,dict) else None
+        expected={'op','path','value'} if op=='set' else {'op','path'}
+        if op not in ('set','remove') or set(patch)!=expected or not isinstance(path,list) or not path or any(type(k) not in (str,int) or isinstance(k,int) and k<0 for k in path):
+            raise ProgramError(f'独立复核补丁第{n}项格式无效；op=set/remove，path为实际键/下标数组，set须有value',owner=owner,kind='contract')
+        cursor=result
+        try:
+            for key in path[:-1]:
+                if isinstance(cursor,dict) and isinstance(key,str) and key in cursor:cursor=cursor[key]
+                elif isinstance(cursor,list) and type(key) is int and key<len(cursor):cursor=cursor[key]
+                else:raise KeyError(key)
+            key=path[-1]
+            if isinstance(cursor,dict) and isinstance(key,str):
+                if op=='set':cursor[key]=copy.deepcopy(patch['value'])
+                elif key in cursor:del cursor[key]
+                else:raise KeyError(key)
+            elif isinstance(cursor,list) and type(key) is int:
+                if op=='set' and key==len(cursor):cursor.append(copy.deepcopy(patch['value']))
+                elif key<len(cursor):
+                    if op=='set':cursor[key]=copy.deepcopy(patch['value'])
+                    else:del cursor[key]
+                else:raise IndexError(key)
+            else:raise KeyError(key)
+        except (KeyError,IndexError,TypeError):
+            raise ProgramError(f'独立复核补丁第{n}项无法定位已存在的父路径 {path!r}；请只修复实际候选中的字段',owner=owner,kind='contract',details={'patch':patch,'patch_index':n}) from None
+    return result
+
+
+def reviewed_candidate(name,draft,review,data,*,owner,adaptive):
+    if review.get('status')!='REVISE':return copy.deepcopy(draft)
+    if adaptive and 'patches' in review:
+        if 'replacement' in review:raise ProgramError('独立复核不能同时提供patches与replacement',owner=owner,kind='contract')
+        return apply_review_patches(draft,review['patches'],owner=owner)
+    replacement=review.get('replacement')
+    if not isinstance(replacement,dict):raise ProgramError('独立复核REVISE缺少可执行补丁或替换合同',owner=owner,kind='contract')
+    if adaptive and name.startswith('adaptive/rules/'):
+        from bonus_agent.adaptive_rules import merge_rule_review
+        return merge_rule_review(draft,replacement,data.get('units',{}))
+    return copy.deepcopy(replacement)
 
 
 def unchanged_rule_candidates(stored,files,reviewer):
@@ -538,13 +592,16 @@ def run_chain(llm,paths,out,*,scenario,period=None,answers=None,resume=True,max_
         state['checkpoint_at']=time.time();state['questions']=[q.model_dump(mode='json') for q in ws.questions]
         if out:save_json(out/CHECKPOINT,state)
 
-    def event(node,ok,result,*,model=None,thought='',request=None,usage_delta=None):
+    def event(node,ok,result,*,model=None,thought='',request=None,usage_delta=None,review_base=None):
         u=usage_delta or {}
         s=Step(node,{'node':node,'checkpoint':identity[:12]},dump(result) if not isinstance(result,str) else result,ok,
                thought=thought,deep=bool(request and request.get('thinking')),at=datetime.now().strftime('%H:%M:%S'),request=request or {},
                tokens_in=u.get('prompt_tokens',0),tokens_out=u.get('completion_tokens',0),model_secs=u.get('latency_s',0))
         steps.append(s)
-        state['events'].append({'round':rnd['n'],'node':node,'status':'PASS' if ok else 'FAIL','model':getattr(model,'name',None),'result':jsonable(result),'request':request or {}})
+        record={'round':rnd['n'],'node':node,'status':'PASS' if ok else 'FAIL','model':getattr(model,'name',None),'result':jsonable(result),'request':request or {}}
+        if review_base is not None:
+            record['review_base']=jsonable(review_base);record['review_base_digest']=fingerprint(record['review_base'])
+        state['events'].append(record)
         if node in graph:
             records=state.setdefault('node_receipts',{})
             if ok:
@@ -599,6 +656,8 @@ def run_chain(llm,paths,out,*,scenario,period=None,answers=None,resume=True,max_
             verdict='从原始证据重新核对候选，尤其同名列、期间、单位、端点、缺省、适用范围。若正确只输出 {"status":"PASS","reason":"明确核对点"}；若有可纠正错误，输出 {"status":"REVISE","reason":"具体反例","replacement":完整修正后的本节点JSON}；有真正业务疑问返回questions。绝不直接复述候选JSON，必须有status或实际questions。'
             if adaptive and node.startswith('adaptive/rules/'):
                 verdict+=' 本规则抽取节点的候选可能含程序依据原文派生的phase、formula、quote，不是输出协议错误；不得仅因已有这些派生字段改写有效候选。请严格遵守level、operation、kind的独立枚举，先解决具体反例。REVISE时核对全部本组原文后，replacement可只给出units中实际需修改的完整单元，程序保留其他单元、合并并重新校验全部。不要重抄已经正确的原文。'
+            elif adaptive:
+                verdict='从原始证据独立核对候选，尤其真实列、期间、单位、端点、缺省、适用范围以及具体反例。正确只回复 {"status":"PASS","reason":"明确核对点"}。修订只回复 {"status":"REVISE","reason":"具体反例","patches":[{"op":"set","path":["实际对象键",0,"实际字段"],"value":修正值}]}；path为candidate中的真实键和从0开始的数组下标，set设置现有/新增字段，remove删除指定字段且不写value。补丁按顺序执行，保留其他全部已核对字段，完整合同由程序重新校验。不得重抄全部候选、改写无关数据集或虚构物理表ID。有真实业务疑问返回questions。'
             system='你是独立财务规则复核者。'+verdict+'\n以下是候选合同的验收标准（其输出格式不是本轮回复格式）：\n'+instructions+'\n【本轮唯一输出协议】'+verdict
         before=vars(model.usage).copy()
         # Mapping and simple validation do not need high reasoning. Complex
@@ -626,7 +685,8 @@ def run_chain(llm,paths,out,*,scenario,period=None,answers=None,resume=True,max_
                 if limits is not None:NODE_REQUEST_LIMITS.reset(limits)
         if not isinstance(raw,dict):raise ChainError(f'{node} 模型未返回JSON对象')
         delta={k:getattr(model.usage,k,0)-before.get(k,0) for k in ('prompt_tokens','completion_tokens','latency_s')}
-        event(node+('/独立复核' if review else '/解析'),True,raw,model=model,request=dict(model.last_call),usage_delta=delta)
+        event(node+('/独立复核' if review else '/解析'),True,raw,model=model,request=dict(model.last_call),usage_delta=delta,
+              review_base=candidate if adaptive and review and candidate is not None else None)
         return raw
 
     def node(name,data,instructions,validator,*,owner=None,archive_epoch=None):
@@ -718,10 +778,7 @@ def run_chain(llm,paths,out,*,scenario,period=None,answers=None,resume=True,max_
             for prior_draft,prior_review in reversed(history):
                 if not prior_draft or not prior_review or unresolved_questions(prior_draft) or unresolved_questions(prior_review):continue
                 try:
-                    recovered=prior_review.get('replacement') if prior_review.get('status')=='REVISE' else prior_draft
-                    if adaptive and name.startswith('adaptive/rules/') and prior_review.get('status')=='REVISE':
-                        from bonus_agent.adaptive_rules import merge_rule_review
-                        recovered=merge_rule_review(prior_draft,recovered,data.get('units',{}))
+                    recovered=reviewed_candidate(name,prior_draft,prior_review,data,owner=owner,adaptive=adaptive)
                     if prior_review.get('status') in ('PASS','REVISE') and isinstance(recovered,dict):
                         recovered.pop('questions',None);validator(recovered)
                         state['specs'][name]=jsonable(recovered)
@@ -772,16 +829,9 @@ def run_chain(llm,paths,out,*,scenario,period=None,answers=None,resume=True,max_
                     # A separately sourced reviewer has identified a real
                     # unresolved rule, not a guessed default or technical bug.
                     question(owner,unresolved_questions(review)[0])
-                if review.get('status')=='REVISE' and isinstance(review.get('replacement'),dict):
-                    if not adaptive:rv.check_reviewed_rule_values(review['replacement'],name,current_rules)
-                    replacement=review['replacement']
-                    # Rule unit IDs form an atomic, independently reviewable
-                    # boundary. Never let a small correction rewrite all the
-                    # already checked units or exhaust output copying them.
-                    if adaptive and name.startswith('adaptive/rules/'):
-                        from bonus_agent.adaptive_rules import merge_rule_review
-                        draft=merge_rule_review(draft,replacement,data.get('units',{}))
-                    else:draft=replacement
+                if review.get('status')=='REVISE':
+                    if not adaptive and isinstance(review.get('replacement'),dict):rv.check_reviewed_rule_values(review['replacement'],name,current_rules)
+                    draft=reviewed_candidate(name,draft,review,data,owner=owner,adaptive=adaptive)
                     replacement_applied=True;validator(draft)
                 elif review.get('status')=='PASS' and not invalid:
                     validator(draft)

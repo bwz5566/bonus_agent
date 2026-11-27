@@ -404,6 +404,12 @@ def route_clause(clause,source,formula):
         level='person' if phase=='roster' else 'report' if phase=='export' else 'source' if phase in PHASES[:2] else 'primary'
         operation={'scope_mapping':'population','reference_mapping':'binding','project_policy':'calculation','coefficient_policy':'adjustment','hold_policy':'funding','roster':'calculation','export':'report'}[phase]
     quote=clause['quote'];kind=clause['kind'];lhs=_formula_lhs(quote,formula)
+    # "Population" is not synonymous with the sale/project master: a
+    # source may explicitly limit the attribution roster's own rows. Such
+    # a selection is a recipient-binding obligation, not a filter on sales.
+    if authority_owner not in PHASES and phase=='scope_mapping' and operation=='population':
+        if re.search(r'(?:分配|发放|归属|分成)(?:人员)?(?:名单|名册)|(?:人员|员工|个人)(?:名单|名册)',quote) and re.search(r'只取|仅取|只使用|仅使用|筛选|限定|按.+匹配|对应.+(?:行|记录)',quote):
+            phase='roster';level='person';operation='binding'
     # Native parameter tables are evidence, not business ledgers. A numeric
     # interval/rate row cannot be satisfied by merely mapping a data source;
     # its actual project/person calculation grain must be selected explicitly.
@@ -428,6 +434,24 @@ def route_clause(clause,source,formula):
         raise ProgramError(f'原文要求实际逐对象聚合：{quote[:230]}；请选择 level=primary, operation=calculation，而非仅登记绑定',owner='scope_mapping',kind='coverage')
     clause['phase']=phase;clause['level']=level;clause['operation']=operation
     return phase
+
+
+def primary_population_invariants(obligations):
+    """Source-only population closure that the deterministic engine enforces.
+
+    A stated exclusion of reference-only objects is satisfied by the engine
+    deriving groups solely from the chosen real primary dataset. It is not a
+    requirement to bind a reference/roster table as a second primary source.
+    """
+    covered=[]
+    for rid,rule in obligations.items():
+        if rule.get('phase')!='scope_mapping' or rule.get('operation')!='population':continue
+        text=normalized(rule['quote'])
+        reference=re.search(r'(?:参考|辅助|补充)(?:数据|表|资料)',text)
+        main_absent=re.search(r'(?:销售单|销售明细|订单|主集合|主数据|主对象)(?:里|中|内)?(?:并)?(?:没有|不存在|未包含|无)',text)
+        excluded=re.search(r'不(?:参与|纳入)(?:核算|计算|统计)|不(?:影响|新增)(?:结果|项目|对象)',text)
+        if reference and main_absent and excluded:covered.append(rid)
+    return covered
 
 
 def validate_clause_chunk(chunk,proposal):
