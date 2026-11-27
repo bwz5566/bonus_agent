@@ -493,6 +493,7 @@ def run_chain(llm,paths,out,*,scenario,period=None,answers=None,resume=True,max_
                             and isinstance(ev.get('result'),dict) and ev['result'].get('receipt',{}).get('output')==fingerprint(spec)),None)
                 if proof:accepted[name]={'spec':copy.deepcopy(spec),'receipt':copy.deepcopy(proof)}
             state['prior_accepted_specs']=accepted
+            if adaptive:state['unchanged_rule_candidates']=unchanged_rule_candidates(stored,hashes,getattr(getattr(llm,'checker_llm',None),'name',''))
             if old_basis:=prior_approved_basis(stored,old):state['prior_approved_basis']=old_basis
         elif adaptive and stored and stored.get('mode')==mode and stored.get('period')==label and last.get('model')==llm.name and stored.get('files')!=hashes:
             # Corrected business rows may change without changing a single

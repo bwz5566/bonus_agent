@@ -320,7 +320,16 @@ def route_clause(clause,source,formula):
     compiled as an order-level adjustment before total confirmation.
     """
     phase=clause.get('phase');level=clause.get('level');operation=clause.get('operation')
-    if level is not None or operation is not None:
+    authority_owner=(source.get('authority') or {}).get('owner')
+    if authority_owner in PHASES:
+        # A real financial revision already has an explicit responsible node.
+        # The model extracts the actual obligation, it must not be asked to
+        # rediscover or contradict the authoritative internal routing.
+        phase=authority_owner
+        level='person' if phase=='roster' else 'report' if phase=='export' else 'source' if phase in PHASES[:2] else 'primary'
+        if operation is not None and operation not in OPERATIONS:raise ProgramError(f'财务确认条款实际动作枚举无效：{operation!r}；责任节点已确定为 {phase}',owner='scope_mapping',kind='contract')
+        if operation is None:operation={'scope_mapping':'population','reference_mapping':'binding','project_policy':'calculation','coefficient_policy':'adjustment','hold_policy':'funding','roster':'calculation','export':'report'}[phase]
+    elif level is not None or operation is not None:
         if level not in LEVELS or operation not in OPERATIONS:raise ProgramError(f'条款层级/动作枚举无效：level={level!r}（只能 {sorted(LEVELS)}），operation={operation!r}（只能 {sorted(OPERATIONS)}）；parameter 是动作，不是层级或条款kind',owner='scope_mapping',kind='contract',details={'field_values':{'level':level,'operation':operation},'allowed':{'level':sorted(LEVELS),'operation':sorted(OPERATIONS)}})
         if level=='report' or operation=='report':phase='export'
         elif level=='person' or operation=='assignment':phase='roster'
@@ -333,6 +342,14 @@ def route_clause(clause,source,formula):
         level='person' if phase=='roster' else 'report' if phase=='export' else 'source' if phase in PHASES[:2] else 'primary'
         operation={'scope_mapping':'population','reference_mapping':'binding','project_policy':'calculation','coefficient_policy':'adjustment','hold_policy':'funding','roster':'calculation','export':'report'}[phase]
     quote=clause['quote'];kind=clause['kind'];lhs=_formula_lhs(quote,formula)
+    # Native parameter tables are evidence, not business ledgers. A numeric
+    # interval/rate row cannot be satisfied by merely mapping a data source;
+    # its actual project/person calculation grain must be selected explicitly.
+    if source.get('table') and kind=='table' and level=='source' and operation=='parameter' and not explicit_binding_assertions(quote):
+        first=normalized(quote.split('|',1)[0])
+        rest=quote.split('|')[1:]
+        if re.search(r'\d',first) and re.search(r'以上|以下|含|[<>≤≥\-]',first) and any(re.search(r'\d+(?:\.\d+)?\s*[%％]',x) for x in rest):
+            raise ProgramError('制度区间及费率参数不能仅归source数据绑定层。请按真实制度适用对象选择level=primary或person，再以operation=parameter/adjustment等绑定实际运算，不得遗漏该档位。',owner='scope_mapping',kind='coverage',details={'actual_rate_row':quote,'allowed_level':['primary','person']})
     # Use only explicit layer language in original evidence. Do not select a
     # grain from a generic word like “员工” in a foreign-key description.
     person_scope=r'按(?:员工|人员|个人)(?:唯一)?(?:编号|ID|身份)?(?:进行)?(?:汇总|合计|发放|分配)|(?:该员工|每名员工|每位员工|每个员工|每人|人员层|个人层|员工层)[^。；;]{0,80}(?:汇总|合计|应得|实发|预发|计奖|奖金|提成)|(?:人员|个人|员工)(?:表)?(?:计奖系数|应得提成|应得金额|实发|主表全员)|(?:零奖金|无订单|无项目)人员'

@@ -567,6 +567,7 @@ class AdaptiveCompiler:
             reply=self.ask(task,'scope_mapping',{'period':period,'units':visible},
                 '只覆盖当前一小组原文，不构造公式合同或节点名称。逐个真实unit ID返回 {"disposition":"operative/context/output","reason":"实际理由","clauses":[{"quote":"unit.text 或 active_text 内真实连续原文，不许引用title上下文","meaning":"一个可验证业务义务","level":"source/primary/person/report","operation":"population/binding/calculation/adjustment/funding/assignment/validation/parameter/report","kind":"policy/formula/table/validation/output"}]}。\n'
                 '枚举严格分开：level只有source、primary、person、report；kind只有policy、formula、table、validation、output；parameter只属于operation。表格比例行通常是kind=table；实际适用到的主对象或人员决定level，而不是因为来源是参数表就归source。繁简混排的多行文字可用source_line（从1计的实际行号或连续行号列表）代替quote，程序直接取原件；不要改写引文。\n'
+                '若单元已包含真实财务authority.owner，它仅表示财务正式指定的责任节点；程序会按该节点确定phase和level，你只需提取实际原文义务及其操作，不需要另行更改内部路由。原始制度费率区间是待使用的计算参数，不是业务表绑定。\n'
                 '层级：source只表示原始表、关联键、主集合及数据完整性；primary是在订单/项目/实际主对象上计算金额、比率、汇总、舍入；person是确认上游归属后按实际员工/收款人汇总，计奖系数、预发抵扣、人员应得与实发、零人员覆盖和全部角色名单，也包含一单仅归属一个人的直接归属。report只表示输出要求。人员层运算不能放到项目层。实际逐对象求和不能只登记原始数据绑定。\n'
                 '动作按原文选择：population主集合、binding字段关联、calculation普通计算、adjustment系数、funding资金归属/总额、assignment人员归属、validation实际检查、parameter制度参数、report实际输出。程序根据level和operation负责内部路由。'
                 '标题、纯说明等context必须明示原因；带有效规则、费率或分支不能以context跳过。若来源有active_text仅它仍有效。一个条款只对应一个真实算式；程序直接读取原文算式，不要自行把自然语言改写成原文不存在的公式。跨项目与人员层的段落拆成各自实际原文条款。每个原文单元恰一项。输出{"units":{...}}。',

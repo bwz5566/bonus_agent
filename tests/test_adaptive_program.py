@@ -305,6 +305,27 @@ def test_merged_sources_explicitly_preserve_physically_missing_nullable_fields()
     with pytest.raises(ProgramError,match='必须可空'):read_datasets(cat,wrong,period='2027Q1')
 
 
+def test_actual_financial_authority_routes_by_confirmed_owner_not_model_guess():
+    raw='本批风险快照按相同来源，客户月平均出货累计至项目实际月份。'
+    u={'Rnew':{'file':'财务正式规则修订','where':'v1','text':raw,'authority':{'owner':'coefficient_policy'}}}
+    c={'quote':raw,'meaning':'实际项目月平均','kind':'policy','level':'source','operation':'parameter'}
+    r={'units':{'Rnew':{'disposition':'operative','reason':'真实本批财务确认','clauses':[c]}}}
+    out,_=validate_clause_chunk(u,r)
+    assert out['Rnew:1']['phase']=='coefficient_policy' and out['Rnew:1']['level']=='primary'
+    # Formal routing does not excuse unsupported monetary/source formulas.
+    u['Rnew']['authority']['owner']='reference_mapping';u['Rnew']['text']='总额=数量×费率';c['quote']=u['Rnew']['text'];c['kind']='formula'
+    with pytest.raises(ProgramError,match='不能仅绑定数据源'):validate_clause_chunk(u,r)
+
+
+def test_native_interval_rate_rules_cannot_be_only_data_binding():
+    text='100-500万 | 0.2% | 0.3%'
+    u={'T1R2':{'file':'policy.pptx','where':'P2','text':text,'table':'T1','row':2,'title':'阶梯费率'}}
+    c={'quote':text,'meaning':'实际制度档费率','kind':'table','level':'source','operation':'parameter'}
+    p={'units':{'T1R2':{'disposition':'operative','reason':'实际制度参数','clauses':[c]}}}
+    with pytest.raises(ProgramError,match='不能仅归source'):validate_clause_chunk(u,p)
+    c['level']='primary';ob,_=validate_clause_chunk(u,p);assert ob['T1R2:1']['phase']=='project_policy'
+
+
 def test_actual_person_grain_cannot_route_to_primary_formula():
     text='人员应得：先按员工编号汇总。应得金额=ROUND(订单合计×人员表计奖系数,2)。'
     unit={'R1':{'file':'policy','where':'line','text':text}}
