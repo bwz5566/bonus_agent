@@ -12,6 +12,7 @@ from copy import deepcopy
 from decimal import Decimal as D
 import re
 import unicodedata
+from openpyxl.utils import get_column_letter, column_index_from_string
 
 from bonus_agent.commission_sources import string
 from bonus_core.dsl.models import to_decimal
@@ -131,9 +132,23 @@ def explicit_binding_assertions(text):
     return result
 
 
+def sparse_source_columns(sheet, *, limit=8):
+    """Bounded physical evidence for side-column notes in a business ledger."""
+    counts=defaultdict(int);cells=defaultdict(list)
+    for r,row in enumerate(sheet.rows,1):
+        for c,value in enumerate(row,1):
+            if value in (None,''):continue
+            counts[c]+=1
+            if counts[c]<=limit:
+                cells[c].append({'cell':f'{get_column_letter(c)}{r}','text':string(sheet.literal(r,c,display=True))[:500]})
+    # Entire nonempty row coverage, not a guessed continuation below a note.
+    return {get_column_letter(c):{'nonempty_count':n,'cells':cells[c]} for c,n in counts.items()
+            if n<=limit and n<len(sheet.rows) and any(len(x['text'])>=12 for x in cells[c])}
+
+
 def source_index(catalog):
     """No keyword gate: index all sheets and actual document/table units."""
-    sheets=[s.profile(1,compact=True) for s in catalog.sheets.values()]
+    sheets=[{**s.profile(1,compact=True),'sparse_columns':sparse_source_columns(s)} for s in catalog.sheets.values()]
     docs=defaultdict(lambda:{'text_units':[],'tables':[],'unreadable':[]})
     for k,v in catalog.blocks.items():
         if not k.startswith('R'):continue
@@ -158,7 +173,7 @@ def validate_source_inventory(catalog,proposal):
         have=set(sheets) if isinstance(sheets,dict) else set()
         raise ProgramError(f'来源清单必须覆盖每张真实表；漏 {sorted(set(catalog.sheets)-have)}；多 {sorted(have-set(catalog.sheets))}',owner='scope_mapping')
     for sid,s in sheets.items():
-        contract(s,required=('kind','reason','rule_ranges'),label=f'{sid} 材料作用',owner='scope_mapping')
+        contract(s,required=('kind','reason','rule_ranges'),optional=('rule_cells',),label=f'{sid} 材料作用',owner='scope_mapping')
         if s['kind'] not in SOURCE_KINDS or not isinstance(s['reason'],str) or not s['reason'].strip():raise ProgramError(f'{sid} 未明确数据/规则用途',owner='scope_mapping')
         ranges=s['rule_ranges']
         if not isinstance(ranges,list):raise ProgramError(f'{sid} 规则范围必须为物理行段',owner='scope_mapping')
@@ -168,8 +183,17 @@ def validate_source_inventory(catalog,proposal):
             for n in range(pair[0],pair[1]+1):
                 if n in seen:raise ProgramError(f'{sid} 规则行范围重叠',owner='scope_mapping')
                 seen.add(n)
-        if s['kind']=='mixed' and not ranges:raise ProgramError(f'{sid} 混合材料必须指出实际规则行',owner='scope_mapping')
-        if s['kind'] not in ('mixed','rule','output') and ranges:raise ProgramError(f'{sid} 数据表规则行须按 mixed 分类',owner='scope_mapping')
+        rule_cells=s.get('rule_cells',[]);sheet=catalog.sheets[sid]
+        if not isinstance(rule_cells,list) or any(not isinstance(a,str) or not re.fullmatch(r'[A-Z]{1,3}[1-9]\d*',a) for a in rule_cells) or len(set(rule_cells))!=len(rule_cells):
+            raise ProgramError(f'{sid} 规则单元格必须为不重复的实际坐标，如 L1',owner='scope_mapping')
+        for a in rule_cells:
+            m=re.fullmatch(r'([A-Z]+)(\d+)',a);r=int(m[2]);c=column_index_from_string(m[1])
+            if r>len(sheet.rows) or c>len(sheet.rows[r-1]) or not string(sheet.rows[r-1][c-1]):
+                raise ProgramError(f'{sid} {a} 实际为空或不存在；请从物理预览和 sparse_columns 的真实非空坐标选择规则',owner='scope_mapping',kind='coverage',location=f'{sheet.file}/{sheet.name}!{a}')
+            if r in seen:raise ProgramError(f'{sid} 规则单元格 {a} 已包含于整行规则范围，不得重复',owner='scope_mapping')
+        if s['kind']=='mixed' and not (ranges or rule_cells):raise ProgramError(f'{sid} 混合材料必须指出实际规则行或单元格',owner='scope_mapping')
+        if s['kind'] not in ('mixed','rule','output') and (ranges or rule_cells):raise ProgramError(f'{sid} 数据表规则须按 mixed 分类',owner='scope_mapping')
+        if s['kind']=='rule' and rule_cells:raise ProgramError(f'{sid} 完整规则表使用整行覆盖；只选择侧栏规则时使用 mixed',owner='scope_mapping')
         if s['kind']=='rule' and ranges and seen!=set(range(1,len(catalog.sheets[sid].rows)+1)):
             raise ProgramError(f'{sid} 标记为完整规则表却排除了部分行；若为混合材料请明确范围',owner='scope_mapping')
     # An image-only rule is not a readable source. Never infer a rate from a
@@ -200,7 +224,7 @@ def rule_units(catalog,inventory):
     for sid,s in inventory['sheets'].items():
         if s['kind'] not in ('rule','mixed','output'):continue
         sheet=catalog.sheets[sid]
-        ranges=s['rule_ranges'] or [[1,len(sheet.rows)]]
+        ranges=s['rule_ranges'] or ([[1,len(sheet.rows)]] if s['kind']!='mixed' and not s.get('rule_cells') else [])
         for start,end in ranges:
             for row in range(start,end+1):
                 raw=' | '.join(string(sheet.literal(row,col,display=True)) for col in range(1,len(sheet.rows[row-1])+1) if sheet.rows[row-1][col-1] is not None).strip()
@@ -208,6 +232,12 @@ def rule_units(catalog,inventory):
                 signature=(sheet.file,where,normalized(raw))
                 if raw and signature not in covered:
                     uid=f'{sid}R{row}';units[uid]={'file':sheet.file,'where':where,'text':raw};covered.add(signature)
+        for a in s.get('rule_cells',[]):
+            m=re.fullmatch(r'([A-Z]+)(\d+)',a);row=int(m[2]);col=column_index_from_string(m[1])
+            raw=string(sheet.literal(row,col,display=True));where=f'{sheet.name}!{a}'
+            signature=(sheet.file,where,normalized(raw))
+            if signature not in covered:
+                uid=f'{sid}C{a}';units[uid]={'file':sheet.file,'where':where,'text':raw};covered.add(signature)
     for tid,t in catalog.tables.items():
         if t.sheet_name:continue  # spreadsheet source rows already addressable
         for row,cells in enumerate(t.rows,1):
@@ -265,6 +295,22 @@ def _non_arithmetic_declaration(segment):
     return False
 
 
+def _ledger_identifier_tail(segment):
+    """A compact product/composite ID among actual record values is not a formula.
+
+    An explicit equality or a labeled short formula row still requires complete
+    mathematical coverage. Do not infer arithmetic from punctuation in codes.
+    """
+    parts=segment.split('|')
+    if len(parts)<4:return False
+    tail=parts[-1]
+    return (any(re.fullmatch(r'[+-]?\d+(?:\.\d+)?',v) for v in parts[:-1])
+            and bool(re.fullmatch(r'[A-Za-z0-9_().+*/\-]+',tail))
+            and bool(re.search(r'[A-Za-z]',tail)) and bool(re.search(r'\d',tail))
+            and not re.match(r'(?i)(?:ROUND|MIN|MAX|ABS|IF)\(',tail)
+            and not any(re.search(r'(?i)公式|formula',v) for v in parts[:-1]))
+
+
 def explicit_formulas(text):
     """Recognize an explicit RHS, not a prose mention of percentage/units.
 
@@ -272,6 +318,7 @@ def explicit_formulas(text):
     operative clause requiring an independent semantic review.
     """
     n=normalized(str(text).replace('\n','；'));result=[]
+    ledger_tail=n.split('|')[-1] if _ledger_identifier_tail(n) else None
     # A native worksheet may separate the indicator label and formula by |.
     # Commas inside MIN/MAX/ROUND are argument separators. A comma AFTER
     # the balanced expression starts explanatory prose, not another operand.
@@ -287,7 +334,7 @@ def explicit_formulas(text):
         rhs=None
         if _non_arithmetic_declaration(segment):continue
         if '=' in segment:rhs=segment.split('=',1)[1]
-        elif '|' in segment:
+        elif '|' in segment and not _ledger_identifier_tail(segment) and (ledger_tail is None or segment.split('|')[-1]!=ledger_tail):
             tail=segment.split('|')[-1]
             if _has_arithmetic(tail):rhs=tail
         arithmetic=rhs and _has_arithmetic(rhs)
@@ -456,7 +503,10 @@ def _validate_unit(uid,source,selected):
             proposed=normalized(c['formula'])
             quote_normal=normalized(c['quote'])
             declaration=any(proposed in s and _non_arithmetic_declaration(s) for s in [quote_normal,*re.split(r'[。；;，,]',quote_normal)])
-            if proposed in quote_normal and _has_arithmetic(proposed) and not declaration:
+            actual_normal=normalized(source.get('active_text',source['text']))
+            id_tail=any(_ledger_identifier_tail(s) and proposed in s.split('|')[-1]
+                        for s in [actual_normal,*re.split(r'[。；;，,]',actual_normal)])
+            if proposed in quote_normal and _has_arithmetic(proposed) and not declaration and not id_tail:
                 extracted=explicit_formulas(proposed);formula=extracted[0] if extracted else proposed.lstrip('=')
         if formula:
             # Literal original expression is parsed by the program, never invented by the model.

@@ -376,7 +376,7 @@ def basis_contract_digest(state):
     if state.get('mode')==ADAPTIVE_MODE:
         saved=state.get('adaptive_basis_contract') or {}
         inventory=saved.get('inventory') or {}
-        contract['adaptive_basis_contract']={'inventory':{k:{'kind':v['kind'],'rule_ranges':v['rule_ranges']} for k,v in inventory.get('sheets',{}).items()},'parts':saved.get('parts'),
+        contract['adaptive_basis_contract']={'inventory':{k:{'kind':v['kind'],'rule_ranges':v['rule_ranges'],'rule_cells':v.get('rule_cells',[])} for k,v in inventory.get('sheets',{}).items()},'parts':saved.get('parts'),
             'basis_clauses':{uid:[c for c in v.get('clauses',[]) if c.get('phase') in NODE_ORDER[:5]]
                 for uid,v in saved.get('clause_proposals',{}).items() if any(c.get('phase') in NODE_ORDER[:5] for c in v.get('clauses',[]))}}
     else:contract['specs']={k:state.get('specs',{}).get(k) for k in NODE_ORDER[:5]}

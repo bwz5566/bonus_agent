@@ -169,6 +169,32 @@ def test_source_coverage_cannot_skip_new_rule_rows():
     with pytest.raises(ProgramError,match='每张真实表'):validate_source_inventory(c,{'sheets':{},'unreadable':{}})
 
 
+def test_mixed_ledger_side_note_is_addressed_by_actual_cell_not_every_record():
+    from bonus_agent.adaptive_rules import source_index, explicit_formulas
+    c=Catalog([]);c.sheets['S1']=Sheet('S1','orders.xlsx','orders',[
+        ('month','customer','model','price','key','存在未交付的订单，整个订单暂停奖金发放。'),
+        (202701,'A1','ABC12+DEF34',120,'202701A1ABC12+DEF34',None),
+        (202702,'B8','ABC56+DEF78',150,'202702B8ABC56+DEF78',None)])
+    profile=source_index(c)['sheets'][0]
+    assert profile['sparse_columns']['F']=={'nonempty_count':1,'cells':[{'cell':'F1','text':'存在未交付的订单，整个订单暂停奖金发放。'}]}
+    inv={'sheets':{'S1':{'kind':'mixed','reason':'原始订单及侧栏规则','rule_ranges':[],'rule_cells':['F1']}},'unreadable':{}}
+    units=rule_units(c,inv);assert set(units)=={'S1CF1'} and units['S1CF1']['text']==profile['sparse_columns']['F']['cells'][0]['text']
+    assert explicit_formulas('202701 | A1 | ABC12+DEF34 | 120 | 202701A1ABC12+DEF34')==[]
+    assert explicit_formulas('202701 | A1 | ABC12+DEF34*2 | 未结算，未支付 | 120 | 202701A1ABC12+DEF34*2')==[]
+    assert explicit_formulas('净额 | 收入-成本')==['收入-成本']
+    assert explicit_formulas('公式 | 1 | 2 | amount2-cost1')==['amount2-cost1']
+    inv['sheets']['S1']['rule_cells']=['F2']
+    with pytest.raises(ProgramError,match='实际为空'):validate_source_inventory(c,inv)
+
+
+def test_model_cannot_reclassify_a_record_composite_key_as_formula():
+    raw='202701 | A1 | ABC12+DEF34 | 120 | 202701A1ABC12+DEF34'
+    u={'S1R2':{'file':'orders.xlsx','where':'orders!2','text':raw}}
+    c={'quote':'202701A1ABC12+DEF34','meaning':'实际拼接主键','level':'source','operation':'binding','kind':'formula','formula':'202701A1ABC12+DEF34'}
+    ob,_=validate_clause_chunk(u,{'units':{'S1R2':{'disposition':'operative','reason':'实际字段','clauses':[c]}}})
+    assert ob['S1R2:1']['formula'] is None
+
+
 def test_phase_without_actual_business_rules_is_skipped_by_program():
     from bonus_agent.adaptive_compiler import AdaptiveCompiler,_empty_fragment
     def prohibited_request(*args,**kwargs):raise AssertionError('empty stage must not call model')

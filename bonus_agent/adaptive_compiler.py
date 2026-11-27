@@ -505,8 +505,9 @@ class AdaptiveCompiler:
         if unsupported:raise ProgramError('图像型材料缺少可读取规则或真实排除授权',owner='scope_mapping',kind='material',details={'sources':unsupported})
         idx=source_index(cat)
         inventory=self.ask('adaptive/source_inventory','scope_mapping',{'period':period,**idx},
-            '盘点材料作用，不编制公式。每张真实S表必须给出 {"kind":"data/rule/mixed/output/context","reason":"真实性质及用途","rule_ranges":[]或实际物理行范围数组[[起行,末行]]}。'
+            '盘点材料作用，不编制公式。每张真实S表必须给出 {"kind":"data/rule/mixed/output/context","reason":"真实性质及用途","rule_ranges":[]或实际物理行范围数组[[起行,末行]],"rule_cells":[]或实际单元格坐标数组}。'
             '业务数据及名单为data；规则/数据混合才mixed；不按文件名字面排除未知资料。制度表/输出要求不得用作销售数据。所有文档文字和原生表后续逐条覆盖。'
+            '混合表中若说明只在某个侧栏或表头单元格，必须使用rule_cells（例如["L1"]），rule_ranges留空；只有实际整行属于规则才标rule_ranges。sparse_columns列出该列全部实际非空坐标和值，严禁将孤立说明推断为整列或后续数据行。产品组合编码、拼接主键和状态明细仍是数据，不因含有+-/而变成公式。逐张核对真实坐标。'
             '输出{"sheets":{"S编号":上述对象},"unreadable":{}}。无法读取的图像需要真实确认非业务规则或补材料，不能猜。'
             ,lambda v:validate_source_inventory(cat,v))
         units=rule_units(cat,inventory);proposals={};rules={}
