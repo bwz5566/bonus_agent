@@ -58,6 +58,12 @@ def test_json_object_request_always_carries_provider_required_json_word(monkeypa
     assert messages==original
 
 
+def test_json_fallback_handles_escaped_quotes_and_reports_incomplete_protocol():
+    from bonus_agent.llm import parse_json
+    assert parse_json('说明 '+json.dumps({'text':'引号"及括号}'} ,ensure_ascii=False)+' 尾注')=={'text':'引号"及括号}'}
+    with pytest.raises(LLMError,match='JSON.*不完整'):parse_json('{"items": [1,')
+
+
 def test_scoped_wall_deadline_keeps_unknown_usage_and_never_retries(monkeypatch):
     import threading,time
     from bonus_agent.llm import NODE_REQUEST_LIMITS

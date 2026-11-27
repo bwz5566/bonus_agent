@@ -419,6 +419,7 @@ def unchanged_rule_candidates(stored,files,reviewer):
     previous data mapping, evaluated amount, or financial confirmation.
     """
     retained={};old_files=stored.get('files',{});sources=stored.get('adaptive_rule_sources',{})
+    authorities={str(v['id']):v for v in stored.get('active_rules',[]) if isinstance(v,dict) and v.get('id')}
     # A new attempt can stop at inventory/API transport before it has had a
     # chance to revalidate the retained units. Do not lose previously checked
     # source-only evidence merely because that attempt has no new unit proof.
@@ -427,7 +428,10 @@ def unchanged_rule_candidates(stored,files,reviewer):
     for digest,record in stored.get('unchanged_rule_candidates',{}).items():
         if not isinstance(digest,str) or not re.fullmatch(r'[0-9a-f]{64}',digest) or not isinstance(record,dict):continue
         filename=record.get('file');receipt=record.get('review_receipt',{})
-        if not filename or not files.get(filename) or files[filename]!=old_files.get(filename) or files[filename]!=record.get('sha256'):continue
+        if record.get('authority_id'):
+            authority=authorities.get(record['authority_id'])
+            if not authority or filename!='财务正式规则修订' or fingerprint(authority)!=record.get('sha256'):continue
+        elif not filename or not files.get(filename) or files[filename]!=old_files.get(filename) or files[filename]!=record.get('sha256'):continue
         if record.get('reviewer')!=reviewer or receipt.get('status')!='PASS' or receipt.get('reviewer')!=reviewer or not isinstance(record.get('proposal'),dict):continue
         retained[digest]=copy.deepcopy(record)
     for uid,proof in stored.get('adaptive_rule_unit_proofs',{}).items():
@@ -435,14 +439,21 @@ def unchanged_rule_candidates(stored,files,reviewer):
         candidate=stored.get('specs',{}).get(task)
         if not isinstance(source,dict) or not isinstance(candidate,dict) or not isinstance(candidate.get('units'),dict):continue
         filename=source.get('file');digest=proof.get('digest')
-        if not filename or not files.get(filename) or files[filename]!=old_files.get(filename):continue
+        source_identity=None;authority_id=None
+        if filename=='财务正式规则修订':
+            authority=authorities.get(str(source.get('where')))
+            if authority and source.get('text')==(authority.get('statement') or f'{authority.get("label",authority["field"])}：{authority["value"]}'):
+                authority_id=str(authority['id']);source_identity=fingerprint(authority)
+        elif filename and files.get(filename) and files[filename]==old_files.get(filename):source_identity=files[filename]
+        if not source_identity:continue
         # The displayed source index intentionally drops table metadata. The
         # recorded full unit digest (tested against the NEW full unit in the
         # compiler) is the stronger identity, not a hash of that display.
         if not isinstance(digest,str) or not re.fullmatch(r'[0-9a-f]{64}',digest) or receipt.get('status')!='PASS' or receipt.get('reviewer')!=reviewer:continue
         if receipt.get('output')!=fingerprint(candidate) or candidate['units'].get(uid)!=proof.get('proposal'):continue
-        retained[digest]={'file':filename,'sha256':files[filename],'answer_key':proof.get('answer_key'),'proposal':copy.deepcopy(proof['proposal']),
+        retained[digest]={'file':filename,'sha256':source_identity,'answer_key':proof.get('answer_key'),'proposal':copy.deepcopy(proof['proposal']),
                           'reviewer':reviewer,'review_receipt':copy.deepcopy(receipt),'historical_task':task,'historical_unit':uid}
+        if authority_id:retained[digest]['authority_id']=authority_id
     return retained
 
 
@@ -706,7 +717,7 @@ def run_chain(llm,paths,out,*,scenario,period=None,answers=None,resume=True,max_
                 # T19 and the first fixed cold run: a real response reached
                 # its output limit. Keep the model/source/step, not the long
                 # incomplete reply; use a compact no-thinking JSON retry.
-                if protocol_attempt or not re.search(r'finish_reason=length|没有 JSON 对象|JSON.*解析',str(exc)) or budget.check(llm):raise
+                if protocol_attempt or not re.search(r'finish_reason=length|没有 JSON 对象|JSON.*(?:解析|不完整)',str(exc),re.I) or budget.check(llm):raise
                 event(node+'/协议恢复',False,{'error':str(exc),'action':'同一节点重新请求完整短JSON，关闭额外思考'},model=model,request=dict(model.last_call))
                 think=False;system+='\n上次响应截断/不是完整JSON。本次只输出所需短JSON，不输出长分析、解释或与当前节点无关内容。'
                 guard()
@@ -805,7 +816,15 @@ def run_chain(llm,paths,out,*,scenario,period=None,answers=None,resume=True,max_
             # context. An accepted receipt on the same evidence epoch can be
             # revalidated on future technical upgrades.
             binding_history=state.get('prior_binding_events',[]) if same_source_binding else state.get('candidate_archive',[])
-            history=archived_candidates(binding_history+state.get('events',[]),name) if draft is None and not feedback and archive_epoch is None else []
+            # Explicit evidence epochs normally prohibit recovery of rejected
+            # historical responses. A same-source, same-financial-version
+            # binding with its exact reviewed base is the narrow exception:
+            # the new deterministic validator must prove the entire contract.
+            binding_epoch_recovery=bool(same_source_binding and archive_epoch is not None)
+            if binding_epoch_recovery:
+                binding_history=[e for e in binding_history if e.get('node')!=name+'/独立复核' or
+                    (e.get('model')==checker.name and isinstance(e.get('review_base'),dict) and e.get('review_base_digest')==fingerprint(e['review_base']))]
+            history=archived_candidates(binding_history+state.get('events',[]),name) if draft is None and not feedback and (archive_epoch is None or binding_epoch_recovery) else []
             old_draft,old_review=history[-1] if history else (None,None)
             for prior_draft,prior_review in reversed(history):
                 if not prior_draft or not prior_review or unresolved_questions(prior_draft) or unresolved_questions(prior_review):continue
@@ -816,10 +835,12 @@ def run_chain(llm,paths,out,*,scenario,period=None,answers=None,resume=True,max_
                         state['specs'][name]=jsonable(recovered)
                         state['receipts'][name]={'status':'PASS','inputs':inputs,'semantic_inputs':semantic_inputs,'output':fingerprint(recovered),'reviewer':checker.name,
                             'review':prior_review.get('reason',''),'confidence':'real_archived_model_response_revalidated','recovered':True}
+                        if archive_epoch is not None:state['receipts'][name]['archive_epoch']=archive_epoch
                         event(name,True,{'receipt':state['receipts'][name],'recovered':'真实旧候选与独立复核已按同源重新校验，不重新付费抽取'});return recovered
                 except HistoryCoverageError as exc:
                     feedback=str(exc);draft=repair_history(exc,recovered)
-                except (ChainError,KeyError,TypeError,ValueError,IndexError):pass
+                except (ChainError,KeyError,TypeError,ValueError,IndexError) as exc:
+                    if same_source_binding:state.setdefault('binding_recovery_diagnostics',[]).append({'node':name,'error':str(exc),'review':prior_review.get('reason','')})
             if old_draft and not old_review:draft=old_draft
         for attempt in range(3):
             reviewed_original=None;replacement_applied=False

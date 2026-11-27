@@ -786,7 +786,10 @@ class AdaptiveCompiler:
         retained=self.state.get('unchanged_rule_candidates',{});revalidated=[]
         for uid,unit in list(pending.items()):
             digest=fingerprint(unit);old=retained.get(digest)
-            if not old or old.get('answer_key')!=answer_key or old.get('file')!=unit.get('file') or old.get('sha256')!=self.state.get('files',{}).get(unit.get('file')):continue
+            authority=unit.get('authority')
+            source_identity=fingerprint(authority) if authority else self.state.get('files',{}).get(unit.get('file'))
+            if not old or old.get('answer_key')!=answer_key or old.get('file')!=unit.get('file') or old.get('sha256')!=source_identity:continue
+            if authority and old.get('authority_id')!=str(authority.get('id')):continue
             actual={'units':{uid:deepcopy(old['proposal'])}}
             try:validate_clause_chunk({uid:unit},actual)
             except ProgramError:continue

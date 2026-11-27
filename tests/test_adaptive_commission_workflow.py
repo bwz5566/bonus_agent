@@ -569,3 +569,20 @@ def test_source_binding_epoch_is_independent_of_code_but_not_financial_revision(
     assert source_binding_epoch(a)==source_binding_epoch(b)
     b['revision_id']='v2';assert source_binding_epoch(a)!=source_binding_epoch(b)
     b=deepcopy(a);b['questions'][0]['answer']='new decision';assert source_binding_epoch(a)!=source_binding_epoch(b)
+
+
+def test_actual_authority_rule_proof_reuse_requires_the_same_financial_version():
+    from bonus_agent.commission_chain import unchanged_rule_candidates
+    from bonus_agent.recovery import fingerprint
+    v={'id':'real-revision','field':'adaptive:r','statement':'本批实际新规则','owner':'scope_mapping'}
+    source={'file':'财务正式规则修订','where':v['id'],'text':v['statement']}
+    selected={'disposition':'operative','reason':'真实财务原文','clauses':[]}
+    uid='Rrev_'+v['id'];candidate={'units':{uid:selected}}
+    digest=fingerprint({**source,'authority':v,'phase':v['owner']})
+    receipt={'status':'PASS','reviewer':'pro','output':fingerprint(candidate)}
+    state={'files':{},'active_rules':[v],'adaptive_rule_sources':{uid:source},'specs':{'rule-task':candidate},
+           'adaptive_rule_unit_proofs':{uid:{'task':'rule-task','digest':digest,'receipt':receipt,'proposal':selected,'answer_key':fingerprint([])}}}
+    recovered=unchanged_rule_candidates(state,{},'pro')
+    assert recovered[digest]['authority_id']==v['id'] and recovered[digest]['sha256']==fingerprint(v)
+    stale={'files':{},'active_rules':[dict(v,statement='不同的确认')],'unchanged_rule_candidates':recovered}
+    assert unchanged_rule_candidates(stale,{},'pro')=={}

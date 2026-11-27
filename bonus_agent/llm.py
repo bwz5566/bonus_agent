@@ -553,22 +553,11 @@ def parse_json(text: str):
     start = s.find("{")
     if start < 0:
         raise LLMError("模型输出中没有 JSON 对象")
-    depth, in_str, esc = 0, False, False
-    for i, ch in enumerate(s[start:], start):
-        if in_str:
-            esc = (ch == "\\") and not esc
-            if ch == '"' and not esc:
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return json.loads(s[start:i + 1])
-    raise LLMError("模型输出的 JSON 不完整")
+    try:
+        value,_=json.JSONDecoder().raw_decode(s,start)
+        return value
+    except json.JSONDecodeError as exc:
+        raise LLMError(f"模型输出的 JSON 不完整或解析失败（位置 {exc.pos}）") from exc
 
 
 @dataclass
