@@ -20,6 +20,7 @@ from bonus_agent.recovery import fingerprint
 from bonus_core.engine.adaptive import (CalculationProgram,Inputs,ProgramError,contract,names,OPERATORS,
     apply_person_program,CONTRIBUTION_DATASET,CONTRIBUTION_FIELDS,canonical_program,canonical_roster,canonical_expression,Context,Record)
 from bonus_core.dsl.models import to_decimal
+from bonus_core.engine.intervals import parse_interval
 
 
 MODE='sales_commission_v2'
@@ -46,6 +47,97 @@ DATASET_HELP+='\nrelationships匹配数量还支持optional_many：若原文允�
 
 
 def _empty_fragment():return {'metrics':{},'parameters':{},'schedules':{},'checks':[],'formula_bindings':{}}
+
+
+def native_interval_layouts(catalog):
+    """Discover unambiguous native interval axes; retain actual coordinates.
+
+    No rate or boundary value is manufactured from a model response. The
+    model subsequently resolves only the financial method/endpoint policy.
+    """
+    result={}
+    def intervals(labels,axis):
+        if len(labels)<2:return False
+        percent=any('%' in normalized(x) for x in labels)
+        try:
+            for x in labels:parse_interval(x,percent=percent,unit='%' if percent else '万' if '万' in str(axis) else '元')
+        except (ValueError,TypeError):return False
+        return True
+    def numeric(values):
+        if not values:return False
+        try:return all(v is not None and str(v).strip() and to_decimal(v) is not None for v in values)
+        except (ValueError,TypeError):return False
+    for tid,t in catalog.tables.items():
+        if t.sheet_name or len(t.rows)<2 or len(t.rows[0])<2:continue
+        rows=t.rows;forms=[]
+        labels=[r[0] if r else '' for r in rows[1:]]
+        if intervals(labels,rows[0][0]):
+            for col in range(2,len(rows[0])+1):
+                values=[r[col-1] if col<=len(r) else None for r in rows[1:]]
+                if numeric(values):forms.append({'id':f'interval_{tid}_c{col}','layout':{'table':tid,'orientation':'rows','rows':list(range(2,len(rows)+1)),'band_column':1,'rate_column':col},'axis':rows[0][0],'rate_label':rows[0][col-1],'labels':labels,'rates':values})
+        horizontal=[];labels=rows[0][1:]
+        if intervals(labels,rows[0][0]):
+            for row in range(2,len(rows)+1):
+                values=rows[row-1][1:1+len(labels)]
+                if len(values)==len(labels) and numeric(values):horizontal.append({'id':f'interval_{tid}_r{row}','layout':{'table':tid,'orientation':'columns','columns':list(range(2,len(rows[0])+1)),'band_row':1,'rate_row':row},'axis':rows[0][0],'rate_label':rows[row-1][0],'labels':labels,'rates':values})
+        # Ambiguous layouts stay in the normal model compilation path.
+        if bool(forms)==bool(horizontal):continue
+        forms=forms or horizontal
+        result[tid]={'table':tid,'title':t.title,'forms':forms,'percent_axis':any('%' in normalized(x) for x in forms[0]['labels'])}
+    return result
+
+
+def normalize_calculation_phases(catalog,units,obligations):
+    """Route explicit calculation subjects after the actual table is known."""
+    tables=native_interval_layouts(catalog)
+    for rid,rule in obligations.items():
+        source=units[rule['unit']]
+        if source.get('authority') or rule['phase'] in ('scope_mapping','reference_mapping','export','roster'):continue
+        quote=rule['quote'];text=source['text'];subject=normalized(text.split('|',1)[0]) if '|' in text else normalized(quote)
+        if re.search(r'汇总每(?:个|位|名)?(?:人|员工|人员)|按(?:人员|员工|个人)(?:身份)?汇总',quote):
+            rule.update(phase='roster',level='person',operation='calculation');continue
+        if re.fullmatch(r'汇总(?:各项目)?(?:提成|奖金)(?:总)?金额[。.]?',normalized(quote)):
+            rule.update(phase='hold_policy',level='primary',operation='funding');continue
+        if ((re.search(r'暂扣|冻结|可分配|正常分配|应发',subject) and re.search(r'提成|奖金|金额|资金|分配',quote)) or
+            (re.search(r'提成总金额|提成总额|奖金总额',subject) and re.search(r'系数',quote)) or
+            (re.search(r'项目',quote) and re.search(r'分配提成金额|正常可分配金额',quote) and re.search(r'保留到分|四舍五入|ROUND',quote,re.I))):
+            rule.update(phase='hold_policy',level='primary',operation='funding');continue
+        table=tables.get(source.get('table'))
+        if table:
+            context=table['title']+' '+''.join(str(f['axis'])+' '+str(f['rate_label']) for f in table['forms'])
+            if table['percent_axis'] and re.search(r'系数|系數|达成|達成|库存|庫存|毛利|逾期',context):
+                rule.update(phase='coefficient_policy',level='primary',operation='parameter');continue
+        if (re.search(r'达成比例|达成率|達成率|毛利率|库存比例|庫存比例|逾期应收(?:款)?比例|系数|系數',subject)
+                and re.search(r'系数|系數|比例|毛利率|达成率|達成率',quote)):
+            rule.update(phase='coefficient_policy',level='primary',operation='adjustment')
+    return obligations
+
+
+def verify_progressive_amounts(metrics,schedules,obligations,*,required_ids=None,financial_ids=None,owner='project_policy'):
+    """An explicit marginal-tier rule must reach an actual tier amount."""
+    wanted=set(obligations) if required_ids is None else set(required_ids)
+    explicit=[rid for rid in wanted if rid in obligations and re.search(r'超额累进|超額累進|累进阶梯',obligations[rid]['quote'])]
+    if not explicit:return
+    def tier_amount_refs(expr,seen):
+        if isinstance(expr,dict):
+            if set(expr)=={'tier'}:
+                t=expr['tier'];s=schedules.get(t.get('schedule'),{})
+                if t.get('output')=='amount' and s.get('method')=='progressive':return {t['schedule']}
+            if set(expr)=={'ref'}:
+                mid=expr['ref']
+                if mid in seen or mid not in metrics:return set()
+                return tier_amount_refs(metrics[mid]['expr'],seen|{mid})
+            return set().union(*(tier_amount_refs(v,seen) for v in expr.values()))
+        if isinstance(expr,list):return set().union(*(tier_amount_refs(v,seen) for v in expr))
+        return set()
+    available=set(metrics) if financial_ids is None else set(financial_ids)
+    for rid in explicit:
+        found=False
+        for mid in available:
+            m=metrics[mid];used=tier_amount_refs(m['expr'],{mid})
+            if used and (rid in m['rules'] or any(rid in schedules[s].get('rules',[]) for s in used)):
+                found=True;break
+        if not found:raise ProgramError('原文明确超额累进阶梯金额；实际可达金额指标未使用method=progressive的tier output=amount，不能仅取整档费率乘全部基数',owner=owner,kind='coverage',rules=[rid],details={'actual_rule':obligations[rid]['quote']})
 
 
 def _merge_map(target,incoming,label,owner):
@@ -100,19 +192,28 @@ def _schema_summary(data,*,physical=False):
 def _metric_summary(metrics):return {k:{'label':v['label'],'type':v.get('type'),'owner':v.get('owner')} for k,v in metrics.items()}
 
 
-def source_attributes(scope):
-    """Expose raw attributes only when the physical grain proves one row per object."""
+def source_attributes(scope,program=None):
+    """Expose scalar raw attributes backed by true per-object uniqueness.
+
+    A detail ledger can still have a project-level currency, category or
+    exchange rate if every real included row of each project agrees. This
+    proof is not a substitute for aggregating monetary detail fields.
+    """
     pop=scope['population'];ds=scope['datasets'].get(pop['dataset'])
     if not ds:return {}
     grain=ds['grain']
-    if grain['kind']!='unique' or not grain['keys'] or not set(grain['keys'])<=set(pop['keys']):return {}
+    unique=grain['kind']=='unique' and grain['keys'] and set(grain['keys'])<=set(pop['keys'])
+    if not unique and program is None:return {}
+    groups=program.prepare_population()[0] if not unique else {}
     result={}
     for field,spec in ds['fields'].items():
         if field in pop['keys']:continue
+        if not unique:
+            if spec['kind']=='money' or any(any(row.values[field]!=rows[0].values[field] for row in rows[1:]) for rows in groups.values()):continue
         ident=f'source:{pop["dataset"]}:{field}'
         query={'dataset':'$project','aggregate':'unique','match':{},'value':{'field':field},
-               'empty':'null' if spec['nullable'] else 'error','nulls':'ignore' if spec['nullable'] else 'error','duplicates':'error'}
-        result[ident]={'label':spec.get('label',field),'expr':{'query':query},'type':{'money':'number','ratio':'number','number':'number','date':'date','bool':'bool'}.get(spec['kind'],'text'),
+               'empty':'null' if spec['nullable'] else 'error','nulls':'ignore' if spec['nullable'] else 'error','duplicates':'error' if unique else 'identical'}
+        result[ident]={'label':spec.get('label',field) if unique else f'{spec.get("label",field)}（实际项目内恒定属性，非金额合计）','expr':{'query':query},'type':{'money':'number','ratio':'number','number':'number','date':'date','bool':'bool'}.get(spec['kind'],'text'),
                        'rules':list(dict.fromkeys(spec.get('rules') or ds.get('rules') or pop['rules'])),'owner':'scope_mapping'}
     return result
 
@@ -163,7 +264,8 @@ def bind_formula_atoms(fragment,available,scope,obligations,phase,period):
     subtree already present in the candidate is lifted verbatim, and the
     original literal formula is still compared to the resulting expression.
     """
-    attrs=source_attributes(scope);metrics=fragment['metrics']
+    prefix=f'source:{scope["population"]["dataset"]}:'
+    attrs={**source_attributes(scope),**{k:v for k,v in available.items() if k.startswith(prefix)}};metrics=fragment['metrics']
     _canonical_parameter_sources(fragment.get('parameters',{}),obligations)
     for m in metrics.values():m['expr']=_project_source_expr(m['expr'],scope,attrs)
     for c in fragment['checks']:c['expr']=_project_source_expr(c['expr'],scope,attrs)
@@ -672,6 +774,7 @@ def _validate_global_bindings(catalog,inventory,obligations,datasets,*,owner,com
 def _restore_obligations(catalog,saved):
     units=rule_units(catalog,saved['inventory'])
     obligations,decisions=validate_clause_chunk(units,{'units':saved['clause_proposals']})
+    normalize_calculation_phases(catalog,units,obligations)
     return units,obligations,decisions
 
 
@@ -687,7 +790,8 @@ def replay_basis(catalog,saved,period):
     datasets=deepcopy(scope['datasets']);_merge_map(datasets,reference['datasets'],'数据集','reference_mapping')
     _validate_data_use(saved['inventory'],datasets)
     _validate_global_bindings(catalog,saved['inventory'],obligations,datasets,owner='reference_mapping',complete=True)
-    fragment=_empty_fragment();attrs=source_attributes(scope)
+    fragment=_empty_fragment();scope_probe=_compile_prefix(catalog,scope['datasets'],scope['population'],_empty_fragment(),period,calculate=False,allow_unbound=True)
+    attrs=source_attributes(scope,scope_probe)
     if 'source_attributes' in parts and parts['source_attributes'].get('metrics')!=attrs:
         raise ProgramError('底层原始属性与实际唯一粒度合同不一致',owner='scope_mapping',kind='binding')
     fragment['metrics'].update(attrs)
@@ -700,6 +804,7 @@ def replay_basis(catalog,saved,period):
     p=CalculationProgram(inputs,plan,period)
     for m in p.metrics.values():validate_numeric_literals(m['expr'],m['rules'],obligations,owner=m.get('owner','project_policy'))
     verify_parameter_usage(fragment['parameters'],fragment['schedules'],{'metrics':p.metrics,'population':p.population,'checks':p.checks},obligations,owner='hold_policy')
+    verify_progressive_amounts(p.metrics,fragment['schedules'],obligations,financial_ids=_financial_metrics(p))
     proof=coverage(obligations,{ph:parts[ph] for ph in BASIS_PHASES},phases=BASIS_PHASES,
                    formula_bindings=fragment['formula_bindings'],metrics=fragment['metrics'],parameters=inputs.parameters,
                    keys=p.keys,financial_metrics=_financial_metrics(p))
@@ -759,6 +864,73 @@ class AdaptiveCompiler:
 
     def ask(self,name,owner,data,prompt,validate,**options):
         return self.request(name,data,prompt,validate,owner=owner,**options)
+
+    def _compile_native_schedules(self,phase,phase_rules,units):
+        fragment=_empty_fragment();covered=set()
+        if phase not in ('project_policy','coefficient_policy'):return fragment,covered
+        tables=native_interval_layouts(self.catalog)
+        policy={rid:r for rid,r in phase_rules.items() if not units[r['unit']].get('table') and
+                re.search(r'阶梯|累进|端点|边界|负数|负基数|最低档|低于|系数|系數',r['quote'])}
+        for tid,table in tables.items():
+            rids=[rid for rid,r in phase_rules.items() if units[r['unit']].get('table')==tid]
+            if not rids:continue
+            # One physical table, one concise metadata contract. Its actual
+            # rows and rate columns are compiled by the program, never copied
+            # by Flash or the independent review.
+            forms={f['id']:f for f in table['forms']}
+            positive_method=('whole' if phase=='coefficient_policy' and table['percent_axis'] else
+                'progressive' if not table['percent_axis'] and any(re.search(r'超额累进|超額累進|累进阶梯',r['quote']) for r in policy.values()) else None)
+            signed=positive_method=='progressive' and any(re.search(r'负(?:数|基数).{0,30}(?:照算|按阶梯|按原)|负的提成',r['quote']) for r in policy.values())
+            method_rules=[rid for rid,r in policy.items() if positive_method=='progressive' and re.search(r'超额累进|超額累進|累进阶梯',r['quote']) or signed and re.search(r'负(?:数|基数).{0,30}(?:照算|按阶梯|按原)|负的提成',r['quote'])]
+            def validate(v,forms=forms,rids=rids,method=positive_method,signed=signed,method_rules=method_rules):
+                contract(v,required=('schedules',),label='独立物理阶梯表元数据',owner=phase)
+                if not isinstance(v['schedules'],dict) or set(v['schedules'])!=set(forms):
+                    raise ProgramError(f'必须为每个实际费率轴提供独立阶梯元数据，实际需要 {sorted(forms)}',owner=phase,kind='coverage')
+                for name,s in v['schedules'].items():
+                    contract(s,required=('bound_unit','rate_unit','method','negative','below','includes'),optional=('rules','layout'),label=f'{name} 阶梯元数据',owner=phase)
+                    form=forms[name];s['layout']=deepcopy(form['layout'])
+                    if table['percent_axis']:s['bound_unit']='percent'
+                    elif all(re.search(r'万|亿|元|萬|億',str(x)) for x in form['labels']):s['bound_unit']='raw'
+                    if method:s['method']=method
+                    if signed:s['negative']='signed'
+                    if all('%' in normalized(x) for x in form['rates']):s['rate_unit']='percent'
+                    elif phase=='coefficient_policy' and table['percent_axis'] and any(re.search(r'系数|系數',phase_rules[rid]['quote']+phase_rules[rid]['meaning']) for rid in rids):
+                        s['rate_unit']='raw'
+                    units={'raw':'元','wan':'万','yi':'亿','percent':'%'}
+                    if s['bound_unit'] in units:
+                        iv=[parse_interval(x,percent=s['bound_unit']=='percent',unit=units[s['bound_unit']]) for x in form['labels']]
+                        iv.sort(key=lambda x:(x.lower is not None,x.lower or to_decimal(0)))
+                        requested=s['includes'] if isinstance(s['includes'],list) and len(s['includes'])==len(iv) else [None]*len(iv)
+                        for i,interval in enumerate(iv):
+                            flags=[x for x in (interval.include_lower,not iv[i-1].include_upper if i and iv[i-1].include_upper is not None else None) if x is not None]
+                            if flags and any(x!=flags[0] for x in flags):raise ProgramError('原始制度区间对同一端点给出了冲突的明确归属',owner=phase,kind='material',metric=name)
+                            if flags:requested[i]=flags[0]
+                            elif type(requested[i]) is not bool and s['method']=='progressive':requested[i]=True
+                        if any(type(x) is not bool for x in requested):raise ProgramError('原文未确定的整档系数端点必须由本批实际规则或财务确认决定',owner=phase,kind='coverage',metric=name)
+                        s['includes']=requested
+                        if iv[0].lower is None:s['below']='first'
+                    selected=names(s.get('rules',[]),f'{name} 规则证据',phase,nonempty=False)
+                    if not set(selected)<=set(phase_rules):raise ProgramError(f'{name} 阶梯元数据引用非本阶段规则',owner=phase,kind='coverage')
+                    s['rules']=list(dict.fromkeys([*rids,*method_rules,*selected]))
+                read_schedules(self.catalog,v['schedules'],owner=phase)
+            reply=self.ask(f'adaptive/{phase}/schedule/{tid}',phase,
+                {'period':self.period,'actual_table':table,'required_schedule_ids':list(forms),'table_rules':_compact({r:phase_rules[r] for r in rids}),
+                 'method_evidence':{rid:{'quote':r['quote'],'meaning':r['meaning']} for rid,r in policy.items()},'program_contract':{'method':positive_method,'negative':'signed' if signed else None}},
+                '只处理当前一张原生制度区间表的计算口径，不生成奖金公式，不复制任何档位数值或坐标。程序已确定各费率轴和完整原始单元格。'
+                '每个required_schedule_id返回 {"bound_unit":"raw/percent/wan/yi","rate_unit":"raw/percent","method":"whole/progressive","negative":"signed/zero/error","below":"first/zero/error","includes":[按区间下界从低到高的布尔值],"rules":[实际口径条款ID，可空]}。'
+                '原始区间明确包含/不含端点时必须遵照实际文字。程序确定method或negative时不得另改；区间为百分数时bound_unit=percent。累进金额和整档系数是不同模式。若实际规则确有影响金额而原件未明确的端点/算法，请提供具体业务问题和例子。'
+                '输出 {"schedules":{"实际schedule ID":上述元数据}}。不要输出bands、费率数组、坐标或新增指标。',validate)
+            _merge_map(fragment['schedules'],reply['schedules'],'阶梯表',phase);covered.update(rids)
+        return fragment,covered
+
+    def _schedule_sources(self,schedules):
+        layouts=native_interval_layouts(self.catalog);result={}
+        for sid,s in schedules.items():
+            layout=s.get('layout',{});t=layouts.get(layout.get('table'))
+            if not t:continue
+            actual=next((f for f in t['forms'] if f['layout']==layout),None)
+            if actual:result[sid]={'table':t['table'],'title':t['title'],'axis':actual['axis'],'rate_label':actual['rate_label'],'method':s['method'],'rules':s['rules']}
+        return result
 
     def build_basis(self):
         cat=self.catalog;period=self.period
@@ -840,6 +1012,13 @@ class AdaptiveCompiler:
             validate_clause_chunk(chunk,reply);proposals.update(reply['units'])
             for uid,unit in chunk.items():proofs[uid]={'digest':fingerprint(unit),'answer_key':answer_key,'task':task,'proposal':deepcopy(reply['units'][uid]),'receipt':deepcopy(self.state['receipts'][task])}
         rules,decisions=validate_clause_chunk(units,{'units':proposals})
+        normalize_calculation_phases(cat,units,rules)
+        # Save the program's canonical responsibility mapping separately
+        # from the independently reviewed original proposals/proof digests.
+        proposals=deepcopy(proposals)
+        for rid,rule in rules.items():
+            uid=rule['unit'];index=int(rid.rsplit(':',1)[1])-1
+            proposals[uid]['clauses'][index].update(phase=rule['phase'],level=rule['level'],operation=rule['operation'])
         self.state['adaptive_rule_decisions']={k:{'disposition':v['disposition'],'reason':v['reason'],'file':v['source']['file'],'where':v['source']['where']} for k,v in decisions.items()}
         profiles=_binding_context(cat,inventory,'basis');parts={}
         scope_rules=_clauses_for(rules,'scope_mapping')
@@ -889,7 +1068,8 @@ class AdaptiveCompiler:
             '\n输出{"datasets":{...},"checks":[{"id":"检查ID","expr":真实布尔表达式JSON对象,"message":"不符时的具体含义","rules":[条款ID]}]}。禁止将SQL/集合符号/自然语言/常量true当成可执行表达式；仅本层数据检查，依赖未来指标的检查留后续计算节点。',validate_ref,archive_epoch='physical-binding-evidence-v2')
         parts['reference_mapping']=reference;_merge_map(datasets,reference['datasets'],'数据集','reference_mapping')
         aggregate=_empty_fragment();aggregate['checks']=deepcopy(reference['checks'])
-        attrs=source_attributes(scope)
+        scope_probe=_compile_prefix(cat,scope['datasets'],scope['population'],_empty_fragment(),period,calculate=False,allow_unbound=True)
+        attrs=source_attributes(scope,scope_probe)
         if attrs:
             parts['source_attributes']={'metrics':attrs};aggregate['metrics'].update(deepcopy(attrs))
             self.event('adaptive/source_attributes',True,{'metrics':list(attrs),'reason':'实际主集合粒度保证每对象唯一源行，保留原始字段及其真实查询'})
@@ -929,10 +1109,14 @@ class AdaptiveCompiler:
         # empty obligation set must not trigger an LLM to hallucinate rules
         # from other phases or invent a coefficient/deduction just to fill it.
         if not phase_rules:return _empty_fragment()
+        prepared,table_covered=self._compile_native_schedules(phase,phase_rules,units)
+        phase_rules={rid:r for rid,r in phase_rules.items() if rid not in table_covered}
+        if not phase_rules:return prepared
         # The outline carries only compact semantic obligations and existing
         # dependency names. Actual formulas and raw parameter cells are fetched
         # separately for each bounded group.
         outline_data={'period':self.period,'phase':phase,'obligations':_compact(phase_rules),'available_metrics':_metric_summary(previous['metrics']),
+                      'available_schedule_sources':self._schedule_sources({**previous['schedules'],**prepared['schedules']}),
                       'data_contracts':_schema_summary(datasets),'project_keys':scope['population']['keys']}
         def valid_outline(v):
             contract(v,required=('groups',),label='指标分组',owner=phase)
@@ -953,16 +1137,20 @@ class AdaptiveCompiler:
             if covered!=set(phase_rules):raise ProgramError(f'指标组漏规则：{sorted(set(phase_rules)-covered)}',owner=phase,kind='coverage')
         outline=self.ask(f'adaptive/{phase}/outline',phase,outline_data,
             '只规划本阶段需要的具名指标组和依赖顺序，不编制公式或复制参数。按先基础后依赖排组，每组只关注相关规则；将同一指标/费率表的规则放同组。'
-            '新指标来自本次材料，不固定数量或名称。项目规则组负责基数及基本金额；系数组仅按材料需要编制调节指标；暂扣/总额组实现资金公式及舍入。已有指标可直接引用。'
+            '新指标来自本次材料，不固定数量或名称。项目规则组负责基数及基本金额；系数组仅按材料需要编制调节指标；暂扣/总额组实现资金公式及舍入。已有指标可直接引用。available_schedule_sources中的每张真实阶梯表已独立编译，勿重复规划这些表格规则。'
             '输出{"groups":[{"id":"唯一英文ID","purpose":"用途","rules":[本阶段实际条款ID],"metrics":{"本组新增指标ID":"指标名称/定义"}}]}；条款全部覆盖。费率/政策组可以没有新增指标；必须在后续实际表达式中使用。',valid_outline)
-        merged=_empty_fragment()
+        merged=prepared
         for group in outline['groups']:
             gid=group['id'];clauses={r:phase_rules[r] for r in group['rules']}
             available=deepcopy(previous);_merge_fragment(available,merged,phase)
+            context=_source_context(self.catalog,units,clauses)
+            precompiled_tables={s.get('layout',{}).get('table') for s in available['schedules'].values()}
+            context['parameter_tables']=[t for t in context['parameter_tables'] if t['id'] not in precompiled_tables]
             data={'period':self.period,'group':group,'data_contracts':_schema_summary(datasets),'project_keys':scope['population']['keys'],
                   'available_metrics':_metric_summary(available['metrics']),'available_parameters':list(available['parameters']),'available_schedules':list(available['schedules']),
+                  'available_schedule_sources':self._schedule_sources(available['schedules']),
                   'dependency_digest':fingerprint({'datasets':datasets,'scope':scope,'available':available}),
-                  **_source_context(self.catalog,units,clauses)}
+                  **context}
             def validate(v,available=available,group=group):
                 _validate_fragment(v,phase,period=self.period)
                 required=set(group['metrics'])
@@ -980,6 +1168,7 @@ class AdaptiveCompiler:
                 if any(not set(v['metrics'][k]['rules'])&set(group['rules']) for k in extras):raise ProgramError('新增辅助指标缺本组真实原文来源',owner=phase,kind='coverage')
                 combined=deepcopy(available);_merge_fragment(combined,v,phase)
                 for m in v['metrics'].values():validate_numeric_literals(m['expr'],m['rules'],all_rules,owner=phase)
+                verify_progressive_amounts(combined['metrics'],combined['schedules'],all_rules,required_ids=group['rules'],owner=phase)
                 probe_program=_compile_prefix(self.catalog,datasets,scope['population'],combined,self.period,owner=phase)
                 # The final phase coverage will also include funding links.
                 formula_ids={r for r in group['rules'] if all_rules[r].get('formula')}
@@ -990,7 +1179,7 @@ class AdaptiveCompiler:
                 '只编制本指标组。实际公式必须包含原文全部因子、顺序和例外；不要计算最终金额。先定义一次实际来源参数/阶梯，再以具名指标引用。'+EXPRESSION_HELP+
                 '\n输出{"metrics":{"规划指标ID":{"label":"实际含义","expr":表达式,"type":"number/text/bool/date","rules":[对应条款ID]}},"parameters":{...},"schedules":{...},"checks":[{"id":"具名检查","expr":布尔表达式,"message":"不通过说明","rules":[条款ID]}],"formula_bindings":{"明示公式条款ID":{"target":"该公式真实指标ID","symbols":{"原文完整符号":{"ref":"指标ID"}或{"param":"参数ID"}或{"key":"项目键"}},"path":[]（可省，确为if分支时写实际args路径）}}}。'
                 '每个原文非数字符号都必须绑定，不能只引用算式而漏新因子。直接复用available_metrics中已经由真实唯一源行产生的底层属性；数值字面量不用登记符号。'
-                '必须保留所有规划指标；可以增加被实际规划公式引用的、带本组证据的具名源查询辅助指标（如原始合同额、实际费率），并用ref绑定原文符号。不要额外创造未使用的指标。无法实现的业务语义给具体反例，不能改用旧公式。',validate)
+                '已预编译的available_schedule_sources给出了真实制度表、轴和费率类别；按实际项目属性选择对应schedule ID，禁止重新抄写这些阶梯表或把累进金额改成整档费率乘基数。必须保留所有规划指标；可以增加被实际规划公式引用的、带本组证据的具名源查询辅助指标（如原始合同额、实际费率），并用ref绑定原文符号。不要额外创造未使用的指标。无法实现的业务语义给具体反例，不能改用旧公式。',validate)
             _merge_fragment(merged,reply,phase)
         return merged
 

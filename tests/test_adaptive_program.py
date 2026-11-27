@@ -440,6 +440,63 @@ def test_literal_join_pair_uses_real_duplicate_header_occurrence():
     assert any(ch.get('field')=='label' and ch['target_field']=='current_alias' for ch in changes)
 
 
+def test_native_interval_schedules_are_compiled_by_actual_axis_not_copied_rates():
+    from bonus_agent.commission_sources import ParameterTable
+    from bonus_agent.adaptive_compiler import AdaptiveCompiler,native_interval_layouts,normalize_calculation_phases
+    from bonus_agent.adaptive_sources import read_schedules
+    c=Catalog([]);c.tables['T1']=ParameterTable('T1','rate.pptx',1,1,'交易额阶梯提成',
+        [['金额区间','新合同','老合同'],['100元以下','1%','0.5%'],['100元以上','2%','1%']])
+    c.tables['T2']=ParameterTable('T2','rate.pptx',2,1,'质量毛利率系数',
+        [['毛利率范围','质量系数'],['10%以下','0.7'],['10%以上','1.2']])
+    tables=native_interval_layouts(c)
+    assert set(tables)=={'T1','T2'} and len(tables['T1']['forms'])==2
+    units={'T1R2':{'table':'T1','text':'100元以下 | 1% | 0.5%'},
+           'R1':{'text':'按超额累进方式计算阶梯提成，负基数按阶梯照算。'},
+           'T2R2':{'table':'T2','text':'10%以下 | 0.7'},
+           'R2':{'text':'奖金总额 | 阶梯金额×质量系数'}}
+    ob={'T1R2:1':{'unit':'T1R2','quote':units['T1R2']['text'],'meaning':'真实费率','phase':'project_policy','level':'primary','operation':'parameter'},
+        'R1:1':{'unit':'R1','quote':units['R1']['text'],'meaning':'累计规则','phase':'project_policy','level':'primary','operation':'calculation'},
+        'T2R2:1':{'unit':'T2R2','quote':units['T2R2']['text'],'meaning':'系数','phase':'project_policy','level':'primary','operation':'parameter'},
+        'R2:1':{'unit':'R2','quote':units['R2']['text'],'meaning':'总额','phase':'project_policy','level':'primary','operation':'calculation'}}
+    for rid,r in ob.items():r['kind']='table' if rid.startswith('T') else 'policy'
+    normalize_calculation_phases(c,units,ob)
+    assert ob['T2R2:1']['phase']=='coefficient_policy' and ob['R2:1']['phase']=='hold_policy'
+    def request(name,data,prompt,validate,**kw):
+        v={'schedules':{sid:{'bound_unit':'raw','rate_unit':'percent','method':'whole','negative':'zero','below':'first','includes':[True,True]}
+                        for sid in data['required_schedule_ids']}}
+        validate(v);return v
+    compiler=AdaptiveCompiler(c,'2027-01',request,lambda *a:None,{})
+    fragment,covered=compiler._compile_native_schedules('project_policy',{k:v for k,v in ob.items() if v['phase']=='project_policy'},units)
+    assert covered=={'T1R2:1'} and len(fragment['schedules'])==2
+    schedules,_=read_schedules(c,fragment['schedules'])
+    assert all(s.method=='progressive' and s.negative=='signed' for s in schedules.values())
+    assert schedules['interval_T1_c2'].steps==((D(0),D('.01'),True),(D(100),D('.02'),True))
+
+
+def test_actual_detail_attribute_uniqueness_is_not_amount_aggregation():
+    from bonus_agent.adaptive_compiler import source_attributes,_compile_prefix,_empty_fragment
+    c=Catalog([]);c.sheets['S1']=Sheet('S1','detail.xlsx','detail',[('合同','币种','汇率','金额','记录'),('A','USD',7,100,'x'),('A','USD',7,120,'y'),('B','RMB',1,200,'z')])
+    ds={'label':'原始明细','fields':{'id':{'kind':'id','nullable':False},'currency':{'kind':'text','nullable':False},'fx':{'kind':'number','nullable':False},'amount':{'kind':'money','nullable':False},'row_id':{'kind':'id','nullable':False}},
+        'sources':[{'sheet':'S1','header_row':1,'columns':{'id':'A','currency':'B','fx':'C','amount':'D','row_id':'E'}}],
+        'grain':{'kind':'detail','keys':[],'duplicates':'error','rules':[]},'rules':[]}
+    scope={'datasets':{'detail':ds},'population':{'dataset':'detail','keys':['id'],'where':True,'rules':[]}}
+    p=_compile_prefix(c,scope['datasets'],scope['population'],_empty_fragment(),'2027-01',calculate=False)
+    attrs=source_attributes(scope,p)
+    assert set(attrs)=={'source:detail:currency','source:detail:fx'}
+    assert all(v['expr']['query']['duplicates']=='identical' for v in attrs.values())
+
+
+def test_progressive_policy_rejects_whole_rate_times_base():
+    from bonus_agent.adaptive_compiler import verify_progressive_amounts
+    rules={'R1':{'quote':'实际阶梯金额按超额累进计算。'}}
+    schedules={'actual':{'method':'progressive','rules':['R1']}}
+    bad={'amount':{'expr':op('mul',ref('base'),{'tier':{'schedule':'actual','value':ref('base'),'output':'rate'}}),'rules':['R1']},
+         'base':{'expr':100,'rules':[]}}
+    with pytest.raises(ProgramError,match='不能仅取整档费率'):verify_progressive_amounts(bad,schedules,rules,financial_ids={'amount','base'})
+    good=deepcopy(bad);good['amount']['expr']={'tier':{'schedule':'actual','value':ref('base'),'output':'amount'}}
+    verify_progressive_amounts(good,schedules,rules,financial_ids={'amount','base'})
+
+
 def test_literal_exclusion_and_nonzero_counterexample_on_real_source_coordinates():
     from bonus_agent.adaptive_compiler import apply_literal_source_exclusions,validate_explicit_zero_exclusion,_compile_prefix,_empty_fragment
     c=Catalog([]);c.sheets={
