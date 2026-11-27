@@ -8,7 +8,7 @@ contracts can be recompiled model-free before approval and export.
 from __future__ import annotations
 
 from copy import deepcopy
-from collections import defaultdict
+from collections import defaultdict,Counter
 from calendar import monthrange
 import re
 
@@ -39,6 +39,8 @@ EXPRESSION_HELP='''表达式是JSON数据，禁止生成Python。形式：数字
 所有业务运算必须有所在阶段条款ID。未知算子不得省略；用questions说明确切缺口及影响。'''
 EXPRESSION_HELP+='\n支持的op：'+', '.join(OPERATORS)
 EXPRESSION_HELP+='\n同一物理阶梯表可用紧凑 layout 替代 bands：纵向 {"orientation":"rows","table":"T编号","rows":[实际行号],"band_column":实际区间列整数,"rate_column":实际费率列整数}；横向 {"orientation":"columns","table":"T编号","columns":[实际列号],"band_row":实际行号,"rate_row":实际行号}。也可用sheet与实际列字母。不能省略真实档位。'
+
+EXPRESSION_HELP+='\n按类别选择不同制度阶梯：{"tier":{"selectors":[{"ref":"已编译实际类别指标"},{"ref":"另一类别指标"}],"cases":[{"values":["实际源类别值","实际另一类别值"],"schedule":"实际阶梯ID"}],"value":{"ref":"计算基数"},"output":"amount/rate"}}。每个实际取值组合必须精确命中一项；禁止默认阶梯。制度标题与实际源类别不是同一字段，须用actual_categories的实际值和原文适用范围逐项对应；不可用标题猜源表值。'
 
 DATASET_HELP='''数据集合同：datasets={"语义ID":{"label":"用途","fields":{"语义字段":{"kind":"id/text/number/money/ratio/month/date/bool","nullable":false,"unit":"raw/percent/wan/yi（可省默认raw）","normalize":"trim/casefold（可省）","minimum":明确下界（可省）, "maximum":明确上界（可省）, "allowed":[明确允许原值]（可省）, "rules":[字段校验条款ID]（可省）}},"sources":[{"sheet":"实际S编号","header_row":实际行号,"columns":{"语义字段":"列字母"},"start_row":首数据行（可省）, "end_row":末行（可省）, "skip":[{"column":"实际判断列","values":[实际排除原值],"reason":"排除理由","rules":[条款ID]}]（可省）}],"grain":{"kind":"detail/unique","keys":[行身份字段，如预算唯一对象或明细单号；明细无唯一号可空],"duplicates":"error/identical","rules":[条款ID]},"relationships":[{"fields":[外键字段],"target":"已定义的目标数据集ID","target_fields":[真实目标键],"cardinality":"exactly_one/at_least_one/optional_unique","rules":[条款ID]}]（可省）,"rules":[条款ID]}}。
 同一语义数据集可绑定多源，每个来源单独列位置/表头；不同来源单位时 columns字段值可为{"column":"实际列","unit":"raw/percent/wan/yi"}。实际标题提供月度的宽表可用 constants:{"月份字段":{"period":"month"}}；不能把不知月份的表当本月。同一语义列恰有一个来源；缺值保持null，0不是缺失。先明确原始明细还是已汇总唯一对象，再定义去重/加总；不要根据金额猜。'''
@@ -98,6 +100,17 @@ def normalize_calculation_phases(catalog,units,obligations):
         quote=rule['quote'];text=source['text'];subject=normalized(text.split('|',1)[0]) if '|' in text else normalized(quote)
         if re.search(r'计算基数|计提基数|阶梯基数',quote) and re.search(r'负数|负基数|负的提成',quote) and re.search(r'阶梯|累进',quote) and not re.search(r'个人|人员|员工|每人',quote):
             rule.update(phase='project_policy',level='primary',operation='calculation');continue
+        # Classification must precede the financial schedule it selects.
+        if (re.search(r'当.+(?:等于|[=＝]).+归类.+为.+',quote) or (re.search(r'阶梯提成率|阶梯费率',quote) and re.search(r'(?:用|采用|取自).{0,20}(?:表|费率)',quote))) and not re.search(r'个人|人员|员工|每人',quote):
+            rule.update(phase='project_policy',level='primary',operation='calculation');continue
+        # Primary-object coefficient fallback and funding rules sometimes
+        # arrive with an erroneous person-level interpretation. Use the
+        # actual subject and operand names, not that inferred level.
+        if not re.search(r'个人|人员|员工|每人|角色|分成',quote):
+            if re.search(r'毛利率|毛利系数|达成率|达成比例',subject) and re.search(r'系数|最低档|低于最低',quote):
+                rule.update(phase='coefficient_policy',level='primary',operation='adjustment');continue
+            if re.search(r'每个项目|项目都先算',quote) and re.search(r'暂扣|冻结',quote) and re.search(r'提成总额|提成总金额',quote):
+                rule.update(phase='hold_policy',level='primary',operation='funding');continue
         if rule['phase'] in ('scope_mapping','reference_mapping','export','roster'):continue
         if re.search(r'汇总每(?:个|位|名)?(?:人|员工|人员)|按(?:人员|员工|个人)(?:身份)?汇总',quote):
             rule.update(phase='roster',level='person',operation='calculation');continue
@@ -117,6 +130,18 @@ def normalize_calculation_phases(catalog,units,obligations):
         if (re.search(r'达成比例|达成率|達成率|毛利率|库存比例|庫存比例|逾期应收(?:款)?比例|系数|系數',subject)
                 and re.search(r'系数|系數|比例|毛利率|达成率|達成率',quote)):
             rule.update(phase='coefficient_policy',level='primary',operation='adjustment')
+    # A quoted composite amount name is a symbol, even when it contains an
+    # arithmetic glyph. Its defining expression must precede consumers.
+    definitions=defaultdict(list)
+    for rid,r in obligations.items():
+        if not r.get('formula'):continue
+        for name in re.findall(r'「([^」]+)」\s*[=＝]',r['quote']):
+            canonical=normalized(name)
+            if re.search(r'[+*/-]',canonical):definitions[canonical].append(rid)
+    for rid,r in obligations.items():
+        if not r.get('formula'):continue
+        dependencies={name:ids[0] for name,ids in definitions.items() if len(ids)==1 and rid!=ids[0] and name in normalized(r['formula'])}
+        if dependencies:r['defined_formula_symbols']=dependencies
     return obligations
 
 
@@ -125,26 +150,38 @@ def verify_progressive_amounts(metrics,schedules,obligations,*,required_ids=None
     wanted=set(obligations) if required_ids is None else set(required_ids)
     explicit=[rid for rid in wanted if rid in obligations and re.search(r'超额累进|超額累進|累进阶梯',obligations[rid]['quote'])]
     if not explicit:return
-    def tier_amount_refs(expr,seen):
+    def tier_amount_nodes(expr,seen):
         if isinstance(expr,dict):
             if set(expr)=={'tier'}:
-                t=expr['tier'];s=schedules.get(t.get('schedule'),{})
-                if t.get('output')=='amount' and s.get('method')=='progressive':return {t['schedule']}
+                t=expr['tier'];ids={t['schedule']} if 'schedule' in t else {c.get('schedule') for c in t.get('cases',[]) if isinstance(c,dict)}
+                ids={sid for sid in ids if schedules.get(sid,{}).get('method')=='progressive'}
+                if t.get('output')=='amount' and ids:return [(t,ids)]
             if set(expr)=={'ref'}:
                 mid=expr['ref']
-                if mid in seen or mid not in metrics:return set()
-                return tier_amount_refs(metrics[mid]['expr'],seen|{mid})
-            return set().union(*(tier_amount_refs(v,seen) for v in expr.values()))
-        if isinstance(expr,list):return set().union(*(tier_amount_refs(v,seen) for v in expr))
-        return set()
+                if mid in seen or mid not in metrics:return []
+                return tier_amount_nodes(metrics[mid]['expr'],seen|{mid})
+            return [n for v in expr.values() for n in tier_amount_nodes(v,seen)]
+        if isinstance(expr,list):return [n for v in expr for n in tier_amount_nodes(v,seen)]
+        return []
     available=set(metrics) if financial_ids is None else set(financial_ids)
     for rid in explicit:
-        found=False
+        found=False;dispatch_ok=False
+        linked_tables={s.get('layout',{}).get('table') for s in schedules.values() if s.get('method')=='progressive' and rid in s.get('rules',[])}-{None}
+        requires_dispatch=len(linked_tables)>1 and bool(re.search(r'按.{0,8}(?:区域|地区|类别|类型).{0,12}(?:对应|分别|适用).{0,16}(?:阶梯|累进)',obligations[rid]['quote']))
+        recoded={mid for mid,m in metrics.items() if mid.startswith('source_category:') and m['label'].split('（',1)[0] in obligations[rid]['quote']}
+        def depends(expr,seen=None):
+            seen=set() if seen is None else seen
+            refs=_metric_refs(expr)-seen
+            return refs|set().union(*(depends(metrics[x]['expr'],seen|refs) for x in refs if x in metrics))
         for mid in available:
-            m=metrics[mid];used=tier_amount_refs(m['expr'],{mid})
+            m=metrics[mid];nodes=tier_amount_nodes(m['expr'],{mid});used=set().union(*(ids for _,ids in nodes))
             if used and (rid in m['rules'] or any(rid in schedules[s].get('rules',[]) for s in used)):
-                found=True;break
+                found=True
+                tables={schedules[s].get('layout',{}).get('table') for s in used}-{None}
+                if linked_tables<=tables and all('selectors' in t and 'cases' in t and recoded<=depends(t['selectors']) for t,_ in nodes):dispatch_ok=True
+                if not requires_dispatch or dispatch_ok:break
         if not found:raise ProgramError('原文明确超额累进阶梯金额；实际可达金额指标未使用method=progressive的tier output=amount，不能仅取整档费率乘全部基数',owner=owner,kind='coverage',rules=[rid],details={'actual_rule':obligations[rid]['quote']})
+        if requires_dispatch and not dispatch_ok:raise ProgramError('原文要求按实际类别对应多张阶梯表；必须使用显式分类阶梯 selectors/cases 覆盖实际源类别和对应费率表，并使用原文归类后的类别，禁止嵌套IF落入默认阶梯',owner=owner,kind='coverage',rules=[rid],details={'actual_rule':obligations[rid]['quote'],'required_tables':sorted(linked_tables),'required_classification_metrics':sorted(recoded)})
 
 
 def _merge_map(target,incoming,label,owner):
@@ -180,7 +217,7 @@ def _merge_fragment(target,incoming,owner):
 def _clauses_for(obligations,phase):return {k:v for k,v in obligations.items() if v['phase']==phase}
 
 
-def _compact(rules):return {k:{'meaning':v['meaning'],'kind':v['kind'],'phase':v['phase'],**({'binding_assertions':v['binding_assertions']} if v.get('binding_assertions') else {})} for k,v in rules.items()}
+def _compact(rules):return {k:{'meaning':v['meaning'],'kind':v['kind'],'phase':v['phase'],**({'binding_assertions':v['binding_assertions']} if v.get('binding_assertions') else {}),**({'defined_formula_symbols':v['defined_formula_symbols']} if v.get('defined_formula_symbols') else {})} for k,v in rules.items()}
 
 
 def _binding_context(catalog,inventory,stage):
@@ -223,6 +260,67 @@ def source_attributes(scope,program=None):
         result[ident]={'label':spec.get('label',field) if unique else f'{spec.get("label",field)}（实际项目内恒定属性，非金额合计）','expr':{'query':query},'type':{'money':'number','ratio':'number','number':'number','date':'date','bool':'bool'}.get(spec['kind'],'text'),
                        'rules':list(dict.fromkeys(spec.get('rules') or ds.get('rules') or pop['rules'])),'owner':'scope_mapping'}
     return result
+
+
+def literal_category_rules(catalog,scope,obligations,attributes):
+    """Compile only explicit, fully bound text-category reassignment rules.
+
+    Example grammar: 当部门=甲、客户不等于乙，归类部门为丙.
+    Physical column headings prove the actual fields, and the unchanged
+    branch retains the original value. No business names are built in.
+    """
+    pop=scope['population'];ds=scope['datasets'][pop['dataset']];aliases=defaultdict(set)
+    for src in ds['sources']:
+        sheet=catalog.sheet(src);header=[normalized(x) if x is not None else '' for x in sheet.rows[src['header_row']-1]]
+        for field,binding in src['columns'].items():
+            if ds['fields'][field]['kind'] not in ('text','id'):continue
+            col=binding['column'] if isinstance(binding,dict) else binding;i=column_index_from_string(col)-1;label=header[i]
+            if label:aliases[label+str(header[:i+1].count(label)) if header.count(label)>1 else label].add(field)
+    def resolve(label):
+        matches=aliases.get(normalized(label),set())
+        if len(matches)!=1:return None
+        field=next(iter(matches));ident=f'source:{pop["dataset"]}:{field}'
+        return {'key':field} if field in pop['keys'] else {'ref':ident} if ident in attributes else None
+    candidates=defaultdict(list)
+    for rid,r in obligations.items():
+        if r['phase']!='project_policy':continue
+        found=re.fullmatch(r'当\s*(.+?)[,，、;；]\s*(?:将)?归类\s*(.+?)\s*为\s*(.+?)[。.]?',r['quote'].strip())
+        if not found:continue
+        condition,target,value=found.groups();dest=resolve(target)
+        if dest is None or not value.strip() or re.search(r'[，,；;]',value):continue
+        predicates=[]
+        for item in re.split(r'[,，、]|且|并且',condition):
+            term=re.fullmatch(r'\s*(.+?)\s*(不等于|不为|!=|≠|等于|[=＝]|为)\s*(.+?)\s*',item)
+            if not term or (operand:=resolve(term[1])) is None:break
+            literal=term[3].strip().strip('「」“”"')
+            if not literal or re.search(r'否则|或者|或是|并非',literal):break
+            predicates.append({'op':'ne' if term[2] in ('不等于','不为','!=','≠') else 'eq','args':[operand,literal]})
+        else:
+            if not predicates:continue
+            condition=predicates[0] if len(predicates)==1 else {'op':'and','args':predicates}
+            field=dest.get('key') or dest['ref'].rsplit(':',1)[1];ident=f'source_category:{pop["dataset"]}:{field}'
+            candidates[ident].append((rid,{'label':f'{target}（原文明确条件归类，其他取原值）','expr':{'op':'if','args':[condition,value.strip().strip('「」“”"'),dest]},'type':'text','rules':[rid],'owner':'project_policy'}))
+    # Competing rules for the same output need an explicit precedence from
+    # the normal compiler instead of silently depending on enumeration order.
+    metrics={ident:items[0][1] for ident,items in candidates.items() if len(items)==1}
+    covered={rid for m in metrics.values() for rid in m['rules']}
+    return metrics,covered
+
+
+def observed_category_domains(program,*,limit=24):
+    """Small exact, counted domains from the evaluated actual population.
+
+    Do not sample arbitrary titles or use expected result data. High-cardinality
+    identity fields are omitted, while every value of a small domain is shown.
+    """
+    counts=defaultdict(Counter)
+    categorical={mid for mid,m in program.metrics.items() if m.get('type') in ('text','bool')}
+    key_fields={k for k in program.keys if program.sales.fields[k]['kind'] in ('text','id','month','bool')}
+    for ctx,_ in program._contexts.values():
+        for ident,value in [(f'key:{k}',v) for k,v in ctx.keys.items() if k in key_fields]+[(k,v) for k,v in ctx.metrics.items() if k in categorical]:
+            if value is None or isinstance(value,(str,bool)):
+                counts[ident][value]+=1
+    return {ident:[{'value':value,'objects':count} for value,count in c.items()] for ident,c in counts.items() if 0<len(c)<=limit}
 
 
 def source_aggregates(catalog,scope,obligations):
@@ -302,13 +400,19 @@ def _project_source_expr(expr,scope,attributes,*,row=False):
     """A project field isn't a row field unless the grain/key proves its value."""
     if not isinstance(expr,dict):return expr
     pop=scope['population'];by_field={m['expr']['query']['value']['field']:key for key,m in attributes.items()}
+    if set(expr)=={'ref'} and not row and isinstance(expr['ref'],str):
+        prefix=f'source:{pop["dataset"]}:'
+        if expr['ref'].startswith(prefix) and expr['ref'][len(prefix):] in pop['keys']:
+            return {'key':expr['ref'][len(prefix):]}
     if set(expr)=={'field'} and not row:
         f=expr['field']
         if f in pop['keys']:return {'key':f}
         if f in by_field:return {'ref':by_field[f]}
     if set(expr)=={'op','args'} and isinstance(expr['args'],list):return {'op':expr['op'],'args':[_project_source_expr(x,scope,attributes,row=row) for x in expr['args']]}
     if set(expr)=={'tier'} and isinstance(expr['tier'],dict) and 'value' in expr['tier']:
-        return {'tier':{**expr['tier'],'value':_project_source_expr(expr['tier']['value'],scope,attributes,row=row)}}
+        t={**expr['tier'],'value':_project_source_expr(expr['tier']['value'],scope,attributes,row=row)}
+        if isinstance(t.get('selectors'),list):t['selectors']=[_project_source_expr(s,scope,attributes,row=row) for s in t['selectors']]
+        return {'tier':t}
     if set(expr)=={'query'} and isinstance(expr['query'],dict):
         q=expr['query'];f=q.get('value',{}).get('field') if isinstance(q.get('value'),dict) and set(q['value'])=={'field'} else None
         same_object=(q.get('dataset')=='$project' and q.get('match')=={} or
@@ -872,6 +976,9 @@ def replay_basis(catalog,saved,period):
     _validate_global_bindings(catalog,saved['inventory'],obligations,datasets,owner='reference_mapping',complete=True)
     fragment=_empty_fragment();scope_probe=_compile_prefix(catalog,scope['datasets'],scope['population'],_empty_fragment(),period,calculate=False,allow_unbound=True)
     attrs={**source_attributes(scope,scope_probe),**source_aggregates(catalog,scope,obligations)}
+    expected_categories,_=literal_category_rules(catalog,scope,obligations,attrs)
+    if any(parts['project_policy']['metrics'].get(k)!=v for k,v in expected_categories.items()):
+        raise ProgramError('已保存项目类别未执行原文明示的来源字段条件归类，需要从阶梯选择前重新编译',owner='project_policy',kind='coverage')
     expected_history,_=source_period_averages(catalog,scope,obligations,period,scope_probe)
     if any(parts['coefficient_policy']['metrics'].get(k)!=v for k,v in expected_history.items()):
         raise ProgramError('已保存客户/主对象历史平均指标与实际原文明示窗口、金额及活动月份定义不一致',owner='coefficient_policy',kind='coverage')
@@ -1210,6 +1317,19 @@ class AdaptiveCompiler:
         # from other phases or invent a coefficient/deduction just to fill it.
         if not phase_rules:return _empty_fragment()
         prepared,table_covered=self._compile_native_schedules(phase,phase_rules,units)
+        if phase=='project_policy':
+            recoded,recoded_covered=literal_category_rules(self.catalog,scope,all_rules,previous['metrics'])
+            if recoded:
+                prepared['metrics'].update(recoded);table_covered.update(recoded_covered)
+                task='adaptive/project_policy/source_categories'
+                proof={'metrics':recoded,'rule_sources':{r:all_rules[r]['quote'] for r in recoded_covered}}
+                receipt={'status':'PASS','inputs':fingerprint({'scope':scope,'rules':proof['rule_sources']}),'output':fingerprint(proof),'reviewer':'程序','review':'原文逐字条件、实际物理字段、未命中原值和真实项目粒度已确定','confidence':'deterministic_literal_category'}
+                self.state.setdefault('specs',{})[task]=deepcopy(proof);self.state.setdefault('receipts',{})[task]=receipt;self.state.setdefault('task_owners',{})[task]=phase
+                self.event(task,True,{'receipt':receipt,'proof':proof})
+            # The first calculation prompt sees the actual small categorical
+            # domains. Later groups reuse domains measured during validation.
+            probe=deepcopy(previous);_merge_fragment(probe,prepared,phase)
+            self._actual_categories=observed_category_domains(_compile_prefix(self.catalog,datasets,scope['population'],probe,self.period,owner=phase))
         if phase=='coefficient_policy':
             scope_probe=_compile_prefix(self.catalog,scope['datasets'],scope['population'],_empty_fragment(),self.period,calculate=False,allow_unbound=True)
             history,history_covered=source_period_averages(self.catalog,scope,all_rules,self.period,scope_probe)
@@ -1222,12 +1342,17 @@ class AdaptiveCompiler:
                 self.event(task,True,{'receipt':receipt,'proof':proof})
         phase_rules={rid:r for rid,r in phase_rules.items() if rid not in table_covered}
         if not phase_rules:return prepared
+        # An original sentence can govern more than one node (e.g. separate
+        # tier and coefficient table families). Keep one canonical obligation
+        # but retain its full meaning as read-only downstream context.
+        shared={rid:r for rid,r in all_rules.items() if phase=='coefficient_policy' and r['phase']=='project_policy' and re.search(r'阶梯提成率|阶梯费率',r['quote']) and re.search(r'系数|系數|其他指标',r['quote'])}
         # The outline carries only compact semantic obligations and existing
         # dependency names. Actual formulas and raw parameter cells are fetched
         # separately for each bounded group.
         outline_data={'period':self.period,'phase':phase,'obligations':_compact(phase_rules),'available_metrics':_metric_summary({**previous['metrics'],**prepared['metrics']}),
                       'available_schedule_sources':self._schedule_sources({**previous['schedules'],**prepared['schedules']}),
-                      'data_contracts':_schema_summary(datasets),'project_keys':scope['population']['keys']}
+                      'data_contracts':_schema_summary(datasets),'project_keys':scope['population']['keys'],
+                      'actual_categories':getattr(self,'_actual_categories',{}),'shared_applicability_rules':{r:v['quote'] for r,v in shared.items()}}
         def valid_outline(v):
             contract(v,required=('groups',),label='指标分组',owner=phase)
             if not isinstance(v['groups'],list):raise ProgramError('指标分组须列表',owner=phase)
@@ -1242,12 +1367,13 @@ class AdaptiveCompiler:
                 metrics=group['metrics']
                 if not isinstance(metrics,dict):raise ProgramError('指标组需要名称/用途映射',owner=phase)
                 if metrics and not r:raise ProgramError('指标组有实际指标但无本阶段原文规则；不能创造无依据的指标',owner=phase,kind='coverage')
-                if declared&set(metrics) or set(metrics)&set(previous['metrics']):raise ProgramError('指标重复声明',owner=phase)
+                if declared&set(metrics) or set(metrics)&(set(previous['metrics'])|set(prepared['metrics'])):raise ProgramError('指标重复声明：已由实际来源编译的指标应直接复用',owner=phase)
                 declared.update(metrics)
             if covered!=set(phase_rules):raise ProgramError(f'指标组漏规则：{sorted(set(phase_rules)-covered)}',owner=phase,kind='coverage')
         outline=self.ask(f'adaptive/{phase}/outline',phase,outline_data,
             '只规划本阶段需要的具名指标组和依赖顺序，不编制公式或复制参数。按先基础后依赖排组，每组只关注相关规则；将同一指标/费率表的规则放同组。'
             '新指标来自本次材料，不固定数量或名称。项目规则组负责基数及基本金额；系数组仅按材料需要编制调节指标；暂扣/总额组实现资金公式及舍入。已有指标可直接引用。available_schedule_sources中的每张真实阶梯表已独立编译，勿重复规划这些表格规则。'
+            'actual_categories来自实际已筛选对象的取值及数量；按区域/类别适用阶梯时需使用原文归类后的类别指标，且需要显式分类阶梯选择，不能以制度标题代替源表值。shared_applicability_rules仅保留确实跨节点的适用范围，不另外规划其上游金额。'
             '输出{"groups":[{"id":"唯一英文ID","purpose":"用途","rules":[本阶段实际条款ID],"metrics":{"本组新增指标ID":"指标名称/定义"}}]}；条款全部覆盖。费率/政策组可以没有新增指标；必须在后续实际表达式中使用。',valid_outline)
         merged=prepared
         for group in outline['groups']:
@@ -1259,6 +1385,7 @@ class AdaptiveCompiler:
             data={'period':self.period,'group':group,'data_contracts':_schema_summary(datasets),'project_keys':scope['population']['keys'],
                   'available_metrics':_metric_summary(available['metrics']),'available_parameters':list(available['parameters']),'available_schedules':list(available['schedules']),
                   'available_schedule_sources':self._schedule_sources(available['schedules']),
+                  'actual_categories':getattr(self,'_actual_categories',{}),'shared_applicability_rules':{r:v['quote'] for r,v in shared.items()},
                   'dependency_digest':fingerprint({'datasets':datasets,'scope':scope,'available':available}),
                   **context}
             def validate(v,available=available,group=group):
@@ -1285,6 +1412,7 @@ class AdaptiveCompiler:
                 if formula_ids:
                     coverage(all_rules,{phase:v},phases=[phase],required_ids=formula_ids,formula_bindings=combined['formula_bindings'],
                              metrics=combined['metrics'],parameters=probe_program.inputs.parameters,keys=scope['population']['keys'])
+                self._actual_categories=observed_category_domains(probe_program)
             reply=self.ask(f'adaptive/{phase}/group/{gid}',phase,data,
                 '只编制本指标组。实际公式必须包含原文全部因子、顺序和例外；不要计算最终金额。先定义一次实际来源参数/阶梯，再以具名指标引用。'+EXPRESSION_HELP+
                 '\n输出{"metrics":{"规划指标ID":{"label":"实际含义","expr":表达式,"type":"number/text/bool/date","rules":[对应条款ID]}},"parameters":{...},"schedules":{...},"checks":[{"id":"具名检查","expr":布尔表达式,"message":"不通过说明","rules":[条款ID]}],"formula_bindings":{"明示公式条款ID":{"target":"该公式真实指标ID","symbols":{"原文完整符号":{"ref":"指标ID"}或{"param":"参数ID"}或{"key":"项目键"}},"path":[]（可省，确为if分支时写实际args路径）}}}。'

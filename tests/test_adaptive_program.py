@@ -499,6 +499,75 @@ def test_progressive_policy_rejects_whole_rate_times_base():
     verify_progressive_amounts(good,schedules,rules,financial_ids={'amount','base'})
 
 
+def test_category_tiers_require_exact_observed_category_match():
+    from bonus_core.engine.adaptive import Schedule
+    c,ds,params,plan,_=fixture()
+    inputs=compile_inputs(c,ds,params,{},period='202701')
+    inputs.schedules={'north':Schedule(((D(0),D('.1'),True),),method='progressive'),
+                      'south':Schedule(((D(0),D('.2'),True),),method='progressive')}
+    selection={'tier':{'selectors':[key('office')],
+                        'cases':[{'values':['N'],'schedule':'north'},{'values':['S'],'schedule':'south'}],
+                        'value':ref('sales_net'),'output':'amount'}}
+    plan['metrics']['gross']['expr']=selection
+    p=CalculationProgram(inputs,deepcopy(plan),'2027-01');b=p.basis()
+    amounts={v['key_values']['office']:v['total'] for v in b['projects'].values()}
+    assert amounts=={'N':D('120'),'S':D('160')}
+    broken=deepcopy(plan);broken['metrics']['gross']['expr']['tier']['cases'][0]['values']=['North office table']
+    with pytest.raises(ProgramError,match='分类阶梯未覆盖实际取值'):
+        CalculationProgram(inputs,broken,'2027-01').basis()
+    broken=deepcopy(plan);broken['metrics']['gross']['expr']['tier']['cases'][1]['values']=['N']
+    with pytest.raises(ProgramError,match='分类阶梯.*重复'):
+        CalculationProgram(inputs,broken,'2027-01')
+
+
+def test_regional_progressive_policy_requires_explicit_dispatch_not_fallback():
+    from bonus_agent.adaptive_compiler import verify_progressive_amounts
+    rules={'R1':{'quote':'按区域对应超额累进阶梯比例计算'}}
+    schedules={s:{'method':'progressive','layout':{'table':s},'rules':['R1']} for s in ('A','B')}
+    tier=lambda s:{'tier':{'schedule':s,'value':ref('base'),'output':'amount'}}
+    bad={'base':{'expr':100,'rules':[]},'amount':{'expr':op('if',op('eq',key('office'),'North office table'),tier('A'),tier('B')),'rules':['R1']}}
+    with pytest.raises(ProgramError,match='显式分类阶梯'):
+        verify_progressive_amounts(bad,schedules,rules,financial_ids={'amount','base'})
+    good=deepcopy(bad);good['amount']['expr']={'tier':{'selectors':[key('office')],'cases':[{'values':['N'],'schedule':'A'},{'values':['S'],'schedule':'B'}],'value':ref('base'),'output':'amount'}}
+    verify_progressive_amounts(good,schedules,rules,financial_ids={'amount','base'})
+
+
+def test_literal_category_reassignment_uses_physical_field_and_exact_literal():
+    from bonus_agent.adaptive_compiler import literal_category_rules,_compile_prefix,_empty_fragment
+    c,ds,params,plan,_=fixture()
+    # Actual field names differ from the semantic IDs of the contract.
+    for sheet in ('S1','S2'):
+        src=c.sheets[sheet];i=0 if sheet=='S1' else 1
+        src.rows[i]=tuple({'Office':'部门','Agreement':'客户','Contract':'客户'}.get(x,x) for x in src.rows[i])
+    scope={'datasets':{'orders':ds['orders']},'population':plan['population']}
+    rules={'R1':{'phase':'project_policy','quote':'当部门=N，客户不等于0008，归类部门为A'}}
+    metrics,covered=literal_category_rules(c,scope,rules,{})
+    assert covered=={'R1'}
+    f=_empty_fragment();f['metrics'].update(metrics)
+    p=_compile_prefix(c,scope['datasets'],scope['population'],f,'2027-01')
+    assert {v['key_values']['agreement']:v['metrics']['source_category:orders:office'] for v in p.basis()['projects'].values()}=={'0007':'A','0008':'S'}
+    rules['R2']={'phase':'project_policy','quote':'当部门=N，归类部门为B'}
+    assert literal_category_rules(c,scope,rules,{})==({},set())
+
+
+def test_compound_source_amount_name_and_literal_citation_are_not_new_operands():
+    from bonus_agent.adaptive_compiler import normalize_calculation_phases
+    units={'R1':{'text':'每个项目都先算「减值+返还」=基数×(1−比率)（补充规则说明第13行）'},
+           'R2':{'text':'可分配=基数−减值+返还'}}
+    ob={'R1:1':{'unit':'R1','quote':units['R1']['text'],'formula':'基数*(1-比率)(补充规则说明第13行)','phase':'hold_policy'},
+        'R2:1':{'unit':'R2','quote':units['R2']['text'],'formula':'基数-减值+返还','phase':'hold_policy'}}
+    normalize_calculation_phases(Catalog([]),units,ob)
+    assert ob['R2:1']['defined_formula_symbols']=={'减值+返还':'R1:1'}
+    assert parse_literal_formula(ob['R1:1']['formula'],{'基数':ref('base'),'比率':ref('rate')})==op('mul',ref('base'),op('sub',{'num':'1'},ref('rate')))
+    metrics={k:{'label':k,'expr':v,'rules':r} for k,v,r in [('base',100,[]),('rate',{'num':'.5'},[]),('combined',op('mul',ref('base'),op('sub',1,ref('rate'))),['R1:1']),('pay',op('sub',ref('base'),ref('combined')),['R2:1'])]}
+    bindings={'R1:1':{'target':'combined','symbols':{'基数':ref('base'),'比率':ref('rate')}},'R2:1':{'target':'pay','symbols':{'基数':ref('base'),'减值+返还':ref('combined')}}}
+    coverage(ob,{'hold_policy':{'metrics':metrics}},phases=['hold_policy'],formula_bindings=bindings,metrics=metrics)
+    bindings['R2:1']['symbols']={'基数':ref('base'),'减值':ref('combined'),'返还':ref('rate')}
+    metrics['pay']['expr']=op('add',op('sub',ref('base'),ref('combined')),ref('rate'))
+    with pytest.raises(ProgramError,match='定义为一个完整金额指标'):
+        coverage(ob,{'hold_policy':{'metrics':metrics}},phases=['hold_policy'],formula_bindings=bindings,metrics=metrics)
+
+
 def test_explicit_period_average_uses_activity_months_and_never_future_months():
     from bonus_agent.adaptive_compiler import source_period_averages,_compile_prefix,_empty_fragment
     c=Catalog([]);c.sheets['S1']=Sheet('S1','detail.xlsx','detail',[('月份','客户','金额'),('202701','A',100),('202702','A',-20),('202703','A',0),('202703','B',50)])

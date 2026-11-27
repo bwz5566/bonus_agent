@@ -124,6 +124,12 @@ def _same(a,b):
     return type(a)==type(b) and a==b
 
 
+def _category_value(x):
+    """Typed exact identity for categorical dispatch (not fuzzy text matching)."""
+    if _number(x):return ('number',x if isinstance(x,F) else F(_decimal(x)))
+    return (type(x).__name__,x)
+
+
 def _field_refs(expr):
     if isinstance(expr,dict):
         if set(expr)=={'field'}:return {expr['field']}
@@ -196,7 +202,9 @@ def canonical_expression(expr,period,*,depth=0):
             if k in q:q[k]=norm(q[k])
         return {'query':q}
     if set(expr)=={'tier'} and isinstance(expr['tier'],dict) and 'value' in expr['tier']:
-        return {'tier':{**expr['tier'],'value':norm(expr['tier']['value'])}}
+        t={**expr['tier'],'value':norm(expr['tier']['value'])}
+        if isinstance(t.get('selectors'),list):t['selectors']=[norm(s) for s in t['selectors']]
+        return {'tier':t}
     return expr
 
 
@@ -330,10 +338,27 @@ class CalculationProgram:
         if kind=='num':
             _decimal(value);return set()
         if kind=='tier':
-            contract(value,required=('schedule','value','output'),label='阶梯表达式',owner=owner)
-            if value['schedule'] not in self.inputs.schedules or value['output'] not in ('amount','rate'):
-                raise ProgramError(f'阶梯表或输出类型无效：{value!r}',owner=owner)
-            return recurse(value['value'])
+            contract(value,required=('value','output'),optional=('schedule','selectors','cases'),label='阶梯表达式',owner=owner)
+            if value['output'] not in ('amount','rate'):raise ProgramError('阶梯输出必须为amount/rate',owner=owner)
+            deps=recurse(value['value'])
+            if 'schedule' in value:
+                if 'selectors' in value or 'cases' in value or not isinstance(value['schedule'],str) or value['schedule'] not in self.inputs.schedules:
+                    raise ProgramError(f'阶梯表无效或同时声明了分类：{value!r}',owner=owner)
+                return deps
+            selectors=value.get('selectors');cases=value.get('cases')
+            if not isinstance(selectors,list) or not selectors or not isinstance(cases,list) or not cases:
+                raise ProgramError('分类阶梯必须明确selectors与全部cases，不支持默认阶梯或空映射',owner=owner)
+            for selector in selectors:deps|=recurse(selector)
+            seen=set()
+            for case in cases:
+                contract(case,required=('values','schedule'),label='分类阶梯项',owner=owner)
+                vals=case['values'];sid=case['schedule']
+                if not isinstance(vals,list) or len(vals)!=len(selectors) or not all(_scalar(x) for x in vals) or not isinstance(sid,str) or sid not in self.inputs.schedules:
+                    raise ProgramError(f'分类阶梯项值的维度或阶梯ID无效：{case!r}',owner=owner)
+                identity=tuple(_category_value(x) for x in vals)
+                if identity in seen:raise ProgramError(f'分类阶梯对应取值重复：{vals!r}',owner=owner,kind='coverage')
+                seen.add(identity)
+            return deps
         if kind=='query':
             contract(value,required=('dataset','aggregate','match','empty','nulls'),optional=('where','value','duplicates'),label='聚合表达式',owner=owner)
             ds=value['dataset'];agg=value['aggregate']
@@ -446,11 +471,19 @@ class CalculationProgram:
         if kind=='period':return _native(self._period(x),exact)
         if kind=='query':return self.query(x,ctx,exact=exact)
         if kind=='tier':
-            schedule=self.inputs.schedules[x['schedule']];v=self._num(val(x['value']))
+            if 'schedule' in x:sid=x['schedule']
+            else:
+                actual=[val(s) for s in x['selectors']];identity=tuple(_category_value(v) for v in actual)
+                selected=next((c for c in x['cases'] if tuple(_category_value(v) for v in c['values'])==identity),None)
+                if selected is None:
+                    raise ProgramError(f'分类阶梯未覆盖实际取值 {actual!r}，禁止默认使用其他阶梯',kind='coverage',details={'selectors':x['selectors'],'actual_values':actual,'declared_values':[c['values'] for c in x['cases']]})
+                sid=selected['schedule']
+                if ctx.trace is not None:ctx.trace.append({'kind':'schedule_selection','selectors':x['selectors'],'values':actual,'schedule':sid})
+            schedule=self.inputs.schedules[sid];v=self._num(val(x['value']))
             steps=schedule.steps
-            if ctx.trace is not None:ctx.trace.append({'kind':'schedule','id':x['schedule'],'value':v,'evidence':schedule.evidence})
+            if ctx.trace is not None:ctx.trace.append({'kind':'schedule','id':sid,'value':v,'evidence':schedule.evidence})
             if x['output']=='rate':
-                if v<steps[0][0] and schedule.below=='error':raise ProgramError(f'{x["schedule"]} 观测值 {v} 低于第一档',kind='data')
+                if v<steps[0][0] and schedule.below=='error':raise ProgramError(f'{sid} 观测值 {v} 低于第一档',kind='data')
                 if v<steps[0][0] and schedule.below=='zero':return _native(0,exact)
                 if exact:
                     selected=steps[0][1]
@@ -458,9 +491,9 @@ class CalculationProgram:
                         if v>F(low) or inc and v==F(low):selected=rate
                     return F(selected)
                 return bracket(v,steps)[1]
-            if v<0 and schedule.negative=='error':raise ProgramError(f'{x["schedule"]} 未授权负基数',kind='data')
+            if v<0 and schedule.negative=='error':raise ProgramError(f'{sid} 未授权负基数',kind='data')
             if 0<=v<steps[0][0]:
-                if schedule.below=='error':raise ProgramError(f'{x["schedule"]} 观测值 {v} 低于第一档',kind='data')
+                if schedule.below=='error':raise ProgramError(f'{sid} 观测值 {v} 低于第一档',kind='data')
                 if schedule.below=='zero':return _native(0,exact)
             return tier_check(v,steps,schedule.method,schedule.negative) if exact else tier_amount(v,steps,schedule.method,schedule.negative)
         raise ProgramError(f'未知表达式 {expr!r}')

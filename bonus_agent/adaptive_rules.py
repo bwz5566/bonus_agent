@@ -659,7 +659,12 @@ def parse_literal_formula(formula,symbols):
             raise ProgramError(f'公式原文符号 {k!r} 必须指向真实具名指标/参数',kind='coverage')
         signature_map[k]=_signature(v)
     if len(set(signature_map.values()))!=len(signature_map):raise ProgramError('原文不同公式符号被合并成同一指标，需分别绑定',kind='coverage')
-    text=normalized(formula);tokens=[];i=0;used=set()
+    text=normalized(formula)
+    # An original trailing cross-reference is not an arithmetic operand.
+    # Strip only a clearly labelled document/line citation appended after
+    # an expression without an intervening operator (retain full quote).
+    text=re.sub(r'(?<![+*/\-,(])\([^()]{0,30}(?:规则|说明|制度|表格|原文)[^()]{0,20}第\d+(?:行|页|条|列)\)$','',text)
+    tokens=[];i=0;used=set()
     keys=sorted(mapped,key=len,reverse=True)
     while i<len(text):
         symbol=next((k for k in keys if text.startswith(k,i)),None)
@@ -730,6 +735,12 @@ def validate_numeric_literals(expr,rule_ids,obligations,*,owner):
         if raw is not None:
             if to_decimal(raw) not in allowed:raise ProgramError(f'计算表达式含原文或参数表不能支持的裸数 {raw!r}；请引用真实参数坐标或对应制度数字',owner=owner,kind='coverage',rules=rule_ids)
         elif isinstance(v,dict):
+            if set(v)=={'tier'} and isinstance(v['tier'],dict) and 'cases' in v['tier']:
+                # Category case values are identities of observed source
+                # records, not calculation constants or policy rates.
+                for k,x in v['tier'].items():
+                    if k not in ('cases','output','schedule'):walk(x)
+                return
             for k,x in v.items():
                 if k not in ('ref','key','field','param','period','schedule','dataset','aggregate','output','empty','nulls','duplicates'):walk(x)
         elif isinstance(v,list):
@@ -742,7 +753,10 @@ def verify_parameter_usage(parameters,schedules,expressions,obligations,*,owner)
     used_params=set();used_schedules=set()
     for _,expr in _walk(expressions):
         if set(expr)=={'param'}:used_params.add(expr['param'])
-        if set(expr)=={'tier'} and isinstance(expr['tier'],dict):used_schedules.add(expr['tier'].get('schedule'))
+        if set(expr)=={'tier'} and isinstance(expr['tier'],dict):
+            tier=expr['tier']
+            if 'schedule' in tier:used_schedules.add(tier['schedule'])
+            else:used_schedules.update(c['schedule'] for c in tier.get('cases',[]) if isinstance(c,dict) and 'schedule' in c)
     for kind,specs,used in [('参数',parameters,used_params),('阶梯',schedules,used_schedules)]:
         for name,spec in specs.items():
             rs=spec.get('rules',[])
@@ -815,6 +829,10 @@ def coverage(obligations,components,*,phases,formula_bindings=None,metrics=None,
                     k,v=next(iter(expr.items()))
                     permitted={'ref':set(symbol_metrics)|({'@alloc','@role_rate','@share'} if target=='settlement_contribution' else set()),'param':set(parameters),'key':set(symbol_keys)}
                     if k not in permitted or v not in permitted[k]:raise ProgramError(f'{sym} 引用了不存在的 {k} {v}')
+                for sym,definition in clause.get('defined_formula_symbols',{}).items():
+                    binding=formula_bindings.get(definition);bound={normalized(k):v for k,v in b['symbols'].items()}.get(sym)
+                    if binding is None or bound!={'ref':binding.get('target')}:
+                        raise ProgramError(f'原文已将「{sym}」定义为一个完整金额指标，必须引用 {definition} 的定义目标，不可拆成其他加减项')
                 expected=parse_literal_formula(literal,b['symbols'])
                 if not _same_literal_tree(actual,expected,parameters):raise ProgramError(f'原文完整算式与实际计算树不同：原文 {literal!r} -> {expected!r}，执行 {actual!r}')
             except (ProgramError,KeyError,TypeError,IndexError,ValueError) as exc:
