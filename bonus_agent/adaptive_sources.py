@@ -259,7 +259,8 @@ def read_parameters(catalog,specs,*,owner='project_policy'):
     if not isinstance(specs,dict):raise ProgramError('参数合同必须是对象',owner=owner)
     for name,p in specs.items():
         try:
-            contract(p,required=('source','kind','unit','rules'),label=f'参数 {name}',owner=owner)
+            contract(p,required=('source','kind','unit','rules'),optional=('label',),label=f'参数 {name}',owner=owner)
+            if 'label' in p and not isinstance(p['label'],str):raise ProgramError(f'参数 {name} label 只能为描述性文字',owner=owner)
             value,loc=read_literal(catalog,p['source'])
             if p['kind'] not in FIELD_KINDS or p['unit'] not in UNITS:raise ProgramError(f'{name} 参数类型/单位无效',owner=owner)
             values[name]=convert_value(value,{'kind':p['kind'],'unit':p['unit'],'nullable':False},location=loc)

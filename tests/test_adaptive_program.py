@@ -568,6 +568,35 @@ def test_compound_source_amount_name_and_literal_citation_are_not_new_operands()
         coverage(ob,{'hold_policy':{'metrics':metrics}},phases=['hold_policy'],formula_bindings=bindings,metrics=metrics)
 
 
+def test_project_scope_query_alias_does_not_infer_whole_external_table():
+    c,ds,params,plan,_=fixture()
+    q=query('$project','sum',fld('revenue'))
+    del q['query']['match'];plan['metrics']['sales_net']['expr']=q
+    params['commission']['label']='实际单元格费率，仅描述'
+    p=CalculationProgram(compile_inputs(c,ds,params,{},period='202701'),deepcopy(plan),'2027-01')
+    assert sorted(v['metrics']['sales_net'] for v in p.basis()['projects'].values())==[D(800),D(1200)]
+    q['query']['dataset']='orders'
+    with pytest.raises(ProgramError,match='match'):
+        CalculationProgram(compile_inputs(c,ds,params,{},period='202701'),plan,'2027-01')
+
+
+def test_retain_reviewed_metric_groups_only_on_exact_financial_version():
+    from bonus_agent.adaptive_compiler import retained_metric_groups,_empty_fragment
+    from bonus_agent.commission_chain import source_binding_epoch
+    from bonus_agent.recovery import fingerprint
+    candidate=_empty_fragment();candidate['metrics']['qty']={'label':'实际数量','expr':1,'rules':['R1']}
+    task='adaptive/project_policy/group/quantity'
+    state={'revision_id':'v1','files':{'actual.xlsx':'hash'},'period':'202701','active_rules':[{'id':'r1'}],'specs':{},'receipts':{}}
+    proof={'status':'PASS','reviewer':'independent','output':fingerprint(candidate)}
+    state['prior_accepted_specs']={task:{'spec':candidate,'receipt':proof}}
+    state['prior_binding_epoch']=source_binding_epoch(state)
+    assert len(retained_metric_groups(state,'project_policy',{'R1':{}}))==1
+    state['revision_id']='v2'
+    assert retained_metric_groups(state,'project_policy',{'R1':{}})==[]
+    state['revision_id']='v1';state['prior_accepted_specs'][task]['spec']['metrics']['qty']['expr']=2
+    assert retained_metric_groups(state,'project_policy',{'R1':{}})==[]
+
+
 def test_explicit_period_average_uses_activity_months_and_never_future_months():
     from bonus_agent.adaptive_compiler import source_period_averages,_compile_prefix,_empty_fragment
     c=Catalog([]);c.sheets['S1']=Sheet('S1','detail.xlsx','detail',[('月份','客户','金额'),('202701','A',100),('202702','A',-20),('202703','A',0),('202703','B',50)])

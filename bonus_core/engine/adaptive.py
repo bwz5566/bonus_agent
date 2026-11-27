@@ -191,6 +191,10 @@ def canonical_expression(expr,period,*,depth=0):
         return {'op':op,'args':args}
     if set(expr)=={'query'} and isinstance(expr['query'],dict):
         q=dict(expr['query'])
+        # $project already denotes exactly the rows of this object. An
+        # omitted match on that reserved source is an explicit empty
+        # additional predicate, not a whole-table business assumption.
+        if q.get('dataset')=='$project':q.setdefault('match',{})
         if q.get('aggregate') in ('count','exists'):
             # These operators do not inspect a value field; null handling is
             # immaterial. A reserved population dataset already defines its

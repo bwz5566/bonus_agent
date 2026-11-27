@@ -500,6 +500,40 @@ def _metric_refs(expr):
     return set()
 
 
+def _component_rule_ids(value):
+    if isinstance(value,dict):
+        local=set(value.get('rules',[])) if isinstance(value.get('rules'),list) and all(isinstance(r,str) for r in value['rules']) else set()
+        return local|set().union(*(_component_rule_ids(v) for k,v in value.items() if k!='rules'))
+    if isinstance(value,list):return set().union(*(_component_rule_ids(x) for x in value))
+    return set()
+
+
+def retained_metric_groups(state,phase,rules):
+    """Only actual accepted contracts from this exact financial revision.
+
+    Derive node identities from executed metrics, not a newly generated
+    outline. Each candidate still needs current source/DSL/coverage replay.
+    """
+    from bonus_agent.commission_chain import source_binding_epoch
+    prefix=f'adaptive/{phase}/group/'
+    if state.get('feedback',{}).get(phase):return []
+    retained={}
+    if state.get('prior_binding_epoch')==source_binding_epoch(state):retained.update(state.get('prior_accepted_specs',{}))
+    for task,spec in state.get('specs',{}).items():
+        if task.startswith(prefix):retained[task]={'spec':spec,'receipt':state.get('receipts',{}).get(task,{})}
+    result=[]
+    for task,record in retained.items():
+        if not task.startswith(prefix) or state.get('feedback',{}).get(task):continue
+        proof=record.get('receipt',{});spec=record.get('spec')
+        if proof.get('status')!='PASS' or not proof.get('reviewer') or not isinstance(spec,dict) or proof.get('output')!=fingerprint(spec):continue
+        if not isinstance(spec.get('metrics'),dict):continue
+        cited=_component_rule_ids(spec);cited.update(spec.get('formula_bindings',{}))
+        bound=sorted(cited&set(rules))
+        if not bound or not spec['metrics']:continue
+        result.append((task,{'id':task[len(prefix):],'purpose':'同材料和财务版本下原已独立复核的实际指标组','rules':bound,'metrics':{k:v['label'] for k,v in spec['metrics'].items()}},deepcopy(spec),deepcopy(proof)))
+    return result
+
+
 def _typed_formula_bindings(value,obligations,owner):
     """Normalize a model's list only when the actual rule IDs are explicit."""
     if isinstance(value,dict):return value
@@ -1346,6 +1380,50 @@ class AdaptiveCompiler:
         # tier and coefficient table families). Keep one canonical obligation
         # but retain its full meaning as read-only downstream context.
         shared={rid:r for rid,r in all_rules.items() if phase=='coefficient_policy' and r['phase']=='project_policy' and re.search(r'阶梯提成率|阶梯费率',r['quote']) and re.search(r'系数|系數|其他指标',r['quote'])}
+        merged=prepared
+        def validate_group(v,available,group,*,all_group_rules=False):
+            _validate_fragment(v,phase,period=self.period)
+            required=set(group['metrics'])
+            if not required<=set(v['metrics']):raise ProgramError(f'指标组缺少规划指标：{sorted(required-set(v["metrics"]))}',owner=phase)
+            bind_formula_atoms(v,available['metrics'],scope,all_rules,phase,self.period)
+            used=set(required);todo=list(required)
+            while todo:
+                mid=todo.pop()
+                for dep in _metric_refs(v['metrics'][mid]['expr']) & set(v['metrics']):
+                    if dep not in used:used.add(dep);todo.append(dep)
+            extras=set(v['metrics'])-required
+            if extras-used:raise ProgramError(f'新增辅助指标没有进入实际规划计算：{sorted(extras-used)}',owner=phase,kind='coverage')
+            if any(not set(v['metrics'][k]['rules'])&set(group['rules']) for k in extras):raise ProgramError('新增辅助指标缺本组真实原文来源',owner=phase,kind='coverage')
+            combined=deepcopy(available);_merge_fragment(combined,v,phase)
+            for m in v['metrics'].values():validate_numeric_literals(m['expr'],m['rules'],all_rules,owner=phase)
+            verify_progressive_amounts(combined['metrics'],combined['schedules'],all_rules,required_ids=group['rules'],owner=phase)
+            probe_program=_compile_prefix(self.catalog,datasets,scope['population'],combined,self.period,owner=phase)
+            formula_ids=set(group['rules']) if all_group_rules else {r for r in group['rules'] if all_rules[r].get('formula')}
+            if formula_ids:
+                coverage(all_rules,{phase:v},phases=[phase],required_ids=formula_ids,formula_bindings=combined['formula_bindings'],metrics=combined['metrics'],parameters=probe_program.inputs.parameters,keys=scope['population']['keys'])
+            self._actual_categories=observed_category_domains(probe_program)
+        # Re-evaluate completed groups against the current dependency prefix
+        # before asking for a new outline. An upgrade or an unrelated failed
+        # group must not discard actual reviewed upstream calculations.
+        waiting=retained_metric_groups(self.state,phase,phase_rules);covered=set();reused_tasks=set()
+        while waiting:
+            progressed=False;deferred=[]
+            for task,group,candidate,proof in waiting:
+                available=deepcopy(previous);_merge_fragment(available,merged,phase)
+                refs=_metric_refs(candidate)-set(candidate['metrics'])
+                if refs-set(available['metrics']):deferred.append((task,group,candidate,proof));continue
+                try:validate_group(candidate,available,group,all_group_rules=True)
+                except (ProgramError,TypeError,ValueError,KeyError,IndexError) as exc:
+                    self.state.setdefault('retained_group_rejections',{})[task]=str(exc)
+                    continue
+                _merge_fragment(merged,candidate,phase);covered.update(group['rules']);reused_tasks.add(task);progressed=True
+                receipt={**proof,'output':fingerprint(candidate),'recovered':True,'confidence':'real_reviewed_metric_group_revalidated','previous_receipt':fingerprint(proof),'current_dependencies':fingerprint({'scope':scope,'datasets':datasets,'available':available})}
+                self.state.setdefault('specs',{})[task]=deepcopy(candidate);self.state.setdefault('receipts',{})[task]=receipt;self.state.setdefault('task_owners',{})[task]=phase
+                self.event(task,True,{'receipt':receipt,'recovered':'同一材料与财务版本：原真实模型指标组已按当前依赖、规则和求值全部重验；不再重新命名或生成'})
+            if not progressed:break
+            waiting=deferred
+        phase_rules={rid:r for rid,r in phase_rules.items() if rid not in covered}
+        if not phase_rules:return merged
         # The outline carries only compact semantic obligations and existing
         # dependency names. Actual formulas and raw parameter cells are fetched
         # separately for each bounded group.
@@ -1356,13 +1434,19 @@ class AdaptiveCompiler:
         def valid_outline(v):
             contract(v,required=('groups',),label='指标分组',owner=phase)
             if not isinstance(v['groups'],list):raise ProgramError('指标分组须列表',owner=phase)
-            declared=set();covered=set();ids=set()
+            declared=set();covered=set();ids=set();formula_groups={}
             for group in v['groups']:
                 contract(group,required=('id','purpose','rules','metrics'),label='局部指标组',owner=phase)
                 gid=group['id']
                 if not isinstance(gid,str) or not re.fullmatch(r'[A-Za-z0-9_\-]+',gid) or gid in ids:raise ProgramError('指标组ID无效/重复',owner=phase)
+                if f'adaptive/{phase}/group/{gid}' in reused_tasks:raise ProgramError('本组已有实际重验通过的合同；只规划未覆盖指标组',owner=phase)
                 ids.add(gid);r=names(group['rules'],'指标组条款',phase,nonempty=False)
                 if not set(r)<=set(phase_rules):raise ProgramError('指标组引用非本阶段条款',owner=phase)
+                for rid in r:
+                    rule=phase_rules[rid]
+                    if rule.get('formula') or re.search(r'超额累进|超額累進|累进阶梯',rule['quote']):
+                        if rid in formula_groups:raise ProgramError(f'同一金额算式条款 {rid} 必须在一个实际计算组实现，不重复分组',owner=phase,kind='coverage')
+                        formula_groups[rid]=gid
                 covered.update(r)
                 metrics=group['metrics']
                 if not isinstance(metrics,dict):raise ProgramError('指标组需要名称/用途映射',owner=phase)
@@ -1373,9 +1457,8 @@ class AdaptiveCompiler:
         outline=self.ask(f'adaptive/{phase}/outline',phase,outline_data,
             '只规划本阶段需要的具名指标组和依赖顺序，不编制公式或复制参数。按先基础后依赖排组，每组只关注相关规则；将同一指标/费率表的规则放同组。'
             '新指标来自本次材料，不固定数量或名称。项目规则组负责基数及基本金额；系数组仅按材料需要编制调节指标；暂扣/总额组实现资金公式及舍入。已有指标可直接引用。available_schedule_sources中的每张真实阶梯表已独立编译，勿重复规划这些表格规则。'
-            'actual_categories来自实际已筛选对象的取值及数量；按区域/类别适用阶梯时需使用原文归类后的类别指标，且需要显式分类阶梯选择，不能以制度标题代替源表值。shared_applicability_rules仅保留确实跨节点的适用范围，不另外规划其上游金额。'
-            '输出{"groups":[{"id":"唯一英文ID","purpose":"用途","rules":[本阶段实际条款ID],"metrics":{"本组新增指标ID":"指标名称/定义"}}]}；条款全部覆盖。费率/政策组可以没有新增指标；必须在后续实际表达式中使用。',valid_outline)
-        merged=prepared
+            'actual_categories来自实际已筛选对象的取值及数量；按区域/类别适用阶梯时需使用原文归类后的类别指标，且需要显式分类阶梯选择，不能以制度标题代替源表值。shared_applicability_rules仅保留确实跨节点的适用范围，不另外规划其上游金额。已保留的实际指标组已通过求值；只规划剩余条款。一个金额算式及其档位选择规则归于同一个实际计算组，不重复规划其原文条款。'
+            '输出{"groups":[{"id":"唯一英文ID","purpose":"用途","rules":[本阶段实际条款ID],"metrics":{"本组新增指标ID":"指标名称/定义"}}]}；条款全部覆盖。费率/政策组可以没有新增指标；必须在后续实际表达式中使用。',valid_outline,structure_only=True)
         for group in outline['groups']:
             gid=group['id'];clauses={r:phase_rules[r] for r in group['rules']}
             available=deepcopy(previous);_merge_fragment(available,merged,phase)
@@ -1388,31 +1471,7 @@ class AdaptiveCompiler:
                   'actual_categories':getattr(self,'_actual_categories',{}),'shared_applicability_rules':{r:v['quote'] for r,v in shared.items()},
                   'dependency_digest':fingerprint({'datasets':datasets,'scope':scope,'available':available}),
                   **context}
-            def validate(v,available=available,group=group):
-                _validate_fragment(v,phase,period=self.period)
-                required=set(group['metrics'])
-                if not required<=set(v['metrics']):raise ProgramError(f'指标组缺少规划指标：{sorted(required-set(v["metrics"]))}',owner=phase)
-                bind_formula_atoms(v,available['metrics'],scope,all_rules,phase,self.period)
-                # Additional named source operands are legitimate when they
-                # are used by a planned calculation. Unused new amounts are not.
-                used=set(required);todo=list(required)
-                while todo:
-                    m=todo.pop()
-                    for dep in _metric_refs(v['metrics'][m]['expr']) & set(v['metrics']):
-                        if dep not in used:used.add(dep);todo.append(dep)
-                extras=set(v['metrics'])-required
-                if extras-used:raise ProgramError(f'新增辅助指标没有进入实际规划计算：{sorted(extras-used)}',owner=phase,kind='coverage')
-                if any(not set(v['metrics'][k]['rules'])&set(group['rules']) for k in extras):raise ProgramError('新增辅助指标缺本组真实原文来源',owner=phase,kind='coverage')
-                combined=deepcopy(available);_merge_fragment(combined,v,phase)
-                for m in v['metrics'].values():validate_numeric_literals(m['expr'],m['rules'],all_rules,owner=phase)
-                verify_progressive_amounts(combined['metrics'],combined['schedules'],all_rules,required_ids=group['rules'],owner=phase)
-                probe_program=_compile_prefix(self.catalog,datasets,scope['population'],combined,self.period,owner=phase)
-                # The final phase coverage will also include funding links.
-                formula_ids={r for r in group['rules'] if all_rules[r].get('formula')}
-                if formula_ids:
-                    coverage(all_rules,{phase:v},phases=[phase],required_ids=formula_ids,formula_bindings=combined['formula_bindings'],
-                             metrics=combined['metrics'],parameters=probe_program.inputs.parameters,keys=scope['population']['keys'])
-                self._actual_categories=observed_category_domains(probe_program)
+            def validate(v,available=available,group=group):validate_group(v,available,group)
             reply=self.ask(f'adaptive/{phase}/group/{gid}',phase,data,
                 '只编制本指标组。实际公式必须包含原文全部因子、顺序和例外；不要计算最终金额。先定义一次实际来源参数/阶梯，再以具名指标引用。'+EXPRESSION_HELP+
                 '\n输出{"metrics":{"规划指标ID":{"label":"实际含义","expr":表达式,"type":"number/text/bool/date","rules":[对应条款ID]}},"parameters":{...},"schedules":{...},"checks":[{"id":"具名检查","expr":布尔表达式,"message":"不通过说明","rules":[条款ID]}],"formula_bindings":{"明示公式条款ID":{"target":"该公式真实指标ID","symbols":{"原文完整符号":{"ref":"指标ID"}或{"param":"参数ID"}或{"key":"项目键"}},"path":[]（可省，确为if分支时写实际args路径）}}}。'
@@ -1511,7 +1570,7 @@ class AdaptiveCompiler:
             if v['distribution_kind']=='direct' and len(roles)!=1:raise ProgramError('直接归属只允许一个归属角色',owner='roster')
         outline=self.ask('adaptive/roster/outline','roster',{'period':self.period,'obligations':_compact(rules),'data_contracts':_schema_summary(datasets),'project_keys':basis['key_fields']},
             '只将当前制度的实际角色规则分成小组，避免一个请求编制所有角色。按真实角色和相关费率表归组；共享名单缺值/人员汇总舍入/人员层计奖规则放global_rules。'
-            '输出{"groups":[{"id":"英文唯一ID","roles":{"真实角色ID":"角色名"},"rules":[相关规则ID],"purpose":"角色用途"}],"global_rules":[共享及人员层条款ID],"distribution_kind":"direct/roles","person_program_required":true或false}。不得漏条款。',validate_outline)
+            '输出{"groups":[{"id":"英文唯一ID","roles":{"真实角色ID":"角色名"},"rules":[相关规则ID],"purpose":"角色用途"}],"global_rules":[共享及人员层条款ID],"distribution_kind":"direct/roles","person_program_required":true或false}。不得漏条款。',validate_outline,structure_only=True)
         combined={'roles':{},'parameters':{},'schedules':{},'formula_bindings':{}}
         for group in outline['groups']:
             group_rules={k:rules[k] for k in group['rules']}

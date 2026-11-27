@@ -593,6 +593,15 @@ def run_chain(llm,paths,out,*,scenario,period=None,answers=None,resume=True,max_
                     for k in ('revision_id','revision_owners','revision_affected'):
                         if k in stored:state[k]=copy.deepcopy(stored[k])
                     epoch=source_binding_epoch(stored);state['prior_binding_epoch']=epoch
+                    # A later node may have stopped before revisiting an
+                    # already reviewed upstream calculation group. Preserve
+                    # its actual proof transitively across executable-only
+                    # upgrades of exactly this financial/source version.
+                    if stored.get('prior_binding_epoch')==epoch:
+                        for task,record in stored.get('prior_accepted_specs',{}).items():
+                            proof=record.get('receipt',{});spec=record.get('spec')
+                            if '/group/' in task and proof.get('status')=='PASS' and proof.get('reviewer')==getattr(getattr(llm,'checker_llm',None),'name','') and spec is not None and proof.get('output')==fingerprint(spec):
+                                accepted.setdefault(task,copy.deepcopy(record))
                     inherited=stored.get('prior_binding_events',[]) if stored.get('prior_binding_epoch')==epoch else []
                     state['prior_binding_events']=copy.deepcopy(inherited+[e for e in stored.get('events',[]) if e.get('node','').removesuffix('/解析').removesuffix('/独立复核') in SOURCE_BINDING_NODES])
             if old_basis:=prior_approved_basis(stored,old):state['prior_approved_basis']=old_basis
@@ -736,10 +745,12 @@ def run_chain(llm,paths,out,*,scenario,period=None,answers=None,resume=True,max_
               review_base=candidate if adaptive and review and candidate is not None else None)
         return raw
 
-    def node(name,data,instructions,validator,*,owner=None,archive_epoch=None):
+    def node(name,data,instructions,validator,*,owner=None,archive_epoch=None,structure_only=False):
         # Reuse only exact current node execution+sources, not mere successful
         # status from a previous amount or unverified candidate.
         owner=owner or name
+        if structure_only and (not adaptive or not name.startswith('adaptive/') or not name.endswith('/outline')):
+            raise ProgramError('仅非金额分组结构可由程序直接复核',owner=owner)
         state.setdefault('task_owners',{})[name]=owner
         if adaptive:
             requests=rv.requests_for_node(revision,owner,diagnosed=bool(state.get('feedback',{}).get(owner)))
@@ -750,6 +761,7 @@ def run_chain(llm,paths,out,*,scenario,period=None,answers=None,resume=True,max_
             rules=rv.rules_for_node(current_rules,name)
         if rules:data={**data,'authorized_rule_versions':rules}
         inputs_payload={'identity':identity,'node':name,'data':data,'instructions':instructions,'answers':[(q.id,q.answer) for q in ws.questions if q.related==owner and q.answer and not q.withdrawn]}
+        if structure_only:inputs_payload['validation_mode']='structural_outline_only'
         if (initial:=state.get('initial_instruction')) and initial['owner']==owner:inputs_payload['initial_note']=initial['text']
         semantic_inputs=fingerprint(inputs_payload)
         if scoped:data={**data,'financial_revision':scoped};inputs_payload['data']=data
@@ -873,6 +885,12 @@ def run_chain(llm,paths,out,*,scenario,period=None,answers=None,resume=True,max_
                         raise repeated
                     seen_invalid.add(signature)
                 if adaptive and not invalid:reviewed_original=copy.deepcopy(draft)
+                if structure_only and not unresolved_questions(draft):
+                    if invalid:raise ProgramError(f'分组结构未通过程序校验：{invalid}',owner=owner,kind='contract')
+                    draft.pop('questions',None);state['specs'][name]=jsonable(draft)
+                    state['receipts'][name]={'status':'PASS','inputs':inputs,'semantic_inputs':semantic_inputs,'output':fingerprint(draft),'reviewer':'程序','review':'仅分组覆盖及名称/顺序检查；所有实际公式和金额仍由独立模型复核','confidence':'structural_outline_only'}
+                    state.get('feedback',{}).pop(name,None)
+                    event(name,True,{'receipt':state['receipts'][name]});return draft
                 review_data=data
                 if rules:
                     rule_sources={sid:catalog.blocks[sid] for sid in rv.authorized_source_ids(draft) if sid in catalog.blocks}
