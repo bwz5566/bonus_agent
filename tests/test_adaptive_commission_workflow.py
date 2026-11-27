@@ -559,3 +559,13 @@ def test_early_inventory_failure_does_not_discard_retained_original_rule_proofs(
     assert unchanged_rule_candidates(failed,failed['files'],'pro')=={digest:record}
     assert unchanged_rule_candidates(failed,{'policy.docx':'changed'},'pro')=={}
     assert unchanged_rule_candidates(failed,failed['files'],'other-pro')=={}
+
+
+def test_source_binding_epoch_is_independent_of_code_but_not_financial_revision():
+    from bonus_agent.commission_chain import source_binding_epoch
+    a={'files':{'data':'hash'},'source_order':['data'],'period':'2027-01','revision_id':'v1','active_rules':[{'id':'rule1'}],
+       'questions':[{'id':'q','answer':'actual answer'}],'profile':'old code'}
+    b=deepcopy(a);b['profile']='new code'
+    assert source_binding_epoch(a)==source_binding_epoch(b)
+    b['revision_id']='v2';assert source_binding_epoch(a)!=source_binding_epoch(b)
+    b=deepcopy(a);b['questions'][0]['answer']='new decision';assert source_binding_epoch(a)!=source_binding_epoch(b)

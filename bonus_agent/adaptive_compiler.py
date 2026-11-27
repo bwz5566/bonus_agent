@@ -29,7 +29,8 @@ FRAGMENT_FIELDS=('metrics','parameters','schedules','checks','formula_bindings')
 
 
 EXPRESSION_HELP='''表达式是JSON数据，禁止生成Python。形式：数字/文字/bool/null，{"key":"项目键字段"}、{"ref":"已有指标ID"}、{"field":"当前明细行字段"}、{"param":"真实参数ID"}、{"period":"month/start/end/year_start/month_number/year"}；{"op":"mul","args":[{"ref":"x"},{"param":"r"}]}。
-聚合：{"query":{"dataset":"实际数据集ID或$project(本项目明细)/$population(已筛选本期全集)","aggregate":"sum/avg/count/count_distinct/unique/min/max/exists","match":{"该数据集字段":{"key":"项目键"}},"where":{"op":"eq","args":[{"field":"month"},{"period":"month"}]},"value":{"field":"金额字段"},"empty":"error/null/zero","nulls":"error/ignore","duplicates":"error/identical（仅unique必填）"}}。match={}代表显式全表范围，不能把全表当项目。where可省；count/exists不用value。字段作用域仅query/主集合where内；指标引用用ref。if条件只选一支，coalesce区分空与零。
+聚合：{"query":{"dataset":"实际数据集ID或$project(本项目明细)/$population(已筛选本期全集)","aggregate":"sum/avg/count/count_distinct/unique/min/max/exists","match":{"该数据集字段":{"key":"项目键"}},"where":{"op":"eq","args":[{"field":"month"},{"key":"实际月份键"}]},"value":{"field":"金额字段"},"empty":"error/null/zero","nulls":"error/ignore","duplicates":"error/identical（仅unique必填）"}}。match={}代表显式全表范围，不能把全表当项目。where可省；count/exists不用value。字段作用域仅query/主集合where内；指标引用用ref。if条件只选一支，coalesce区分空与零。
+期间语义：period.month是整个核算区间的结束月，不是每个主对象自己的月份。跨期若实际规则要求按对象所属月份匹配预算、名单、首发日期、累计历史等，应使用真实对象月份key或已编译的对象日期指标；只有全期统一时点的规则才能引用全局period值。原件不存在月份键时不得发明该键。
 阶梯：{"tier":{"schedule":"已编译阶梯ID","value":{"ref":"基数"},"output":"amount/rate"}}。参数仅指向真实格或原文：{"source":{"table":"T编号","row":2,"column":3},"kind":"number/ratio/text/date/month/bool/id/money","unit":"raw/percent/wan/yi","rules":["条款ID"]}；也可source={"sheet":"S编号","row":2,"column":"B"}或{"block":"实际原文单元ID","quote":"原文","value":"确在引文中的单值"}。
 阶梯定义：{"bands":[{"label":实际格坐标,"rate":实际格坐标}],"bound_unit":"raw/percent/wan/yi","rate_unit":"raw/percent","method":"whole/progressive","negative":"signed/zero/error","below":"first/zero/error","includes":[从低到高逐档布尔值],"rules":[条款ID]}；原文为纯数值下限表才可设 interpretation="thresholds"。
 所有业务运算必须有所在阶段条款ID。未知算子不得省略；用questions说明确切缺口及影响。'''
@@ -41,6 +42,7 @@ DATASET_HELP='''数据集合同：datasets={"语义ID":{"label":"用途","fields
 DATASET_HELP+='\n若实际表存在不参与的非空物理行段，必须注明 excluded_ranges:[{"start":实际行,"end":实际行,"reason":"为何不参与","rules":[实际条款ID]}]，不能截断未解释的物理行。制度表若当参数查找数据集使用，dataset.purpose="lookup"；不可由它创建项目主集合。实际原始外键须用relationships校验全表，不只验证有计算结果的匹配行。'
 DATASET_HELP+='\n多来源的同一语义字段若在某一真实来源完全没有列，必须 fields 中声明 nullable:true，且该来源使用 absent_fields:{"该语义字段":{"reason":"实际表头缺少此字段的证据","rules":[相关原文条款ID]}}；程序填真实缺失null并保留缺列来源，不得绑定不相关列、填0或假设业务状态。非空字段与粒度键不能声明缺列；每个来源的columns/constants/absent_fields合计应恰好覆盖语义字段。'
 DATASET_HELP+='\n数据集只读真实物理字段或有明确来源的常量。求和、计数、是否满足出货/资格条件等派生指标应在后续公式节点编译，不能声明成所有来源均absent_fields的原始字段。原始明细可有多个相同项目键；population.keys定义主对象分组，不要把同一批明细重新声明为已经汇总的唯一项目数据集。'
+DATASET_HELP+='\nrelationships匹配数量还支持optional_many：若原文允许参考表存在主明细没有的对象，参考表到主明细的关联可匹配0行或多行并记录实际数量，不是必存在外键。真实要求每条业务记录都匹配目标时仍用exactly_one/at_least_one。'
 
 
 def _empty_fragment():return {'metrics':{},'parameters':{},'schedules':{},'checks':[],'formula_bindings':{}}
@@ -437,6 +439,179 @@ def validate_explicit_zero_exclusion(catalog,scope,rules,program):
                 raise ProgramError(f'原文该字段仅明确排除0，但当前独立字段筛选在 {field}={value} 时结果为 {actual}，不等价于非零；其他条件应按各自真实条款另行筛选',owner='scope_mapping',kind='coverage',rules=zero_rules,details={'field':field,'test_value':value,'expected':value!=0,'actual':actual,'actual_predicates':isolated})
 
 
+def explicit_reference_pairs(catalog,scope,reference,obligations):
+    """Resolve literal A-with-B joins against actual physical header aliases.
+
+    Duplicate headings retain their physical occurrence number; an original
+    rule referring to a second occurrence does not mean a similarly named
+    legal-name field. No semantic field name invented by a model is evidence.
+    """
+    def aliases(ds):
+        result=defaultdict(set)
+        for src in ds.get('sources',[]):
+            sheet=catalog.sheet(src);h=src['header_row']
+            headings=[normalized(x) if x is not None else '' for x in sheet.rows[h-1]]
+            for field,binding in src['columns'].items():
+                col=binding['column'] if isinstance(binding,dict) else binding
+                i=column_index_from_string(col)-1;label=headings[i]
+                if not label:continue
+                result[field].add(label+str(headings[:i+1].count(label)) if headings.count(label)>1 else label)
+        return result
+    main=scope['population']['dataset'];target_aliases=aliases(scope['datasets'][main]);found={}
+    for name,ds in reference['datasets'].items():
+        own=aliases(ds)
+        for i,rel in enumerate(ds.get('relationships',[])):
+            if rel.get('target')!=main:continue
+            for field in rel['fields']:
+                matches=defaultdict(list)
+                for rid in rel.get('rules',[]):
+                    if rid not in obligations:continue
+                    quote=obligations[rid]['quote'];text=normalized(quote)
+                    if not re.search(r'对应|匹配|关联',quote):continue
+                    for a in own.get(field,[]):
+                        for target,labels in target_aliases.items():
+                            for b in labels:
+                                if a==b:continue
+                                if any(a+j+b in text or b+j+a in text for j in ('与','和','匹配','对应')):
+                                    matches[target].append({'rule':rid,'quote':quote,'source_heading':a,'target_heading':b})
+                if len(matches)>1:raise ProgramError(f'{name}.{field} 的原文精确配对指向多个真实主字段，需核对实际规则',owner='reference_mapping',kind='binding',dataset=name,details={'candidates':dict(matches)})
+                if matches:
+                    target,evidence=next(iter(matches.items()));found[(name,i,field)]={'target_field':target,'evidence':evidence}
+    return found
+
+
+def normalize_reference_relationships(scope,reference,obligations,*,catalog=None):
+    """Keep real association keys without inventing mandatory reverse FKs.
+
+    A policy explicitly permitting reference-only records means a lookup
+    record may match zero or many original detail rows. Forward integrity
+    checks for actual business objects, and explicit required FKs, are not
+    relaxed. The downstream per-object metric still performs its own lookup.
+    """
+    closure=primary_population_invariants(obligations)
+    main=scope['population']['dataset'];changes=[]
+    pairs=explicit_reference_pairs(catalog,scope,reference,obligations) if catalog is not None else {}
+    for name,ds in reference['datasets'].items():
+        for i,rel in enumerate(ds.get('relationships',[])):
+            for n,field in enumerate(rel['fields']):
+                exact=pairs.get((name,i,field))
+                if exact and rel['target_fields'][n]!=exact['target_field']:
+                    changes.append({'dataset':name,'field':field,'old_target':rel['target_fields'][n],**exact})
+                    rel['target_fields'][n]=exact['target_field']
+            explicit=[obligations[r]['quote'] for r in rel.get('rules',[]) if r in obligations]
+            mandatory=any(re.search(r'(?:每条|每行|所有|全部)(?:参考|辅助|补充).{0,60}(?:必须|均须|都须|不得缺少)',q) for q in explicit)
+            allowed=bool(closure and ds.get('purpose')=='lookup' and rel.get('target')==main and not mandatory)
+            if rel.get('cardinality')=='optional_many':
+                if not allowed:raise ProgramError(f'{name} 的optional_many关联缺少明确允许参考表存在主对象外记录的原文；不能用可选关联代替必须存在的真实外键',owner='reference_mapping',kind='coverage',rules=rel.get('rules',[]))
+                continue
+            if not allowed:continue
+            changes.append({'dataset':name,'target':main,'old':rel.get('cardinality'),'new':'optional_many','source_rules':closure})
+            rel['cardinality']='optional_many'
+    return changes
+
+
+def normalize_reference_checks(scope,reference,obligations,*,catalog=None):
+    """Replace only provably redundant structural checks with typed evidence.
+
+    Models sometimes express a uniqueness/foreign-key audit using pseudo SQL
+    operators. Do not add an unbounded SQL interpreter, or accept a tautology.
+    The existing physical grain/relationship/null-preservation contracts run
+    over the actual data and are the execution proof for those exact checks.
+    Retain the original draft check and the replacement evidence for replay.
+    """
+    datasets={**scope['datasets'],**reference['datasets']}
+    literal_pairs=explicit_reference_pairs(catalog,scope,reference,obligations) if catalog is not None else {}
+    raw=list(reference['checks'])
+    existing=reference.get('structural_checks',[])
+    if not isinstance(existing,list):raise ProgramError('结构检查证据必须为列表',owner='reference_mapping',kind='contract')
+    for item in existing:
+        if not isinstance(item,dict) or not isinstance(item.get('check'),dict):raise ProgramError('结构检查证据缺原始候选',owner='reference_mapping',kind='contract')
+        raw.append(item['check'])
+    def args(x,op,n=None):
+        if isinstance(x,dict) and x.get('op')==op and isinstance(x.get('args'),list) and (n is None or len(x['args'])==n):return x['args']
+        return None
+    def dsid(x):return x.get('dataset') if isinstance(x,dict) else None
+    def fields_of(x):
+        a=args(x,'tuple')
+        if a is not None and all(isinstance(y,dict) and set(y)=={'field'} for y in a):return [y['field'] for y in a]
+        return None
+    def proof(c):
+        eq=args(c.get('expr'),'eq',2)
+        if eq is None:return None
+        required=set(c.get('rules',[]))
+        for left,right in (eq,eq[::-1]):
+            ca=args(left,'count',1)
+            if ca is None:continue
+            distinct=args(ca[0],'distinct',1)
+            if distinct is not None and args(right,'count',0)==[]:
+                keys=fields_of(distinct[0])
+                matches=[(name,ds) for name,ds in datasets.items() if keys and ds.get('grain',{}).get('kind')=='unique' and ds['grain'].get('duplicates')=='error'
+                         and set(ds['grain'].get('keys',[]))==set(keys) and required<=set(ds.get('rules',[])+ds['grain'].get('rules',[]))]
+                if matches:return {'kind':'physical_unique_grain','datasets':[x[0] for x in matches],'keys':keys,'rules':sorted(required)}
+            filt=args(ca[0],'filter',2)
+            if filt is None:continue
+            name=dsid(filt[0]);ds=datasets.get(name)
+            if not ds:continue
+            # Exact shape: count(all rows in source with no matching target).
+            negate=args(filt[1],'not',1)
+            exists=args(negate[0],'exists') if negate is not None else None
+            if exists and (right==0 or right=={'num':'0'}):
+                target=dsid(exists[0]);where=exists[0].get('where') if isinstance(exists[0],dict) else None
+                if where is None and len(exists)==2 and isinstance(exists[1],dict):where=exists[1].get('where')
+                predicates=args(where,'and') or [where]
+                pairs=set()
+                for p in predicates:
+                    pair=args(p,'eq',2)
+                    if not pair or not all(isinstance(x,dict) and set(x)=={'field'} for x in pair):break
+                    a,b=[x['field'] for x in pair];prefix=str(name)+'.';other=str(target)+'.'
+                    if a.startswith(other) and b.startswith(prefix):a,b=b,a
+                    if not a.startswith(prefix) or not b.startswith(other):break
+                    pairs.add((a[len(prefix):],b[len(other):]))
+                else:
+                    for i,rel in enumerate(ds.get('relationships',[])):
+                        if rel['target']!=target or not required<=set(rel.get('rules',[])):continue
+                        actual=set(zip(rel['fields'],rel['target_fields']));overrides=[]
+                        if pairs!=actual:
+                            if {a for a,b in pairs}!={a for a,b in actual}:continue
+                            for a,b in actual-pairs:
+                                exact=literal_pairs.get((name,i,a))
+                                if not exact or exact['target_field']!=b:break
+                                overrides.append(exact)
+                            else:
+                                if not overrides:continue
+                                # Original pseudo-check used a different
+                                # target label; actual literal evidence owns
+                                # the corrected physical relationship.
+                                pass
+                            if len(overrides)!=len(actual-pairs):continue
+                        if rel['cardinality'] in ('exactly_one','at_least_one') or rel['cardinality']=='optional_many' and primary_population_invariants(obligations):
+                            return {'kind':'physical_relationship','dataset':name,'target':target,'cardinality':rel['cardinality'],'field_pairs':sorted(actual),'original_field_pairs':sorted(pairs),'literal_overrides':overrides,'rules':sorted(required)}
+            # A model's count(null)==count(null) is not an independent check.
+            # Only replace it when actual source rules and typed readers prove
+            # the exact field is read unchanged and its nulls are preserved.
+            missing=args(filt[1],'is_missing',1)
+            if left==right and missing and isinstance(missing[0],dict) and set(missing[0])=={'field'}:
+                field=missing[0]['field'];spec=ds.get('fields',{}).get(field,{})
+                if spec.get('nullable') and required<=set(spec.get('rules',[])) and all(field not in src.get('constants',{}) and (field in src.get('columns',{}) or field in src.get('absent_fields',{})) for src in ds['sources']):
+                    if any(re.search(r'空值.{0,15}(?:保留|保持)|不.{0,12}(?:替换|填充).{0,6}(?:零|0)',obligations[r]['quote']) for r in required if r in obligations):
+                        return {'kind':'physical_null_preservation','dataset':name,'field':field,'rules':sorted(required)}
+        return None
+    keep=[];replaced=[];seen={}
+    for c in raw:
+        contract(c,required=('id','expr','message','rules'),optional=('owner',),label='参考数据检查',owner='reference_mapping')
+        if c['id'] in seen:
+            if seen[c['id']]!=c:raise ProgramError(f'参考检查 {c["id"]} 重复且合同不一致',owner='reference_mapping',kind='contract')
+            continue
+        seen[c['id']]=c
+        evidence=proof(c)
+        if evidence:replaced.append({'check':deepcopy(c),'proof':evidence})
+        else:keep.append(c)
+    reference['checks']=keep
+    if replaced:reference['structural_checks']=replaced
+    else:reference.pop('structural_checks',None)
+    return replaced
+
+
 def _financial_metrics(program):
     f=program.funding;todo=[f['total'],f['payable'],f['alloc'],*f['destinations']];found=set()
     while todo:
@@ -507,6 +682,8 @@ def replay_basis(catalog,saved,period):
     scope_rules=_clauses_for(obligations,'scope_mapping');rechecked=deepcopy(scope)
     apply_literal_source_exclusions(catalog,rechecked,scope_rules)
     if rechecked!=scope:raise ProgramError('已保存主集合未包含当前原文明确的物理标记排除规则，需要重新绑定',owner='scope_mapping',kind='coverage')
+    ref_rechecked=deepcopy(reference);normalize_reference_relationships(scope,ref_rechecked,obligations,catalog=catalog);normalize_reference_checks(scope,ref_rechecked,obligations,catalog=catalog)
+    if ref_rechecked!=reference:raise ProgramError('已保存参考关联仍包含与明确主集合口径冲突的反向必存在外键，需要重新绑定',owner='reference_mapping',kind='coverage')
     datasets=deepcopy(scope['datasets']);_merge_map(datasets,reference['datasets'],'数据集','reference_mapping')
     _validate_data_use(saved['inventory'],datasets)
     _validate_global_bindings(catalog,saved['inventory'],obligations,datasets,owner='reference_mapping',complete=True)
@@ -684,11 +861,13 @@ class AdaptiveCompiler:
         parts['scope_mapping']=scope;datasets=deepcopy(scope['datasets'])
         ref_rules=_clauses_for(rules,'reference_mapping')
         def validate_ref(v):
-            contract(v,required=('datasets','checks'),label='参考源绑定',owner='reference_mapping')
+            contract(v,required=('datasets','checks'),optional=('structural_checks',),label='参考源绑定',owner='reference_mapping')
+            normalize_reference_relationships(scope,v,rules,catalog=cat)
             data=deepcopy(datasets);_merge_map(data,v['datasets'],'数据集','reference_mapping');_validate_data_use(inventory,data)
             _validate_global_bindings(cat,inventory,rules,data,owner='reference_mapping',complete=True)
             if not isinstance(v['checks'],list):raise ProgramError('检查项须列表',owner='reference_mapping')
             canonical_program(v,period)
+            normalize_reference_checks(scope,v,rules,catalog=cat)
             for check in v['checks']:
                 contract(check,required=('id','expr','message','rules'),optional=('owner',),label='补充源真实校验',owner='reference_mapping')
                 if not isinstance(check['expr'],dict):raise ProgramError(f'{check["id"]} 必须为可执行布尔表达式 JSON，不能用文字或常量伪造检查；已有实际relationships无需重复检查',owner='reference_mapping',kind='contract',rules=check['rules'])
@@ -701,9 +880,9 @@ class AdaptiveCompiler:
             else:compile_inputs(cat,data,{}, {},period=period,owner='reference_mapping')
         reference=self.ask('reference_mapping','reference_mapping',{'period':period,'physical_sheets':profiles,'rules':ref_rules,
                 'global_binding_assertions':{k:v['binding_assertions'] for k,v in rules.items() if v.get('binding_assertions')},
-                'required_basis_metrics':_compact({k:v for k,v in rules.items() if v['phase'] in METRIC_PHASES}), 'already_bound':_schema_summary(datasets,physical=True),'population':scope['population']},
+                'required_basis_metrics':_compact({k:v for k,v in rules.items() if v['phase'] in METRIC_PHASES and re.search(r'表|明细|清单|资料|数据|匹配|关联|查询|取值',v['quote'])}), 'already_bound':_schema_summary(datasets,physical=True),'population':scope['population']},
             '只绑定补充、历史、预算、考核等真实参考数据。已有主数据集不要重复声明。按当前规则确定期段、单位、粒度、重复记录含义；历史和当期来源不能混淆。所有已声明原始外键的真实目标表均需在本节点完成绑定及实际校验；有适用于全部业务表的明确布局/单位约束时，把全部业务表（含后续人员主表与人员层参数原表）预先绑定并校验，不执行人员金额。'
-            +DATASET_HELP+'\n已有already_bound含实际字段、粒度、物理绑定、规则引用和relationships；程序直接执行这些已登记的关系、字段约束、表头及单位检查，已有源规则回执跨两个绑定节点有效。请独立核对它们是否实际完成本节点义务，不重复声明，不虚构检查。仅补尚未绑定的源和无法由现有合同覆盖的真实数据检查。已有关系完整且无新增需求时明确输出{"datasets":{},"checks":[]}。'
+            +DATASET_HELP+'\n原始材料字段绑定不编辑单元格值；财务已更正的材料以当前物理原件为准。含姓名及比例的复合文字字段仍为text，后续人员节点依据实际规则解析；单一数值比例才为ratio。已有already_bound含实际字段、粒度、物理绑定、规则引用和relationships；程序直接执行这些已登记的关系、字段约束、表头及单位检查，已有源规则回执跨两个绑定节点有效。请独立核对它们是否实际完成本节点义务，不重复声明，不虚构检查。仅补尚未绑定的源和无法由现有合同覆盖的真实数据检查。已有关系完整且无新增需求时明确输出{"datasets":{},"checks":[]}。'
             '\n输出{"datasets":{...},"checks":[{"id":"检查ID","expr":真实布尔表达式JSON对象,"message":"不符时的具体含义","rules":[条款ID]}]}。禁止将SQL/集合符号/自然语言/常量true当成可执行表达式；仅本层数据检查，依赖未来指标的检查留后续计算节点。',validate_ref,archive_epoch='physical-binding-evidence-v2')
         parts['reference_mapping']=reference;_merge_map(datasets,reference['datasets'],'数据集','reference_mapping')
         aggregate=_empty_fragment();aggregate['checks']=deepcopy(reference['checks'])

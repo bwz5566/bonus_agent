@@ -401,6 +401,16 @@ def reviewed_candidate(name,draft,review,data,*,owner,adaptive):
     return copy.deepcopy(replacement)
 
 
+SOURCE_BINDING_NODES={'adaptive/source_inventory','scope_mapping','reference_mapping'}
+
+
+def source_binding_epoch(state):
+    """Identity of physical sources and real financial decisions, not code."""
+    return fingerprint({'files':state.get('files',{}),'source_order':state.get('source_order',[]),'period':state.get('period'),
+        'revision_id':state.get('revision_id',''),'active_rules':state.get('active_rules',[]),
+        'answers':[(q.get('id'),q.get('answer'),q.get('withdrawn')) for q in state.get('questions',[]) if q.get('answer')]})
+
+
 def unchanged_rule_candidates(stored,files,reviewer):
     """A material correction invalidates the bindings, money and approvals.
 
@@ -558,7 +568,16 @@ def run_chain(llm,paths,out,*,scenario,period=None,answers=None,resume=True,max_
                             and isinstance(ev.get('result'),dict) and ev['result'].get('receipt',{}).get('output')==fingerprint(spec)),None)
                 if proof:accepted[name]={'spec':copy.deepcopy(spec),'receipt':copy.deepcopy(proof)}
             state['prior_accepted_specs']=accepted
-            if adaptive:state['unchanged_rule_candidates']=unchanged_rule_candidates(stored,hashes,getattr(getattr(llm,'checker_llm',None),'name',''))
+            if adaptive:
+                state['unchanged_rule_candidates']=unchanged_rule_candidates(stored,hashes,getattr(getattr(llm,'checker_llm',None),'name',''))
+                # An executable-only upgrade inside the SAME financial
+                # revision must not re-invalidate previously accepted bindings.
+                if stored.get('revision_id','')==rv.active_id(ledger) and fingerprint(stored.get('active_rules',[]))==fingerprint(current_rules):
+                    for k in ('revision_id','revision_owners','revision_affected'):
+                        if k in stored:state[k]=copy.deepcopy(stored[k])
+                    epoch=source_binding_epoch(stored);state['prior_binding_epoch']=epoch
+                    inherited=stored.get('prior_binding_events',[]) if stored.get('prior_binding_epoch')==epoch else []
+                    state['prior_binding_events']=copy.deepcopy(inherited+[e for e in stored.get('events',[]) if e.get('node','').removesuffix('/解析').removesuffix('/独立复核') in SOURCE_BINDING_NODES])
             if old_basis:=prior_approved_basis(stored,old):state['prior_approved_basis']=old_basis
         elif adaptive and stored and stored.get('mode')==mode and stored.get('period')==label and last.get('model')==llm.name and stored.get('files')!=hashes:
             # Corrected business rows may change without changing a single
@@ -768,9 +787,10 @@ def run_chain(llm,paths,out,*,scenario,period=None,answers=None,resume=True,max_
         # Re-examine previously received but rejected candidates after a
         # program-only repair or an interrupted request. This is not a saved
         # financial result or an invented confirmation.
-        if draft is None and not feedback and not scoped and owner not in state.get('revision_owners',[]) and not any(q.answer and not q.withdrawn for q in ws.questions if q.related==owner):
+        same_source_binding=adaptive and name in SOURCE_BINDING_NODES and state.get('prior_binding_epoch')==source_binding_epoch(state)
+        if draft is None and not feedback and (same_source_binding or not scoped and owner not in state.get('revision_owners',[]) and not any(q.answer and not q.withdrawn for q in ws.questions if q.related==owner)):
             prior_candidate=state.get('prior_accepted_specs',{}).get(name)
-            if prior_candidate and prior_candidate['receipt'].get('archive_epoch')==archive_epoch:
+            if prior_candidate and prior_candidate['receipt'].get('archive_epoch')==archive_epoch and (not same_source_binding or prior_candidate['receipt'].get('reviewer')==checker.name):
                 try:
                     recovered=copy.deepcopy(prior_candidate['spec']);validator(recovered)
                     state['specs'][name]=jsonable(recovered)
@@ -784,7 +804,8 @@ def run_chain(llm,paths,out,*,scenario,period=None,answers=None,resume=True,max_
             # must not recover a formerly rejected review from incomplete
             # context. An accepted receipt on the same evidence epoch can be
             # revalidated on future technical upgrades.
-            history=archived_candidates(state.get('candidate_archive',[])+state.get('events',[]),name) if draft is None and not feedback and archive_epoch is None else []
+            binding_history=state.get('prior_binding_events',[]) if same_source_binding else state.get('candidate_archive',[])
+            history=archived_candidates(binding_history+state.get('events',[]),name) if draft is None and not feedback and archive_epoch is None else []
             old_draft,old_review=history[-1] if history else (None,None)
             for prior_draft,prior_review in reversed(history):
                 if not prior_draft or not prior_review or unresolved_questions(prior_draft) or unresolved_questions(prior_review):continue

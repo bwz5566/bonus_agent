@@ -335,7 +335,7 @@ def check_relationships(datasets,specs,*,allow_unbound=False,owner='reference_ma
         for i,rel in enumerate(ds.get('relationships',[])):
             contract(rel,required=('fields','target','target_fields','cardinality','rules'),label=f'{name} 关联关系',owner=owner)
             target=rel['target'];keys=names(rel['fields'],f'{name} 外键',owner);target_keys=names(rel['target_fields'],f'{name} 目标键',owner)
-            if len(keys)!=len(target_keys) or not set(keys)<=set(datasets[name].fields) or rel['cardinality'] not in ('exactly_one','at_least_one','optional_unique'):
+            if len(keys)!=len(target_keys) or not set(keys)<=set(datasets[name].fields) or rel['cardinality'] not in ('exactly_one','at_least_one','optional_unique','optional_many'):
                 raise ProgramError(f'{name} 关联关系键/匹配数量无效',owner=owner)
             if target not in datasets:
                 if allow_unbound:continue
@@ -346,7 +346,7 @@ def check_relationships(datasets,specs,*,allow_unbound=False,owner='reference_ma
             matched=0;optional_missing=0
             for row in datasets[name].rows:
                 key=tuple(row.values[k] for k in keys);hits=index.get(key,[]) if not any(v is None or v=='' for v in key) else []
-                n=len(hits);mode=rel['cardinality'];ok=n==1 if mode=='exactly_one' else n>=1 if mode=='at_least_one' else n<=1
+                n=len(hits);mode=rel['cardinality'];ok=n==1 if mode=='exactly_one' else n>=1 if mode=='at_least_one' else n<=1 if mode=='optional_unique' else True
                 if not ok:raise ProgramError(f'{row.source} 关联 {target} 的键 {key} 实际匹配 {n} 行，不符合 {mode}',owner=owner,dataset=name,location=row.source,kind='data',rules=rel['rules'],details={'target':target,'key':list(key),'actual_matches':hits})
                 matched+=bool(n);optional_missing+=not n
             result[f'{name}:{i}']={'target':target,'matched':matched,'optional_missing':optional_missing,'cardinality':rel['cardinality'],'rules':rel['rules']}

@@ -410,6 +410,21 @@ def route_clause(clause,source,formula):
     if authority_owner not in PHASES and phase=='scope_mapping' and operation=='population':
         if re.search(r'(?:分配|发放|归属|分成)(?:人员)?(?:名单|名册)|(?:人员|员工|个人)(?:名单|名册)',quote) and re.search(r'只取|仅取|只使用|仅使用|筛选|限定|按.+匹配|对应.+(?:行|记录)',quote):
             phase='roster';level='person';operation='binding'
+    # Binding an original parameter *to a computed metric* is not the same
+    # obligation as binding physical ledger columns. Preserve explicit
+    # computation/recipient semantics even if a model calls the action binding.
+    if authority_owner not in PHASES and phase=='reference_mapping' and operation in ('binding','parameter'):
+        physical=bool(explicit_binding_assertions(quote) or re.search(r'表头|列名|字段名|关联键|唯一键|物理列|原始列|第\d+列',quote))
+        allocation=bool(re.search(r'总包分成比例|角色(?:份额|比例|分配|分成)|人员分配比例|个人分配比例',quote))
+        if allocation and not explicit_binding_assertions(quote) and (operation=='parameter' or not physical):
+            phase='roster';level='person';operation='parameter'
+        elif not physical:
+            if re.search(r'系数',quote) and re.search(r'系数.{0,30}(?:用|采用|取|按)|(?:每个|逐个|逐)(?:项目|订单|合同).{0,80}(?:取|使用|计算).{0,25}系数',quote):
+                phase='coefficient_policy';level='primary';operation='adjustment'
+            elif re.search(r'阶梯提成|奖励点数|提成率|费率|奖金率',quote) and re.search(r'按.{0,60}(?:计算|算)|以.{0,90}为(?:计算)?依据|计算基数',quote):
+                phase='project_policy';level='primary';operation='calculation'
+            elif source.get('table') and kind=='table' and re.search(r'阶梯',quote) and re.search(r'月|RMB|币|区间|档',quote):
+                phase='project_policy';level='primary';operation='parameter'
     # Native parameter tables are evidence, not business ledgers. A numeric
     # interval/rate row cannot be satisfied by merely mapping a data source;
     # its actual project/person calculation grain must be selected explicitly.

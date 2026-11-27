@@ -360,6 +360,86 @@ def test_secondary_roster_scope_is_not_primary_population_and_reference_closure_
     assert primary_population_invariants(ob)==['R2:1']
 
 
+def test_metric_parameter_and_role_share_policies_are_not_physical_bindings():
+    examples=[
+        ('合同质量系数使用质量对应的系数表。','primary','binding','coefficient_policy'),
+        ('每个订单按规则去参考数据里取对应系数。','source','binding','coefficient_policy'),
+        ('阶梯提成按合同的计算基数算。','primary','binding','project_policy'),
+        ('奖励点数确认，以每笔交易的销售额为依据。','source','binding','project_policy'),
+        ('角色份额未标单位时默认按百分数；表头明示单位时按明示值。','source','parameter','roster'),
+        ('按原表字段名关联客户编码。','source','binding','reference_mapping')]
+    for text,level,operation,phase in examples:
+        u={'R1':{'file':'policy','where':'row','text':text}}
+        c={'quote':text,'meaning':text,'kind':'policy','level':level,'operation':operation}
+        ob,_=validate_clause_chunk(u,{'units':{'R1':{'disposition':'operative','reason':'实际原文','clauses':[c]}}})
+        assert ob['R1:1']['phase']==phase,(text,ob)
+    text='销售额阶梯(RMB/月) | 新合同 | 旧合同'
+    u={'T1R1':{'file':'policy','where':'P1','text':text,'table':'T1','row':1}}
+    c={'quote':text,'meaning':'区间单位','kind':'table','level':'source','operation':'parameter'}
+    ob,_=validate_clause_chunk(u,{'units':{'T1R1':{'disposition':'operative','reason':'实际制度参数','clauses':[c]}}})
+    assert ob['T1R1:1']['phase']=='project_policy'
+
+
+def test_reference_only_records_are_not_required_reverse_foreign_keys():
+    from bonus_agent.adaptive_compiler import normalize_reference_relationships
+    from bonus_agent.adaptive_sources import check_relationships
+    scope={'population':{'dataset':'orders'}}
+    reference={'datasets':{'budget':{'purpose':'lookup','relationships':[{'fields':['region'],'target':'orders','target_fields':['region'],'cardinality':'at_least_one','rules':['R1']}]}}}
+    ob={'R1':{'phase':'scope_mapping','operation':'population','quote':'参考表中有但订单中不存在的对象不参与核算。'}}
+    changes=normalize_reference_relationships(scope,reference,ob)
+    assert len(changes)==1 and reference['datasets']['budget']['relationships'][0]['cardinality']=='optional_many'
+    datasets={'orders':Dataset({'region':{}},(Record({'region':'A'},'sale1'),Record({'region':'A'},'sale2'))),
+              'budget':Dataset({'region':{}},(Record({'region':'A'},'budget1'),Record({'region':'B'},'budget2')))}
+    proof=check_relationships(datasets,reference['datasets'])
+    assert proof['budget:0']['matched']==1 and proof['budget:0']['optional_missing']==1
+    with pytest.raises(ProgramError,match='缺少明确允许'):normalize_reference_relationships(scope,reference,{})
+
+
+def test_redundant_structural_check_normalization_requires_exact_typed_evidence():
+    from bonus_agent.adaptive_compiler import normalize_reference_relationships,normalize_reference_checks
+    scope={'population':{'dataset':'orders'},'datasets':{'orders':{'fields':{'id':{}},'grain':{'kind':'detail','keys':[]}}}}
+    lookup={'purpose':'lookup','fields':{'id':{},'quality':{'nullable':True,'rules':['R3']}},
+         'sources':[{'columns':{'id':'A','quality':'B'}}],
+         'grain':{'kind':'unique','keys':['id'],'duplicates':'error','rules':['R2']},'rules':[],
+         'relationships':[{'fields':['id'],'target':'orders','target_fields':['id'],'cardinality':'at_least_one','rules':['R1']}]}
+    missing=op('count',op('filter',{'dataset':'lookup'},op('is_missing',fld('quality'))))
+    fk=op('eq',op('count',op('filter',{'dataset':'lookup'},op('not',op('exists',{'dataset':'orders','where':op('eq',fld('orders.id'),fld('lookup.id'))})))),0)
+    unique=op('eq',op('count',op('distinct',op('tuple',fld('id')))),op('count'))
+    checks=[{'id':'fk','expr':fk,'message':'原关联缺失','rules':['R1']},
+            {'id':'unique','expr':unique,'message':'不重复','rules':['R2']},
+            {'id':'null','expr':op('eq',missing,missing),'message':'空值保留','rules':['R3']},
+            {'id':'real','expr':op('gt',ref('computed'),0),'message':'实际业务计算条件','rules':['R2']}]
+    v={'datasets':{'lookup':lookup},'checks':checks}
+    ob={'R1':{'phase':'scope_mapping','operation':'population','quote':'参考表中有但订单中不存在的对象不参与核算。'},'R2':{'quote':'唯一编号'},'R3':{'quote':'空值保留为空，不替换为零。'}}
+    normalize_reference_relationships(scope,v,ob)
+    proofs=normalize_reference_checks(scope,v,ob)
+    assert {x['proof']['kind'] for x in proofs}=={'physical_relationship','physical_unique_grain','physical_null_preservation'}
+    assert [x['id'] for x in v['checks']]==['real']
+    frozen=deepcopy(v);normalize_reference_checks(scope,v,ob);assert frozen==v
+    # A different field relation is not silently treated as the validated one.
+    changed=deepcopy(frozen);changed['datasets']['lookup']['relationships'][0]['target_fields']=['other']
+    normalize_reference_checks(scope,changed,ob)
+    assert 'fk' in [x['id'] for x in changed['checks']]
+
+
+def test_literal_join_pair_uses_real_duplicate_header_occurrence():
+    from bonus_agent.adaptive_compiler import normalize_reference_relationships
+    c=Catalog([]);c.sheets={
+        'S1':Sheet('S1','orders.xlsx','orders',[('简称','名称','简称'),('old','legal','actual')]),
+        'S2':Sheet('S2','budget.xlsx','budget',[('名称','预算'),('actual',100)])}
+    main={'sources':[{'sheet':'S1','header_row':1,'columns':{'old_alias':'A','legal_name':'B','current_alias':'C'}}]}
+    lookup={'purpose':'lookup','sources':[{'sheet':'S2','header_row':1,'columns':{'label':'A','budget':'B'}}],
+            'relationships':[{'fields':['label'],'target':'orders','target_fields':['legal_name'],'cardinality':'at_least_one','rules':['R2']}]}
+    scope={'population':{'dataset':'orders'},'datasets':{'orders':main}}
+    v={'datasets':{'budget':lookup}}
+    rules={'R1':{'phase':'scope_mapping','operation':'population','quote':'参考表中有但订单中不存在的对象不参与核算。'},
+           'R2':{'quote':'对应月份，简称2与名称，按实际金额和预算计算。'}}
+    changes=normalize_reference_relationships(scope,v,rules,catalog=c)
+    assert lookup['relationships'][0]['target_fields']==['current_alias']
+    assert lookup['relationships'][0]['cardinality']=='optional_many'
+    assert any(ch.get('field')=='label' and ch['target_field']=='current_alias' for ch in changes)
+
+
 def test_literal_exclusion_and_nonzero_counterexample_on_real_source_coordinates():
     from bonus_agent.adaptive_compiler import apply_literal_source_exclusions,validate_explicit_zero_exclusion,_compile_prefix,_empty_fragment
     c=Catalog([]);c.sheets={
