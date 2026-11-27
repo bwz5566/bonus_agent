@@ -89,6 +89,7 @@ def read_datasets(catalog: Catalog, specs: dict, *, period, owner='scope_mapping
             keys=names(grain['keys'],f'{name} 粒度键',owner,nonempty=grain['kind']=='unique')
             if not set(keys)<=set(fields):raise ProgramError(f'{name} 粒度键不在字段合同中',owner=owner)
             if not isinstance(ds['sources'],list) or not ds['sources']:raise ProgramError(f'{name} 没有实际材料',owner=owner)
+            nowhere={f for f in fields if all(isinstance(src,dict) and isinstance(src.get('absent_fields'),dict) and f in src['absent_fields'] for src in ds['sources'])}
             rows=[];seen_physical=set();excluded=[];source_summary=[];seen_keys={};ranges_by_sheet=defaultdict(list);headers_by_sheet=defaultdict(set);outside_by_sheet=defaultdict(list)
             for src in ds['sources']:
                 contract(src,required=('sheet','header_row','columns'),optional=('start_row','end_row','skip','constants','excluded_ranges','absent_fields'),label=f'{name} 物理来源',owner=owner)
@@ -114,7 +115,7 @@ def read_datasets(catalog: Catalog, specs: dict, *, period, owner='scope_mapping
                 for f,proof in absent.items():
                     contract(proof,required=('reason','rules'),label=f'{name}.{f} 来源缺列',owner=owner)
                     if not fields[f]['nullable'] or f in keys or not isinstance(proof['reason'],str) or not proof['reason'].strip():
-                        raise ProgramError(f'{name}/{sheet.id} 缺失字段 {f} 必须可空、非粒度键并说明实际缺列证据',owner=owner,kind='binding')
+                        raise ProgramError(f'{name}/{sheet.id} 缺失字段 {f} 必须可空、非粒度键并说明实际缺列证据；不能将待计算的派生指标伪装为物理缺列，应在公式节点由真实原始字段计算',owner=owner,kind='binding')
                     names(proof['rules'],f'{name}.{f} 缺列条款',owner,nonempty=False)
                     known={normalized(f),normalized(fields[f].get('label',f))}
                     for other in ds['sources']:
@@ -188,13 +189,14 @@ def read_datasets(catalog: Catalog, specs: dict, *, period, owner='scope_mapping
                             before=seen_keys[key]
                             if grain['duplicates']=='identical' and before.values==vals:
                                 dupes+=1;excluded.append({'where':where,'reason':'经明确声明的同键完全相同记录去重','first':before.source});continue
-                            raise ProgramError(f'{name} 数据粒度键 {key} 重复：{before.source} / {where}；不能猜测加总或去重',owner=owner,kind='duplicate',dataset=name,location=where,
+                            raise ProgramError(f'{name} 数据粒度键 {key} 重复：{before.source} / {where}；不能猜测加总或去重。若真实材料是多条明细对应同一主对象，保留明细粒度并由population分组、公式节点聚合，不得声明已聚合唯一表',owner=owner,kind='duplicate',dataset=name,location=where,
                                                details={'first':before.source,'second':where,'key':list(key),'first_values':before.values,'second_values':vals})
                     record=Record(vals,where,locations);rows.append(record);count+=1
                     if keys:seen_keys[key]=record
                 source_summary.append({'sheet':sheet.id,'file':sheet.file,'name':sheet.name,'header_row':h,'range':[start,end],
                                        'physical_rows':max(0,end-start+1),'included':count,'blank':empty_rows,'duplicate_identical':dupes,'columns':raw_cols,
                                        'absent_fields':{f:{**proof,'source':constant_locations[f]} for f,proof in absent.items()}})
+            if nowhere:raise ProgramError(f'{name} 字段 {sorted(nowhere)} 在所有来源均声明缺列，不能当作物理数据字段。若是业务派生指标，删除该物理字段，在后续公式节点由已有真实字段计算；若是实际必需输入，明确材料缺口。absent_fields仅用于部分来源真缺列。',owner=owner,kind='binding',dataset=name,details={'all_sources_absent':sorted(nowhere)})
             for sid,ranges in ranges_by_sheet.items():
                 sheet=catalog.sheets[sid];start=min(headers_by_sheet[sid])+1
                 for n in range(start,len(sheet.rows)+1):

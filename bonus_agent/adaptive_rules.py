@@ -148,7 +148,15 @@ def sparse_source_columns(sheet, *, limit=8):
 
 def source_index(catalog):
     """No keyword gate: index all sheets and actual document/table units."""
-    sheets=[{**s.profile(1,compact=True),'sparse_columns':sparse_source_columns(s)} for s in catalog.sheets.values()]
+    sheets=[]
+    for s in catalog.sheets.values():
+        profile={**s.profile(1,compact=True),'sparse_columns':sparse_source_columns(s)}
+        # Short tables can be classified from every actual physical row,
+        # rather than extrapolating rules from the first few sample rows.
+        if len(s.rows)<=24 and sum(len(string(v)) for row in s.rows for v in row)<=5000:
+            profile['all_rows']=[{'row':i,'cells':{get_column_letter(j):string(s.literal(i,j,display=True))[:180]
+                for j,v in enumerate(row,1) if v not in (None,'')}} for i,row in enumerate(s.rows,1)]
+        sheets.append(profile)
     docs=defaultdict(lambda:{'text_units':[],'tables':[],'unreadable':[]})
     for k,v in catalog.blocks.items():
         if not k.startswith('R'):continue
@@ -193,9 +201,11 @@ def validate_source_inventory(catalog,proposal):
             if r in seen:raise ProgramError(f'{sid} 规则单元格 {a} 已包含于整行规则范围，不得重复',owner='scope_mapping')
         if s['kind']=='mixed' and not (ranges or rule_cells):raise ProgramError(f'{sid} 混合材料必须指出实际规则行或单元格',owner='scope_mapping')
         if s['kind'] not in ('mixed','rule','output') and (ranges or rule_cells):raise ProgramError(f'{sid} 数据表规则须按 mixed 分类',owner='scope_mapping')
-        if s['kind']=='rule' and rule_cells:raise ProgramError(f'{sid} 完整规则表使用整行覆盖；只选择侧栏规则时使用 mixed',owner='scope_mapping')
-        if s['kind']=='rule' and ranges and seen!=set(range(1,len(catalog.sheets[sid].rows)+1)):
-            raise ProgramError(f'{sid} 标记为完整规则表却排除了部分行；若为混合材料请明确范围',owner='scope_mapping')
+        if s['kind']=='rule':
+            # A full rule table is always covered in full. Whether a first
+            # row is a structural header is decided at the clause level.
+            # The reviewer cannot accidentally exclude a valid unseen rule.
+            s['rule_ranges']=[];s['rule_cells']=[]
     # An image-only rule is not a readable source. Never infer a rate from a
     # page label. The financial answer can explicitly identify it as context or
     # supply a readable transcription; no automatic guessed disposition.
@@ -304,11 +314,16 @@ def _ledger_identifier_tail(segment):
     parts=segment.split('|')
     if len(parts)<4:return False
     tail=parts[-1]
-    return (any(re.fullmatch(r'[+-]?\d+(?:\.\d+)?',v) for v in parts[:-1])
+    plausible=(any(re.fullmatch(r'[+-]?\d+(?:\.\d+)?',v) for v in parts[:-1])
             and bool(re.fullmatch(r'[A-Za-z0-9_().+*/\-]+',tail))
             and bool(re.search(r'[A-Za-z]',tail)) and bool(re.search(r'\d',tail))
             and not re.match(r'(?i)(?:ROUND|MIN|MAX|ABS|IF)\(',tail)
             and not any(re.search(r'(?i)公式|formula',v) for v in parts[:-1]))
+    if not plausible:return False
+    # Prove the compact key is a concatenation of actual preceding fields.
+    # A multi-column table may also contain a genuine ASCII arithmetic
+    # expression; do not suppress it simply because digits occur in symbols.
+    return any(tail==''.join(parts[i:j]) for i in range(len(parts)-2) for j in range(i+2,len(parts)))
 
 
 def explicit_formulas(text):

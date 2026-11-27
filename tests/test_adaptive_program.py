@@ -165,6 +165,8 @@ def test_source_coverage_cannot_skip_new_rule_rows():
     c=Catalog([]);c.sheets['S1']=Sheet('S1','novel.xlsx','policy',[('name','value'),('新指标','测试规则'),('结算','测试规则2')])
     inventory={'sheets':{'S1':{'kind':'rule','reason':'制度','rule_ranges':[]}},'unreadable':{}}
     units=rule_units(c,inventory);assert set(units)=={'S1R1','S1R2','S1R3'}
+    inventory['sheets']['S1']['rule_ranges']=[[2,2]]
+    assert set(rule_units(c,inventory))=={'S1R1','S1R2','S1R3'}
     with pytest.raises(ProgramError,match='逐原文'):validate_clause_chunk(units,{'units':{}})
     with pytest.raises(ProgramError,match='每张真实表'):validate_source_inventory(c,{'sheets':{},'unreadable':{}})
 
@@ -183,6 +185,7 @@ def test_mixed_ledger_side_note_is_addressed_by_actual_cell_not_every_record():
     assert explicit_formulas('202701 | A1 | ABC12+DEF34*2 | 未结算，未支付 | 120 | 202701A1ABC12+DEF34*2')==[]
     assert explicit_formulas('净额 | 收入-成本')==['收入-成本']
     assert explicit_formulas('公式 | 1 | 2 | amount2-cost1')==['amount2-cost1']
+    assert explicit_formulas('1 | type | 2 | amount2-cost1')==['amount2-cost1']
     inv['sheets']['S1']['rule_cells']=['F2']
     with pytest.raises(ProgramError,match='实际为空'):validate_source_inventory(c,inv)
 
@@ -329,6 +332,10 @@ def test_merged_sources_explicitly_preserve_physically_missing_nullable_fields()
     with pytest.raises(ProgramError,match='实际存在已知表头'):read_datasets(cat,wrong,period='2027Q1')
     wrong=deepcopy(ds);wrong['sales']['fields']['paid']['nullable']=False
     with pytest.raises(ProgramError,match='必须可空'):read_datasets(cat,wrong,period='2027Q1')
+    wrong=deepcopy(ds);wrong['sales']['fields']['computed_status']={'kind':'bool','nullable':True}
+    for src in wrong['sales']['sources']:
+        src.setdefault('absent_fields',{})['computed_status']={'reason':'由金额派生，无物理列','rules':[]}
+    with pytest.raises(ProgramError,match='在所有来源均声明缺列'):read_datasets(cat,wrong,period='2027Q1')
 
 
 def test_actual_financial_authority_routes_by_confirmed_owner_not_model_guess():
