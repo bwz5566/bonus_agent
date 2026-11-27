@@ -130,9 +130,26 @@ def test_kimi_report_repair_uses_named_outputs_and_preserves_financial_phase(tmp
     assert (TaskBoard(ar.ws).statuses()['deliver']['status'] == 'PASS') == preserve_distribution
 
 
+def test_default_models_do_not_attach_kimi_even_if_key_is_configured(monkeypatch):
+    monkeypatch.setenv('MOONSHOT_API_KEY', 'test-repair-access')
+    monkeypatch.setenv('GEMINI_API_KEY', 'test-gemini-access')
+    cfg=yaml.safe_load(DEFAULT_CONFIG.read_text(encoding='utf-8'))
+    assert cfg['default']=='deepseek-flash'
+    for name in ('deepseek-flash','deepseek-flash-pro','gemini-4-hydrogen'):
+        primary=LLM.from_config(name,cfg)
+        assert primary.repair_llm is None
+        if name.startswith('deepseek'):
+            assert primary.think_llm.model==primary.checker_llm.model=='deepseek-v4-pro'
+            assert primary.recovery_mode=='advisor'
+
+
 def test_kimi_protocol_and_budget_are_bound_to_the_repair_route(monkeypatch):
     monkeypatch.setenv('MOONSHOT_API_KEY', 'test-repair-access')
-    primary = LLM.from_config('deepseek-flash', yaml.safe_load(DEFAULT_CONFIG.read_text(encoding='utf-8')))
+    cfg=yaml.safe_load(DEFAULT_CONFIG.read_text(encoding='utf-8'))
+    # The optional legacy recovery connector is exercised only after an
+    # explicit opt-in; a configured credential alone must not activate it.
+    cfg['models']['deepseek-flash'].update(repair_model='kimi-k3.1-pro',recovery_mode='supervisor')
+    primary = LLM.from_config('deepseek-flash',cfg)
     repair = primary.repair_llm
     budget = RunBudget(0, 20_000).bind(primary)
     assert repair.model == 'kimi-k3.1-pro' and repair.run_budget is budget

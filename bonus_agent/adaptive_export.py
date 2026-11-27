@@ -31,10 +31,20 @@ SECTIONS={'project','summary','roles','person','parameters','trace','coverage','
 
 
 def validate_layout(layout,basis,settlement=None):
-    contract(layout,required=('columns','sections','rules','formula_bindings'),optional=('groups','person_columns','person_totals'),label='输出布局',owner='export')
-    keys=set(basis['key_fields']);metrics=set(basis['metric_fields']);labels=set()
+    contract(layout,required=('columns','sections','rules','formula_bindings'),optional=('groups','person_columns','person_totals','project_totals'),label='输出布局',owner='export')
+    keys=set(basis['key_fields']);metrics=set(basis['metric_fields']);labels=set();pb=(settlement or {}).get('person_basis') or {}
+    person_keys=set(pb.get('key_fields',[]));person_metrics=set(pb.get('metric_fields',{}))
+    def normalize_column(col):
+        if isinstance(col,dict) and 'source' not in col:
+            direct=[k for k in ('key','ref') if k in col]
+            if len(direct)==1:col['source']={direct[0]:col.pop(direct[0])}
+    def member(src,ks,ms):
+        if not isinstance(src,dict) or len(src)!=1:return False
+        k,v=next(iter(src.items()))
+        return isinstance(v,str) and (k=='key' and v in ks or k=='ref' and v in ms)
     if not isinstance(layout['columns'],list) or not isinstance(layout['sections'],dict):raise ProgramError('报表字段/章节定义无效',owner='export')
     for col in layout['columns']:
+        normalize_column(col)
         contract(col,required=('label','source','rules'),label='报表列',owner='export')
         src=col['source']
         if not isinstance(src,dict) or len(src)!=1:raise ProgramError('报表列必须指向实际指标或项目键',owner='export')
@@ -47,24 +57,32 @@ def validate_layout(layout,basis,settlement=None):
         if name=='person' and not (settlement or {}).get('person_basis'):raise ProgramError('实际没有独立人员层指标，不能虚构人员核算章节',owner='export')
         contract(section,required=('rules',),label='报表章节',owner='export')
     for group in layout.get('groups',[]):
-        contract(group,required=('label','by','metrics','rules'),label='分组汇总',owner='export')
+        contract(group,required=('label','by','metrics','rules'),optional=('layer',),label='分组汇总',owner='export')
         if not group['label'] or not isinstance(group['by'],list) or not group['by'] or not isinstance(group['metrics'],list) or not group['metrics']:
             raise ProgramError('分组汇总字段无效',owner='export')
-        for src in group['by']:
-            if not isinstance(src,dict) or len(src)!=1:raise ProgramError('汇总分组应为实际键或指标',owner='export')
-            k,v=next(iter(src.items()))
-            if k not in ('key','ref') or v not in (keys if k=='key' else metrics):raise ProgramError('分组汇总引用不存在的列',owner='export')
-        if not set(group['metrics'])<=metrics:raise ProgramError('汇总计算引用不存在的指标',owner='export')
-    pb=(settlement or {}).get('person_basis') or {}
+        group['by']=[src['source'] if isinstance(src,dict) and set(src)=={'source'} else src for src in group['by']]
+        if any(not isinstance(m,str) for m in group['metrics']):raise ProgramError('分组汇总指标须为实际指标ID',owner='export')
+        layers=[]
+        if all(member(s,keys,metrics) for s in group['by']) and set(group['metrics'])<=metrics:layers.append('project')
+        if pb and all(member(s,person_keys,person_metrics) for s in group['by']) and set(group['metrics'])<=person_metrics:layers.append('person')
+        if 'layer' not in group:
+            if len(layers)!=1:raise ProgramError(f'分组「{group["label"]}」的键及指标未唯一指向实际计算层：{layers}；请明确project/person，不混用',owner='export')
+            group['layer']=layers[0]
+        if group['layer'] not in layers:raise ProgramError(f'分组「{group["label"]}」引用了其它层级或不存在的列/指标',owner='export')
+    person_labels=set()
     for col in layout.get('person_columns',[]):
+        normalize_column(col)
         contract(col,required=('label','source','rules'),label='人员层报表列',owner='export')
         src=col['source']
         if not isinstance(src,dict) or len(src)!=1:raise ProgramError('人员列必须对应已核算人员指标',owner='export')
         k,v=next(iter(src.items()))
         if k not in ('key','ref') or v not in (pb.get('key_fields',[]) if k=='key' else pb.get('metric_fields',{})):raise ProgramError(f'人员输出列未计算 {src}',owner='export')
-    for item in layout.get('person_totals',[]):
-        contract(item,required=('metric','label','rules'),label='人员汇总指标',owner='export')
-        if item['metric'] not in pb.get('metric_fields',{}):raise ProgramError('人员汇总指标未计算',owner='export')
+        if col['label'] in person_labels:raise ProgramError(f'人员报表列名称重复：{col["label"]}',owner='export')
+        person_labels.add(col['label'])
+    for field,available in [('project_totals',metrics),('person_totals',person_metrics)]:
+        for item in layout.get(field,[]):
+            contract(item,required=('metric','label','rules'),label='计算层汇总指标',owner='export')
+            if item['metric'] not in available:raise ProgramError(f'{field} 汇总指标未计算：{item["metric"]}',owner='export')
     return layout
 
 
@@ -102,6 +120,17 @@ def verify_explicit_output_fields(layout,basis,settlement,obligations):
             names=e_names if re.search(r'人员|员工|个人|收款人',desc) else p_names
             missing=[x for x in labels if norm(x) not in names]
             if missing:raise ProgramError(f'{rid} 输出要求中有明确列但当前布局未提供：{missing}；请绑定对应已核算键/指标，确实缺指标时返回其计算节点',owner='export',kind='coverage',rules=[rid],details={'missing_columns':missing,'available':sorted(names)})
+        # Explicit requests to total all money columns are report operations
+        # over already frozen fields, not new business calculations. Include
+        # every unambiguous monetary column from the model's actual layout.
+        if re.search(r'汇总(?:各|所有|全部|每个)?(?:金额|提成金额)列|(?:各|所有|全部)金额列[^。；;]{0,8}(?:汇总|合计)',clause['quote']):
+            for field,columns,objects,prefix in [('project_totals',layout['columns'],basis['projects'],'项目字段'),('person_totals',layout.get('person_columns',[]),personal.get('projects',{}),'人员字段')]:
+                totals=layout.setdefault(field,[]);known={v['metric'] for v in totals}
+                for col in columns:
+                    mid=col.get('source',{}).get('ref');label=col['label']
+                    money=bool(re.search(r'金额|合同额|销售额|回款|基数|提成|奖金|佣金|应得|实发|抵扣|预发|欠款|暂扣|冻结',label)) and not re.search(r'率|系数|比例|编号|数量|人数|天数',label)
+                    if mid and mid not in known and money and objects and all(isinstance(p['metrics'].get(mid),D) for p in objects.values()):
+                        totals.append({'metric':mid,'label':prefix+'汇总：'+label,'rules':[rid]});known.add(mid)
 
 
 def _json(x):return json.dumps(x,ensure_ascii=False,default=str,separators=(',',':'))
@@ -227,7 +256,7 @@ def write_adaptive_workbook(path,basis,settlement,state,*,layout=None):
             count=max((len(role_groups[(k,rid)]) for k in order),default=0)
             slots.extend((rid,i,r['label']+(str(i+1) if count>1 else '')) for i in range(count))
     if 1+len(cols)+2*len(slots)>16384:raise ProgramError('报表列数超出Excel容量，不截断数据',owner='export')
-    formula_expected=[];project_rows={};person_rows=[];fallbacks=[];summary_checks={};inline_checks={}
+    formula_expected=[];project_rows={};person_rows=[];fallbacks=[];summary_checks={};inline_checks={};group_checks=[]
     try:
         with xlsxwriter.Workbook(str(target),{'strings_to_formulas':False,'strings_to_urls':False}) as book:
             work=book.add_worksheet('提成奖核算底稿');summary=book.add_worksheet('核算汇总');parameters=book.add_worksheet('参数与来源')
@@ -359,7 +388,12 @@ def write_adaptive_workbook(path,basis,settlement,state,*,layout=None):
                 personal_cols.extend(('key',k,k) for k in personal['key_fields'] if ('key',k) not in pseen)
                 personal_cols.extend(('ref',k,label) for k,label in personal['metric_fields'].items() if ('ref',k) not in pseen)
                 for ci,(k,v,_) in enumerate(personal_cols,1):personal_canonical.setdefault((k,v),ci)
-                head(person_sheet,['人员唯一键']+[label for _,_,label in personal_cols]);person_sheet.set_column(0,0,42)
+                labels=['人员唯一键'];used=set(labels)
+                for _,_,label in personal_cols:
+                    candidate=label;j=2
+                    while candidate in used:candidate=f'{label}（{j}）';j+=1
+                    labels.append(candidate);used.add(candidate)
+                head(person_sheet,labels);person_sheet.set_column(0,0,42)
                 for ri,(identity,person) in enumerate(personal['projects'].items(),1):
                     personal_rows[identity]=ri;pid=str(person['key_values'][plan['identity_key']]);person_id_rows[pid]=ri;value(person_sheet,ri,0,identity)
                     refs={k:_ref(person_sheet.name,ri,ci) for k,ci in personal_canonical.items()};qs=render_queries(identity,person,refs,personal.get('trace_pool',{}))
@@ -371,6 +405,11 @@ def write_adaptive_workbook(path,basis,settlement,state,*,layout=None):
             total_ids={funding['labels']['alloc']:funding['alloc'],funding['labels']['total']:funding['total'],**{v:k for k,v in funding['destinations'].items()}}
             for label,amount in basis['totals'].items():
                 mid=total_ids[label];value(summary,row,0,label);span=_range(work.name,1,len(order),canonical[('ref',mid)]);formula(summary,row,1,f'ROUND(SUM({span}),{digits})',amount,moneyfmt);summary_rows[label]=row;row+=1
+            for item in layout.get('project_totals',[]):
+                mid=item['metric'];vals=[p['metrics'][mid] for p in projects.values()]
+                if not all(isinstance(x,D) for x in vals):raise ProgramError(f'项目汇总 {mid} 不是金额/数值',owner='export')
+                amount=sum(vals,D(0));value(summary,row,0,item['label']);formula(summary,row,1,f'SUM({_range(work.name,1,len(order),canonical[("ref",mid)])})',amount,moneyfmt)
+                summary_checks[row]=amount;row+=1
             if settlement:
                 row+=1;summary.write_row(row,0,['人员/待分配','金额','人员唯一ID','去向'],hfmt);row+=1;begin=row
                 end_role=len(settlement['rows']);ids=_range(role_sheet.name,1,end_role,3);dest=_range(role_sheet.name,1,end_role,9);amounts=_range(role_sheet.name,1,end_role,8)
@@ -412,17 +451,31 @@ def write_adaptive_workbook(path,basis,settlement,state,*,layout=None):
             if grouped:
                 head(grouped,['分组要求','分组值','指标ID','合计']);gr=1
                 for definition in layout['groups']:
+                    if definition['layer']=='person':
+                        objects,sheet,rows,colmap=personal['projects'],person_sheet,personal_rows,personal_canonical
+                    else:
+                        objects,sheet,rows,colmap=projects,work,project_rows,canonical
                     groups=defaultdict(list)
-                    for key,p in projects.items():
+                    for key,p in objects.items():
                         vals=[]
                         for src in definition['by']:
                             typ,v=next(iter(src.items()));vals.append(p['key_values'][v] if typ=='key' else p['metrics'][v])
                         groups[tuple(vals)].append(key)
                     for vals,keys_ in groups.items():
                         for mid in definition['metrics']:
-                            refs_=[_ref(work.name,project_rows[k],canonical[('ref',mid)]) for k in keys_];vals_=[projects[k]['metrics'][mid] for k in keys_]
+                            vals_=[objects[k]['metrics'][mid] for k in keys_]
                             if not all(isinstance(x,D) for x in vals_):raise ProgramError(f'分组汇总 {mid} 不是金额/数值',owner='export')
-                            grouped.write_row(gr,0,[definition['label'],_json(vals),mid]);formula(grouped,gr,3,'SUM('+','.join(refs_)+')',sum(vals_,D(0)));gr+=1
+                            # Contiguous rows form ranges; avoid one formula argument
+                            # per object for the common large-group case.
+                            runs=[]
+                            for ri in sorted(rows[k] for k in keys_):
+                                if runs and runs[-1][1]+1==ri:runs[-1][1]=ri
+                                else:runs.append([ri,ri])
+                            refs_=[_range(sheet.name,a,b,colmap[('ref',mid)]) for a,b in runs]
+                            e='+'.join('SUM('+','.join(refs_[i:i+100])+')' for i in range(0,len(refs_),100))
+                            labels=[definition['label'],_json(vals),mid];amount=sum(vals_,D(0))
+                            grouped.write_row(gr,0,labels);metric_value(grouped,gr,3,lambda:e,amount,'分组/'+definition['label']+'/'+_json(vals)+'/'+mid,moneyfmt)
+                            group_checks.append((labels,amount));gr+=1
             head(ledger,['来源条款/单元','阶段','实际原文/理由','实际计算组件','状态']);lr=1
             all_coverage={**basis.get('rule_coverage',{}),**((settlement or {}).get('rule_coverage',{})),**state.get('adaptive_output_coverage',{})}
             for rid,record in all_coverage.items():
@@ -461,7 +514,12 @@ def write_adaptive_workbook(path,basis,settlement,state,*,layout=None):
                 vals=sum_sheet[ri][:4];person_digits=personal['funding']['summary_digits'] if personal else settlement['rounding']['digits']
                 if vals[0]!=item['name'] or not _money_equal(vals[1],item['amount'],person_digits) or tuple(vals[2:])!=(item['id'],item['destination']):raise ProgramError('Excel实名/待分配回读不一致',owner='export')
             for ri,expected in summary_checks.items():
-                if not _money_equal(sum_sheet[ri][1],expected,max(digits,settlement['rounding']['digits'])):raise ProgramError(f'Excel资金去向汇总 {sum_sheet[ri][0]} 回读不一致',owner='export')
+                if not _money_equal(sum_sheet[ri][1],expected,max(digits,(settlement or {}).get('rounding',{}).get('digits',digits))):raise ProgramError(f'Excel资金去向汇总 {sum_sheet[ri][0]} 回读不一致',owner='export')
+            if grouped:
+                observed=list(cached['分组汇总'].values)[1:]
+                if len(observed)!=len(group_checks):raise ProgramError('Excel分组覆盖不一致',owner='export')
+                for actual,(labels,amount) in zip(observed,group_checks):
+                    if actual[:3]!=tuple(labels) or not _equal(actual[3],amount):raise ProgramError(f'Excel分组 {labels} 回读不一致',owner='export')
             if settlement:
                 actual=list(cached['角色分配'].values)[1:]
                 if len(actual)!=len(settlement['rows']):raise ProgramError('Excel角色行数不一致',owner='export')

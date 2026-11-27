@@ -400,8 +400,11 @@ class PersonalContracts(Contracts):
                 'identity_key':'id','name_metric':'name','attributed_metric':'order_sum','contribution_amount':'raw','rules':[self.rid('master')],
                 'parameters':{},'schedules':{},'formula_bindings':forms}
         if node=='adaptive/export/layout':
-            rid=self.rid('output');return {'columns':[],'person_columns':[{'label':'员工编号','source':key('id'),'rules':[rid]}],
-               'person_totals':[{'label':'超预发合计','metric':'over','rules':[rid]}],'sections':{'person':{'rules':[rid]},'project':{'rules':[rid]}},'rules':[],'formula_bindings':{}}
+            rid=self.rid('output');return {'columns':[{'label':'净销售额','source':ref('sales_net'),'rules':[rid]}],
+                'person_columns':[{'label':'员工编号','source':key('id'),'rules':[rid]},{'label':'预发合计','source':ref('advance'),'rules':[rid]},{'label':'个人计奖系数','source':ref('factor'),'rules':[rid]}],
+                'groups':[{'label':'合同','by':[key('agreement')],'metrics':['pay'],'rules':[rid]},
+                          {'label':'员工','layer':'person','by':[{'source':key('id')}],'metrics':['paid','over'],'rules':[rid]}],
+                'person_totals':[{'label':'超预发合计','metric':'over','rules':[rid]}],'sections':{'person':{'rules':[rid]},'project':{'rules':[rid]}},'rules':[],'formula_bindings':{}}
         return super().reply(msg)
 
 
@@ -416,7 +419,7 @@ def test_formal_person_stage_includes_zero_master_and_prepaid(tmp_path):
         '实际抵扣=min(人员应得,预发合计)',
         '本次实发=max(人员应得-预发合计,0)',
         '超预发=max(预发合计-人员应得,0)',
-        '输出项目底稿和人员核算底稿，包括超预发合计。',
+        '输出项目底稿：净销售额、agreement；输出人员核算底稿：员工编号、预发合计、个人计奖系数，并汇总各金额列。',
     ]),encoding='utf8')
     employees=policy.parent/'employees.csv';employees.write_text('ID,Name,Factor\nA001,同名甲,0.5\nB001,同名甲,1\nC001,无订单,1\n',encoding='utf8')
     advances=policy.parent/'advances.csv';advances.write_text('Record,ID,Amount\nR1,A001,20\nR2,A001,5\nR3,B001,3\n',encoding='utf8');paths += [employees,advances]
@@ -430,8 +433,29 @@ def test_formal_person_stage_includes_zero_master_and_prepaid(tmp_path):
     assert len(people)==3 and D(people['A001']['amount'])==D('29.4') and D(people['B001']['metrics']['over'])==3 and D(people['C001']['amount'])==0
     assert D(s['funding_bridge']['entitled'])==D('54.4') and D(s['residual'])==0
     wb=load_workbook(out/'result.xlsx',read_only=True,data_only=True)
-    try:assert '人员核算底稿' in wb.sheetnames and len(list(wb['人员核算底稿'].values))==4
+    try:
+        pr=list(wb['人员核算底稿'].values);assert len(pr)==4 and len(set(pr[0]))==len(pr[0])
+        groups={(g,json.loads(v)[0],m):D(str(a)) for g,v,m,a in list(wb['分组汇总'].values)[1:]}
+        assert groups['员工','A001','paid']==D('29.4') and groups['员工','B001','over']==3 and groups['员工','C001','paid']==0
+        assert sum(a for (g,_,m),a in groups.items() if g=='合同' and m=='pay')==D('108.8')
+        totals={r[0]:r[1] for r in wb['核算汇总'].values if r[0]}
+        assert '项目字段汇总：净销售额' in totals and D(str(totals['人员字段汇总：预发合计']))==28
+        assert '人员字段汇总：个人计奖系数' not in totals
     finally:wb.close()
+
+
+def test_report_group_cannot_mix_or_guess_calculation_layers():
+    import pytest
+    from bonus_agent.adaptive_export import validate_layout,default_layout
+    from bonus_core.engine.adaptive import ProgramError
+    basis={'key_fields':['id'],'metric_fields':{'project_amount':'金额','shared':'共同字段'}}
+    settlement={'person_basis':{'key_fields':['id'],'metric_fields':{'person_amount':'金额','shared':'共同字段'}}}
+    layout=default_layout();layout['groups']=[{'label':'人员','by':[{'source':key('id')}],'metrics':['person_amount'],'rules':[]}]
+    assert validate_layout(layout,basis,settlement)['groups'][0]['layer']=='person'
+    g=layout['groups'][0];g['metrics']=['project_amount']
+    with pytest.raises(ProgramError,match='其它层级'):validate_layout(layout,basis,settlement)
+    g.pop('layer');g['metrics']=['shared']
+    with pytest.raises(ProgramError,match='未唯一指向'):validate_layout(layout,basis,settlement)
 
 
 class GroupedContracts(Contracts):

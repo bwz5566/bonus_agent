@@ -917,8 +917,8 @@ class AdaptiveCompiler:
                 'funding':basis['funding'],'roles':{k:v['label'] for k,v in self.state['adaptive_roster_contract']['roles'].items()},
                 'person_keys':pk,'person_metrics':personal.get('metric_fields',{}),'person_funding':personal.get('funding')},
             '仅根据输出要求安排已经计算的表格，不改变规则或金额。全部项目键、所有已编制指标、实际角色明细及实名/待分配汇总都会保留。'
-            '为本次要求的列名称、顺序和分组指定实际来源；不要新造金额列。输出{"columns":[{"label":"报表字段名","source":{"ref":"真实指标ID"}或{"key":"真实项目键"},"rules":[对应输出条款ID]}],"sections":{"project/summary/roles/parameters/trace/coverage/approvals":{"rules":[对应输出条款ID]}},"groups":[{"label":"分组名","by":[{"key":"实际项目键"}或{"ref":"指标ID"}],"metrics":[汇总数值指标ID],"rules":[条款ID]}],"rules":[全局输出条款ID],"formula_bindings":{明示输出公式条款ID:{"target":"相同的已计算指标ID","symbols":{...}}}}。'
-            '如有独立人员层，可增加person_columns（同columns格式但引用实际person_keys/person_metrics）、person_totals:[{"metric":"实际人员金额指标ID","label":"汇总名称","rules":[条款ID]}]、sections.person。人员层公式目标用person:指标ID。明确输出要求无法由现有指标满足时，给出具体缺失字段及应返回补充的责任节点。',validate)
+            '为本次要求的列名称、顺序和分组指定实际来源；不要新造金额列。输出{"columns":[{"label":"报表字段名","source":{"ref":"真实指标ID"}或{"key":"真实项目键"},"rules":[对应输出条款ID]}],"sections":{"project/summary/roles/parameters/trace/coverage/approvals":{"rules":[对应输出条款ID]}},"groups":[{"label":"分组名","layer":"project或person","by":[{"key":"本层实际键"}或{"ref":"本层实际指标ID"}],"metrics":[本层汇总数值指标ID],"rules":[条款ID]}],"rules":[全局输出条款ID],"formula_bindings":{明示输出公式条款ID:{"target":"相同的已计算指标ID","symbols":{...}}}}。分组的键和指标必须来自同一实际计算层，不跨层混用。'
+            '按要求增加project_totals:[{"metric":"实际项目金额指标ID","label":"汇总名称","rules":[条款ID]}]。如有独立人员层，可增加person_columns（同columns格式但引用实际person_keys/person_metrics）、person_totals（同project_totals格式但引用实际人员指标）、sections.person。需要汇总各金额列时，涵盖两层实际金额列，不把费率、比例、系数或编号当成金额加总。人员层公式目标用person:指标ID。明确输出要求无法由现有指标满足时，给出具体缺失字段及应返回补充的责任节点。',validate)
         self.state['adaptive_output_contract']=layout
         self.state['adaptive_output_coverage']=coverage(obligations,{'export':layout},phases=['export'],formula_bindings=layout['formula_bindings'],
              metrics=fragment['metrics'],parameters=parameter_ids,keys=basis['key_fields'],person_metrics=pm,person_keys=pk)

@@ -66,8 +66,7 @@ models:
     json_with_thinking: true
     checker: gemini-4-hydrogen-review
     checker_required: true
-    recovery_mode: supervisor
-    repair_model: kimi-k3.1-pro
+    recovery_mode: inline          # 暂不连接第三方恢复模型
     workflow_mode: staged
     max_input_tokens: 160000
     max_history_chars: 80000
@@ -149,8 +148,7 @@ models:
     json_mode: json_object
     extra_body: {thinking: {type: disabled}}     # 默认开思考且 effort=high，一步就能把 8192 个输出 tokens 用完
     think_model: deepseek-v4-pro
-    recovery_mode: supervisor     # Flash执行，Kimi监督与修复，Pro独立复核。
-    repair_model: kimi-k3.1-pro
+    recovery_mode: advisor         # Flash执行，Pro按需诊断及独立复核；暂不自动调用Kimi。
     checker: deepseek-v4-pro
     checker_required: true
     workflow_mode: staged
@@ -162,8 +160,7 @@ models:
     json_mode: json_object
     extra_body: {thinking: {type: disabled}}
     think_model: deepseek-v4-pro
-    recovery_mode: supervisor
-    repair_model: kimi-k3.1-pro
+    recovery_mode: advisor         # Kimi仍可在明确需要时另行配置，不因已有Key自动接入。
     checker: deepseek-v4-pro
     checker_required: true
     workflow_mode: staged

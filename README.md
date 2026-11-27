@@ -171,22 +171,22 @@ bonus run --rules rules.yaml --mapping mapping.yaml \
 
 ## 二、模型选型
 
-### Windows 本机试用 Gemini 4 Hydrogen
+### Windows 本机启动与可选模型
 
-在 `config/secrets.yaml` 填写 `providers.gemini.api_key`，保存后重启网页服务。也可以设置环境变量 `GEMINI_API_KEY`，环境变量优先。密钥可在 [Google AI Studio](https://aistudio.google.com/apikey) 创建。
+默认使用 DeepSeek：在本地 `config/secrets.yaml` 配置 `providers.deepseek.api_key` 或设置 `DEEPSEEK_API_KEY`，保存后重启网页服务。环境变量优先。
 
 ```powershell
 Set-Location D:\hy_project\bonus_agent
 .\tools\restart-local.ps1
 ```
 
-脚本在端口 8080 启动服务，默认模型为 `gemini-4-hydrogen`，数据目录为 `D:\bonus_data`。看到模型名和 PID 后打开 <http://127.0.0.1:8080>。日常执行使用低推理强度，独立复核使用单独的 Gemini 上下文，主要金额复核使用高推理强度。已配置的 Kimi 继续负责故障协助。切换服务会保留案卷和累计用量。
+脚本在端口 8080 启动服务，默认模型为 `deepseek-flash`，数据目录为 `D:\bonus_data`。看到模型名和 PID 后打开 <http://127.0.0.1:8080>。Flash 分节点编制，Pro 局部诊断及独立复核，程序执行确定性计算。当前默认不接入 Kimi。切换服务会保留案卷和累计用量。
 
-切回 DeepSeek 时，在同一目录运行 `.\tools\restart-local.ps1 -Model deepseek-flash`。
+可选 Gemini：在 `config/secrets.yaml` 填写 `providers.gemini.api_key` 或设置 `GEMINI_API_KEY`（[Google AI Studio](https://aistudio.google.com/apikey)），运行 `.\tools\restart-local.ps1 -Model gemini-4-hydrogen`。切回 DeepSeek 使用 `-Model deepseek-flash`。
 
 ### 其他模型
 
-使用 `deepseek-flash` 或 `deepseek-flash-pro` 时，可在本地 `config/secrets.yaml` 的 `providers.moonshot.api_key` 配置 Kimi 密钥，也可设置 `MOONSHOT_API_KEY`。配置后，任务的构建校验失败或持续无进展可触发 `kimi-k3.1-pro`。修复只读取当前任务的局部证据，每个任务版本最多尝试一次，并计入同一作业限额。程序验证候选通过后，DeepSeek 接着执行原案卷。原有的独立金额复核和财务确认仍走各自阶段。
+Kimi 的可选恢复接口保留，但 `deepseek-flash`、`deepseek-flash-pro` 和 Gemini 的默认路由均不装载该模型，即使本机已有 Moonshot 密钥也不会自动调用。后续若出现独立确认的真实卡点，再明确启用相应恢复配置。原有独立金额复核和财务确认仍走各自阶段。
 
 1. 在阿里云百炼开通服务，拿到 API Key。
 2. 写入 Key：`cp config/secrets.example.yaml config/secrets.yaml`，填 `api_key`（该文件已加入 .gitignore，不会提交）；也可以设置环境变量 `DASHSCOPE_API_KEY`，环境变量优先。
