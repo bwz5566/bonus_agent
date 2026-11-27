@@ -409,6 +409,17 @@ def unchanged_rule_candidates(stored,files,reviewer):
     previous data mapping, evaluated amount, or financial confirmation.
     """
     retained={};old_files=stored.get('files',{});sources=stored.get('adaptive_rule_sources',{})
+    # A new attempt can stop at inventory/API transport before it has had a
+    # chance to revalidate the retained units. Do not lose previously checked
+    # source-only evidence merely because that attempt has no new unit proof.
+    # The compiler still checks the full current unit digest, source hash,
+    # answer epoch and actual proposal from each carried record.
+    for digest,record in stored.get('unchanged_rule_candidates',{}).items():
+        if not isinstance(digest,str) or not re.fullmatch(r'[0-9a-f]{64}',digest) or not isinstance(record,dict):continue
+        filename=record.get('file');receipt=record.get('review_receipt',{})
+        if not filename or not files.get(filename) or files[filename]!=old_files.get(filename) or files[filename]!=record.get('sha256'):continue
+        if record.get('reviewer')!=reviewer or receipt.get('status')!='PASS' or receipt.get('reviewer')!=reviewer or not isinstance(record.get('proposal'),dict):continue
+        retained[digest]=copy.deepcopy(record)
     for uid,proof in stored.get('adaptive_rule_unit_proofs',{}).items():
         source=sources.get(uid);receipt=proof.get('receipt',{});task=proof.get('task')
         candidate=stored.get('specs',{}).get(task)

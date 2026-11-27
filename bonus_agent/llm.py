@@ -27,6 +27,27 @@ BASIS_PART_REASONING = ContextVar('basis_part_reasoning', default=None)
 NODE_REQUEST_LIMITS = ContextVar('node_request_limits', default=None)
 
 
+def _ensure_json_prompt(messages):
+    """The provider's json_object mode requires a literal JSON instruction.
+
+    Some short node/reviewer protocols contain an object example but no
+    occurrence of the word JSON. Enforce the transport contract centrally,
+    without changing the caller's messages or node-specific schema.
+    """
+    for message in messages:
+        content=message.get('content')
+        texts=[content] if isinstance(content,str) else [x.get('text','') for x in content if isinstance(x,dict)] if isinstance(content,list) else []
+        if any(isinstance(x,str) and 'json' in x.lower() for x in texts):return messages
+    instruction='输出一个符合本节点结构的合法 JSON 对象。'
+    out=list(messages)
+    for i,message in enumerate(out):
+        if message.get('role')!='system':continue
+        content=message.get('content')
+        if isinstance(content,str):out[i]={**message,'content':content+'\n'+instruction};return out
+        if isinstance(content,list):out[i]={**message,'content':[*content,{'type':'text','text':instruction}]};return out
+    return [{'role':'system','content':instruction},*out]
+
+
 class ScopedRequestDeadline(TimeoutError):
     """A dispatched request exceeded a scoped wall-clock deadline."""
 
@@ -946,6 +967,7 @@ class LLM:
                 kwargs["response_format"] = {"type": "json_schema", "json_schema": {"name": "output", "schema": schema}}
             else:
                 kwargs["response_format"] = {"type": "json_object"}
+                kwargs["messages"] = _ensure_json_prompt(kwargs["messages"])
         self.last_call = {'model': self.model, 'thinking': think, 'status': 'requesting',
                           'reasoning_effort': (body or {}).get('reasoning_effort'), 'transport_retries_limit': MAX_RETRIES}
         resp = self._send(kwargs, think)

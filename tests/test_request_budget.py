@@ -47,6 +47,17 @@ def transport(monkeypatch, responses=None):
     return client
 
 
+def test_json_object_request_always_carries_provider_required_json_word(monkeypatch):
+    client=transport(monkeypatch);llm=model()
+    messages=[{'role':'system','content':'独立核对候选，正确只返回状态对象。'},{'role':'user','content':'核对字段。'}]
+    original=copy.deepcopy(messages)
+    assert llm.chat_json(messages)=={}
+    actual=client.requests[0]
+    assert actual['response_format']=={'type':'json_object'}
+    assert 'json' in actual['messages'][0]['content'].lower()
+    assert messages==original
+
+
 def test_scoped_wall_deadline_keeps_unknown_usage_and_never_retries(monkeypatch):
     import threading,time
     from bonus_agent.llm import NODE_REQUEST_LIMITS

@@ -545,3 +545,17 @@ def test_large_role_rules_are_compiled_as_separate_role_groups(tmp_path):
     cs.confirm_totals(out,SCHEME,rv.receipt_token(rv.state_of(cs.load_case(out))),'测试财务');a=run();assert a.status=='OK',a.error
     calls=[json.loads(m[-1]['content'])['current_node'] for m in primary.calls]
     assert 'adaptive/roster/role_group/partner' in calls and 'adaptive/roster/role_group/service' in calls
+
+
+def test_early_inventory_failure_does_not_discard_retained_original_rule_proofs():
+    from bonus_agent.commission_chain import unchanged_rule_candidates
+    from bonus_agent.recovery import fingerprint
+    digest=fingerprint({'file':'policy.docx','where':'p2','text':'实际制度'})
+    selected={'disposition':'operative','reason':'原件','clauses':[]}
+    record={'file':'policy.docx','sha256':'unchanged','answer_key':fingerprint([]),'proposal':selected,
+            'reviewer':'pro','review_receipt':{'status':'PASS','reviewer':'pro','output':fingerprint(selected)},
+            'historical_task':'real-rule-review','historical_unit':'R1'}
+    failed={'files':{'policy.docx':'unchanged'},'status':'FAILED','unchanged_rule_candidates':{digest:record},'adaptive_rule_unit_proofs':{}}
+    assert unchanged_rule_candidates(failed,failed['files'],'pro')=={digest:record}
+    assert unchanged_rule_candidates(failed,{'policy.docx':'changed'},'pro')=={}
+    assert unchanged_rule_candidates(failed,failed['files'],'other-pro')=={}
